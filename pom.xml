@@ -40,6 +40,12 @@
             <url>https://github.com/mbarcia</url>
         </developer>
     </developers>
+    <scm>
+        <connection>scm:git:https://github.com/The-Pipeline-Framework/pipelineframework-runtime.git</connection>
+        <developerConnection>scm:git:git@github.com:The-Pipeline-Framework/pipelineframework-runtime.git</developerConnection>
+        <url>https://github.com/The-Pipeline-Framework/pipelineframework-runtime</url>
+        <tag>HEAD</tag>
+    </scm>
 
     <repositories>
         <repository>
@@ -72,7 +78,8 @@
         <mockito.version>5.21.0</mockito.version>
         <tpf.contracts.version>26.9.4-SNAPSHOT</tpf.contracts.version>
         <tpf.compiler.version>26.9.4-SNAPSHOT</tpf.compiler.version>
-        <maven.deploy.skip>true</maven.deploy.skip>
+        <maven.deploy.skip>false</maven.deploy.skip>
+        <gpg.skip>true</gpg.skip>
         <skipTests>false</skipTests>
         <skipUnitTests>false</skipUnitTests>
         <argLine />
@@ -243,15 +250,63 @@
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-deploy-plugin</artifactId>
                     <version>3.1.4</version>
-                    <configuration><skip>true</skip></configuration>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-source-plugin</artifactId>
+                    <version>3.3.1</version>
+                    <executions>
+                        <execution><id>attach-sources</id><goals><goal>jar-no-fork</goal></goals></execution>
+                    </executions>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-javadoc-plugin</artifactId>
+                    <version>3.11.2</version>
+                    <configuration><doclint>all,-missing</doclint></configuration>
+                    <executions>
+                        <execution><id>attach-javadocs</id><goals><goal>jar</goal></goals></execution>
+                    </executions>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-gpg-plugin</artifactId>
+                    <version>3.2.8</version>
+                    <configuration><skip>${gpg.skip}</skip></configuration>
+                    <executions>
+                        <execution><id>sign-artifacts</id><phase>verify</phase><goals><goal>sign</goal></goals></execution>
+                    </executions>
+                </plugin>
+                <plugin>
+                    <groupId>org.sonatype.central</groupId>
+                    <artifactId>central-publishing-maven-plugin</artifactId>
+                    <version>0.9.0</version>
+                    <extensions>true</extensions>
+                    <configuration>
+                        <publishingServerId>central</publishingServerId>
+                        <autoPublish>true</autoPublish>
+                        <waitUntil>published</waitUntil>
+                        <waitMaxTime>7200</waitMaxTime>
+                    </configuration>
                 </plugin>
             </plugins>
         </pluginManagement>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-deploy-plugin</artifactId>
-                <configuration><skip>true</skip></configuration>
+                <artifactId>maven-source-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-javadoc-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-gpg-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.sonatype.central</groupId>
+                <artifactId>central-publishing-maven-plugin</artifactId>
             </plugin>
         </plugins>
     </build>

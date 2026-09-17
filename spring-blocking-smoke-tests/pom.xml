@@ -30,6 +30,7 @@
     <description>Internal Spring Boot generated blocking application smoke tests</description>
 
     <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
         <spring.boot.version>4.0.7</spring.boot.version>
         <pipeline.generatedSourcesDir>${project.build.directory}/generated-sources/pipeline</pipeline.generatedSourcesDir>
     </properties>
@@ -96,6 +97,15 @@
 
     <build>
         <plugins>
+            <plugin>
+                <artifactId>maven-deploy-plugin</artifactId>
+                <configuration><skip>true</skip></configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.sonatype.central</groupId>
+                <artifactId>central-publishing-maven-plugin</artifactId>
+                <configuration><skipPublishing>true</skipPublishing></configuration>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
