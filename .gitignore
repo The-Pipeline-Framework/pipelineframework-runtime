@@ -1,0 +1,97 @@
+### IntelliJ IDEA ###
+out/
+*.iml
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### Eclipse ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+# Maven caches
+.maven-build-cache/
+**/.maven-build-cache/
+.mvn-local/
+
+### VS Code ###
+.vscode/
+
+### Mac OS ###
+.DS_Store
+
+# Project
+/.idea/
+.idea/workspace.xml
+target/
+.m2/
+*.out
+
+# Local configuration and logs
+*.log
+*.pid
+
+# VitePress build output and cache
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+docs/node_modules/
+
+# Web UI build output
+web-ui/build/
+web-ui/.svelte-kit/
+web-ui/node_modules/
+
+# UI Dashboard build output
+ui-dashboard/dist/
+ui-dashboard/node_modules/
+
+# Vite cache
+web-ui/node_modules/.vite/
+
+# Local notes (kept out of Git)
+.local-notes/
+
+# Maven Release Plugin backup files
+pom.xml.releaseBackup
+/release.properties
+
+# Terraform CLI
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+/examples/csv-payments/config/pipeline.runtime.yaml
+
+# flatten plugin
+**/.flattened-pom.xml
+
+# Local classpath dumps
+*-cp.txt
+*deliver-cp.txt
+
+# Python cache files
+__pycache__/
+
+# Qwen Code local config
+.qwen/
+
+# MCP
+/.mcp.json
+
+# Codex
+.codex/
+
+### Repowise
+.repowise/
+
+### Gitnexus
+.gitnexus/
+
+# Cloudflare Wrangler local cache
+.wrangler/
