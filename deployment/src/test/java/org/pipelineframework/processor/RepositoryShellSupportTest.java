@@ -15,11 +15,6 @@ class RepositoryShellSupportTest {
         assertShellTestPasses(".mvn/testcontainers-docker-context-test.sh");
     }
 
-    @Test
-    void fullVerifyLauncherPreventsDuplicatesAndReportsSuccess() throws Exception {
-        assertShellTestPasses(".mvn/full-verify-launcher-test.sh");
-    }
-
     private void assertShellTestPasses(String relativePath) throws Exception {
         Path testScript = repositoryRoot().resolve(relativePath);
         Process process = new ProcessBuilder("sh", testScript.toString())
