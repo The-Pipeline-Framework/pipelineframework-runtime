@@ -19,4 +19,5 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
+          cache-path: ${{ github.workspace }}/.m2/repository
       - run: ./mvnw clean verify --no-transfer-progress -Dmaven.repo.local="$PWD/.m2/repository"
