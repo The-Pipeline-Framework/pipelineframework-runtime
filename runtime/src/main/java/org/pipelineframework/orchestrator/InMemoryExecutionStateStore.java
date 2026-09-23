@@ -90,7 +90,8 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     null,
                     command.nowEpochMs(),
                     command.nowEpochMs(),
-                    command.ttlEpochS());
+                    command.ttlEpochS(),
+                    command.pagingState());
 
                 executionIdByScopedKey.put(scopedKey, executionId);
                 String scopedId = scopedExecutionId(command.tenantId(), executionId);
@@ -202,7 +203,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.failedStepIndex(),
                     current.failedCommandId(),
                     current.redriveTargetCommandId(),
-                    current.redriveReason());
+                    current.redriveReason(), current.pagingState());
                 executionsByScopedId.put(scopedId, claimed);
                 return Optional.of(claimed);
             }
@@ -262,7 +263,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.failedStepIndex(),
                     current.failedCommandId(),
                     current.redriveTargetCommandId(),
-                    current.redriveReason());
+                    current.redriveReason(), current.pagingState());
                 executionsByScopedId.put(scopedId, renewed);
                 return Optional.of(renewed);
             }
@@ -311,7 +312,46 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
+                executionsByScopedId.put(scopedId, updated);
+                return Optional.of(updated);
+            }
+        });
+    }
+
+    @Override
+    public boolean supportsPagedProgress() {
+        return true;
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> advancePage(
+        String tenantId,
+        String executionId,
+        long expectedVersion,
+        String transitionKey,
+        PagedExecutionState nextPage,
+        long nowEpochMs) {
+        Objects.requireNonNull(nextPage, "nextPage must not be null");
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                String scopedId = scopedExecutionId(tenantId, executionId);
+                ExecutionRecord<Object, Object> current = getActiveRecord(scopedId, nowEpochMs);
+                if (current == null || current.version() != expectedVersion
+                    || current.status() != ExecutionStatus.RUNNING
+                    || current.pagingState().isEmpty()
+                    || nextPage.pageIndex() != current.pagingState().orElseThrow().pageIndex() + 1) {
+                    return Optional.empty();
+                }
+                ExecutionRecord<Object, Object> updated = new ExecutionRecord<>(
+                    current.tenantId(), current.executionId(), current.executionKey(), current.pipelineId(),
+                    current.contractVersion(), current.releaseVersion(), current.resultShape(),
+                    ExecutionStatus.QUEUED, current.version() + 1, 0, 0, null, 0L,
+                    nowEpochMs, transitionKey, current.inputPayload(), null, null, null, null,
+                    current.createdAtEpochMs(), nowEpochMs, current.ttlEpochS(),
+                    current.firstCircuitDeferredAtEpochMs(), current.circuitDeferralCount(),
+                    current.circuitIdentity(), ExecutionRedriveIntent.REPLAY, -1, Optional.empty(),
+                    Optional.empty(), Optional.empty(), Optional.of(nextPage));
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -361,7 +401,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -412,7 +452,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -469,7 +509,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -550,7 +590,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -600,7 +640,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -636,7 +676,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.createdAtEpochMs(), nowEpochMs, current.ttlEpochS(), firstCircuitDeferredAtEpochMs,
                     circuitDeferralCount, circuitIdentity == null ? "" : circuitIdentity,
                     current.redriveIntent(), current.failedStepIndex(), current.failedCommandId(),
-                    current.redriveTargetCommandId(), current.redriveReason());
+                    current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -725,7 +765,10 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.circuitIdentity(),
                     ExecutionRedriveIntent.REPLAY,
                     failedStepIndex,
-                    failedCommandId);
+                    failedCommandId,
+                    Optional.empty(),
+                    Optional.empty(),
+                    current.pagingState());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -847,7 +890,8 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.failedStepIndex(),
                     current.failedCommandId(),
                     retainedTarget,
-                    retainedReason);
+                    retainedReason,
+                    current.pagingState());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }

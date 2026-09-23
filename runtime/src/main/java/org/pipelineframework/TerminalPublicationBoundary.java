@@ -34,7 +34,22 @@ class TerminalPublicationBoundary {
     Objects.requireNonNull(completed, "completed must not be null");
     TerminalPublicationPlan plan = completed.terminalPublication();
     return publishCheckpoint(completed, plan, nowEpochMs)
-        .chain(() -> publishObjectOutput(plan, nowEpochMs));
+        .chain(() -> publishObjectOutput(plan, nowEpochMs))
+        .chain(() -> composeExhaustedPagedOutput(completed));
+  }
+
+  private Uni<Void> composeExhaustedPagedOutput(CompletedSegment completed) {
+    if (objectPublishCompletionService == null
+        || completed.result().pageCompletion().filter(completion -> completion.exhausted()).isEmpty()) {
+      return Uni.createFrom().voidItem();
+    }
+    var page = completed.segment().record().pagingState();
+    if (page.isEmpty()) {
+      return Uni.createFrom().failure(new IllegalStateException(
+          "exhausted page completion requires durable paging state"));
+    }
+    return objectPublishCompletionService.completePagedIfConfigured(
+        completed.segment().record().executionId(), page.orElseThrow().pageIndex());
   }
 
   private Uni<Void> publishCheckpoint(CompletedSegment completed, TerminalPublicationPlan plan, long nowEpochMs) {

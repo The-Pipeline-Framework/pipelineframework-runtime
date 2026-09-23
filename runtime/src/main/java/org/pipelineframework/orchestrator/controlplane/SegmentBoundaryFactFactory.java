@@ -23,7 +23,7 @@ final class SegmentBoundaryFactFactory {
             record.contractVersion(),
             record.releaseVersion(),
             record.resultShape(),
-            segmentId(record.executionId(), record.currentStepIndex()),
+            segmentId(record),
             record.currentStepIndex(),
             -1,
             command.inputPayload(),
@@ -194,7 +194,10 @@ final class SegmentBoundaryFactFactory {
     }
 
     static String segmentId(ExecutionRecord<Object, Object> record) {
-        return segmentId(record.executionId(), record.currentStepIndex());
+        String base = segmentId(record.executionId(), record.currentStepIndex());
+        return record.pagingState()
+            .map(page -> base + ":page:" + page.pageIndex())
+            .orElse(base);
     }
 
     static String segmentId(String executionId, int stepIndex) {

@@ -165,6 +165,12 @@ class QueueAsyncCoordinator {
       providerReadinessErrors.add(
           "ExecutionStateStore(" + executionStateStore.providerName() + "): live lease renewal is not supported");
     }
+    if (PipelinePagingPlan.from(releaseIdentityResolver().contract()).isPresent()
+        && !executionStateStore.supportsPagedProgress()) {
+      providerReadinessErrors.add(
+          "ExecutionStateStore(" + executionStateStore.providerName()
+              + "): fenced paged progress is not supported");
+    }
     executionStateStore.startupValidationError()
         .ifPresent(error -> providerReadinessErrors
             .add("ExecutionStateStore(" + executionStateStore.providerName() + "): " + error));
@@ -577,7 +583,8 @@ class QueueAsyncCoordinator {
             this::contractVersion,
             this::releaseVersion,
             this::segmentBoundaryLedger,
-            this::activateLocalReleaseForSubmission);
+            this::activateLocalReleaseForSubmission,
+            () -> PipelinePagingPlan.from(releaseIdentityResolver().contract()));
         submissionFlow = current;
       }
       return current;

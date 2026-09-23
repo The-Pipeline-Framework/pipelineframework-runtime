@@ -37,6 +37,13 @@ public class ObjectPublishCompletionService {
         return runner().enabled();
     }
 
+    public Uni<Void> completePagedIfConfigured(String executionId, int lastPageIndex) {
+        ObjectPublishRunner active = runner();
+        return active.enabled()
+            ? active.completePagedOutput(executionId, lastPageIndex)
+            : Uni.createFrom().voidItem();
+    }
+
     private ObjectPublishRunner runner() {
         ObjectPublishRunner active = runner;
         if (active != null) {

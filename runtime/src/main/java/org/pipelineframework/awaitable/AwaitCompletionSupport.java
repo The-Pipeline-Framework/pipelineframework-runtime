@@ -61,7 +61,7 @@ public class AwaitCompletionSupport {
             context.tenantId(),
             context.executionId(),
             stepIndex,
-            context.executionId() + ":" + stepIndex,
+            context.identityScope() + ":" + stepIndex,
             input,
             null,
             null)
@@ -145,7 +145,8 @@ public class AwaitCompletionSupport {
             context.currentStepIndex(),
             context.continuationMode(),
             context.terminalOutputOwnership(),
-            context.traceMetadata());
+            context.traceMetadata(),
+            context.pageContext());
     }
 
     @SuppressWarnings("unchecked")
@@ -249,7 +250,7 @@ public class AwaitCompletionSupport {
             context.tenantId(),
             context.executionId(),
             context.currentStepIndex(),
-            context.executionId() + ":" + context.currentStepIndex() + ":" + index,
+            context.identityScope() + ":" + context.currentStepIndex() + ":" + index,
             item,
             unitId,
             index,
@@ -290,7 +291,7 @@ public class AwaitCompletionSupport {
                 context.tenantId(),
                 context.executionId(),
                 stepIndex,
-                context.executionId() + ":" + stepIndex + ":" + index,
+                context.identityScope() + ":" + stepIndex + ":" + index,
                 item,
                 unitId,
                 index,
@@ -349,7 +350,7 @@ public class AwaitCompletionSupport {
     }
 
     private static String streamUnitId(AwaitCompletionDescriptor descriptor, AwaitExecutionContext context, int stepIndex) {
-        return UUID.nameUUIDFromBytes((context.tenantId() + ":" + context.executionId() + ":"
+        return UUID.nameUUIDFromBytes((context.tenantId() + ":" + context.identityScope() + ":"
             + descriptor.stepId() + ":" + stepIndex).getBytes(StandardCharsets.UTF_8)).toString();
     }
 

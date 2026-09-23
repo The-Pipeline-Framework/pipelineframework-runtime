@@ -18,12 +18,14 @@ package org.pipelineframework;
 
 import java.text.MessageFormat;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.ObservesAsync;
@@ -72,6 +74,9 @@ import org.pipelineframework.orchestrator.PipelineTransitionWorkerSelector;
 import org.pipelineframework.orchestrator.TransitionCommandEnvelope;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope;
+import org.pipelineframework.orchestrator.PagedTransitionCompletion;
+import org.pipelineframework.paging.PagedSourceCompletion;
+import org.pipelineframework.telemetry.PageExecutionTelemetry;
 import org.pipelineframework.orchestrator.TransitionWorkerCommand;
 import org.pipelineframework.orchestrator.TransitionWorkerExecutor;
 import org.pipelineframework.orchestrator.TransitionWorkerOutcome;
@@ -144,6 +149,9 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
 
   @Inject
   PipelineReleaseIdentityResolver releaseIdentityResolver;
+
+  @Inject
+  PageExecutionTelemetry pageExecutionTelemetry;
 
   private volatile TransitionPayloadCodec fallbackPayloadCodec;
   private volatile PipelineReleaseIdentityResolver fallbackReleaseIdentityResolver;
@@ -490,22 +498,51 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
     }
     AtomicBoolean terminalOutputPublished = new AtomicBoolean(false);
     AtomicBoolean terminalInputPassthrough = new AtomicBoolean(false);
+    AtomicReference<java.util.concurrent.CompletionStage<PagedSourceCompletion>> pageCompletion =
+        new AtomicReference<>();
     return executePipelineStreamingFromCommand(
             decodedCommand,
             command,
             terminalOutputPublished,
             terminalInputPassthrough,
+            pageCompletion,
             policy.continuationMode(),
             policy.terminalOutputOwnership())
-        .collect().asList()
-        .onItem().transform(items -> {
+        // Object Publish has already durably consumed each terminal item. Retaining those items
+        // in the worker result would turn an otherwise live stream into whole-source collection.
+        .collect().in(ArrayList<Object>::new, (items, item) -> {
+          if (!terminalOutputPublished.get()) {
+            items.add(item);
+          }
+        })
+        .onItem().transformToUni(items -> {
           if (terminalInputPassthrough.get()) {
-            return TransitionResultEnvelope.completedTerminalInputPassthrough();
+            return Uni.createFrom().item(TransitionResultEnvelope.completedTerminalInputPassthrough());
           }
           boolean published = terminalOutputPublished.get();
-          return policy.encodeOutputs()
+          TransitionResultEnvelope completed = policy.encodeOutputs()
               ? TransitionResultEnvelope.completed(payloadCodec(), published ? List.of() : items, published)
               : TransitionResultEnvelope.completedInProcess(items, published);
+          if (command.pageContext().isEmpty()) {
+            return Uni.createFrom().item(completed);
+          }
+          java.util.concurrent.CompletionStage<PagedSourceCompletion> providerCompletion = pageCompletion.get();
+          if (providerCompletion == null) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                "paged transition completed without opening its paged source"));
+          }
+          return Uni.createFrom().completionStage(providerCompletion)
+              .onItem().transform(page -> {
+                page.validateAgainst(new org.pipelineframework.paging.PagedSourceRequest<>(
+                    decodedCommand.inputPayload(),
+                    command.pageContext().orElseThrow().sourceIdentity(),
+                    command.pageContext().orElseThrow().startCheckpoint(),
+                    command.pageContext().orElseThrow().maxRecords()));
+                PagedTransitionCompletion wireCompletion = new PagedTransitionCompletion(
+                    page.consumedRecords(), page.nextCheckpoint(), page.exhausted());
+                wireCompletion.validateAgainst(command.pageContext().orElseThrow());
+                return completed.withPageCompletion(wireCompletion);
+              });
         })
         .onFailure(AwaitThrowableSupport::containsAwaitSuspension).recoverWithUni(failure -> {
           AwaitSuspendedException suspended = AwaitThrowableSupport.extractAwaitSuspension(failure);
@@ -598,6 +635,7 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
       TransitionCommandEnvelope envelope,
       AtomicBoolean terminalOutputPublished,
       AtomicBoolean terminalInputPassthrough,
+      AtomicReference<java.util.concurrent.CompletionStage<PagedSourceCompletion>> pageCompletion,
       AwaitContinuationMode continuationMode,
       TerminalOutputOwnership terminalOutputOwnership) {
     return Multi.createFrom().deferred(() -> {
@@ -625,7 +663,8 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
               command.currentStepIndex(),
               continuationMode,
               terminalOutputOwnership,
-              java.util.Map.of()));
+              java.util.Map.of(),
+              command.pageContext()));
           PipelineExecutionContextHolder.set(executionContext);
           rehydratedInput.pipelineContext().ifPresentOrElse(
               PipelineContextHolder::set,
@@ -642,6 +681,18 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
               return Multi.createFrom().failure(inputFailure);
             }
             List<Object> steps = loadStepsForExecution();
+            if (command.pageContext().isPresent()) {
+              if (command.currentStepIndex() != 0 || steps.isEmpty()) {
+                restoreExecutionContexts(previousPipeline, previous, previousExecution);
+                return Multi.createFrom().failure(new IllegalStateException(
+                    "paged transitions must begin at the first source step"));
+              }
+              steps = new ArrayList<>(steps);
+              steps.set(0, new PagedSourceStepAdapter(
+                  steps.getFirst(), command.pageContext().orElseThrow(), pageCompletion,
+                  pageExecutionTelemetry == null ? PageExecutionTelemetry.disabled() : pageExecutionTelemetry,
+                  command.attempt() > 0));
+            }
             int requestedStopBeforeStepIndex = command.stopBeforeStepIndex();
             if (requestedStopBeforeStepIndex > steps.size()) {
               restoreExecutionContexts(previousPipeline, previous, previousExecution);

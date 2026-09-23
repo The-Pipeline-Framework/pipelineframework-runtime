@@ -1,6 +1,7 @@
 package org.pipelineframework;
 
 import java.util.Objects;
+import java.util.Optional;
 
 import org.pipelineframework.orchestrator.ExecutionCreateCommand;
 import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
@@ -11,13 +12,25 @@ record PipelineRunSubmissionPlan(
     ExecutionInputSnapshot snapshot,
     String executionKey,
     ExecutionResultShape resultShape,
+    Optional<PipelinePagingPlan> paging,
     long nowEpochMs,
     long ttlEpochS) {
+
+  PipelineRunSubmissionPlan(
+      PipelineRunSubmission submission,
+      ExecutionInputSnapshot snapshot,
+      String executionKey,
+      ExecutionResultShape resultShape,
+      long nowEpochMs,
+      long ttlEpochS) {
+    this(submission, snapshot, executionKey, resultShape, Optional.empty(), nowEpochMs, ttlEpochS);
+  }
 
   PipelineRunSubmissionPlan {
     Objects.requireNonNull(submission, "submission must not be null");
     Objects.requireNonNull(snapshot, "snapshot must not be null");
     Objects.requireNonNull(resultShape, "resultShape must not be null");
+    paging = Objects.requireNonNull(paging, "paging must not be null");
     executionKey = scopedRootExecutionKey(
         submission.pipelineId(),
         submission.releaseVersion(),
@@ -25,6 +38,12 @@ record PipelineRunSubmissionPlan(
   }
 
   ExecutionCreateCommand createCommand() {
+    Optional<org.pipelineframework.orchestrator.PagedExecutionState> pagingState = paging.map(plan ->
+        new org.pipelineframework.orchestrator.PagedExecutionState(
+            0,
+            submission.pipelineId() + ":" + submission.releaseVersion() + ":" + executionKey,
+            Optional.empty(),
+            plan.maxRecords()));
     return new ExecutionCreateCommand(
         submission.tenantId(),
         executionKey,
@@ -33,6 +52,9 @@ record PipelineRunSubmissionPlan(
         submission.releaseVersion(),
         snapshot,
         resultShape,
+        Optional.empty(),
+        0,
+        pagingState,
         nowEpochMs,
         ttlEpochS);
   }

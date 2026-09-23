@@ -379,7 +379,7 @@ public class AwaitCoordinator {
             return Uni.createFrom().failure(new IllegalStateException("Command callback requires a supporting interaction store"));
         }
         return createOrGet(descriptor, context.tenantId(), context.executionId(), context.currentStepIndex(),
-            context.executionId() + ":" + context.currentStepIndex(), input, "", "", context.traceMetadata())
+            context.identityScope() + ":" + context.currentStepIndex(), input, "", "", context.traceMetadata())
             .invoke(created -> {
                 validatePinnedCompletionProjector(created.record(), descriptor);
                 if (created.duplicate() && !PipelineJson.mapper().valueToTree(input)

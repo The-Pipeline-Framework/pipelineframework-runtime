@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -23,6 +24,7 @@ import org.pipelineframework.config.ParallelismPolicy;
 import org.pipelineframework.config.PipelineConfig;
 import org.pipelineframework.orchestrator.OrchestratorMode;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
+import org.pipelineframework.orchestrator.PagedTransitionContext;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -71,7 +73,7 @@ class AwaitCompletionSupportTest {
     }
 
     @Test
-    void interactionApiAwaitSuspendsThroughTheQueueAsyncContinuationPath() {
+  void interactionApiAwaitSuspendsThroughTheQueueAsyncContinuationPath() {
         AwaitCompletionSupport support = support();
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         AwaitExecutionContext context = new AwaitExecutionContext("tenant1", "exec123", 0);
@@ -114,7 +116,34 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.isNull());
         org.mockito.Mockito.verify(awaitCoordinator).dispatch(testDescriptor, mockRecord);
         org.mockito.Mockito.verify(awaitCoordinator, never()).supportsLiveAwaitWindow(testDescriptor);
-    }
+  }
+
+  @Test
+  void pagedAwaitIdentityIncludesPageAndRemainsStableWithinItsRetry() {
+    AwaitCompletionSupport support = support();
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    AwaitExecutionContextHolder.set(new AwaitExecutionContext(
+        "tenant1", "exec123", 2, AwaitContinuationMode.DURABLE_HANDOFF,
+        TerminalOutputOwnership.TRANSITION_WORKER, Map.of(),
+        Optional.of(new PagedTransitionContext(7, "source", Optional.of("checkpoint"), 100))));
+    AwaitCompletionDescriptor testDescriptor = descriptor();
+    AwaitInteractionRecord record = new AwaitInteractionRecord(
+        "tenant1", "exec123", "review", 2, String.class.getName(),
+        "interaction-id", "correlation-id", "causation-id", "idem-key", 0L,
+        AwaitInteractionStatus.WAITING, "input", null, null, null, null, "interaction-api",
+        Map.of(), System.currentTimeMillis() + 300000, System.currentTimeMillis(),
+        System.currentTimeMillis(), System.currentTimeMillis() + 86400);
+    when(awaitCoordinator.createOrGet(testDescriptor, "tenant1", "exec123", 2,
+        "exec123:page:7:2", "input", null, null))
+        .thenReturn(Uni.createFrom().item(new AwaitCreateResult(record, false)));
+    when(awaitCoordinator.dispatch(testDescriptor, record)).thenReturn(Uni.createFrom().item(record));
+
+    assertThrows(AwaitSuspendedException.class,
+        () -> support.awaitOneToOne(testDescriptor, "input").await().indefinitely());
+
+    org.mockito.Mockito.verify(awaitCoordinator).createOrGet(testDescriptor, "tenant1", "exec123", 2,
+        "exec123:page:7:2", "input", null, null);
+  }
 
     @Test
     void awaitOneToOneWithDescriptorUniCapturesExecutionContextBeforeReactiveResolution() {
