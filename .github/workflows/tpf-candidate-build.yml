@@ -52,7 +52,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          bash scripts/collect-candidate-files.sh "$RUNNER_TEMP/tpf-candidate-build"
+          bash scripts/collect-candidate-files.sh "$RUNNER_TEMP/tpf-candidate-build" "$RUNNER_TEMP/tpf-candidate-maven-repository"
           cp "$RUNNER_TEMP/tpf-candidate-version.json" "$RUNNER_TEMP/tpf-candidate-build/candidate-manifest.json"
           python3 scripts/create-build-metadata.py "$RUNNER_TEMP/tpf-candidate-build"
       - name: Upload candidate files and preliminary build metadata

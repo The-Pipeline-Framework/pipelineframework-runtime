@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-output_dir=${1:?usage: collect-candidate-files.sh OUTPUT_DIR}
+output_dir=${1:?usage: collect-candidate-files.sh OUTPUT_DIR [MAVEN_REPOSITORY]}
 [[ ! -e "$output_dir" ]] || { echo "output directory already exists: $output_dir" >&2; exit 2; }
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
+maven_repository=${2:-"$repo_root/.m2/repository"}
 mkdir -p "$output_dir/repository"
 version=$(python3 - "$repo_root/pom.xml" <<'PY'
 import sys
@@ -13,7 +14,7 @@ PY
 )
 for artifact_id in pipelineframework-runtime-parent pipelineframework pipelineframework-deployment pipelineframework-runtime-spring cache-plugin persistence-plugin repository-plugin; do
   group_path=org/pipelineframework
-  artifact_dir="$repo_root/.m2/repository/$group_path/$artifact_id/$version"
+  artifact_dir="$maven_repository/$group_path/$artifact_id/$version"
   [[ -d "$artifact_dir" ]] || { echo "missing installed candidate coordinate: $artifact_id:$version" >&2; exit 1; }
   relative="$group_path/$artifact_id/$version"
   mkdir -p "$output_dir/repository/$(dirname "$relative")"
