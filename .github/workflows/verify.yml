@@ -21,3 +21,36 @@ jobs:
           cache: maven
           cache-path: ${{ github.workspace }}/.m2/repository
       - run: ./mvnw clean verify --no-transfer-progress -Dmaven.repo.local="$PWD/.m2/repository"
+      - name: Summarize Surefire unit coverage
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob
+          import os
+          import xml.etree.ElementTree as ET
+
+          reports = sorted(glob.glob("**/target/site/jacoco/jacoco.xml", recursive=True))
+          summary = ["### Surefire unit coverage", "", "| Module | Lines | Branches |", "| --- | ---: | ---: |"]
+          for path in reports:
+              root = ET.parse(path).getroot()
+              counters = {counter.attrib["type"]: counter.attrib for counter in root.findall("counter")}
+              def percent(counter):
+                  covered = int(counter["covered"])
+                  missed = int(counter["missed"])
+                  total = covered + missed
+                  return "n/a" if total == 0 else f"{covered / total:.1%}"
+              module = os.path.relpath(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path)))))
+              summary.append(f"| `{module}` | {percent(counters['LINE'])} | {percent(counters['BRANCH'])} |")
+          if not reports:
+              summary.extend(["", "No module reports were produced (for example, Maven verify may have failed before reporting)."])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("\n".join(summary) + "\n")
+          PY
+      - name: Upload Surefire unit coverage reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runtime-unit-coverage
+          path: '**/target/site/jacoco/**'
+          if-no-files-found: warn
+          retention-days: 14
