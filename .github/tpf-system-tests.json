@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "suites": {
+    "deployment": {
+      "command": [
+        "./mvnw",
+        "-B",
+        "clean",
+        "verify",
+        "--no-transfer-progress",
+        "-Dmaven.deploy.skip=true",
+        "-Dgpg.skip=true"
+      ],
+      "timeoutMinutes": 45
+    }
+  }
+}
