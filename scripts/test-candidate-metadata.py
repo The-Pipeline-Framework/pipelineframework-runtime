@@ -14,6 +14,7 @@ COORDS = [
     ("org.pipelineframework", "pipelineframework", "jar"),
     ("org.pipelineframework", "pipelineframework-deployment", "jar"),
     ("org.pipelineframework", "pipelineframework-runtime-spring", "jar"),
+    ("org.pipelineframework", "pipelineframework-release-maven-plugin", "jar"),
     ("org.pipelineframework", "cache-plugin", "jar"),
     ("org.pipelineframework", "persistence-plugin", "jar"),
     ("org.pipelineframework", "repository-plugin", "jar"),
@@ -53,7 +54,7 @@ for event, candidate_type, number in [("pull_request", "pr", "42"), ("push", "ma
         metadata = json.loads((candidate_root / "build-metadata.json").read_text())
         assert metadata["candidateVersion"] == candidate
         assert metadata["pullRequestNumber"] == (42 if number else None)
-        assert len(metadata["mavenArtifacts"]) == 7
+        assert len(metadata["mavenArtifacts"]) == 8
         for artifact in metadata["mavenArtifacts"]:
             for item in artifact["files"]:
                 path = repository / pathlib.Path(*artifact["groupId"].split(".")) / artifact["artifactId"] / candidate / item["name"]

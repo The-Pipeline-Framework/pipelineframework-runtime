@@ -4,6 +4,7 @@ This repository publishes TPF's runtime integrations:
 
 - the Quarkus `pipelineframework` runtime and `pipelineframework-deployment` build-time pair;
 - the Spring runtime adapter;
+- the release descriptor Maven plugin;
 - foundational persistence, cache, and repository plugins.
 
 Spring smoke-test modules stay here because they verify behavior owned by the Spring adapter; they are internal test
