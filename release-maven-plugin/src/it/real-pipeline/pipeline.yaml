@@ -1,0 +1,22 @@
+version: 2
+appName: release-descriptor-real-pipeline-it
+basePackage: org.pipelineframework.release.it
+transport: LOCAL
+platform: COMPUTE
+types:
+  EchoInput:
+    java: org.pipelineframework.release.it.EchoInput
+    fields: [[value, string]]
+  EchoOutput:
+    java: org.pipelineframework.release.it.EchoOutput
+    fields: [[value, string]]
+steps:
+  - name: Echo
+    service: org.pipelineframework.release.it.EchoService
+    cardinality: ONE_TO_ONE
+    input: EchoInput
+    output: EchoOutput
+    java:
+      input: org.pipelineframework.release.it.EchoInput
+      output: org.pipelineframework.release.it.EchoOutput
+    terminal: true

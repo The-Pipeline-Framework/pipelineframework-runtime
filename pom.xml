@@ -91,6 +91,7 @@
         <module>runtime-spring</module>
         <module>runtime</module>
         <module>deployment</module>
+        <module>release-maven-plugin</module>
         <module>plugins</module>
         <module>spring-smoke-tests</module>
         <module>spring-blocking-smoke-tests</module>
