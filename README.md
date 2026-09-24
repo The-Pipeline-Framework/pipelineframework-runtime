@@ -21,7 +21,7 @@ Build with an isolated Maven repository:
 
 Use the `central-publishing` profile only to sign and deploy the canonical reactor. For the component map and
 compatibility policy, see the
-[TPF Components and Repositories](https://pipelineframework.org/architecture/components-and-repositories) page.
+[TPF Components and Repositories](https://github.com/The-Pipeline-Framework/pipelineframework/blob/main/docs/architecture/components-and-repositories.md) page.
 
 ## System-test candidates
 
