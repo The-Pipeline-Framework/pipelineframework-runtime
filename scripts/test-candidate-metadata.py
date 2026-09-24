@@ -29,7 +29,12 @@ for event, candidate_type, number in [("pull_request", "pr", "42"), ("push", "ma
             directory = repository / pathlib.Path(*group.split(".")) / artifact / candidate
             directory.mkdir(parents=True)
             ns = "http://maven.apache.org/POM/4.0.0"
-            pom = f'<project xmlns="{ns}"><modelVersion>4.0.0</modelVersion><groupId>{group}</groupId><artifactId>{artifact}</artifactId><version>{candidate}</version><packaging>{packaging}</packaging></project>\n'
+            if artifact == "pipelineframework":
+                pom = (f'<project xmlns="{ns}"><modelVersion>4.0.0</modelVersion><parent><groupId>{group}</groupId>'
+                       f'<artifactId>pipelineframework-runtime-parent</artifactId><version>{candidate}</version>'
+                       f'</parent><artifactId>{artifact}</artifactId><packaging>{packaging}</packaging></project>\n')
+            else:
+                pom = f'<project xmlns="{ns}"><modelVersion>4.0.0</modelVersion><groupId>{group}</groupId><artifactId>{artifact}</artifactId><version>{candidate}</version><packaging>{packaging}</packaging></project>\n'
             (directory / f"{artifact}-{candidate}.pom").write_text(pom)
             if packaging == "jar":
                 (directory / f"{artifact}-{candidate}.jar").write_bytes(b"deterministic candidate jar fixture")

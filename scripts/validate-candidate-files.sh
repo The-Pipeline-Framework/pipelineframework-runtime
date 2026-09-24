@@ -92,8 +92,11 @@ for artifact, (group, name, packaging) in zip(artifacts, coords, strict=True):
         expected_paths.add(path.relative_to(root / "repository").as_posix())
     pom = ET.parse(directory / f"{name}-{version}.pom").getroot()
     ns = "{http://maven.apache.org/POM/4.0.0}"
-    assert pom.findtext(ns + "groupId") == group, f"bad POM group: {name}"
-    assert pom.findtext(ns + "artifactId") == name and pom.findtext(ns + "version") == version
+    parent = pom.find(ns + "parent")
+    actual_group = pom.findtext(ns + "groupId") or (parent.findtext(ns + "groupId") if parent is not None else "")
+    actual_version = pom.findtext(ns + "version") or (parent.findtext(ns + "version") if parent is not None else "")
+    assert actual_group == group, f"bad POM group: {name}"
+    assert pom.findtext(ns + "artifactId") == name and actual_version == version
 actual_paths = {p.relative_to(root / "repository").as_posix() for p in (root / "repository").rglob("*") if p.is_file()}
 assert actual_paths == expected_paths, f"unexpected repository files: {actual_paths ^ expected_paths}"
 assert not any(p.is_symlink() for p in (root / "repository").rglob("*")), "symlink in candidate repository"
