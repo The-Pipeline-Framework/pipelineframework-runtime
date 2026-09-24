@@ -30,6 +30,7 @@
     <description>Internal Spring Boot generated blocking application smoke tests</description>
 
     <properties>
+        <jacoco.skip>true</jacoco.skip>
         <maven.deploy.skip>true</maven.deploy.skip>
         <spring.boot.version>4.0.7</spring.boot.version>
         <pipeline.generatedSourcesDir>${project.build.directory}/generated-sources/pipeline</pipeline.generatedSourcesDir>
