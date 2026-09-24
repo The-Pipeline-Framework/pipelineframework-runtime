@@ -66,7 +66,7 @@ jobs:
           app-id: ${{ vars.SYSTEM_TEST_APP_ID }}
           private-key: ${{ secrets.SYSTEM_TEST_APP_PRIVATE_KEY }}
           owner: The-Pipeline-Framework
-          repositories: pipelineframework-runtime
+          repositories: pipelineframework
           permission-contents: write
       - name: Set up Java and GitHub Packages authentication
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
