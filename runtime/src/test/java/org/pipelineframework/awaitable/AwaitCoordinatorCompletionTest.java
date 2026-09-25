@@ -3,6 +3,7 @@ package org.pipelineframework.awaitable;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -37,6 +38,27 @@ import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.TransitionAwaitSuspension;
 
 class AwaitCoordinatorCompletionTest {
+
+    @Test
+    void pageIdentityScopeSeparatesDerivedIdentitiesButRetainsLogicalExecutionId() {
+        AwaitCoordinator coordinator = coordinator(new InMemoryAwaitInteractionStore());
+        AwaitCompletionDescriptor descriptor = descriptor("FraudCheck");
+
+        AwaitInteractionRecord first = coordinator.createOrGet(
+            descriptor, "tenant-1", "exec-1", "exec-1:page:0", 1, "cause",
+            Map.of("orderId", "o-1"), "alice", "fraud-review", Map.of())
+            .await().indefinitely().record();
+        AwaitInteractionRecord second = coordinator.createOrGet(
+            descriptor, "tenant-1", "exec-1", "exec-1:page:1", 1, "cause",
+            Map.of("orderId", "o-1"), "alice", "fraud-review", Map.of())
+            .await().indefinitely().record();
+
+        assertEquals("exec-1", first.executionId());
+        assertEquals("exec-1", second.executionId());
+        assertNotEquals(first.unitId(), second.unitId());
+        assertNotEquals(first.idempotencyKey(), second.idempotencyKey());
+        assertNotEquals(first.correlationId(), second.correlationId());
+    }
 
     @Test
     void createOrGetPersistsExplicitOriginTraceMetadata() {
@@ -182,7 +204,7 @@ class AwaitCoordinatorCompletionTest {
             null).await().indefinitely();
 
         assertEquals(payload, result.record().requestPayload());
-        assertEquals("ProtoFraudCheck:name=checkout.proto", result.record().idempotencyKey());
+        assertEquals("exec-1:ProtoFraudCheck:name=checkout.proto", result.record().idempotencyKey());
     }
 
     @Test
@@ -262,7 +284,7 @@ class AwaitCoordinatorCompletionTest {
             null,
             null).await().indefinitely();
 
-        assertEquals("V3PaymentProvider:id=canonical-payment-1", result.record().idempotencyKey());
+        assertEquals("exec-1:V3PaymentProvider:id=canonical-payment-1", result.record().idempotencyKey());
         assertEquals(Map.of("id", "canonical-payment-1"), result.record().requestPayload());
     }
 

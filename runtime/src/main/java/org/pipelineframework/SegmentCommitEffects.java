@@ -77,7 +77,6 @@ class SegmentCommitEffects {
         workDispatcher,
         deadLetterPublisher);
   }
-
   private Uni<Void> commitCompleted(CompletedSegment completed) {
     ClaimedSegment segment = completed.segment();
     long nowEpochMs = System.currentTimeMillis();
@@ -107,11 +106,14 @@ class SegmentCommitEffects {
             .orElseGet(() -> Uni.createFrom().failure(successCommitFailure(completed))))
         .replaceWithVoid();
   }
-
   private Uni<Void> advancePage(
       CompletedSegment completed,
       PagedTransitionCompletion completion,
       long nowEpochMs) {
+    if (!completed.outputItems().isEmpty() && !terminalPublicationBoundary.pagedOutputEnabled()) {
+      return Uni.createFrom().failure(new IllegalStateException(
+          "paged execution with terminal output requires configured Object Publish composition"));
+    }
     ClaimedSegment segment = completed.segment();
     PagedExecutionState current = segment.record().pagingState().orElseThrow(() ->
         new IllegalStateException("worker returned page completion for an unpaged execution"));
@@ -169,14 +171,15 @@ class SegmentCommitEffects {
       AwaitItemContinuationHandler itemContinuationHandler) {
     ClaimedSegment segment = suspended.segment();
     long nowEpochMs = System.currentTimeMillis();
-    return executionStateStore.markWaitingExternal(
-            segment.record().tenantId(),
-            segment.record().executionId(),
-            segment.record().version(),
-            segment.transitionKey(),
-            suspended.suspension().unitId(),
-            suspended.suspension().stepIndex(),
-            nowEpochMs)
+    var waiting = suspended.suspension().pageCompletion().isPresent()
+        ? executionStateStore.markWaitingExternal(
+            segment.record().tenantId(), segment.record().executionId(), segment.record().version(),
+            segment.transitionKey(), suspended.suspension().unitId(), suspended.suspension().stepIndex(),
+            suspended.suspension().pageCompletion(), nowEpochMs)
+        : executionStateStore.markWaitingExternal(
+            segment.record().tenantId(), segment.record().executionId(), segment.record().version(),
+            segment.transitionKey(), suspended.suspension().unitId(), suspended.suspension().stepIndex(), nowEpochMs);
+    return waiting
         .onItem().transformToUni(updated -> {
           if (updated.isEmpty()) {
             return Uni.createFrom().failure(waitingExternalFailure(suspended));

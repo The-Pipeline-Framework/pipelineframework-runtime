@@ -38,6 +38,10 @@ class TerminalPublicationBoundary {
         .chain(() -> composeExhaustedPagedOutput(completed));
   }
 
+  boolean pagedOutputEnabled() {
+    return objectPublishCompletionService != null && objectPublishCompletionService.enabled();
+  }
+
   private Uni<Void> composeExhaustedPagedOutput(CompletedSegment completed) {
     if (objectPublishCompletionService == null
         || completed.result().pageCompletion().filter(completion -> completion.exhausted()).isEmpty()) {
@@ -75,7 +79,13 @@ class TerminalPublicationBoundary {
         segment,
         () -> plan.alreadyPublished()
             ? Uni.createFrom().voidItem()
-            : objectPublishCompletionService.publishIfConfigured(() -> plan.decodedOutputItems(payloadCodec.get())))
+            : segment.record().pagingState()
+                .map(page -> objectPublishCompletionService.publishIfConfigured(
+                    () -> plan.decodedOutputItems(payloadCodec.get()),
+                    segment.record().executionId(),
+                    page))
+                .orElseGet(() -> objectPublishCompletionService.publishIfConfigured(
+                    () -> plan.decodedOutputItems(payloadCodec.get()))))
         .run(segmentBoundaryLedger.get(), nowEpochMs);
   }
 }

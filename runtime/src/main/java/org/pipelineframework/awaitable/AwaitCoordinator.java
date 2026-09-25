@@ -87,14 +87,15 @@ public class AwaitCoordinator {
         String assignee,
         String group
     ) {
-        return createOrGet(descriptor, tenantId, executionId, stepIndex, causationId, requestPayload, assignee, group,
-            traceMetadataForCurrentExecution());
+        return createOrGet(descriptor, tenantId, executionId, executionId, stepIndex, causationId,
+            requestPayload, assignee, group, traceMetadataForCurrentExecution());
     }
 
     Uni<AwaitCreateResult> createOrGet(
         AwaitCompletionDescriptor descriptor,
         String tenantId,
         String executionId,
+        String identityScope,
         int stepIndex,
         String causationId,
         Object requestPayload,
@@ -102,7 +103,7 @@ public class AwaitCoordinator {
         String group,
         Map<String, Object> traceMetadata
     ) {
-        String unitId = deriveUnitId(tenantId, executionId, descriptor.stepId(), stepIndex);
+        String unitId = deriveUnitId(tenantId, identityScope, descriptor.stepId(), stepIndex);
         return registerDescriptor(descriptor)
             .onItem().transformToUni(registered -> createOrGetUnit(
                 registered, tenantId, unitId, executionId, stepIndex)
@@ -111,6 +112,7 @@ public class AwaitCoordinator {
                 unit.unitId(),
                 tenantId,
                 executionId,
+                identityScope,
                 stepIndex,
                 causationId,
                 requestPayload,
@@ -138,14 +140,15 @@ public class AwaitCoordinator {
         String assignee,
         String group
     ) {
-        return createOrGetItem(descriptor, tenantId, executionId, stepIndex, causationId, requestPayload, unitId,
-            itemIndex, assignee, group, traceMetadataForCurrentExecution());
+        return createOrGetItem(descriptor, tenantId, executionId, executionId, stepIndex, causationId,
+            requestPayload, unitId, itemIndex, assignee, group, traceMetadataForCurrentExecution());
     }
 
     Uni<AwaitCreateResult> createOrGetItem(
         AwaitCompletionDescriptor descriptor,
         String tenantId,
         String executionId,
+        String identityScope,
         int stepIndex,
         String causationId,
         Object requestPayload,
@@ -162,7 +165,7 @@ public class AwaitCoordinator {
                 }
                 return createOrGetUnit(registered, tenantId, unitId, executionId, stepIndex)
                     .onItem().transformToUni(unit -> createItemInPreparedUnit(
-                        registered, unitId, tenantId, executionId, stepIndex, causationId, requestPayload,
+                        registered, unitId, tenantId, executionId, identityScope, stepIndex, causationId, requestPayload,
                         itemIndex, assignee, group, traceMetadata));
             });
     }
@@ -194,14 +197,15 @@ public class AwaitCoordinator {
         String assignee,
         String group
     ) {
-        return createOrGetPreparedItem(descriptor, tenantId, executionId, stepIndex, causationId, requestPayload,
-            unitId, itemIndex, assignee, group, traceMetadataForCurrentExecution());
+        return createOrGetPreparedItem(descriptor, tenantId, executionId, executionId, stepIndex, causationId,
+            requestPayload, unitId, itemIndex, assignee, group, traceMetadataForCurrentExecution());
     }
 
     Uni<AwaitCreateResult> createOrGetPreparedItem(
         AwaitCompletionDescriptor descriptor,
         String tenantId,
         String executionId,
+        String identityScope,
         int stepIndex,
         String causationId,
         Object requestPayload,
@@ -217,7 +221,7 @@ public class AwaitCoordinator {
                     return Uni.createFrom().failure(new IllegalArgumentException("itemIndex must be non-negative"));
                 }
                 return createItemInPreparedUnit(
-                    registered, unitId, tenantId, executionId, stepIndex, causationId, requestPayload,
+                    registered, unitId, tenantId, executionId, identityScope, stepIndex, causationId, requestPayload,
                     itemIndex, assignee, group, traceMetadata);
             });
     }
@@ -378,7 +382,8 @@ public class AwaitCoordinator {
         if (descriptor.callback().isEmpty() || !interactionStore().supportsCommandCompletion()) {
             return Uni.createFrom().failure(new IllegalStateException("Command callback requires a supporting interaction store"));
         }
-        return createOrGet(descriptor, context.tenantId(), context.executionId(), context.currentStepIndex(),
+        return createOrGet(descriptor, context.tenantId(), context.executionId(), context.identityScope(),
+            context.currentStepIndex(),
             context.identityScope() + ":" + context.currentStepIndex(), input, "", "", context.traceMetadata())
             .invoke(created -> {
                 validatePinnedCompletionProjector(created.record(), descriptor);
@@ -764,6 +769,7 @@ public class AwaitCoordinator {
         String unitId,
         String tenantId,
         String executionId,
+        String identityScope,
         int stepIndex,
         String causationId,
         Object requestPayload,
@@ -776,10 +782,10 @@ public class AwaitCoordinator {
         long now = System.currentTimeMillis();
         long deadline = now + descriptor.timeout().toMillis();
         long ttl = Instant.ofEpochMilli(deadline).plusSeconds(86_400).getEpochSecond();
-        String idempotencyKey = deriveIdempotencyKey(descriptor, executionId, canonicalRequestPayload)
+        String idempotencyKey = deriveIdempotencyKey(descriptor, identityScope, canonicalRequestPayload)
             + (descriptor.callback().isPresent() ? ":step=" + stepIndex : "")
             + (itemIndex == null ? "" : ":item=" + itemIndex);
-        String correlationId = deriveCorrelationId(descriptor, tenantId, executionId, idempotencyKey);
+        String correlationId = deriveCorrelationId(descriptor, tenantId, identityScope, idempotencyKey);
         return acquireAdmission(descriptor, tenantId, unitId, itemIndex, executionId, deadline)
             .onItem().transformToUni(lease -> interactionStore().createOrGet(new AwaitCreateCommand(
                 tenantId,
@@ -815,6 +821,7 @@ public class AwaitCoordinator {
         String unitId,
         String tenantId,
         String executionId,
+        String identityScope,
         int stepIndex,
         String causationId,
         Object requestPayload,
@@ -824,7 +831,7 @@ public class AwaitCoordinator {
         Map<String, Object> traceMetadata
     ) {
         return createInteraction(
-            descriptor, unitId, tenantId, executionId, stepIndex, causationId, requestPayload,
+            descriptor, unitId, tenantId, executionId, identityScope, stepIndex, causationId, requestPayload,
             itemIndex, assignee, group, traceMetadata);
     }
 
@@ -1381,7 +1388,7 @@ public class AwaitCoordinator {
             return executionId + ":" + descriptor.stepId();
         }
         JsonNode node = PipelineJson.mapper().valueToTree(requestPayload);
-        StringBuilder builder = new StringBuilder(descriptor.stepId());
+        StringBuilder builder = new StringBuilder(executionId).append(':').append(descriptor.stepId());
         for (String field : descriptor.idempotencyKeyFields()) {
             builder.append(':').append(field).append('=');
             JsonNode value = node == null ? null : node.get(field);

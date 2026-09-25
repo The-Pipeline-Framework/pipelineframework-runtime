@@ -27,6 +27,7 @@ import org.pipelineframework.config.pipeline.PipelineYamlConfig;
 import org.pipelineframework.config.pipeline.PipelineYamlConfigLoader;
 import org.pipelineframework.config.pipeline.PipelineYamlConfigLocator;
 import org.pipelineframework.awaitable.AwaitExecutionContextHolder;
+import org.pipelineframework.orchestrator.PagedExecutionState;
 import org.pipelineframework.orchestrator.PagedTransitionContext;
 
 /**
@@ -143,6 +144,20 @@ public final class ObjectPublishRunner {
     }
 
     public Uni<Void> publishItems(List<?> items) {
+        return publishItems(items, pageContext());
+    }
+
+    public Uni<Void> publishItems(
+        List<?> items,
+        String executionId,
+        PagedExecutionState page) {
+        Objects.requireNonNull(executionId, "executionId must not be null");
+        Objects.requireNonNull(page, "page must not be null");
+        return publishItems(items, Optional.of(new PagedPublishContext(
+            executionId, page.toTransitionContext())));
+    }
+
+    private Uni<Void> publishItems(List<?> items, Optional<PagedPublishContext> page) {
         PipelineObjectOutputConfig output = objectOutput()
             .orElseThrow(() -> new IllegalStateException("pipeline output object binding is not configured"));
         PipelineObjectPublishConfig target = target(output);
@@ -151,7 +166,11 @@ public final class ObjectPublishRunner {
             return Uni.createFrom().voidItem();
         }
         if (mapper() instanceof StreamingObjectPublishMapper<?>) {
-            return publishStreamingItems(items);
+            return publishStreamingItems(items, page);
+        }
+        if (page.isPresent()) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                "paged Object Publish requires PagedStreamingObjectPublishMapper"));
         }
         return publishBatchItems(target, items);
     }
@@ -168,7 +187,7 @@ public final class ObjectPublishRunner {
         return chain;
     }
 
-    private Uni<Void> publishStreamingItems(List<?> items) {
+    private Uni<Void> publishStreamingItems(List<?> items, Optional<PagedPublishContext> page) {
         PipelineObjectOutputConfig output = objectOutput()
             .orElseThrow(() -> new IllegalStateException("pipeline output object binding is not configured"));
         PipelineObjectPublishConfig target = target(output);
@@ -177,8 +196,14 @@ public final class ObjectPublishRunner {
             return Uni.createFrom().voidItem();
         }
         StreamingObjectPublishMapper<Object> mapper = streamingMapper();
+        ObjectTargetProvider provider = registry.require(target.provider());
+        if (page.isPresent() && (!(mapper instanceof PagedStreamingObjectPublishMapper<?>)
+            || !(provider instanceof PagedObjectTargetProvider))) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                "paged Object Publish requires PagedStreamingObjectPublishMapper and PagedObjectTargetProvider"));
+        }
         StreamingPublishState state = new StreamingPublishState(
-            target, registry.require(target.provider()), mapper, Optional.empty());
+            target, provider, mapper, page);
         Uni<Void> chain = Uni.createFrom().voidItem();
         for (Object item : items) {
             chain = chain.chain(() -> state.publishItem(adaptTerminalItem(item)).replaceWithVoid());

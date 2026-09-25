@@ -537,6 +537,33 @@ class QueueAsyncSegmentPipelineTest {
   }
 
   @Test
+  void pagedAwaitSuspensionPersistsProviderCompletionWithWaitingState() {
+    ExecutionRecord<Object, Object> claimed = pagedRecord(
+        "exec-paged-await", 0, 0L, Optional.empty(), "initial", ExecutionStatus.QUEUED);
+    ExecutionRecord<Object, Object> waiting = withStatus(claimed, ExecutionStatus.WAITING_EXTERNAL, 1L);
+    PagedTransitionCompletion pageCompletion = new PagedTransitionCompletion(
+        100, Optional.of("checkpoint-1"), false);
+    TransitionAwaitSuspension suspension = new TransitionAwaitSuspension(
+        "tenant-1", "exec-paged-await", "unit-1", 2).withPageCompletion(pageCompletion);
+    when(executionStateStore.claimLease(
+        eq("tenant-1"), eq("exec-paged-await"), any(), anyLong(), eq(1000L)))
+        .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
+    when(executionStateStore.markWaitingExternal(
+        eq("tenant-1"), eq("exec-paged-await"), eq(0L), eq("exec-paged-await:page:0:0:0"),
+        eq("unit-1"), eq(2), eq(Optional.of(pageCompletion)), anyLong()))
+        .thenReturn(Uni.createFrom().item(Optional.of(waiting)));
+
+    pipeline().process(
+        new ExecutionWorkItem("tenant-1", "exec-paged-await"),
+        command -> Uni.createFrom().item(TransitionResultEnvelope.waiting(suspension)),
+        AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER).await().indefinitely();
+
+    verify(executionStateStore).markWaitingExternal(
+        eq("tenant-1"), eq("exec-paged-await"), eq(0L), eq("exec-paged-await:page:0:0:0"),
+        eq("unit-1"), eq(2), eq(Optional.of(pageCompletion)), anyLong());
+  }
+
+  @Test
   void missedSuccessCasFailsCommitAndSkipsRunSucceededFact() {
     ExecutionRecord<Object, Object> claimed = record("exec-success-cas-miss", ExecutionResultShape.MATERIALIZED_MULTI);
     when(executionStateStore.claimLease(eq("tenant-1"), eq("exec-success-cas-miss"), any(), anyLong(), eq(1000L)))

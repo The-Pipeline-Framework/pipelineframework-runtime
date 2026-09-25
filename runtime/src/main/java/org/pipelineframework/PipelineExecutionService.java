@@ -500,6 +500,11 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
     AtomicBoolean terminalInputPassthrough = new AtomicBoolean(false);
     AtomicReference<java.util.concurrent.CompletionStage<PagedSourceCompletion>> pageCompletion =
         new AtomicReference<>();
+    command.pageContext()
+        .flatMap(org.pipelineframework.orchestrator.PagedTransitionContext::suspendedCompletion)
+        .ifPresent(completion -> pageCompletion.set(CompletableFuture.completedFuture(
+            new PagedSourceCompletion(
+                completion.consumedRecords(), completion.nextCheckpoint(), completion.exhausted()))));
     return executePipelineStreamingFromCommand(
             decodedCommand,
             command,
@@ -526,32 +531,45 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
           if (command.pageContext().isEmpty()) {
             return Uni.createFrom().item(completed);
           }
-          java.util.concurrent.CompletionStage<PagedSourceCompletion> providerCompletion = pageCompletion.get();
-          if (providerCompletion == null) {
-            return Uni.createFrom().failure(new IllegalStateException(
-                "paged transition completed without opening its paged source"));
-          }
-          return Uni.createFrom().completionStage(providerCompletion)
-              .onItem().transform(page -> {
-                page.validateAgainst(new org.pipelineframework.paging.PagedSourceRequest<>(
-                    decodedCommand.inputPayload(),
-                    command.pageContext().orElseThrow().sourceIdentity(),
-                    command.pageContext().orElseThrow().startCheckpoint(),
-                    command.pageContext().orElseThrow().maxRecords()));
-                PagedTransitionCompletion wireCompletion = new PagedTransitionCompletion(
-                    page.consumedRecords(), page.nextCheckpoint(), page.exhausted());
-                wireCompletion.validateAgainst(command.pageContext().orElseThrow());
-                return completed.withPageCompletion(wireCompletion);
-              });
+          return validatedPageCompletion(decodedCommand, command, pageCompletion)
+              .onItem().transform(completed::withPageCompletion);
         })
         .onFailure(AwaitThrowableSupport::containsAwaitSuspension).recoverWithUni(failure -> {
           AwaitSuspendedException suspended = AwaitThrowableSupport.extractAwaitSuspension(failure);
           return awaitCoordinator.suspensionSnapshot(suspended)
-              .onItem().transform(TransitionResultEnvelope::waiting);
+              .onItem().transformToUni(snapshot -> command.pageContext().isEmpty()
+                  ? Uni.createFrom().item(TransitionResultEnvelope.waiting(snapshot))
+                  : validatedPageCompletion(decodedCommand, command, pageCompletion)
+                      .onItem().transform(completion -> TransitionResultEnvelope.waiting(
+                          snapshot.withPageCompletion(completion))));
         })
         .onFailure().recoverWithItem(failure -> TransitionResultEnvelope.failed(
             PipelineStepExecutionFailure.source(failure),
             PipelineStepExecutionFailure.stepIndex(failure)));
+  }
+
+  private Uni<PagedTransitionCompletion> validatedPageCompletion(
+      TransitionWorkerCommand decodedCommand,
+      TransitionCommandEnvelope command,
+      AtomicReference<java.util.concurrent.CompletionStage<PagedSourceCompletion>> pageCompletion) {
+    java.util.concurrent.CompletionStage<PagedSourceCompletion> providerCompletion = pageCompletion.get();
+    if (providerCompletion == null) {
+      return Uni.createFrom().failure(new IllegalStateException(
+          "paged transition completed without opening its paged source"));
+    }
+    return Uni.createFrom().completionStage(providerCompletion)
+        .onItem().transform(page -> {
+          var context = command.pageContext().orElseThrow();
+          page.validateAgainst(new org.pipelineframework.paging.PagedSourceRequest<>(
+              decodedCommand.inputPayload(),
+              context.sourceIdentity(),
+              context.startCheckpoint(),
+              context.maxRecords()));
+          PagedTransitionCompletion wireCompletion = new PagedTransitionCompletion(
+              page.consumedRecords(), page.nextCheckpoint(), page.exhausted());
+          wireCompletion.validateAgainst(context);
+          return wireCompletion;
+        });
   }
 
   private java.util.Optional<String> validateCommandIdentity(
@@ -682,16 +700,22 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
             }
             List<Object> steps = loadStepsForExecution();
             if (command.pageContext().isPresent()) {
-              if (command.currentStepIndex() != 0 || steps.isEmpty()) {
+              if (steps.isEmpty()) {
                 restoreExecutionContexts(previousPipeline, previous, previousExecution);
                 return Multi.createFrom().failure(new IllegalStateException(
-                    "paged transitions must begin at the first source step"));
+                    "paged transitions require a source step"));
               }
-              steps = new ArrayList<>(steps);
-              steps.set(0, new PagedSourceStepAdapter(
-                  steps.getFirst(), command.pageContext().orElseThrow(), pageCompletion,
-                  pageExecutionTelemetry == null ? PageExecutionTelemetry.disabled() : pageExecutionTelemetry,
-                  command.attempt() > 0));
+              if (command.currentStepIndex() == 0) {
+                steps = new ArrayList<>(steps);
+                steps.set(0, new PagedSourceStepAdapter(
+                    steps.getFirst(), command.pageContext().orElseThrow(), pageCompletion,
+                    pageExecutionTelemetry == null ? PageExecutionTelemetry.disabled() : pageExecutionTelemetry,
+                    command.attempt() > 0));
+              } else if (command.pageContext().orElseThrow().suspendedCompletion().isEmpty()) {
+                restoreExecutionContexts(previousPipeline, previous, previousExecution);
+                return Multi.createFrom().failure(new IllegalStateException(
+                    "a resumed paged transition requires retained page completion"));
+              }
             }
             int requestedStopBeforeStepIndex = command.stopBeforeStepIndex();
             if (requestedStopBeforeStepIndex > steps.size()) {

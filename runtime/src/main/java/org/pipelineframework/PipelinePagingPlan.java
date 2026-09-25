@@ -1,5 +1,6 @@
 package org.pipelineframework;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -34,9 +35,18 @@ record PipelinePagingPlan(int maxRecords) {
       throw new IllegalStateException("paging requires the first step to be ONE_TO_MANY");
     }
     Object configured = paging.get("maxRecords");
-    if (!(configured instanceof Number number) || number.intValue() < 1) {
+    if (!(configured instanceof Number number)) {
       throw new IllegalStateException("generated paging.maxRecords must be a positive integer");
     }
-    return Optional.of(new PipelinePagingPlan(number.intValue()));
+    final int maxRecords;
+    try {
+      maxRecords = new BigDecimal(number.toString()).intValueExact();
+    } catch (ArithmeticException | NumberFormatException failure) {
+      throw new IllegalStateException("generated paging.maxRecords must be a positive integer", failure);
+    }
+    if (maxRecords < 1) {
+      throw new IllegalStateException("generated paging.maxRecords must be a positive integer");
+    }
+    return Optional.of(new PipelinePagingPlan(maxRecords));
   }
 }

@@ -202,33 +202,48 @@ class ObjectPublishRunnerTest {
             config(target, PagedStreamingTestMapper.class.getName()),
             new ObjectTargetRegistry(List.of(provider)),
             ObjectPublishTelemetry.NOOP);
-        AwaitExecutionContextHolder.set(new AwaitExecutionContext(
-            "tenant", "execution-paged", 0, AwaitContinuationMode.LIVE_IF_SUPPORTED,
-            TerminalOutputOwnership.TRANSITION_WORKER, Map.of(),
-            java.util.Optional.of(new PagedTransitionContext(0, "source-v1", java.util.Optional.empty(), 1000))));
-        try {
-            @SuppressWarnings("unchecked")
-            Multi<TestOutput> published = (Multi<TestOutput>) runner.publish(
-                Multi.createFrom().items(new TestOutput("payments", "María\nGarcía")));
+        publishPage(runner, 0, new TestOutput("payments", "María\nGarcía"));
+        publishPage(runner, 1, new TestOutput("payments", "Zoë"));
+        provider.sessions.put(".tpf-pages/another-execution/payments/part", new StreamingRecordingSession(
+            new ObjectWriteOpenRequest(
+                "results", target, ".tpf-pages/another-execution/payments/part",
+                "text/plain", Map.of(), "foreign")));
 
-            assertEquals(List.of(new TestOutput("payments", "María\nGarcía")),
-                published.collect().asList().await().indefinitely());
-        } finally {
-            AwaitExecutionContextHolder.clear();
-        }
+        List<String> stagedKeys = provider.sessions.entrySet().stream()
+            .filter(entry -> entry.getKey().contains("execution-paged") == false)
+            .filter(entry -> entry.getValue().openRequest.metadata().containsKey("tpf.page.index"))
+            .sorted(java.util.Comparator.comparingInt(entry -> Integer.parseInt(
+                entry.getValue().openRequest.metadata().get("tpf.page.index"))))
+            .map(Map.Entry::getKey)
+            .toList();
+        assertEquals(2, stagedKeys.size());
+        assertEquals("María\nGarcía\n", provider.sessions.get(stagedKeys.getFirst()).body());
+        assertEquals("Zoë\n", provider.sessions.get(stagedKeys.getLast()).body());
 
-        String stagedKey = provider.sessions.keySet().iterator().next();
-        assertFalse(stagedKey.equals("payments.out"));
-        assertEquals("María\nGarcía\n", provider.sessions.get(stagedKey).body());
-
-        runner.completePagedOutput("execution-paged", 0).await().indefinitely();
+        runner.completePagedOutput("execution-paged", 1).await().indefinitely();
 
         PagedObjectCompositionRequest composition = provider.composition.get();
         assertEquals("payments.out", composition.objectKey());
-        assertEquals(List.of(stagedKey), composition.orderedPartKeys());
+        assertEquals(stagedKeys, composition.orderedPartKeys());
         assertEquals("header\n", new String(composition.prefix(), StandardCharsets.UTF_8));
         assertEquals("footer\n", new String(composition.suffix(), StandardCharsets.UTF_8));
-        assertEquals("1", composition.metadata().get("recordCount"));
+        assertEquals("2", composition.metadata().get("recordCount"));
+    }
+
+    private static void publishPage(ObjectPublishRunner runner, int pageIndex, TestOutput item) {
+        AwaitExecutionContextHolder.set(new AwaitExecutionContext(
+            "tenant", "execution-paged", 0, AwaitContinuationMode.LIVE_IF_SUPPORTED,
+            TerminalOutputOwnership.TRANSITION_WORKER, Map.of(),
+            java.util.Optional.of(new PagedTransitionContext(
+                pageIndex, "source-v1", pageIndex == 0 ? java.util.Optional.empty()
+                    : java.util.Optional.of("checkpoint-" + pageIndex), 1000))));
+        try {
+            @SuppressWarnings("unchecked")
+            Multi<TestOutput> published = (Multi<TestOutput>) runner.publish(Multi.createFrom().item(item));
+            assertEquals(List.of(item), published.collect().asList().await().indefinitely());
+        } finally {
+            AwaitExecutionContextHolder.clear();
+        }
     }
 
     @Test
@@ -489,7 +504,9 @@ class ObjectPublishRunnerTest {
         }
 
         @Override public CompletionStage<List<PagedObjectPart>> listParts(PagedObjectPartQuery query) {
-            return CompletableFuture.completedFuture(sessions.entrySet().stream().map(entry -> {
+            return CompletableFuture.completedFuture(sessions.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(query.stagePrefix()))
+                .map(entry -> {
                 Map<String, String> metadata = entry.getValue().openRequest.metadata();
                 return new PagedObjectPart(
                     entry.getKey(), metadata.get("tpf.page.group"), metadata.get("tpf.page.finalKey"),

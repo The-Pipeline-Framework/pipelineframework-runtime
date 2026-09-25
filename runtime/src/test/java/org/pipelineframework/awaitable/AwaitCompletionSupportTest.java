@@ -93,11 +93,13 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(0),
             org.mockito.ArgumentMatchers.anyString(),
             org.mockito.ArgumentMatchers.eq("input"),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull()))
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap()))
             .thenReturn(io.smallrye.mutiny.Uni.createFrom().item(mockCreateResult));
         when(awaitCoordinator.dispatch(testDescriptor, mockRecord))
             .thenReturn(io.smallrye.mutiny.Uni.createFrom().item(mockRecord));
@@ -109,11 +111,13 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(0),
             org.mockito.ArgumentMatchers.anyString(),
             org.mockito.ArgumentMatchers.eq("input"),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull());
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap());
         org.mockito.Mockito.verify(awaitCoordinator).dispatch(testDescriptor, mockRecord);
         org.mockito.Mockito.verify(awaitCoordinator, never()).supportsLiveAwaitWindow(testDescriptor);
   }
@@ -133,16 +137,16 @@ class AwaitCompletionSupportTest {
         AwaitInteractionStatus.WAITING, "input", null, null, null, null, "interaction-api",
         Map.of(), System.currentTimeMillis() + 300000, System.currentTimeMillis(),
         System.currentTimeMillis(), System.currentTimeMillis() + 86400);
-    when(awaitCoordinator.createOrGet(testDescriptor, "tenant1", "exec123", 2,
-        "exec123:page:7:2", "input", null, null))
+    when(awaitCoordinator.createOrGet(testDescriptor, "tenant1", "exec123", "exec123:page:7", 2,
+        "exec123:page:7:2", "input", null, null, Map.of()))
         .thenReturn(Uni.createFrom().item(new AwaitCreateResult(record, false)));
     when(awaitCoordinator.dispatch(testDescriptor, record)).thenReturn(Uni.createFrom().item(record));
 
     assertThrows(AwaitSuspendedException.class,
         () -> support.awaitOneToOne(testDescriptor, "input").await().indefinitely());
 
-    org.mockito.Mockito.verify(awaitCoordinator).createOrGet(testDescriptor, "tenant1", "exec123", 2,
-        "exec123:page:7:2", "input", null, null);
+    org.mockito.Mockito.verify(awaitCoordinator).createOrGet(testDescriptor, "tenant1", "exec123", "exec123:page:7", 2,
+        "exec123:page:7:2", "input", null, null, Map.of());
   }
 
     @Test
@@ -169,11 +173,13 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(4),
             org.mockito.ArgumentMatchers.anyString(),
             org.mockito.ArgumentMatchers.eq("input"),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull()))
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap()))
             .thenReturn(Uni.createFrom().item(mockCreateResult));
         when(awaitCoordinator.dispatch(testDescriptor, mockRecord))
             .thenReturn(Uni.createFrom().item(mockRecord));
@@ -184,11 +190,13 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(4),
             org.mockito.ArgumentMatchers.anyString(),
             org.mockito.ArgumentMatchers.eq("input"),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull());
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap());
     }
 
     @Test
@@ -201,7 +209,7 @@ class AwaitCompletionSupportTest {
 
         Uni<String> pending = support.awaitOneToOne(descriptor(), "input");
         AwaitExecutionContextHolder.set(caller);
-        when(awaitCoordinator.createOrGet(any(), any(), any(), anyInt(), any(), any(), any(), any()))
+        when(awaitCoordinator.createOrGet(any(), any(), any(), any(), anyInt(), any(), any(), any(), any(), org.mockito.ArgumentMatchers.anyMap()))
             .thenAnswer(invocation -> {
                 assertEquals(captured, AwaitExecutionContextHolder.get());
                 return Uni.createFrom().nothing();
@@ -228,24 +236,26 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(2),
             any(),
             any(),
             any(),
             anyInt(),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull()))
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap()))
             .thenAnswer(invocation -> {
                 if (AwaitExecutionContextHolder.get() == null) {
                     return Uni.createFrom().failure(new IllegalStateException("missing await execution context"));
                 }
-                Integer index = invocation.getArgument(7, Integer.class);
+                Integer index = invocation.getArgument(8, Integer.class);
                 String interactionId = "interaction-" + index;
                 AwaitInteractionRecord record = new AwaitInteractionRecord(
                     "tenant1", "exec123", "review", 2, String.class.getName(),
                     interactionId, "correlation-" + index, "causation-" + index, "idem-" + index,
                     0L, org.pipelineframework.awaitable.AwaitInteractionStatus.WAITING,
-                    invocation.getArgument(5), null, invocation.getArgument(6), index, null,
+                    invocation.getArgument(6), null, invocation.getArgument(7), index, null,
                     null, null,
                     "interaction-api", Map.of(), System.currentTimeMillis() + 300000, System.currentTimeMillis(),
                     System.currentTimeMillis(), System.currentTimeMillis() + 86400);
@@ -299,20 +309,22 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(2),
             any(),
             any(),
             any(),
             anyInt(),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull()))
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap()))
             .thenAnswer(invocation -> {
-                Integer index = invocation.getArgument(7, Integer.class);
+                Integer index = invocation.getArgument(8, Integer.class);
                 AwaitInteractionRecord record = new AwaitInteractionRecord(
                     "tenant1", "exec123", "review", 2, String.class.getName(),
                     "interaction-" + index, "correlation-" + index, "causation-" + index, "idem-" + index,
                     0L, AwaitInteractionStatus.WAITING,
-                    invocation.getArgument(5), null, invocation.getArgument(6), index, null,
+                    invocation.getArgument(6), null, invocation.getArgument(7), index, null,
                     null, null,
                     "interaction-api", Map.of(), System.currentTimeMillis() + 300000, System.currentTimeMillis(),
                     System.currentTimeMillis(), System.currentTimeMillis() + 86400);
@@ -363,20 +375,22 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(2),
             any(),
             any(),
             any(),
             anyInt(),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull()))
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap()))
             .thenAnswer(invocation -> {
-                Integer index = invocation.getArgument(7, Integer.class);
+                Integer index = invocation.getArgument(8, Integer.class);
                 AwaitInteractionRecord record = new AwaitInteractionRecord(
                     "tenant1", "exec123", "review", 2, String.class.getName(),
                     "interaction-" + index, "correlation-" + index, "causation-" + index, "idem-" + index,
                     0L, AwaitInteractionStatus.WAITING,
-                    invocation.getArgument(5), null, invocation.getArgument(6), index, null,
+                    invocation.getArgument(6), null, invocation.getArgument(7), index, null,
                     null, null,
                     "interaction-api", Map.of(), System.currentTimeMillis() + 300000, System.currentTimeMillis(),
                     System.currentTimeMillis(), System.currentTimeMillis() + 86400);
@@ -436,19 +450,21 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(2),
             any(),
             any(),
             any(),
             anyInt(),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull()))
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap()))
             .thenAnswer(invocation -> {
-                Integer index = invocation.getArgument(7, Integer.class);
+                Integer index = invocation.getArgument(8, Integer.class);
                 AwaitInteractionRecord record = itemRecord(
                     index,
                     AwaitInteractionStatus.WAITING,
-                    invocation.getArgument(5),
+                    invocation.getArgument(6),
                     null);
                 return Uni.createFrom().item(new AwaitCreateResult(record, false));
             });
@@ -498,13 +514,15 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(2),
             org.mockito.ArgumentMatchers.anyString(),
             org.mockito.ArgumentMatchers.any(),
             org.mockito.ArgumentMatchers.anyString(),
             org.mockito.ArgumentMatchers.anyInt(),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull());
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap());
         org.mockito.Mockito.verify(awaitCoordinator, never()).markDispatchComplete(
             org.mockito.ArgumentMatchers.anyString(),
             org.mockito.ArgumentMatchers.anyString(),
@@ -527,14 +545,16 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(2),
             any(), any(), any(), anyInt(),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull()))
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap()))
             .thenAnswer(invocation -> {
-                int index = invocation.getArgument(7, Integer.class);
+                int index = invocation.getArgument(8, Integer.class);
                 return Uni.createFrom().item(new AwaitCreateResult(itemRecord(
-                    index, AwaitInteractionStatus.WAITING, invocation.getArgument(5), null), false));
+                    index, AwaitInteractionStatus.WAITING, invocation.getArgument(6), null), false));
             });
         when(awaitCoordinator.dispatch(org.mockito.ArgumentMatchers.eq(testDescriptor), any()))
             .thenAnswer(invocation -> {
@@ -583,17 +603,19 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(2),
             any(),
             any(),
             any(),
             anyInt(),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull()))
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap()))
             .thenAnswer(invocation -> {
-                int index = invocation.getArgument(7, Integer.class);
+                int index = invocation.getArgument(8, Integer.class);
                 return Uni.createFrom().item(new AwaitCreateResult(
-                    itemRecord(index, AwaitInteractionStatus.WAITING, invocation.getArgument(5), null), false));
+                    itemRecord(index, AwaitInteractionStatus.WAITING, invocation.getArgument(6), null), false));
             });
         when(awaitCoordinator.dispatch(org.mockito.ArgumentMatchers.eq(testDescriptor), any()))
             .thenAnswer(invocation -> {
@@ -646,14 +668,16 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(2),
             any(), any(), any(), anyInt(),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull()))
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap()))
             .thenAnswer(invocation -> {
-                int index = invocation.getArgument(7, Integer.class);
+                int index = invocation.getArgument(8, Integer.class);
                 return Uni.createFrom().item(new AwaitCreateResult(itemRecord(
-                    index, AwaitInteractionStatus.WAITING, invocation.getArgument(5), null), false));
+                    index, AwaitInteractionStatus.WAITING, invocation.getArgument(6), null), false));
             });
         when(awaitCoordinator.dispatchLive(org.mockito.ArgumentMatchers.eq(testDescriptor), any()))
             .thenAnswer(invocation -> {
@@ -740,14 +764,16 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(2),
             any(), any(), any(), anyInt(),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull()))
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap()))
             .thenAnswer(invocation -> {
-                int index = invocation.getArgument(7, Integer.class);
+                int index = invocation.getArgument(8, Integer.class);
                 return Uni.createFrom().item(new AwaitCreateResult(itemRecord(
-                    index, AwaitInteractionStatus.WAITING, invocation.getArgument(5), null), false));
+                    index, AwaitInteractionStatus.WAITING, invocation.getArgument(6), null), false));
             });
         when(awaitCoordinator.dispatchLive(org.mockito.ArgumentMatchers.eq(testDescriptor), any()))
             .thenAnswer(invocation -> {
@@ -794,7 +820,7 @@ class AwaitCompletionSupportTest {
 
         assertEquals(List.of(), output);
         org.mockito.Mockito.verify(awaitCoordinator, never()).createOrGetItem(
-            any(), any(), any(), anyInt(), any(), any(), any(), anyInt(), any(), any());
+            any(), any(), any(), any(), anyInt(), any(), any(), any(), anyInt(), any(), any(), org.mockito.ArgumentMatchers.anyMap());
         org.mockito.Mockito.verify(awaitCoordinator, never()).markDispatchComplete(
             any(), any(), anyInt(), anyLong());
     }
@@ -811,13 +837,15 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.eq(testDescriptor),
             org.mockito.ArgumentMatchers.eq("tenant1"),
             org.mockito.ArgumentMatchers.eq("exec123"),
+            org.mockito.ArgumentMatchers.eq("exec123"),
             org.mockito.ArgumentMatchers.eq(2),
             any(),
             any(),
             any(),
             org.mockito.ArgumentMatchers.eq(0),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull()))
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap()))
             .thenReturn(Uni.createFrom().item(new AwaitCreateResult(failed, false)));
 
         IllegalStateException error = assertThrows(
@@ -853,13 +881,15 @@ class AwaitCompletionSupportTest {
             org.mockito.ArgumentMatchers.any(),
             org.mockito.ArgumentMatchers.anyString(),
             org.mockito.ArgumentMatchers.anyString(),
+            org.mockito.ArgumentMatchers.anyString(),
             anyInt(),
             org.mockito.ArgumentMatchers.anyString(),
             org.mockito.ArgumentMatchers.any(),
             org.mockito.ArgumentMatchers.anyString(),
             anyInt(),
             org.mockito.ArgumentMatchers.isNull(),
-            org.mockito.ArgumentMatchers.isNull())).thenAnswer(invocation -> awaitCoordinator.createOrGetItem(
+            org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.anyMap())).thenAnswer(invocation -> awaitCoordinator.createOrGetItem(
                 invocation.getArgument(0),
                 invocation.getArgument(1),
                 invocation.getArgument(2),
@@ -869,7 +899,9 @@ class AwaitCompletionSupportTest {
                 invocation.getArgument(6),
                 invocation.getArgument(7),
                 invocation.getArgument(8),
-                invocation.getArgument(9)));
+                invocation.getArgument(9),
+                invocation.getArgument(10),
+                invocation.getArgument(11)));
         lenient().when(awaitCoordinator.reconcileCompletedItemInteractions(
             org.mockito.ArgumentMatchers.anyString(),
             org.mockito.ArgumentMatchers.anyString(),

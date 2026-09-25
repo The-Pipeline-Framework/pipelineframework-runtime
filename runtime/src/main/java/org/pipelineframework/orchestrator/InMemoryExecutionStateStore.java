@@ -367,6 +367,22 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
         String awaitUnitId,
         int awaitStepIndex,
         long nowEpochMs) {
+        return markWaitingExternal(
+            tenantId, executionId, expectedVersion, transitionKey, awaitUnitId,
+            awaitStepIndex, Optional.empty(), nowEpochMs);
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> markWaitingExternal(
+        String tenantId,
+        String executionId,
+        long expectedVersion,
+        String transitionKey,
+        String awaitUnitId,
+        int awaitStepIndex,
+        Optional<PagedTransitionCompletion> pageCompletion,
+        long nowEpochMs) {
+        Objects.requireNonNull(pageCompletion, "pageCompletion must not be null");
         return Uni.createFrom().item(() -> {
             synchronized (lock) {
                 String scopedId = scopedExecutionId(tenantId, executionId);
@@ -401,7 +417,10 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore {
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(),
+                    pageCompletion.map(completion -> current.pagingState().orElseThrow(() ->
+                        new IllegalStateException("page completion requires durable paging state"))
+                        .withSuspendedCompletion(completion)).or(() -> current.pagingState()));
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }

@@ -5,6 +5,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.UUID;
 import java.util.concurrent.Executors;
@@ -52,6 +53,7 @@ import org.pipelineframework.orchestrator.TransitionWorkerExecutor;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 import org.pipelineframework.orchestrator.release.LocalPipelineReleaseActivation;
+import org.pipelineframework.orchestrator.release.PipelineReleaseRegistry;
 import org.pipelineframework.orchestrator.dto.ExecutionStatusDto;
 import org.pipelineframework.orchestrator.dto.RunAsyncAcceptedDto;
 import org.pipelineframework.objectpublish.ObjectPublishCompletionService;
@@ -112,6 +114,9 @@ class QueueAsyncCoordinator {
   LocalPipelineReleaseActivation localReleaseActivation;
 
   @Inject
+  PipelineReleaseRegistry releaseRegistry;
+
+  @Inject
   ControlPlaneAdmissionPolicy controlPlaneAdmissionPolicy;
 
   @Inject
@@ -165,7 +170,7 @@ class QueueAsyncCoordinator {
       providerReadinessErrors.add(
           "ExecutionStateStore(" + executionStateStore.providerName() + "): live lease renewal is not supported");
     }
-    if (PipelinePagingPlan.from(releaseIdentityResolver().contract()).isPresent()
+    if (localPagingPlan().isPresent()
         && !executionStateStore.supportsPagedProgress()) {
       providerReadinessErrors.add(
           "ExecutionStateStore(" + executionStateStore.providerName()
@@ -584,11 +589,56 @@ class QueueAsyncCoordinator {
             this::releaseVersion,
             this::segmentBoundaryLedger,
             this::activateLocalReleaseForSubmission,
-            () -> PipelinePagingPlan.from(releaseIdentityResolver().contract()));
+            this::pagingPlanFor);
         submissionFlow = current;
       }
       return current;
     }
+  }
+
+  private Optional<PipelinePagingPlan> localPagingPlan() {
+    return PipelinePagingPlan.from(releaseIdentityResolver().contract());
+  }
+
+  private Uni<Optional<PipelinePagingPlan>> pagingPlanFor(PipelineRunSubmission submission) {
+    if (targetsLocalContract(submission)) {
+      return validatePagingStore(localPagingPlan());
+    }
+    if (releaseRegistry == null) {
+      return Uni.createFrom().failure(new IllegalStateException(
+          "submitted release contract is unavailable for paging validation"));
+    }
+    return releaseRegistry.get(
+            submission.tenantId(), submission.pipelineId(), submission.releaseVersion())
+        .onItem().transformToUni(release -> {
+          if (release.isEmpty() || release.orElseThrow().contract() == null) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                "submitted release contract is unavailable for paging validation: "
+                    + submission.pipelineId() + ":" + submission.releaseVersion()));
+          }
+          var pinned = release.orElseThrow();
+          if (!submission.contractVersion().equals(pinned.contractVersion())) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                "submitted contract version does not match the pinned release contract"));
+          }
+          return validatePagingStore(PipelinePagingPlan.from(pinned.contract()));
+        });
+  }
+
+  private Uni<Optional<PipelinePagingPlan>> validatePagingStore(
+      Optional<PipelinePagingPlan> plan) {
+    if (plan.isPresent() && !executionStateStore.supportsPagedProgress()) {
+      return Uni.createFrom().failure(new IllegalStateException(
+          "ExecutionStateStore(" + executionStateStore.providerName()
+              + ") does not support fenced paged progress"));
+    }
+    return Uni.createFrom().item(plan);
+  }
+
+  private boolean targetsLocalContract(PipelineRunSubmission submission) {
+    return pipelineId().equals(submission.pipelineId())
+        && contractVersion().equals(submission.contractVersion())
+        && releaseVersion().equals(submission.releaseVersion());
   }
 
   private Uni<Void> activateLocalReleaseForSubmission(PipelineRunSubmission submission) {

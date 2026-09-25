@@ -60,11 +60,13 @@ public class AwaitCompletionSupport {
             descriptor,
             context.tenantId(),
             context.executionId(),
+            context.identityScope(),
             stepIndex,
             context.identityScope() + ":" + stepIndex,
             input,
             null,
-            null)
+            null,
+            context.traceMetadata())
             .onItem().transformToUni(created -> {
                 AwaitInteractionRecord record = created.record();
                 Uni<AwaitInteractionRecord> dispatched = record.status() == AwaitInteractionStatus.WAITING
@@ -249,13 +251,15 @@ public class AwaitCompletionSupport {
             descriptor,
             context.tenantId(),
             context.executionId(),
+            context.identityScope(),
             context.currentStepIndex(),
             context.identityScope() + ":" + context.currentStepIndex() + ":" + index,
             item,
             unitId,
             index,
             null,
-            null)
+            null,
+            context.traceMetadata())
             .onItem().transformToUni(created -> {
                 AwaitInteractionRecord record = created.record();
                 if (record.status() == AwaitInteractionStatus.COMPLETED) {
@@ -290,13 +294,15 @@ public class AwaitCompletionSupport {
                 descriptor,
                 context.tenantId(),
                 context.executionId(),
+                context.identityScope(),
                 stepIndex,
                 context.identityScope() + ":" + stepIndex + ":" + index,
                 item,
                 unitId,
                 index,
                 null,
-                null)
+                null,
+                context.traceMetadata())
                 .onItem().transformToUni(created -> {
                     AwaitInteractionRecord record = created.record();
                     return record.status() == AwaitInteractionStatus.WAITING

@@ -8,6 +8,7 @@ import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 
 import io.smallrye.mutiny.Uni;
+import org.pipelineframework.orchestrator.PagedExecutionState;
 
 /**
  * Publishes queue-async terminal output objects before an execution is marked successful.
@@ -31,6 +32,22 @@ public class ObjectPublishCompletionService {
         }
         List<?> outputItems = outputItemsSupplier.get();
         return active.publishItems(outputItems == null ? List.of() : outputItems);
+    }
+
+    public Uni<Void> publishIfConfigured(
+        Supplier<List<?>> outputItemsSupplier,
+        String executionId,
+        PagedExecutionState page) {
+        Objects.requireNonNull(outputItemsSupplier, "outputItemsSupplier must not be null");
+        ObjectPublishRunner active = runner();
+        if (!active.enabled()) {
+            return Uni.createFrom().voidItem();
+        }
+        List<?> outputItems = outputItemsSupplier.get();
+        return active.publishItems(
+            outputItems == null ? List.of() : outputItems,
+            Objects.requireNonNull(executionId, "executionId must not be null"),
+            Objects.requireNonNull(page, "page must not be null"));
     }
 
     public boolean enabled() {

@@ -40,7 +40,7 @@ class QueueAsyncSubmissionFlow {
   private final Supplier<String> releaseVersion;
   private final Supplier<SegmentBoundaryLedger> segmentBoundaryLedger;
   private final Function<PipelineRunSubmission, Uni<Void>> releaseActivation;
-  private final Supplier<Optional<PipelinePagingPlan>> pagingPlan;
+  private final Function<PipelineRunSubmission, Uni<Optional<PipelinePagingPlan>>> pagingPlan;
 
   QueueAsyncSubmissionFlow(
       PipelineOrchestratorConfig orchestratorConfig,
@@ -65,7 +65,7 @@ class QueueAsyncSubmissionFlow {
         releaseVersion,
         segmentBoundaryLedger,
         ignored -> Uni.createFrom().voidItem(),
-        Optional::empty);
+        ignored -> Uni.createFrom().item(Optional.empty()));
   }
 
   QueueAsyncSubmissionFlow(
@@ -82,7 +82,7 @@ class QueueAsyncSubmissionFlow {
       Function<PipelineRunSubmission, Uni<Void>> releaseActivation) {
     this(orchestratorConfig, executionInputPolicy, executionResultShapeResolver, executionStateStore,
         workDispatcher, admissionPolicy, pipelineId, contractVersion, releaseVersion,
-        segmentBoundaryLedger, releaseActivation, Optional::empty);
+        segmentBoundaryLedger, releaseActivation, ignored -> Uni.createFrom().item(Optional.empty()));
   }
 
   QueueAsyncSubmissionFlow(
@@ -97,7 +97,7 @@ class QueueAsyncSubmissionFlow {
       Supplier<String> releaseVersion,
       Supplier<SegmentBoundaryLedger> segmentBoundaryLedger,
       Function<PipelineRunSubmission, Uni<Void>> releaseActivation,
-      Supplier<Optional<PipelinePagingPlan>> pagingPlan) {
+      Function<PipelineRunSubmission, Uni<Optional<PipelinePagingPlan>>> pagingPlan) {
     this.orchestratorConfig = Objects.requireNonNull(orchestratorConfig, "orchestratorConfig must not be null");
     this.executionInputPolicy = Objects.requireNonNull(executionInputPolicy, "executionInputPolicy must not be null");
     this.executionResultShapeResolver =
@@ -199,14 +199,15 @@ class QueueAsyncSubmissionFlow {
     }
     ExecutionResultShape resultShape = executionResultShapeResolver.resolve();
     try {
-      return Uni.createFrom().item(new PipelineRunSubmissionPlan(
-          submission,
-          snapshot,
-          executionKey,
-          resultShape,
-          pagingPlan.get(),
-          now,
-          ttlEpochS));
+      return pagingPlan.apply(submission)
+          .onItem().transform(plan -> new PipelineRunSubmissionPlan(
+              submission,
+              snapshot,
+              executionKey,
+              resultShape,
+              plan,
+              now,
+              ttlEpochS));
     } catch (IllegalArgumentException e) {
       return Uni.createFrom().failure(new BadRequestException(e.getMessage()));
     }

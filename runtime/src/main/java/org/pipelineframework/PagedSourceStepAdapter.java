@@ -1,16 +1,20 @@
 package org.pipelineframework;
 
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicReference;
 
 import io.smallrye.mutiny.Multi;
 import org.pipelineframework.orchestrator.PagedTransitionContext;
+import org.pipelineframework.config.StepConfig;
+import org.pipelineframework.invocation.TransportBoundaryInvocation;
 import org.pipelineframework.paging.PagedSourceCompletion;
 import org.pipelineframework.paging.PagedSourceOperation;
 import org.pipelineframework.paging.PagedSourceRequest;
 import org.pipelineframework.paging.PagedSourceStream;
 import org.pipelineframework.step.StepOneToMany;
+import org.pipelineframework.step.Configurable;
 import org.pipelineframework.step.ConfigurableStep;
 import org.pipelineframework.telemetry.PageExecutionTelemetry;
 
@@ -21,6 +25,8 @@ final class PagedSourceStepAdapter extends ConfigurableStep implements StepOneTo
   private final AtomicReference<CompletionStage<PagedSourceCompletion>> completion;
   private final PageExecutionTelemetry telemetry;
   private final boolean replay;
+  private final Configurable sourceConfig;
+  private final boolean transportBoundary;
 
   @SuppressWarnings("unchecked")
   PagedSourceStepAdapter(
@@ -38,26 +44,48 @@ final class PagedSourceStepAdapter extends ConfigurableStep implements StepOneTo
     this.completion = Objects.requireNonNull(completion, "completion must not be null");
     this.telemetry = Objects.requireNonNull(telemetry, "telemetry must not be null");
     this.replay = replay;
+    this.sourceConfig = sourceStep instanceof Configurable configurable ? configurable : this;
+    this.transportBoundary = sourceStep instanceof TransportBoundaryInvocation;
   }
 
   @Override
   public Multi<Object> applyOneToMany(Object input) {
-    PagedSourceStream<Object> opened = operation.openPage(new PagedSourceRequest<>(
-        input,
-        context.sourceIdentity(),
-        context.startCheckpoint(),
-        context.maxRecords()));
-    PageExecutionTelemetry.PageObservation observation = telemetry.open(replay);
-    CompletionStage<PagedSourceCompletion> observedCompletion = opened.completion()
-        .whenComplete((result, failure) -> {
-          if (failure == null) {
-            observation.complete(result);
-          }
-        });
-    if (!completion.compareAndSet(null, observedCompletion)) {
+    CompletableFuture<PagedSourceCompletion> reserved = new CompletableFuture<>();
+    if (!completion.compareAndSet(null, reserved)) {
       return Multi.createFrom().failure(new IllegalStateException(
           "a paged source step may open only one page per transition"));
     }
-    return Multi.createFrom().publisher(observation.observeDemand(opened.items()));
+    try {
+      PagedSourceStream<Object> opened = operation.openPage(new PagedSourceRequest<>(
+          input,
+          context.sourceIdentity(),
+          context.startCheckpoint(),
+          context.maxRecords()));
+      PageExecutionTelemetry.PageObservation observation = telemetry.open(replay);
+      opened.completion().whenComplete((result, failure) -> {
+        if (failure == null) {
+          observation.complete(result);
+          reserved.complete(result);
+        } else {
+          reserved.completeExceptionally(failure);
+        }
+      });
+      return Multi.createFrom().publisher(observation.observeDemand(opened.items()));
+    } catch (RuntimeException failure) {
+      reserved.completeExceptionally(failure);
+      throw failure;
+    }
+  }
+
+  @Override
+  public StepConfig effectiveConfig() {
+    return sourceConfig == this ? super.effectiveConfig() : sourceConfig.effectiveConfig();
+  }
+
+  @Override
+  public boolean shouldRetry(Throwable failure) {
+    return !transportBoundary && (sourceConfig == this
+        ? StepOneToMany.super.shouldRetry(failure)
+        : sourceConfig.shouldRetry(failure));
   }
 }
