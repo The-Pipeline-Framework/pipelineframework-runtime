@@ -44,6 +44,14 @@ final class ReleaseDescriptorGenerator {
         String releaseVersion,
         List<ReleaseArtifactInput> artifacts
     ) {
+        if (contract == null) {
+            throw new IllegalArgumentException("Pipeline Contract is required");
+        }
+        String pipelineId = requireText(contract.pipelineId(), "pipelineId");
+        String contractVersion = requireText(contract.contractVersion(), "contractVersion");
+        if (contract.steps() == null) {
+            throw new IllegalArgumentException("Pipeline Contract steps are required");
+        }
         String version = requireText(releaseVersion, "releaseVersion");
         if (artifacts == null || artifacts.isEmpty()) {
             throw new IllegalArgumentException("At least one release artifact is required");
@@ -83,8 +91,8 @@ final class ReleaseDescriptorGenerator {
         }
         return new PipelineReleaseDescriptor(
             PipelineReleaseDescriptor.CURRENT_SCHEMA_VERSION,
-            requireText(contract.pipelineId(), "pipelineId"),
-            requireText(contract.contractVersion(), "contractVersion"),
+            pipelineId,
+            contractVersion,
             version,
             descriptors);
     }

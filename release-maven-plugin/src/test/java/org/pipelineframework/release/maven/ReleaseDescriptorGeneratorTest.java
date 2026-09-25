@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
+import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -128,6 +129,28 @@ class ReleaseDescriptorGeneratorTest {
     }
 
     @Test
+    void rejectsNullAssociationsThroughDescriptorValidation() throws Exception {
+        Path artifact = Files.writeString(temporaryDirectory.resolve("artifact.bin"), "artifact");
+        ReleaseArtifactInput input = new ReleaseArtifactInput(
+            "worker",
+            "local-file",
+            artifact,
+            "file:///worker",
+            Collections.singletonList(null),
+            null);
+
+        assertTrue(input.capabilities().isEmpty());
+        assertThrows(IllegalArgumentException.class, () -> generator.generate(contract, "release-1", List.of(input)));
+    }
+
+    @Test
+    void rejectsBlankContractIdentityBeforeArtifactProcessing() {
+        PipelineContractDescriptor invalid = contract(" ", "sha256:contract");
+
+        assertThrows(IllegalArgumentException.class, () -> generator.generate(invalid, "release-1", List.of()));
+    }
+
+    @Test
     void rejectsMissingAndMismatchedEmbeddedContracts() throws Exception {
         Path noContract = temporaryDirectory.resolve("empty.jar");
         try (JarOutputStream output = new JarOutputStream(Files.newOutputStream(noContract))) {
@@ -195,7 +218,6 @@ class ReleaseDescriptorGeneratorTest {
             "output",
             "example." + name,
             "",
-            Map.of(),
             Map.of());
     }
 
