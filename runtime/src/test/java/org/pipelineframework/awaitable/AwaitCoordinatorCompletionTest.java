@@ -46,18 +46,34 @@ class AwaitCoordinatorCompletionTest {
 
         AwaitInteractionRecord first = coordinator.createOrGet(
             descriptor, "tenant-1", "exec-1", "exec-1:page:0", 1, "cause",
-            Map.of("orderId", "o-1"), "alice", "fraud-review", Map.of())
+            Map.of("paymentRecordId", "p-1"), "alice", "fraud-review", Map.of())
             .await().indefinitely().record();
         AwaitInteractionRecord second = coordinator.createOrGet(
             descriptor, "tenant-1", "exec-1", "exec-1:page:1", 1, "cause",
-            Map.of("orderId", "o-1"), "alice", "fraud-review", Map.of())
+            Map.of("paymentRecordId", "p-1"), "alice", "fraud-review", Map.of())
             .await().indefinitely().record();
 
         assertEquals("exec-1", first.executionId());
         assertEquals("exec-1", second.executionId());
         assertNotEquals(first.unitId(), second.unitId());
+        assertEquals("exec-1:page:0:FraudCheck:paymentRecordId=p-1", first.idempotencyKey());
+        assertEquals("exec-1:page:1:FraudCheck:paymentRecordId=p-1", second.idempotencyKey());
         assertNotEquals(first.idempotencyKey(), second.idempotencyKey());
         assertNotEquals(first.correlationId(), second.correlationId());
+    }
+
+    @Test
+    void unpagedConfiguredIdempotencyKeyRemainsStableAcrossExecutions() {
+        AwaitCompletionDescriptor descriptor = descriptor("FraudCheck");
+        AwaitInteractionRecord first = coordinator(new InMemoryAwaitInteractionStore()).createOrGet(
+            descriptor, "tenant-1", "exec-1", 1, "cause", Map.of("paymentRecordId", "p-1"),
+            "alice", "fraud-review").await().indefinitely().record();
+        AwaitInteractionRecord second = coordinator(new InMemoryAwaitInteractionStore()).createOrGet(
+            descriptor, "tenant-1", "exec-2", 1, "cause", Map.of("paymentRecordId", "p-1"),
+            "alice", "fraud-review").await().indefinitely().record();
+
+        assertEquals("FraudCheck:paymentRecordId=p-1", first.idempotencyKey());
+        assertEquals(first.idempotencyKey(), second.idempotencyKey());
     }
 
     @Test
@@ -204,7 +220,7 @@ class AwaitCoordinatorCompletionTest {
             null).await().indefinitely();
 
         assertEquals(payload, result.record().requestPayload());
-        assertEquals("exec-1:ProtoFraudCheck:name=checkout.proto", result.record().idempotencyKey());
+        assertEquals("ProtoFraudCheck:name=checkout.proto", result.record().idempotencyKey());
     }
 
     @Test
@@ -284,7 +300,7 @@ class AwaitCoordinatorCompletionTest {
             null,
             null).await().indefinitely();
 
-        assertEquals("exec-1:V3PaymentProvider:id=canonical-payment-1", result.record().idempotencyKey());
+        assertEquals("V3PaymentProvider:id=canonical-payment-1", result.record().idempotencyKey());
         assertEquals(Map.of("id", "canonical-payment-1"), result.record().requestPayload());
     }
 

@@ -782,7 +782,8 @@ public class AwaitCoordinator {
         long now = System.currentTimeMillis();
         long deadline = now + descriptor.timeout().toMillis();
         long ttl = Instant.ofEpochMilli(deadline).plusSeconds(86_400).getEpochSecond();
-        String idempotencyKey = deriveIdempotencyKey(descriptor, identityScope, canonicalRequestPayload)
+        String idempotencyKey = deriveIdempotencyKey(
+            descriptor, executionId, identityScope, canonicalRequestPayload)
             + (descriptor.callback().isPresent() ? ":step=" + stepIndex : "")
             + (itemIndex == null ? "" : ":item=" + itemIndex);
         String correlationId = deriveCorrelationId(descriptor, tenantId, identityScope, idempotencyKey);
@@ -1383,12 +1384,21 @@ public class AwaitCoordinator {
         };
     }
 
-    private String deriveIdempotencyKey(AwaitCompletionDescriptor descriptor, String executionId, Object requestPayload) {
+    private String deriveIdempotencyKey(
+        AwaitCompletionDescriptor descriptor,
+        String executionId,
+        String identityScope,
+        Object requestPayload
+    ) {
         if (descriptor.idempotencyKeyFields().isEmpty()) {
-            return executionId + ":" + descriptor.stepId();
+            return identityScope + ":" + descriptor.stepId();
         }
         JsonNode node = PipelineJson.mapper().valueToTree(requestPayload);
-        StringBuilder builder = new StringBuilder(executionId).append(':').append(descriptor.stepId());
+        StringBuilder builder = new StringBuilder();
+        if (!identityScope.equals(executionId)) {
+            builder.append(identityScope).append(':');
+        }
+        builder.append(descriptor.stepId());
         for (String field : descriptor.idempotencyKeyFields()) {
             builder.append(':').append(field).append('=');
             JsonNode value = node == null ? null : node.get(field);
