@@ -1,6 +1,8 @@
 package org.pipelineframework.release.maven;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 record ReleaseArtifactInput(
@@ -12,7 +14,7 @@ record ReleaseArtifactInput(
     List<String> capabilities
 ) {
     ReleaseArtifactInput {
-        stepIds = stepIds == null ? List.of() : List.copyOf(stepIds);
-        capabilities = capabilities == null ? List.of() : List.copyOf(capabilities);
+        stepIds = stepIds == null ? List.of() : Collections.unmodifiableList(new ArrayList<>(stepIds));
+        capabilities = capabilities == null ? List.of() : Collections.unmodifiableList(new ArrayList<>(capabilities));
     }
 }
