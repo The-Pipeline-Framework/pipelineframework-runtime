@@ -20,12 +20,17 @@ import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.helpers.test.AssertSubscriber;
 import io.smallrye.mutiny.subscription.MultiEmitter;
 import org.junit.jupiter.api.Test;
+import org.pipelineframework.awaitable.AwaitContinuationMode;
+import org.pipelineframework.awaitable.AwaitExecutionContext;
+import org.pipelineframework.awaitable.AwaitExecutionContextHolder;
+import org.pipelineframework.awaitable.TerminalOutputOwnership;
 import org.pipelineframework.config.boundary.PipelineObjectNamingConfig;
 import org.pipelineframework.config.boundary.PipelineObjectOutputConfig;
 import org.pipelineframework.config.boundary.PipelineObjectPublishConfig;
 import org.pipelineframework.config.boundary.PipelineObjectPublishGroupingConfig;
 import org.pipelineframework.config.boundary.PipelineOutputBoundaryConfig;
 import org.pipelineframework.config.pipeline.PipelineYamlConfig;
+import org.pipelineframework.orchestrator.PagedTransitionContext;
 
 class ObjectPublishRunnerTest {
 
@@ -187,6 +192,61 @@ class ObjectPublishRunnerTest {
     }
 
     @Test
+    void pagedPublishStagesStablePartsThenComposesOneFinalGroup() {
+        PagedRecordingProvider provider = new PagedRecordingProvider();
+        PipelineObjectPublishConfig target = new PipelineObjectPublishConfig(
+            "results", "object", "paged", Map.of(),
+            new PipelineObjectNamingConfig("{groupKey}.out"), null,
+            new PipelineObjectPublishGroupingConfig(32));
+        ObjectPublishRunner runner = new ObjectPublishRunner(
+            config(target, PagedStreamingTestMapper.class.getName()),
+            new ObjectTargetRegistry(List.of(provider)),
+            ObjectPublishTelemetry.NOOP);
+        publishPage(runner, 0, new TestOutput("payments", "María\nGarcía"));
+        publishPage(runner, 1, new TestOutput("payments", "Zoë"));
+        provider.sessions.put(".tpf-pages/another-execution/payments/part", new StreamingRecordingSession(
+            new ObjectWriteOpenRequest(
+                "results", target, ".tpf-pages/another-execution/payments/part",
+                "text/plain", Map.of(), "foreign")));
+
+        List<String> stagedKeys = provider.sessions.entrySet().stream()
+            .filter(entry -> entry.getKey().contains("execution-paged") == false)
+            .filter(entry -> entry.getValue().openRequest.metadata().containsKey("tpf.page.index"))
+            .sorted(java.util.Comparator.comparingInt(entry -> Integer.parseInt(
+                entry.getValue().openRequest.metadata().get("tpf.page.index"))))
+            .map(Map.Entry::getKey)
+            .toList();
+        assertEquals(2, stagedKeys.size());
+        assertEquals("María\nGarcía\n", provider.sessions.get(stagedKeys.getFirst()).body());
+        assertEquals("Zoë\n", provider.sessions.get(stagedKeys.getLast()).body());
+
+        runner.completePagedOutput("execution-paged", 1).await().indefinitely();
+
+        PagedObjectCompositionRequest composition = provider.composition.get();
+        assertEquals("payments.out", composition.objectKey());
+        assertEquals(stagedKeys, composition.orderedPartKeys());
+        assertEquals("header\n", new String(composition.prefix(), StandardCharsets.UTF_8));
+        assertEquals("footer\n", new String(composition.suffix(), StandardCharsets.UTF_8));
+        assertEquals("2", composition.metadata().get("recordCount"));
+    }
+
+    private static void publishPage(ObjectPublishRunner runner, int pageIndex, TestOutput item) {
+        AwaitExecutionContextHolder.set(new AwaitExecutionContext(
+            "tenant", "execution-paged", 0, AwaitContinuationMode.LIVE_IF_SUPPORTED,
+            TerminalOutputOwnership.TRANSITION_WORKER, Map.of(),
+            java.util.Optional.of(new PagedTransitionContext(
+                pageIndex, "source-v1", pageIndex == 0 ? java.util.Optional.empty()
+                    : java.util.Optional.of("checkpoint-" + pageIndex), 1000))));
+        try {
+            @SuppressWarnings("unchecked")
+            Multi<TestOutput> published = (Multi<TestOutput>) runner.publish(Multi.createFrom().item(item));
+            assertEquals(List.of(item), published.collect().asList().await().indefinitely());
+        } finally {
+            AwaitExecutionContextHolder.clear();
+        }
+    }
+
+    @Test
     void publishMultiEnforcesMaxOpenGroups() {
         StreamingRecordingProvider provider = new StreamingRecordingProvider();
         ObjectPublishRunner runner = new ObjectPublishRunner(
@@ -313,6 +373,35 @@ class ObjectPublishRunnerTest {
         }
     }
 
+    public static final class PagedStreamingTestMapper implements PagedStreamingObjectPublishMapper<TestOutput> {
+        @Override public String groupKey(TestOutput item) { return item.group(); }
+        @Override public ObjectPayloadChunk groupPrefix(String groupKey) {
+            return new ObjectPayloadChunk("header\n".getBytes(StandardCharsets.UTF_8));
+        }
+        @Override public ObjectPayloadChunk groupSuffix(String groupKey, Map<String, String> metadata) {
+            return new ObjectPayloadChunk("footer\n".getBytes(StandardCharsets.UTF_8));
+        }
+        @Override public Map<String, String> combinePageMetadata(
+            String groupKey, Map<String, String> accumulated, Map<String, String> page) {
+            long prior = Long.parseLong(accumulated.getOrDefault("recordCount", "0"));
+            long current = Long.parseLong(page.getOrDefault("recordCount", "0"));
+            return Map.of("recordCount", String.valueOf(prior + current));
+        }
+        @Override public ObjectPublishGroupRenderer<TestOutput> openGroup(String groupKey, TestOutput firstItem) {
+            return new ObjectPublishGroupRenderer<>() {
+                private int count;
+                @Override public String contentType() { return "text/plain"; }
+                @Override public ObjectPayloadChunk onItem(TestOutput item) {
+                    count++;
+                    return new ObjectPayloadChunk((item.value() + "\n").getBytes(StandardCharsets.UTF_8));
+                }
+                @Override public Map<String, String> finalMetadata() {
+                    return Map.of("recordCount", String.valueOf(count));
+                }
+            };
+        }
+    }
+
     record TestOutput(String group, String value) {
     }
 
@@ -399,6 +488,38 @@ class ObjectPublishRunnerTest {
             StreamingRecordingSession session = new StreamingRecordingSession(request);
             sessions.put(request.objectKey(), session);
             return CompletableFuture.completedFuture(session);
+        }
+    }
+
+    private static final class PagedRecordingProvider implements PagedObjectTargetProvider {
+        private final Map<String, StreamingRecordingSession> sessions = new LinkedHashMap<>();
+        private final AtomicReference<PagedObjectCompositionRequest> composition = new AtomicReference<>();
+
+        @Override public String providerName() { return "paged"; }
+
+        @Override public CompletionStage<ObjectWriteSession> open(ObjectWriteOpenRequest request) {
+            StreamingRecordingSession session = new StreamingRecordingSession(request);
+            sessions.put(request.objectKey(), session);
+            return CompletableFuture.completedFuture(session);
+        }
+
+        @Override public CompletionStage<List<PagedObjectPart>> listParts(PagedObjectPartQuery query) {
+            return CompletableFuture.completedFuture(sessions.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(query.stagePrefix()))
+                .map(entry -> {
+                Map<String, String> metadata = entry.getValue().openRequest.metadata();
+                return new PagedObjectPart(
+                    entry.getKey(), metadata.get("tpf.page.group"), metadata.get("tpf.page.finalKey"),
+                    metadata.get("tpf.page.contentType"),
+                    Integer.parseInt(metadata.get("tpf.page.index")),
+                    entry.getValue().closeMetadata);
+            }).toList());
+        }
+
+        @Override public CompletionStage<ObjectWriteResult> compose(PagedObjectCompositionRequest request) {
+            composition.set(request);
+            return CompletableFuture.completedFuture(new ObjectWriteResult(
+                null, request.prefix().length + request.suffix().length, "checksum", null));
         }
     }
 

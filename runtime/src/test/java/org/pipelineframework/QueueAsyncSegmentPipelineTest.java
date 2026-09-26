@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 
@@ -31,6 +32,8 @@ import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
+import org.pipelineframework.orchestrator.PagedExecutionState;
+import org.pipelineframework.orchestrator.PagedTransitionCompletion;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.TransitionAwaitSuspension;
 import org.pipelineframework.orchestrator.TransitionCommandEnvelope;
@@ -46,12 +49,14 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -134,11 +139,82 @@ class QueueAsyncSegmentPipelineTest {
         .thenReturn(Uni.createFrom().voidItem());
     lenient().when(objectPublishCompletionService.publishIfConfigured(org.mockito.ArgumentMatchers.<Supplier<List<?>>>any()))
         .thenReturn(Uni.createFrom().voidItem());
+    lenient().when(objectPublishCompletionService.completePagedIfConfigured(any(), anyInt()))
+        .thenReturn(Uni.createFrom().voidItem());
+    lenient().when(workDispatcher.enqueueNow(any())).thenReturn(Uni.createFrom().voidItem());
     lenient().when(executionFailureHandler.handleExecutionFailure(any(), any(), any(), any(), any(), any()))
         .thenReturn(Uni.createFrom().voidItem());
     lenient().when(awaitCoordinator.importSuspension(any())).thenReturn(Uni.createFrom().voidItem());
     lenient().when(awaitContinuations.afterParentWaiting(any(), any(), anyLong(), any()))
         .thenReturn(Uni.createFrom().voidItem());
+  }
+
+  @Test
+  void advancesThreePagesAndFinalizesOnlyTheExhaustedPage() {
+    ExecutionRecord<Object, Object> page0 = pagedRecord("exec-three-pages", 0, 0L, Optional.empty(), null,
+        ExecutionStatus.QUEUED);
+    String page0Transition = "exec-three-pages:page:0:0:0";
+    ExecutionRecord<Object, Object> page1 = pagedRecord("exec-three-pages", 1, 1L, Optional.of("cp-1"),
+        page0Transition, ExecutionStatus.QUEUED);
+    String page1Transition = "exec-three-pages:page:1:0:0";
+    ExecutionRecord<Object, Object> page2 = pagedRecord("exec-three-pages", 2, 2L, Optional.of("cp-2"),
+        page1Transition, ExecutionStatus.QUEUED);
+    ExecutionRecord<Object, Object> succeeded = pagedRecord("exec-three-pages", 2, 3L,
+        Optional.of("cp-2"), "exec-three-pages:page:2:0:0", ExecutionStatus.SUCCEEDED);
+    when(executionStateStore.claimLease(eq("tenant-1"), eq("exec-three-pages"), any(), anyLong(), anyLong()))
+        .thenReturn(Uni.createFrom().item(Optional.of(page0)),
+            Uni.createFrom().item(Optional.of(page1)),
+            Uni.createFrom().item(Optional.of(page2)));
+    when(executionStateStore.advancePage(eq("tenant-1"), eq("exec-three-pages"), eq(0L),
+        eq(page0Transition), any(), anyLong())).thenReturn(Uni.createFrom().item(Optional.of(page1)));
+    when(executionStateStore.advancePage(eq("tenant-1"), eq("exec-three-pages"), eq(1L),
+        eq(page1Transition), any(), anyLong())).thenReturn(Uni.createFrom().item(Optional.of(page2)));
+    when(executionStateStore.markSucceeded(eq("tenant-1"), eq("exec-three-pages"), eq(2L),
+        eq("exec-three-pages:page:2:0:0"), eq(List.of()), anyLong()))
+        .thenReturn(Uni.createFrom().item(Optional.of(succeeded)));
+    AtomicInteger invocation = new AtomicInteger();
+
+    for (int expectedPage = 0; expectedPage < 3; expectedPage++) {
+      pipeline().process(new ExecutionWorkItem("tenant-1", "exec-three-pages"), command -> {
+        int page = invocation.getAndIncrement();
+        assertEquals(page, command.pageContext().orElseThrow().pageIndex());
+        return Uni.createFrom().item(TransitionResultEnvelope.completedInProcess(List.of(), true)
+            .withPageCompletion(page < 2
+                ? new PagedTransitionCompletion(100, Optional.of("cp-" + (page + 1)), false)
+                : new PagedTransitionCompletion(25, Optional.empty(), true)));
+      }, AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER).await().indefinitely();
+    }
+
+    verify(workDispatcher, times(2)).enqueueNow(new ExecutionWorkItem("tenant-1", "exec-three-pages"));
+    verify(objectPublishCompletionService).completePagedIfConfigured("exec-three-pages", 2);
+    verify(executionStateStore).markSucceeded(eq("tenant-1"), eq("exec-three-pages"), eq(2L),
+        eq("exec-three-pages:page:2:0:0"), eq(List.of()), anyLong());
+  }
+
+  @Test
+  void duplicatePageCommitDoesNotQueueTheSuccessorTwice() {
+    ExecutionRecord<Object, Object> page0 = pagedRecord("exec-duplicate-page", 0, 0L, Optional.empty(), null,
+        ExecutionStatus.QUEUED);
+    String transitionKey = "exec-duplicate-page:page:0:0:0";
+    ExecutionRecord<Object, Object> page1 = pagedRecord("exec-duplicate-page", 1, 1L, Optional.of("cp-1"),
+        transitionKey, ExecutionStatus.QUEUED);
+    when(executionStateStore.claimLease(eq("tenant-1"), eq("exec-duplicate-page"), any(), anyLong(), anyLong()))
+        .thenReturn(Uni.createFrom().item(Optional.of(page0)));
+    when(executionStateStore.advancePage(eq("tenant-1"), eq("exec-duplicate-page"), eq(0L),
+        eq(transitionKey), any(), anyLong()))
+        .thenReturn(Uni.createFrom().item(Optional.of(page1)), Uni.createFrom().item(Optional.empty()));
+    when(executionStateStore.getExecution("tenant-1", "exec-duplicate-page"))
+        .thenReturn(Uni.createFrom().item(Optional.of(page1)));
+
+    for (int duplicate = 0; duplicate < 2; duplicate++) {
+      pipeline().process(new ExecutionWorkItem("tenant-1", "exec-duplicate-page"), command ->
+          Uni.createFrom().item(TransitionResultEnvelope.completedInProcess(List.of(), true)
+              .withPageCompletion(new PagedTransitionCompletion(100, Optional.of("cp-1"), false))),
+          AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER).await().indefinitely();
+    }
+
+    verify(workDispatcher).enqueueNow(new ExecutionWorkItem("tenant-1", "exec-duplicate-page"));
+    verify(executionStateStore).getExecution("tenant-1", "exec-duplicate-page");
   }
 
   @Test
@@ -461,6 +537,33 @@ class QueueAsyncSegmentPipelineTest {
   }
 
   @Test
+  void pagedAwaitSuspensionPersistsProviderCompletionWithWaitingState() {
+    ExecutionRecord<Object, Object> claimed = pagedRecord(
+        "exec-paged-await", 0, 0L, Optional.empty(), "initial", ExecutionStatus.QUEUED);
+    ExecutionRecord<Object, Object> waiting = withStatus(claimed, ExecutionStatus.WAITING_EXTERNAL, 1L);
+    PagedTransitionCompletion pageCompletion = new PagedTransitionCompletion(
+        100, Optional.of("checkpoint-1"), false);
+    TransitionAwaitSuspension suspension = new TransitionAwaitSuspension(
+        "tenant-1", "exec-paged-await", "unit-1", 2).withPageCompletion(pageCompletion);
+    when(executionStateStore.claimLease(
+        eq("tenant-1"), eq("exec-paged-await"), any(), anyLong(), eq(1000L)))
+        .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
+    when(executionStateStore.markWaitingExternal(
+        eq("tenant-1"), eq("exec-paged-await"), eq(0L), eq("exec-paged-await:page:0:0:0"),
+        eq("unit-1"), eq(2), eq(Optional.of(pageCompletion)), anyLong()))
+        .thenReturn(Uni.createFrom().item(Optional.of(waiting)));
+
+    pipeline().process(
+        new ExecutionWorkItem("tenant-1", "exec-paged-await"),
+        command -> Uni.createFrom().item(TransitionResultEnvelope.waiting(suspension)),
+        AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER).await().indefinitely();
+
+    verify(executionStateStore).markWaitingExternal(
+        eq("tenant-1"), eq("exec-paged-await"), eq(0L), eq("exec-paged-await:page:0:0:0"),
+        eq("unit-1"), eq(2), eq(Optional.of(pageCompletion)), anyLong());
+  }
+
+  @Test
   void missedSuccessCasFailsCommitAndSkipsRunSucceededFact() {
     ExecutionRecord<Object, Object> claimed = record("exec-success-cas-miss", ExecutionResultShape.MATERIALIZED_MULTI);
     when(executionStateStore.claimLease(eq("tenant-1"), eq("exec-success-cas-miss"), any(), anyLong(), eq(1000L)))
@@ -693,6 +796,20 @@ class QueueAsyncSegmentPipelineTest {
         1L,
         1L,
         99999999L);
+  }
+
+  private static ExecutionRecord<Object, Object> pagedRecord(
+      String executionId,
+      int pageIndex,
+      long version,
+      Optional<String> checkpoint,
+      String lastTransitionKey,
+      ExecutionStatus status) {
+    return new ExecutionRecord<>(
+        "tenant-1", executionId, "key-" + executionId, "pipeline-a", "contract-a", "release-a",
+        ExecutionResultShape.SINGLE, status, version, 0, 0, null, 0L, 0L, lastTransitionKey,
+        "input-" + executionId, null, null, null, null, 1L, 1L, 99999999L,
+        Optional.of(new PagedExecutionState(pageIndex, "source-identity", checkpoint, 100)));
   }
 
   private static ExecutionRecord<Object, Object> withStatus(

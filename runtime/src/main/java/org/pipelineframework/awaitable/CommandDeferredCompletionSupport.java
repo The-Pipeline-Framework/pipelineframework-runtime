@@ -2,6 +2,7 @@ package org.pipelineframework.awaitable;
 
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Map;
 import java.util.function.Function;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -42,9 +43,10 @@ public class CommandDeferredCompletionSupport {
         AwaitExecutionContext context = Optional.ofNullable(AwaitExecutionContextHolder.get())
             .map(current -> new AwaitExecutionContext(current.tenantId(), current.executionId(),
                 current.currentStepIndex(), current.continuationMode(), current.terminalOutputOwnership(),
-                current.traceMetadata()))
+                current.traceMetadata(), current.pageContext()))
             .orElseGet(() -> new AwaitExecutionContext(execution.tenantId(), execution.executionId(),
-                execution.currentStepIndex()));
+                execution.currentStepIndex(), AwaitContinuationMode.LIVE_IF_SUPPORTED,
+                TerminalOutputOwnership.TRANSITION_WORKER, Map.of(), Optional.empty()));
         return coordinator.registerCommandCompletion(descriptor, context, input)
             .chain(created -> {
                 AwaitInteractionRecord record = created.record();

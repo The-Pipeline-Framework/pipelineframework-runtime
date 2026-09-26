@@ -3,6 +3,7 @@ package org.pipelineframework.orchestrator;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Runtime-local transition result. Remote transports exchange {@link TransitionWireResult}.
@@ -19,7 +20,19 @@ public record TransitionResultEnvelope(
     TransitionFailureEnvelope failure,
     @JsonIgnore List<?> decodedOutputItems,
     boolean terminalOutputPublished,
-    boolean terminalInputPassthrough) {
+    boolean terminalInputPassthrough,
+    Optional<PagedTransitionCompletion> pageCompletion) {
+    public TransitionResultEnvelope(
+        TransitionWorkerOutcome outcome,
+        List<SerializedTransitionPayload> outputPayloads,
+        TransitionAwaitSuspension awaitSuspension,
+        TransitionFailureEnvelope failure,
+        List<?> decodedOutputItems,
+        boolean terminalOutputPublished,
+        boolean terminalInputPassthrough) {
+        this(outcome, outputPayloads, awaitSuspension, failure, decodedOutputItems,
+            terminalOutputPublished, terminalInputPassthrough, Optional.empty());
+    }
     public TransitionResultEnvelope(
         TransitionWorkerOutcome outcome,
         List<SerializedTransitionPayload> outputPayloads,
@@ -41,6 +54,7 @@ public record TransitionResultEnvelope(
         Objects.requireNonNull(outcome, "TransitionResultEnvelope.outcome must not be null");
         outputPayloads = outputPayloads == null ? List.of() : List.copyOf(outputPayloads);
         decodedOutputItems = decodedOutputItems == null ? null : List.copyOf(decodedOutputItems);
+        pageCompletion = Optional.ofNullable(pageCompletion).orElseGet(Optional::empty);
         if (outcome == TransitionWorkerOutcome.WAITING_EXTERNAL && awaitSuspension == null) {
             throw new IllegalArgumentException("WAITING_EXTERNAL transition envelope requires awaitSuspension");
         }
@@ -61,6 +75,9 @@ public record TransitionResultEnvelope(
         }
         if (outcome != TransitionWorkerOutcome.COMPLETED && terminalInputPassthrough) {
             throw new IllegalArgumentException("Only COMPLETED transition envelopes may retain terminal input");
+        }
+        if (outcome != TransitionWorkerOutcome.COMPLETED && pageCompletion.isPresent()) {
+            throw new IllegalArgumentException("Only COMPLETED transition envelopes may include page completion");
         }
         if (terminalOutputPublished && terminalInputPassthrough) {
             throw new IllegalArgumentException("A terminal transition cannot publish output and retain terminal input");
@@ -125,6 +142,16 @@ public record TransitionResultEnvelope(
             outputItems == null ? List.of() : outputItems,
             terminalOutputPublished,
             false);
+    }
+
+    /** Adds provider-validated page progress to an otherwise completed result. */
+    public TransitionResultEnvelope withPageCompletion(PagedTransitionCompletion completion) {
+        if (outcome != TransitionWorkerOutcome.COMPLETED) {
+            throw new IllegalStateException("page completion requires a completed transition");
+        }
+        return new TransitionResultEnvelope(outcome, outputPayloads, awaitSuspension, failure,
+            decodedOutputItems, terminalOutputPublished, terminalInputPassthrough,
+            Optional.of(Objects.requireNonNull(completion, "completion must not be null")));
     }
 
     /**
@@ -210,7 +237,8 @@ public record TransitionResultEnvelope(
             awaitSuspension,
             failure,
             terminalOutputPublished,
-            terminalInputPassthrough);
+            terminalInputPassthrough,
+            pageCompletion);
     }
 
     /**
@@ -228,7 +256,8 @@ public record TransitionResultEnvelope(
             result.failure(),
             null,
             result.terminalOutputPublished(),
-            result.terminalInputPassthrough());
+            result.terminalInputPassthrough(),
+            result.pageCompletion());
     }
 
     /**

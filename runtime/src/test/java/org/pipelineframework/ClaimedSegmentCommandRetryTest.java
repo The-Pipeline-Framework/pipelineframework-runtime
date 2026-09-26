@@ -3,6 +3,7 @@ package org.pipelineframework;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.util.Optional;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.pipelineframework.orchestrator.ExecutionRecord;
@@ -10,10 +11,50 @@ import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
+import org.pipelineframework.orchestrator.PagedExecutionState;
 import org.pipelineframework.orchestrator.TransitionCommandEnvelope;
 import org.pipelineframework.orchestrator.TransitionWorkerCommand;
 
 class ClaimedSegmentCommandRetryTest {
+
+    @Test
+    void confirmedOwnerLossReplaysTheSamePageStartCheckpoint() {
+        PagedExecutionState page = new PagedExecutionState(
+            4, "source-v1", Optional.of("opaque-page-4-start"), 1_000);
+        ExecutionRecord<Object, Object> record = new ExecutionRecord<>(
+            "tenant-a",
+            "exec-paged",
+            "key-paged",
+            "pipeline-a",
+            "contract-a",
+            "release-a",
+            ExecutionResultShape.SINGLE,
+            ExecutionStatus.RUNNING,
+            12L,
+            0,
+            2,
+            "replacement-worker",
+            100L,
+            0L,
+            "exec-paged:page:4:0:1",
+            "input",
+            null,
+            null,
+            null,
+            null,
+            1L,
+            2L,
+            99L,
+            Optional.of(page));
+
+        ClaimedSegment claimed = ClaimedSegment.from(record);
+        TransitionWorkerCommand decoded = claimed
+            .transitionCommand("input", new JsonTransitionPayloadCodec())
+            .toCommand(new JsonTransitionPayloadCodec());
+
+        assertEquals("exec-paged:page:4:0:2", claimed.transitionKey());
+        assertEquals(page.toTransitionContext(), decoded.pageContext().orElseThrow());
+    }
 
     @ParameterizedTest
     @ValueSource(ints = {2, 5, 6})

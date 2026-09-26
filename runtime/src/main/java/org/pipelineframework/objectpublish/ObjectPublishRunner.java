@@ -26,6 +26,9 @@ import org.pipelineframework.config.boundary.PipelineObjectPublishConfig;
 import org.pipelineframework.config.pipeline.PipelineYamlConfig;
 import org.pipelineframework.config.pipeline.PipelineYamlConfigLoader;
 import org.pipelineframework.config.pipeline.PipelineYamlConfigLocator;
+import org.pipelineframework.awaitable.AwaitExecutionContextHolder;
+import org.pipelineframework.orchestrator.PagedExecutionState;
+import org.pipelineframework.orchestrator.PagedTransitionContext;
 
 /**
  * Runtime-neutral terminal object publish engine.
@@ -116,7 +119,14 @@ public final class ObjectPublishRunner {
             .orElseThrow(() -> new IllegalStateException("pipeline output object binding is not configured"));
         PipelineObjectPublishConfig target = target(output);
         StreamingObjectPublishMapper<Object> mapper = streamingMapper();
-        StreamingPublishState state = new StreamingPublishState(target, registry.require(target.provider()), mapper);
+        Optional<PagedPublishContext> page = pageContext();
+        ObjectTargetProvider provider = registry.require(target.provider());
+        if (page.isPresent() && (!(mapper instanceof PagedStreamingObjectPublishMapper<?>)
+            || !(provider instanceof PagedObjectTargetProvider))) {
+            throw new IllegalStateException(
+                "paged Object Publish requires PagedStreamingObjectPublishMapper and PagedObjectTargetProvider");
+        }
+        StreamingPublishState state = new StreamingPublishState(target, provider, mapper, page);
         return multi.onItem()
             .transformToUniAndConcatenate(item -> state.publishItem(adaptTerminalItem(item)).replaceWith(item))
             .onCompletion().call(state::closeAll)
@@ -134,6 +144,20 @@ public final class ObjectPublishRunner {
     }
 
     public Uni<Void> publishItems(List<?> items) {
+        return publishItems(items, pageContext());
+    }
+
+    public Uni<Void> publishItems(
+        List<?> items,
+        String executionId,
+        PagedExecutionState page) {
+        Objects.requireNonNull(executionId, "executionId must not be null");
+        Objects.requireNonNull(page, "page must not be null");
+        return publishItems(items, Optional.of(new PagedPublishContext(
+            executionId, page.toTransitionContext())));
+    }
+
+    private Uni<Void> publishItems(List<?> items, Optional<PagedPublishContext> page) {
         PipelineObjectOutputConfig output = objectOutput()
             .orElseThrow(() -> new IllegalStateException("pipeline output object binding is not configured"));
         PipelineObjectPublishConfig target = target(output);
@@ -142,7 +166,11 @@ public final class ObjectPublishRunner {
             return Uni.createFrom().voidItem();
         }
         if (mapper() instanceof StreamingObjectPublishMapper<?>) {
-            return publishStreamingItems(items);
+            return publishStreamingItems(items, page);
+        }
+        if (page.isPresent()) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                "paged Object Publish requires PagedStreamingObjectPublishMapper"));
         }
         return publishBatchItems(target, items);
     }
@@ -159,7 +187,7 @@ public final class ObjectPublishRunner {
         return chain;
     }
 
-    private Uni<Void> publishStreamingItems(List<?> items) {
+    private Uni<Void> publishStreamingItems(List<?> items, Optional<PagedPublishContext> page) {
         PipelineObjectOutputConfig output = objectOutput()
             .orElseThrow(() -> new IllegalStateException("pipeline output object binding is not configured"));
         PipelineObjectPublishConfig target = target(output);
@@ -168,7 +196,14 @@ public final class ObjectPublishRunner {
             return Uni.createFrom().voidItem();
         }
         StreamingObjectPublishMapper<Object> mapper = streamingMapper();
-        StreamingPublishState state = new StreamingPublishState(target, registry.require(target.provider()), mapper);
+        ObjectTargetProvider provider = registry.require(target.provider());
+        if (page.isPresent() && (!(mapper instanceof PagedStreamingObjectPublishMapper<?>)
+            || !(provider instanceof PagedObjectTargetProvider))) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                "paged Object Publish requires PagedStreamingObjectPublishMapper and PagedObjectTargetProvider"));
+        }
+        StreamingPublishState state = new StreamingPublishState(
+            target, provider, mapper, page);
         Uni<Void> chain = Uni.createFrom().voidItem();
         for (Object item : items) {
             chain = chain.chain(() -> state.publishItem(adaptTerminalItem(item)).replaceWithVoid());
@@ -441,20 +476,119 @@ public final class ObjectPublishRunner {
         return value == null || value.isBlank() ? Optional.empty() : Optional.of(value.trim());
     }
 
+    /** Composes committed parts after the exhausted page and before logical execution success. */
+    public Uni<Void> completePagedOutput(String executionId, int lastPageIndex) {
+        PipelineObjectOutputConfig output = objectOutput()
+            .orElseThrow(() -> new IllegalStateException("pipeline output object binding is not configured"));
+        PipelineObjectPublishConfig target = target(output);
+        if (!(registry.require(target.provider()) instanceof PagedObjectTargetProvider provider)) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                "Object target provider does not support paged composition: " + target.provider()));
+        }
+        if (!(streamingMapper() instanceof PagedStreamingObjectPublishMapper<?> rawMapper)) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                "Object output mapper does not support paged composition"));
+        }
+        @SuppressWarnings("unchecked")
+        PagedStreamingObjectPublishMapper<Object> mapper =
+            (PagedStreamingObjectPublishMapper<Object>) rawMapper;
+        String stageRoot = stageRoot(executionId, target.name());
+        return toUni(provider.listParts(new PagedObjectPartQuery(target.name(), target, stageRoot)))
+            .onItem().transformToUni(parts -> composeGroups(
+                executionId, lastPageIndex, target, provider, mapper, parts));
+    }
+
+    private Uni<Void> composeGroups(
+        String executionId,
+        int lastPageIndex,
+        PipelineObjectPublishConfig target,
+        PagedObjectTargetProvider provider,
+        PagedStreamingObjectPublishMapper<Object> mapper,
+        List<PagedObjectPart> allParts) {
+        Map<String, List<PagedObjectPart>> groups = new LinkedHashMap<>();
+        allParts.stream()
+            .filter(part -> part.pageIndex() <= lastPageIndex)
+            .forEach(part -> groups.computeIfAbsent(part.groupKey(), ignored -> new ArrayList<>()).add(part));
+        Uni<Void> chain = Uni.createFrom().voidItem();
+        for (Map.Entry<String, List<PagedObjectPart>> entry : groups.entrySet()) {
+            chain = chain.chain(() -> composeGroup(executionId, target, provider, mapper,
+                entry.getKey(), entry.getValue()));
+        }
+        return chain;
+    }
+
+    private Uni<Void> composeGroup(
+        String executionId,
+        PipelineObjectPublishConfig target,
+        PagedObjectTargetProvider provider,
+        PagedStreamingObjectPublishMapper<Object> mapper,
+        String groupKey,
+        List<PagedObjectPart> parts) {
+        List<PagedObjectPart> ordered = parts.stream()
+            .sorted(java.util.Comparator.comparingInt(PagedObjectPart::pageIndex))
+            .toList();
+        String finalKey = ordered.getFirst().finalObjectKey();
+        String contentType = ordered.getFirst().contentType();
+        if (ordered.stream().anyMatch(part -> !finalKey.equals(part.finalObjectKey()))) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                "paged object group changed its final key across pages: " + groupKey));
+        }
+        Map<String, String> combined = Map.of();
+        for (PagedObjectPart part : ordered) {
+            combined = safeMap(mapper.combinePageMetadata(groupKey, combined, part.metadata()),
+                "combined page metadata");
+        }
+        ObjectPayloadChunk prefix = mapper.groupPrefix(groupKey);
+        ObjectPayloadChunk suffix = mapper.groupSuffix(groupKey, combined);
+        Map<String, String> metadata = new LinkedHashMap<>(combined);
+        metadata.put("target", target.name());
+        metadata.put("groupKey", groupKey);
+        PagedObjectCompositionRequest request = new PagedObjectCompositionRequest(
+            target.name(), target, finalKey, contentType, metadata,
+            "object-publish-compose:" + target.name() + ":" + executionId + ":" + finalKey,
+            prefix == null ? new byte[0] : prefix.bytes(),
+            ordered.stream().map(PagedObjectPart::objectKey).toList(),
+            suffix == null ? new byte[0] : suffix.bytes());
+        Instant started = Instant.now();
+        return toUni(provider.compose(request))
+            .invoke(result -> {
+                telemetry.writeDuration(target.name(), target.provider(), Duration.between(started, Instant.now()));
+                telemetry.published(target.name(), target.provider(), finalKey, result.bytes());
+            })
+            .replaceWithVoid();
+    }
+
+    private static Optional<PagedPublishContext> pageContext() {
+        return Optional.ofNullable(AwaitExecutionContextHolder.get())
+            .flatMap(context -> context.pageContext()
+                .map(page -> new PagedPublishContext(context.executionId(), page)));
+    }
+
+    private static String stageRoot(String executionId, String targetName) {
+        return ".tpf-pages/" + sha256(executionId.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            + "/" + targetName + "/";
+    }
+
+    private record PagedPublishContext(String executionId, PagedTransitionContext page) {
+    }
+
     private final class StreamingPublishState {
         private final PipelineObjectPublishConfig target;
         private final ObjectTargetProvider provider;
         private final StreamingObjectPublishMapper<Object> mapper;
+        private final Optional<PagedPublishContext> page;
         private final Map<String, StreamingGroupState> groups = new LinkedHashMap<>();
 
         private StreamingPublishState(
             PipelineObjectPublishConfig target,
             ObjectTargetProvider provider,
-            StreamingObjectPublishMapper<Object> mapper
+            StreamingObjectPublishMapper<Object> mapper,
+            Optional<PagedPublishContext> page
         ) {
             this.target = target;
             this.provider = provider;
             this.mapper = mapper;
+            this.page = page;
         }
 
         private Uni<Object> publishItem(Object item) {
@@ -481,17 +615,31 @@ public final class ObjectPublishRunner {
             Map<String, String> initialLabels = safeMap(renderer.initialLabels(), "initial labels");
             String contentType = normalize(renderer.contentType()).orElse(target.payload().contentType());
             String objectKey = renderKey(target.naming().keyTemplate(), groupKey, initialLabels);
+            String finalObjectKey = objectKey;
             Map<String, String> metadata = new LinkedHashMap<>();
             metadata.put("target", target.name());
             metadata.put("groupKey", groupKey);
             metadata.putAll(initialLabels);
+            if (page.isPresent()) {
+                PagedPublishContext context = page.orElseThrow();
+                String groupToken = sha256(groupKey.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                objectKey = stageRoot(context.executionId(), target.name()) + groupToken
+                    + "/page-" + String.format(java.util.Locale.ROOT, "%020d", context.page().pageIndex()) + ".part";
+                metadata.put("tpf.page.index", String.valueOf(context.page().pageIndex()));
+                metadata.put("tpf.page.group", groupKey);
+                metadata.put("tpf.page.finalKey", finalObjectKey);
+                metadata.put("tpf.page.contentType", contentType);
+                metadata.put("tpf.page.partKey", objectKey);
+            }
             ObjectWriteOpenRequest request = new ObjectWriteOpenRequest(
                 target.name(),
                 target,
                 objectKey,
                 contentType,
                 metadata,
-                "object-publish:" + target.name() + ":" + objectKey);
+                page.isPresent()
+                    ? "object-publish-page:" + target.name() + ":" + objectKey
+                    : "object-publish:" + target.name() + ":" + objectKey);
             return new StreamingGroupState(target, provider, renderer, request, metadata);
         }
 

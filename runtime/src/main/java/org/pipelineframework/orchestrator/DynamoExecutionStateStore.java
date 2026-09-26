@@ -72,6 +72,13 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
     private static final String LEASE_EXPIRES_EPOCH_MS = "lease_expires_epoch_ms";
     private static final String NEXT_DUE_EPOCH_MS = "next_due_epoch_ms";
     private static final String LAST_TRANSITION_KEY = "last_transition_key";
+    private static final String PAGE_INDEX = "page_index";
+    private static final String PAGE_SOURCE_IDENTITY = "page_source_identity";
+    private static final String PAGE_START_CHECKPOINT = "page_start_checkpoint";
+    private static final String PAGE_MAX_RECORDS = "page_max_records";
+    private static final String PAGE_COMPLETION_CONSUMED_RECORDS = "page_completion_consumed_records";
+    private static final String PAGE_COMPLETION_NEXT_CHECKPOINT = "page_completion_next_checkpoint";
+    private static final String PAGE_COMPLETION_EXHAUSTED = "page_completion_exhausted";
     private static final String INPUT_SHAPE = "input_shape";
     private static final String INPUT_PAYLOAD_JSON = "input_payload_json";
     private static final String INPUT_PAYLOAD_REFERENCE = "input_payload_reference";
@@ -257,6 +264,23 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
             transitionKey,
             resultPayload,
             nowEpochMs));
+    }
+
+    @Override
+    public boolean supportsPagedProgress() {
+        return true;
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> advancePage(
+        String tenantId,
+        String executionId,
+        long expectedVersion,
+        String transitionKey,
+        PagedExecutionState nextPage,
+        long nowEpochMs) {
+        return blocking(() -> advancePageBlocking(
+            tenantId, executionId, expectedVersion, transitionKey, nextPage, nowEpochMs));
     }
 
     @Override
@@ -515,7 +539,8 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
             null,
             command.nowEpochMs(),
             command.nowEpochMs(),
-            command.ttlEpochS());
+            command.ttlEpochS(),
+            command.pagingState());
 
         try {
             writeNewExecution(scopedExecutionKey, created, command.inputCanonicalTypeId(), command.nowEpochMs(), command.ttlEpochS());
@@ -842,6 +867,88 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
         }
     }
 
+    private Optional<ExecutionRecord<Object, Object>> advancePageBlocking(
+        String tenantId,
+        String executionId,
+        long expectedVersion,
+        String transitionKey,
+        PagedExecutionState nextPage,
+        long nowEpochMs
+    ) {
+        Objects.requireNonNull(nextPage, "nextPage must not be null");
+        Map<String, String> names = Map.ofEntries(
+            Map.entry("#status", STATUS),
+            Map.entry("#version", VERSION),
+            Map.entry("#step", CURRENT_STEP_INDEX),
+            Map.entry("#attempt", ATTEMPT),
+            Map.entry("#transition", LAST_TRANSITION_KEY),
+            Map.entry("#pageIndex", PAGE_INDEX),
+            Map.entry("#pageIdentity", PAGE_SOURCE_IDENTITY),
+            Map.entry("#pageCheckpoint", PAGE_START_CHECKPOINT),
+            Map.entry("#pageMax", PAGE_MAX_RECORDS),
+            Map.entry("#redriveIntent", REDRIVE_INTENT),
+            Map.entry("#failedStep", FAILED_STEP_INDEX),
+            Map.entry("#failedCommand", FAILED_COMMAND_ID),
+            Map.entry("#redriveTarget", REDRIVE_TARGET_COMMAND_ID),
+            Map.entry("#redriveReason", REDRIVE_REASON),
+            Map.entry("#result", RESULT_PAYLOAD_JSON),
+            Map.entry("#resultReference", RESULT_PAYLOAD_REFERENCE),
+            Map.entry("#resultDigest", RESULT_PAYLOAD_DIGEST),
+            Map.entry("#pageCompletionConsumed", PAGE_COMPLETION_CONSUMED_RECORDS),
+            Map.entry("#pageCompletionCheckpoint", PAGE_COMPLETION_NEXT_CHECKPOINT),
+            Map.entry("#pageCompletionExhausted", PAGE_COMPLETION_EXHAUSTED),
+            Map.entry("#leaseOwner", LEASE_OWNER),
+            Map.entry("#leaseExpires", LEASE_EXPIRES_EPOCH_MS),
+            Map.entry("#nextDue", NEXT_DUE_EPOCH_MS),
+            Map.entry("#awaitUnit", AWAIT_UNIT_ID),
+            Map.entry("#errorCode", ERROR_CODE),
+            Map.entry("#errorMessage", ERROR_MESSAGE),
+            Map.entry("#updated", UPDATED_AT_EPOCH_MS),
+            Map.entry("#ttl", TTL_EPOCH_S));
+        Map<String, AttributeValue> values = new HashMap<>();
+        values.put(":expected", avN(expectedVersion));
+        values.put(":running", avS(ExecutionStatus.RUNNING.name()));
+        values.put(":queued", avS(ExecutionStatus.QUEUED.name()));
+        values.put(":transition", avS(transitionKey));
+        values.put(":pageIndex", avN(nextPage.pageIndex()));
+        values.put(":pageIdentity", avS(nextPage.sourceIdentity()));
+        values.put(":pageCheckpoint", avS(nextPage.startCheckpoint().orElseThrow()));
+        values.put(":pageMax", avN(nextPage.maxRecords()));
+        values.put(":previousPageIndex", avN(nextPage.pageIndex() - 1));
+        values.put(":replay", avS(ExecutionRedriveIntent.REPLAY.name()));
+        values.put(":failedStep", avN(-1));
+        values.put(":zero", avN(0));
+        values.put(":one", avN(1));
+        values.put(":now", avN(nowEpochMs));
+        values.put(":nowSec", avN(Instant.ofEpochMilli(nowEpochMs).getEpochSecond()));
+        UpdateItemRequest request = UpdateItemRequest.builder()
+            .tableName(executionTable())
+            .key(executionPrimaryKey(tenantId, executionId))
+            .conditionExpression("#version = :expected AND #status = :running AND #pageIndex = :previousPageIndex "
+                + "AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)")
+            .updateExpression("SET #status = :queued, #version = #version + :one, "
+                + "#step = :zero, #attempt = :zero, #transition = :transition, "
+                + "#pageIndex = :pageIndex, #pageIdentity = :pageIdentity, "
+                + "#pageCheckpoint = :pageCheckpoint, #pageMax = :pageMax, "
+                + "#leaseExpires = :zero, #nextDue = :now, #updated = :now, "
+                + "#redriveIntent = :replay, #failedStep = :failedStep "
+                + "REMOVE #leaseOwner, #awaitUnit, #errorCode, #errorMessage, "
+                + "#failedCommand, #redriveTarget, #redriveReason, #result, #resultReference, #resultDigest, "
+                + "#pageCompletionConsumed, #pageCompletionCheckpoint, #pageCompletionExhausted")
+            .expressionAttributeNames(names)
+            .expressionAttributeValues(values)
+            .returnValues(ReturnValue.ALL_NEW)
+            .build();
+        try {
+            Map<String, AttributeValue> attributes = dynamoClient().updateItem(request).attributes();
+            return attributes == null || attributes.isEmpty()
+                ? Optional.empty()
+                : Optional.of(toRecord(attributes));
+        } catch (ConditionalCheckFailedException ignored) {
+            return Optional.empty();
+        }
+    }
+
     @Override
     public Uni<Optional<ExecutionRecord<Object, Object>>> markWaitingExternal(
         String tenantId,
@@ -852,6 +959,23 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
         int awaitStepIndex,
         long nowEpochMs
     ) {
+        return markWaitingExternal(
+            tenantId, executionId, expectedVersion, transitionKey, awaitUnitId,
+            awaitStepIndex, Optional.empty(), nowEpochMs);
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> markWaitingExternal(
+        String tenantId,
+        String executionId,
+        long expectedVersion,
+        String transitionKey,
+        String awaitUnitId,
+        int awaitStepIndex,
+        Optional<PagedTransitionCompletion> pageCompletion,
+        long nowEpochMs
+    ) {
+        Objects.requireNonNull(pageCompletion, "pageCompletion must not be null");
         return blocking(() -> markWaitingExternalBlocking(
             tenantId,
             executionId,
@@ -859,6 +983,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
             transitionKey,
             awaitUnitId,
             awaitStepIndex,
+            pageCompletion,
             nowEpochMs));
     }
 
@@ -907,6 +1032,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
         String transitionKey,
         String awaitUnitId,
         int awaitStepIndex,
+        Optional<PagedTransitionCompletion> pageCompletion,
         long nowEpochMs
     ) {
         Map<String, String> names = new HashMap<>(Map.ofEntries(
@@ -925,7 +1051,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
             Map.entry("#redriveIntent", REDRIVE_INTENT),
             Map.entry("#updated", UPDATED_AT_EPOCH_MS),
             Map.entry("#ttl", TTL_EPOCH_S)));
-        Map<String, AttributeValue> values = Map.ofEntries(
+        Map<String, AttributeValue> values = new HashMap<>(Map.ofEntries(
             Map.entry(":expected", avN(expectedVersion)),
             Map.entry(":waiting", avS(ExecutionStatus.WAITING_EXTERNAL.name())),
             Map.entry(":step", avN(awaitStepIndex)),
@@ -935,16 +1061,44 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
             Map.entry(":zero", avN(0)),
             Map.entry(":now", avN(nowEpochMs)),
             Map.entry(":one", avN(1)),
-            Map.entry(":nowSec", avN(Instant.ofEpochMilli(nowEpochMs).getEpochSecond())));
+            Map.entry(":nowSec", avN(Instant.ofEpochMilli(nowEpochMs).getEpochSecond()))));
+        pageCompletion.ifPresent(completion -> {
+            names.put("#pageIdentity", PAGE_SOURCE_IDENTITY);
+            names.put("#pageCompletionConsumed", PAGE_COMPLETION_CONSUMED_RECORDS);
+            names.put("#pageCompletionCheckpoint", PAGE_COMPLETION_NEXT_CHECKPOINT);
+            names.put("#pageCompletionExhausted", PAGE_COMPLETION_EXHAUSTED);
+            values.put(":pageCompletionConsumed", avN(completion.consumedRecords()));
+            values.put(":pageCompletionExhausted", avBool(completion.exhausted()));
+            completion.nextCheckpoint().ifPresent(checkpoint ->
+                values.put(":pageCompletionCheckpoint", avS(checkpoint)));
+        });
+
+        String pageCompletionUpdate = pageCompletion.isPresent()
+            ? ", #pageCompletionConsumed = :pageCompletionConsumed, "
+                + "#pageCompletionExhausted = :pageCompletionExhausted"
+                + (pageCompletion.orElseThrow().nextCheckpoint().isPresent()
+                    ? ", #pageCompletionCheckpoint = :pageCompletionCheckpoint"
+                    : "")
+            : "";
+        String pageCompletionCondition = pageCompletion.isPresent()
+            ? " AND attribute_exists(#pageIdentity)"
+            : "";
+        String pageCompletionRemove = pageCompletion.isPresent()
+            && pageCompletion.orElseThrow().nextCheckpoint().isEmpty()
+                ? ", #pageCompletionCheckpoint"
+                : "";
 
         UpdateItemRequest request = UpdateItemRequest.builder()
             .tableName(executionTable())
             .key(executionPrimaryKey(tenantId, executionId))
-            .conditionExpression("#version = :expected AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)")
+            .conditionExpression("#version = :expected AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)"
+                + pageCompletionCondition)
             .updateExpression(
                 "SET #status = :waiting, #version = #version + :one, #step = :step, #nextDue = :nextDue, " +
                     "#transition = :transition, #awaitUnit = :awaitUnit, #leaseExpires = :zero, " +
-                    "#updated = :now REMOVE #result, #resultReference, #errorCode, #errorMessage, #leaseOwner, #redriveIntent")
+                    "#updated = :now" + pageCompletionUpdate
+                    + " REMOVE #result, #resultReference, #errorCode, #errorMessage, #leaseOwner, #redriveIntent"
+                    + pageCompletionRemove)
             .expressionAttributeNames(names)
             .expressionAttributeValues(values)
             .returnValues(ReturnValue.ALL_NEW)
@@ -1680,6 +1834,18 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
         record.failedCommandId().ifPresent(value -> putIfPresent(item, FAILED_COMMAND_ID, value));
         record.redriveTargetCommandId().ifPresent(value -> putIfPresent(item, REDRIVE_TARGET_COMMAND_ID, value));
         record.redriveReason().ifPresent(value -> putIfPresent(item, REDRIVE_REASON, value));
+        record.pagingState().ifPresent(page -> {
+            item.put(PAGE_INDEX, avN(page.pageIndex()));
+            item.put(PAGE_SOURCE_IDENTITY, avS(page.sourceIdentity()));
+            page.startCheckpoint().ifPresent(value -> item.put(PAGE_START_CHECKPOINT, avS(value)));
+            item.put(PAGE_MAX_RECORDS, avN(page.maxRecords()));
+            page.suspendedCompletion().ifPresent(completion -> {
+                item.put(PAGE_COMPLETION_CONSUMED_RECORDS, avN(completion.consumedRecords()));
+                completion.nextCheckpoint().ifPresent(value ->
+                    item.put(PAGE_COMPLETION_NEXT_CHECKPOINT, avS(value)));
+                item.put(PAGE_COMPLETION_EXHAUSTED, avBool(completion.exhausted()));
+            });
+        });
         putIfPresent(item, LEASE_OWNER, record.leaseOwner());
         putIfPresent(item, LAST_TRANSITION_KEY, record.lastTransitionKey());
         putInputPayload(item, record, inputCanonicalTypeId);
@@ -2012,6 +2178,20 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
             .filter(value -> !value.isBlank());
         Optional<String> redriveReason = Optional.ofNullable(readString(item, REDRIVE_REASON))
             .filter(value -> !value.isBlank());
+        Optional<PagedExecutionState> pagingState = Optional.ofNullable(readString(item, PAGE_SOURCE_IDENTITY))
+            .filter(value -> !value.isBlank())
+            .map(identity -> new PagedExecutionState(
+                (int) readLong(item, PAGE_INDEX),
+                identity,
+                Optional.ofNullable(readString(item, PAGE_START_CHECKPOINT)).filter(value -> !value.isBlank()),
+                (int) readLong(item, PAGE_MAX_RECORDS),
+                item.containsKey(PAGE_COMPLETION_CONSUMED_RECORDS)
+                    ? Optional.of(new PagedTransitionCompletion(
+                        (int) readLong(item, PAGE_COMPLETION_CONSUMED_RECORDS),
+                        Optional.ofNullable(readString(item, PAGE_COMPLETION_NEXT_CHECKPOINT))
+                            .filter(value -> !value.isBlank()),
+                        readBoolean(item, PAGE_COMPLETION_EXHAUSTED)))
+                    : Optional.empty()));
         ExecutionRecord<Object, Object> stored = new ExecutionRecord<>(
             tenantId,
             executionId,
@@ -2049,7 +2229,8 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
             failedStepIndex,
             failedCommandId,
             redriveTargetCommandId,
-            redriveReason);
+            redriveReason,
+            pagingState);
         return withPayloads(stored, readInputPayload(stored, item), readResultPayload(stored, item));
     }
 
@@ -2060,7 +2241,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
             stored.lastTransitionKey(), inputPayload, stored.awaitUnitId(), resultPayload, stored.errorCode(), stored.errorMessage(),
             stored.createdAtEpochMs(), stored.updatedAtEpochMs(), stored.ttlEpochS(), stored.firstCircuitDeferredAtEpochMs(),
             stored.circuitDeferralCount(), stored.circuitIdentity(), stored.redriveIntent(), stored.failedStepIndex(),
-            stored.failedCommandId(), stored.redriveTargetCommandId(), stored.redriveReason());
+            stored.failedCommandId(), stored.redriveTargetCommandId(), stored.redriveReason(), stored.pagingState());
     }
 
     private ExecutionRecord<Object, Object> withCurrentStepIndex(ExecutionRecord<Object, Object> stored, int currentStepIndex) {
@@ -2071,7 +2252,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
             stored.errorMessage(), stored.createdAtEpochMs(), stored.updatedAtEpochMs(), stored.ttlEpochS(),
             stored.firstCircuitDeferredAtEpochMs(), stored.circuitDeferralCount(), stored.circuitIdentity(),
             stored.redriveIntent(), stored.failedStepIndex(), stored.failedCommandId(),
-            stored.redriveTargetCommandId(), stored.redriveReason());
+            stored.redriveTargetCommandId(), stored.redriveReason(), stored.pagingState());
     }
 
     private ExecutionRedriveIntent readRedriveIntent(Map<String, AttributeValue> item) {
@@ -2283,6 +2464,10 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
         return AttributeValue.builder().n(Long.toString(value)).build();
     }
 
+    private static AttributeValue avBool(boolean value) {
+        return AttributeValue.builder().bool(value).build();
+    }
+
     private static String readString(Map<String, AttributeValue> item, String key) {
         AttributeValue value = item.get(key);
         if (value == null) {
@@ -2297,6 +2482,11 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
             return 0L;
         }
         return Long.parseLong(value.n());
+    }
+
+    private static boolean readBoolean(Map<String, AttributeValue> item, String key) {
+        AttributeValue value = item.get(key);
+        return value != null && Boolean.TRUE.equals(value.bool());
     }
 
     private static String scopedExecutionKey(String tenantId, String executionKey) {

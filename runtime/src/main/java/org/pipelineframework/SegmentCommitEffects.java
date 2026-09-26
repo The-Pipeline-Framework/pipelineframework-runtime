@@ -11,6 +11,9 @@ import org.pipelineframework.orchestrator.DeadLetterPublisher;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
+import org.pipelineframework.orchestrator.PagedExecutionState;
+import org.pipelineframework.orchestrator.PagedTransitionCompletion;
+import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
@@ -74,20 +77,27 @@ class SegmentCommitEffects {
         workDispatcher,
         deadLetterPublisher);
   }
-
   private Uni<Void> commitCompleted(CompletedSegment completed) {
     ClaimedSegment segment = completed.segment();
     long nowEpochMs = System.currentTimeMillis();
     return segmentBoundaryLedger.get()
         .recordSegmentCompleted(segment.record(), segment.transitionKey(), completed.result(), nowEpochMs)
         .chain(() -> terminalPublicationBoundary.publishBeforeSuccess(completed, nowEpochMs))
-        .chain(() -> executionStateStore.markSucceeded(
+        .chain(() -> completed.result().pageCompletion()
+            .filter(page -> !page.exhausted())
+            .map(page -> advancePage(completed, page, nowEpochMs))
+            .orElseGet(() -> completeExecution(completed, nowEpochMs)));
+  }
+
+  private Uni<Void> completeExecution(CompletedSegment completed, long nowEpochMs) {
+    ClaimedSegment segment = completed.segment();
+    return executionStateStore.markSucceeded(
             segment.record().tenantId(),
             segment.record().executionId(),
             segment.record().version(),
             segment.transitionKey(),
             completed.outputItems(),
-            nowEpochMs))
+            nowEpochMs)
         .onItem().transformToUni(updated -> updated
             .map(succeeded -> segmentBoundaryLedger.get().recordRunSucceeded(
                 succeeded,
@@ -96,20 +106,80 @@ class SegmentCommitEffects {
             .orElseGet(() -> Uni.createFrom().failure(successCommitFailure(completed))))
         .replaceWithVoid();
   }
+  private Uni<Void> advancePage(
+      CompletedSegment completed,
+      PagedTransitionCompletion completion,
+      long nowEpochMs) {
+    if (!completed.outputItems().isEmpty() && !terminalPublicationBoundary.pagedOutputEnabled()) {
+      return Uni.createFrom().failure(new IllegalStateException(
+          "paged execution with terminal output requires configured Object Publish composition"));
+    }
+    ClaimedSegment segment = completed.segment();
+    PagedExecutionState current = segment.record().pagingState().orElseThrow(() ->
+        new IllegalStateException("worker returned page completion for an unpaged execution"));
+    String checkpoint = completion.nextCheckpoint().orElseThrow(() ->
+        new IllegalStateException("non-exhausted page did not return a successor checkpoint"));
+    PagedExecutionState successor = current.successor(checkpoint);
+    return executionStateStore.advancePage(
+            segment.record().tenantId(),
+            segment.record().executionId(),
+            segment.record().version(),
+            segment.transitionKey(),
+            successor,
+            nowEpochMs)
+        .onItem().transformToUni(updated -> updated
+            .map(queued -> workDispatcher.enqueueNow(new ExecutionWorkItem(
+                queued.tenantId(), queued.executionId())))
+            .orElseGet(() -> reconcilePageCommit(completed, successor)))
+        .replaceWithVoid();
+  }
+
+  private Uni<Void> reconcilePageCommit(
+      CompletedSegment completed,
+      PagedExecutionState successor) {
+    ClaimedSegment segment = completed.segment();
+    return executionStateStore.getExecution(
+            segment.record().tenantId(), segment.record().executionId())
+        .onItem().transformToUni(current -> current
+            .filter(record -> pageAlreadyCommitted(record, successor, segment.transitionKey()))
+            .map(ignored -> Uni.createFrom().voidItem())
+            .orElseGet(() -> Uni.createFrom().failure(pageCommitFailure(completed, successor))));
+  }
+
+  private static boolean pageAlreadyCommitted(
+      ExecutionRecord<Object, Object> current,
+      PagedExecutionState successor,
+      String transitionKey) {
+    return current.pagingState().filter(state ->
+        state.pageIndex() > successor.pageIndex()
+            || (state.equals(successor) && transitionKey.equals(current.lastTransitionKey())))
+        .isPresent();
+  }
+
+  private IllegalStateException pageCommitFailure(
+      CompletedSegment completed,
+      PagedExecutionState successor) {
+    return new IllegalStateException(
+        "Failed to commit page " + (successor.pageIndex() - 1) + " for execution "
+            + completed.segment().record().executionId()
+            + " (expectedVersion=" + completed.segment().record().version()
+            + ", transitionKey=" + completed.segment().transitionKey() + ")");
+  }
 
   private Uni<Void> commitSuspended(
       SuspendedSegment suspended,
       AwaitItemContinuationHandler itemContinuationHandler) {
     ClaimedSegment segment = suspended.segment();
     long nowEpochMs = System.currentTimeMillis();
-    return executionStateStore.markWaitingExternal(
-            segment.record().tenantId(),
-            segment.record().executionId(),
-            segment.record().version(),
-            segment.transitionKey(),
-            suspended.suspension().unitId(),
-            suspended.suspension().stepIndex(),
-            nowEpochMs)
+    var waiting = suspended.suspension().pageCompletion().isPresent()
+        ? executionStateStore.markWaitingExternal(
+            segment.record().tenantId(), segment.record().executionId(), segment.record().version(),
+            segment.transitionKey(), suspended.suspension().unitId(), suspended.suspension().stepIndex(),
+            suspended.suspension().pageCompletion(), nowEpochMs)
+        : executionStateStore.markWaitingExternal(
+            segment.record().tenantId(), segment.record().executionId(), segment.record().version(),
+            segment.transitionKey(), suspended.suspension().unitId(), suspended.suspension().stepIndex(), nowEpochMs);
+    return waiting
         .onItem().transformToUni(updated -> {
           if (updated.isEmpty()) {
             return Uni.createFrom().failure(waitingExternalFailure(suspended));

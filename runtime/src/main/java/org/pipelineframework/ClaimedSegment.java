@@ -28,7 +28,7 @@ record ClaimedSegment(
     Objects.requireNonNull(record, "record must not be null");
     return new ClaimedSegment(
         record,
-        transitionKey(record.executionId(), record.currentStepIndex(), record.attempt()));
+        transitionKey(record));
   }
 
   boolean resumesFromAwait() {
@@ -57,7 +57,8 @@ record ClaimedSegment(
         retryCompleted ? Optional.empty() : record.redriveIntent() == ExecutionRedriveIntent.REISSUE_COMMAND
             ? record.redriveTargetCommandId()
             : record.failedCommandId(),
-        retryCompleted ? Optional.empty() : record.redriveReason());
+        retryCompleted ? Optional.empty() : record.redriveReason(),
+        record.pagingState().map(org.pipelineframework.orchestrator.PagedExecutionState::toTransitionContext));
     SerializedTransitionPayload encodedPayload = payloadCodec.encode(payload);
     return TransitionCommandEnvelope.from(
         command,
@@ -68,7 +69,10 @@ record ClaimedSegment(
         encodedPayload);
   }
 
-  private static String transitionKey(String executionId, int stepIndex, int attempt) {
-    return executionId + ":" + stepIndex + ":" + attempt;
+  private static String transitionKey(ExecutionRecord<Object, Object> record) {
+    String page = record.pagingState()
+        .map(state -> ":page:" + state.pageIndex())
+        .orElse("");
+    return record.executionId() + page + ":" + record.currentStepIndex() + ":" + record.attempt();
   }
 }

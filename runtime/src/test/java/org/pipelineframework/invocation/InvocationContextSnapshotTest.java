@@ -17,6 +17,7 @@ import org.pipelineframework.context.PipelineContext;
 import org.pipelineframework.context.PipelineContextHolder;
 import org.pipelineframework.execution.PipelineExecutionContext;
 import org.pipelineframework.execution.PipelineExecutionContextHolder;
+import org.pipelineframework.orchestrator.PagedTransitionContext;
 import org.pipelineframework.runtime.core.RuntimeAdapters;
 import org.pipelineframework.telemetry.PipelineRunContext;
 import org.pipelineframework.telemetry.PipelineRunContextHolder;
@@ -61,6 +62,24 @@ class InvocationContextSnapshotTest {
             assertEquals("tenant-1", executionCtx.tenantId());
             assertEquals("exec-abc", executionCtx.executionId());
             assertEquals(3, executionCtx.currentStepIndex());
+        });
+    }
+
+    @Test
+    void preservesInternalPageContextWithoutAddingItToApplicationExecutionIdentity() {
+        PagedTransitionContext page = new PagedTransitionContext(2, "source-v1", Optional.of("opaque-2"), 1000);
+        AwaitExecutionContext awaitCtx = new AwaitExecutionContext(
+            "tenant-1",
+            "exec-page",
+            3,
+            org.pipelineframework.awaitable.AwaitContinuationMode.LIVE_IF_SUPPORTED,
+            org.pipelineframework.awaitable.TerminalOutputOwnership.TRANSITION_WORKER,
+            java.util.Map.of(),
+            Optional.of(page));
+
+        new InvocationContextSnapshot(null, awaitCtx).run(() -> {
+            assertEquals(Optional.of(page), AwaitExecutionContextHolder.get().pageContext());
+            assertEquals("exec-page", PipelineExecutionContextHolder.get().orElseThrow().executionId());
         });
     }
 

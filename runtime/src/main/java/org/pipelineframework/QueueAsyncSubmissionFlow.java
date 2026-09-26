@@ -40,6 +40,7 @@ class QueueAsyncSubmissionFlow {
   private final Supplier<String> releaseVersion;
   private final Supplier<SegmentBoundaryLedger> segmentBoundaryLedger;
   private final Function<PipelineRunSubmission, Uni<Void>> releaseActivation;
+  private final Function<PipelineRunSubmission, Uni<Optional<PipelinePagingPlan>>> pagingPlan;
 
   QueueAsyncSubmissionFlow(
       PipelineOrchestratorConfig orchestratorConfig,
@@ -63,7 +64,8 @@ class QueueAsyncSubmissionFlow {
         contractVersion,
         releaseVersion,
         segmentBoundaryLedger,
-        ignored -> Uni.createFrom().voidItem());
+        ignored -> Uni.createFrom().voidItem(),
+        ignored -> Uni.createFrom().item(Optional.empty()));
   }
 
   QueueAsyncSubmissionFlow(
@@ -78,6 +80,24 @@ class QueueAsyncSubmissionFlow {
       Supplier<String> releaseVersion,
       Supplier<SegmentBoundaryLedger> segmentBoundaryLedger,
       Function<PipelineRunSubmission, Uni<Void>> releaseActivation) {
+    this(orchestratorConfig, executionInputPolicy, executionResultShapeResolver, executionStateStore,
+        workDispatcher, admissionPolicy, pipelineId, contractVersion, releaseVersion,
+        segmentBoundaryLedger, releaseActivation, ignored -> Uni.createFrom().item(Optional.empty()));
+  }
+
+  QueueAsyncSubmissionFlow(
+      PipelineOrchestratorConfig orchestratorConfig,
+      ExecutionInputPolicy executionInputPolicy,
+      ExecutionResultShapeResolver executionResultShapeResolver,
+      ExecutionStateStore executionStateStore,
+      WorkDispatcher workDispatcher,
+      ControlPlaneAdmissionPolicy admissionPolicy,
+      Supplier<String> pipelineId,
+      Supplier<String> contractVersion,
+      Supplier<String> releaseVersion,
+      Supplier<SegmentBoundaryLedger> segmentBoundaryLedger,
+      Function<PipelineRunSubmission, Uni<Void>> releaseActivation,
+      Function<PipelineRunSubmission, Uni<Optional<PipelinePagingPlan>>> pagingPlan) {
     this.orchestratorConfig = Objects.requireNonNull(orchestratorConfig, "orchestratorConfig must not be null");
     this.executionInputPolicy = Objects.requireNonNull(executionInputPolicy, "executionInputPolicy must not be null");
     this.executionResultShapeResolver =
@@ -91,6 +111,7 @@ class QueueAsyncSubmissionFlow {
     this.segmentBoundaryLedger =
         Objects.requireNonNull(segmentBoundaryLedger, "segmentBoundaryLedger must not be null");
     this.releaseActivation = Objects.requireNonNull(releaseActivation, "releaseActivation must not be null");
+    this.pagingPlan = Objects.requireNonNull(pagingPlan, "pagingPlan must not be null");
   }
 
   Uni<RunAsyncAcceptedDto> submit(
@@ -178,13 +199,15 @@ class QueueAsyncSubmissionFlow {
     }
     ExecutionResultShape resultShape = executionResultShapeResolver.resolve();
     try {
-      return Uni.createFrom().item(new PipelineRunSubmissionPlan(
-          submission,
-          snapshot,
-          executionKey,
-          resultShape,
-          now,
-          ttlEpochS));
+      return pagingPlan.apply(submission)
+          .onItem().transform(plan -> new PipelineRunSubmissionPlan(
+              submission,
+              snapshot,
+              executionKey,
+              resultShape,
+              plan,
+              now,
+              ttlEpochS));
     } catch (IllegalArgumentException e) {
       return Uni.createFrom().failure(new BadRequestException(e.getMessage()));
     }

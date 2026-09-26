@@ -60,11 +60,13 @@ public class AwaitCompletionSupport {
             descriptor,
             context.tenantId(),
             context.executionId(),
+            context.identityScope(),
             stepIndex,
-            context.executionId() + ":" + stepIndex,
+            context.identityScope() + ":" + stepIndex,
             input,
             null,
-            null)
+            null,
+            context.traceMetadata())
             .onItem().transformToUni(created -> {
                 AwaitInteractionRecord record = created.record();
                 Uni<AwaitInteractionRecord> dispatched = record.status() == AwaitInteractionStatus.WAITING
@@ -145,7 +147,8 @@ public class AwaitCompletionSupport {
             context.currentStepIndex(),
             context.continuationMode(),
             context.terminalOutputOwnership(),
-            context.traceMetadata());
+            context.traceMetadata(),
+            context.pageContext());
     }
 
     @SuppressWarnings("unchecked")
@@ -248,13 +251,15 @@ public class AwaitCompletionSupport {
             descriptor,
             context.tenantId(),
             context.executionId(),
+            context.identityScope(),
             context.currentStepIndex(),
-            context.executionId() + ":" + context.currentStepIndex() + ":" + index,
+            context.identityScope() + ":" + context.currentStepIndex() + ":" + index,
             item,
             unitId,
             index,
             null,
-            null)
+            null,
+            context.traceMetadata())
             .onItem().transformToUni(created -> {
                 AwaitInteractionRecord record = created.record();
                 if (record.status() == AwaitInteractionStatus.COMPLETED) {
@@ -289,13 +294,15 @@ public class AwaitCompletionSupport {
                 descriptor,
                 context.tenantId(),
                 context.executionId(),
+                context.identityScope(),
                 stepIndex,
-                context.executionId() + ":" + stepIndex + ":" + index,
+                context.identityScope() + ":" + stepIndex + ":" + index,
                 item,
                 unitId,
                 index,
                 null,
-                null)
+                null,
+                context.traceMetadata())
                 .onItem().transformToUni(created -> {
                     AwaitInteractionRecord record = created.record();
                     return record.status() == AwaitInteractionStatus.WAITING
@@ -349,7 +356,7 @@ public class AwaitCompletionSupport {
     }
 
     private static String streamUnitId(AwaitCompletionDescriptor descriptor, AwaitExecutionContext context, int stepIndex) {
-        return UUID.nameUUIDFromBytes((context.tenantId() + ":" + context.executionId() + ":"
+        return UUID.nameUUIDFromBytes((context.tenantId() + ":" + context.identityScope() + ":"
             + descriptor.stepId() + ":" + stepIndex).getBytes(StandardCharsets.UTF_8)).toString();
     }
 

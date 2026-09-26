@@ -3,6 +3,7 @@ package org.pipelineframework.awaitable;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -37,6 +38,43 @@ import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.TransitionAwaitSuspension;
 
 class AwaitCoordinatorCompletionTest {
+
+    @Test
+    void pageIdentityScopeSeparatesDerivedIdentitiesButRetainsLogicalExecutionId() {
+        AwaitCoordinator coordinator = coordinator(new InMemoryAwaitInteractionStore());
+        AwaitCompletionDescriptor descriptor = descriptor("FraudCheck");
+
+        AwaitInteractionRecord first = coordinator.createOrGet(
+            descriptor, "tenant-1", "exec-1", "exec-1:page:0", 1, "cause",
+            Map.of("paymentRecordId", "p-1"), "alice", "fraud-review", Map.of())
+            .await().indefinitely().record();
+        AwaitInteractionRecord second = coordinator.createOrGet(
+            descriptor, "tenant-1", "exec-1", "exec-1:page:1", 1, "cause",
+            Map.of("paymentRecordId", "p-1"), "alice", "fraud-review", Map.of())
+            .await().indefinitely().record();
+
+        assertEquals("exec-1", first.executionId());
+        assertEquals("exec-1", second.executionId());
+        assertNotEquals(first.unitId(), second.unitId());
+        assertEquals("exec-1:page:0:FraudCheck:paymentRecordId=p-1", first.idempotencyKey());
+        assertEquals("exec-1:page:1:FraudCheck:paymentRecordId=p-1", second.idempotencyKey());
+        assertNotEquals(first.idempotencyKey(), second.idempotencyKey());
+        assertNotEquals(first.correlationId(), second.correlationId());
+    }
+
+    @Test
+    void unpagedConfiguredIdempotencyKeyRemainsStableAcrossExecutions() {
+        AwaitCompletionDescriptor descriptor = descriptor("FraudCheck");
+        AwaitInteractionRecord first = coordinator(new InMemoryAwaitInteractionStore()).createOrGet(
+            descriptor, "tenant-1", "exec-1", 1, "cause", Map.of("paymentRecordId", "p-1"),
+            "alice", "fraud-review").await().indefinitely().record();
+        AwaitInteractionRecord second = coordinator(new InMemoryAwaitInteractionStore()).createOrGet(
+            descriptor, "tenant-1", "exec-2", 1, "cause", Map.of("paymentRecordId", "p-1"),
+            "alice", "fraud-review").await().indefinitely().record();
+
+        assertEquals("FraudCheck:paymentRecordId=p-1", first.idempotencyKey());
+        assertEquals(first.idempotencyKey(), second.idempotencyKey());
+    }
 
     @Test
     void createOrGetPersistsExplicitOriginTraceMetadata() {

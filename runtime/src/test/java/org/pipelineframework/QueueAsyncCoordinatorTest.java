@@ -52,6 +52,9 @@ import org.pipelineframework.orchestrator.controlplane.ControlPlaneProjection;
 import org.pipelineframework.orchestrator.controlplane.InMemoryControlPlaneJournal;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 import org.pipelineframework.orchestrator.dto.ExecutionStatusDto;
+import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
+import org.pipelineframework.orchestrator.release.PipelineReleaseRecord;
+import org.pipelineframework.orchestrator.release.PipelineReleaseRegistry;
 import org.pipelineframework.awaitable.AwaitCompletionCommand;
 import org.pipelineframework.awaitable.AwaitCompletionResult;
 import org.pipelineframework.awaitable.AwaitCoordinator;
@@ -144,6 +147,9 @@ class QueueAsyncCoordinatorTest {
     @Mock
     private ExecutionResultShapeResolver executionResultShapeResolver;
 
+    @Mock
+    private PipelineReleaseRegistry releaseRegistry;
+
     @BeforeEach
     void setUp() {
         inputPolicy = new ExecutionInputPolicy();
@@ -172,6 +178,7 @@ class QueueAsyncCoordinatorTest {
         coordinator.executionInputPolicy = inputPolicy;
         coordinator.executionFailureHandler = failureHandler;
         coordinator.executionResultShapeResolver = executionResultShapeResolver;
+        coordinator.releaseRegistry = releaseRegistry;
         lenient().when(orchestratorConfig.worker()).thenReturn(workerConfig);
         lenient().when(workerConfig.executionMode()).thenReturn(TransitionWorkerExecutionMode.SAME_THREAD);
         lenient().when(workerConfig.maxInFlight()).thenReturn(64);
@@ -396,6 +403,11 @@ class QueueAsyncCoordinatorTest {
     @Test
     void executePipelineAsyncExplicitIdentityOverloadDelegatesToSubmissionFlow() {
         configureQueueModeDefaults();
+        PipelineReleaseRecord release = mock(PipelineReleaseRecord.class);
+        when(release.contractVersion()).thenReturn("contract-explicit");
+        when(release.contract()).thenReturn(PipelineContractDescriptor.localFallback());
+        when(releaseRegistry.get("tenant-1", "pipeline-explicit", "release-explicit"))
+            .thenReturn(Uni.createFrom().item(Optional.of(release)));
         when(executionStateStore.createOrGetExecution(any()))
             .thenReturn(Uni.createFrom().item(new CreateExecutionResult(
                 createRecord("tenant-1", "exec-explicit", "key-explicit"),

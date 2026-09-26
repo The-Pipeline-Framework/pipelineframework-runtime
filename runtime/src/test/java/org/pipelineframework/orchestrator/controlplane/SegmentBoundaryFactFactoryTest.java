@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
@@ -14,6 +15,7 @@ import org.pipelineframework.awaitable.AwaitUnitStatus;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
 import org.pipelineframework.orchestrator.ExecutionStatus;
+import org.pipelineframework.orchestrator.PagedExecutionState;
 import org.pipelineframework.orchestrator.TransitionAwaitSuspension;
 
 class SegmentBoundaryFactFactoryTest {
@@ -97,6 +99,12 @@ class SegmentBoundaryFactFactoryTest {
         assertEquals(publicationFacts.prepared().publicationId(), publicationFacts.completed().publicationId());
     }
 
+    @Test
+    void pagedAttemptsUseDistinctImmutableSegmentIdentities() {
+        assertEquals("run-paged:segment:2:page:0", SegmentBoundaryFactFactory.segmentId(pagedRecord(0)));
+        assertEquals("run-paged:segment:2:page:1", SegmentBoundaryFactFactory.segmentId(pagedRecord(1)));
+    }
+
     private static ExecutionRecord<Object, Object> record(String executionId) {
         return new ExecutionRecord<>(
             "tenant",
@@ -122,6 +130,15 @@ class SegmentBoundaryFactFactoryTest {
             1L,
             1L,
             999999L);
+    }
+
+    private static ExecutionRecord<Object, Object> pagedRecord(int pageIndex) {
+        return new ExecutionRecord<>(
+            "tenant", "run-paged", "key-run-paged", "pipeline", "contract", "release",
+            ExecutionResultShape.SINGLE, ExecutionStatus.QUEUED, 0L, 2, 0, null, 0L, 0L,
+            null, "input", null, null, null, null, 1L, 1L, 999999L,
+            Optional.of(new PagedExecutionState(pageIndex, "source-v1",
+                pageIndex == 0 ? Optional.empty() : Optional.of("opaque-" + pageIndex), 1000)));
     }
 
     private static AwaitUnitRecord unit(boolean dispatchComplete, Integer expectedItemCount) {
