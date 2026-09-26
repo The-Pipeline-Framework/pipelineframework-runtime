@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.pipelineframework.it</groupId>
+    <artifactId>release-descriptor-real-pipeline-it</artifactId>
+    <version>1.0.0</version>
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.outputTimestamp>2026-09-23T00:00:00Z</project.build.outputTimestamp>
+        <tpf.version>@project.version@</tpf.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.pipelineframework</groupId>
+            <artifactId>pipelineframework-api</artifactId>
+            <version>${tpf.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.pipelineframework</groupId>
+            <artifactId>pipelineframework-runtime-api</artifactId>
+            <version>${tpf.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.14.0</version>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.pipelineframework</groupId>
+                            <artifactId>pipelineframework-compiler</artifactId>
+                            <version>${tpf.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                    <compilerArgs>
+                        <arg>-Apipeline.config=${project.basedir}/pipeline.yaml</arg>
+                        <arg>-Apipeline.generatedSourcesDir=${project.build.directory}/generated-sources/pipeline</arg>
+                        <arg>-Apipeline.module=${project.artifactId}</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.2</version>
+            </plugin>
+            <plugin>
+                <groupId>org.pipelineframework</groupId>
+                <artifactId>pipelineframework-release-maven-plugin</artifactId>
+                <version>${tpf.version}</version>
+                <configuration>
+                    <releaseVersion>it-release-1</releaseVersion>
+                    <artifactUri>maven://org.pipelineframework.it:release-descriptor-real-pipeline-it:1.0.0</artifactUri>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>generate-release-descriptor</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
