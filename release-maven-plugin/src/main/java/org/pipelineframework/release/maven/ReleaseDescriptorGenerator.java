@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,6 +26,7 @@ import org.pipelineframework.orchestrator.release.PipelineReleaseArtifactDescrip
 import org.pipelineframework.orchestrator.release.PipelineReleaseDescriptor;
 
 final class ReleaseDescriptorGenerator {
+    private static final long LOCK_RETRY_MILLIS = 10L;
     private static final Set<String> SUPPORTED_KINDS = Set.of("jar", "local-file", "native-binary", "lambda-zip");
 
     private final ObjectMapper mapper;
@@ -121,9 +123,7 @@ final class ReleaseDescriptorGenerator {
         }
         try {
             Files.createDirectories(parent);
-            synchronized (ReleaseDescriptorGenerator.class) {
-                writeLocked(target, parent, descriptor, content);
-            }
+            writeLocked(target, parent, descriptor, content);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to write Pipeline Release Descriptor " + outputFile + ": " + e.getMessage(), e);
         }
@@ -137,7 +137,7 @@ final class ReleaseDescriptorGenerator {
     ) throws IOException {
         Path lockFile = target.resolveSibling("." + target.getFileName() + ".lock");
         try (FileChannel lockChannel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-             FileLock ignored = lockChannel.lock()) {
+             FileLock ignored = acquireFileLock(lockChannel)) {
             if (Files.exists(target)) {
                 validateExistingDescriptor(target, descriptor, content);
             }
@@ -147,6 +147,21 @@ final class ReleaseDescriptorGenerator {
                 moveIntoPlace(temporary, target);
             } finally {
                 Files.deleteIfExists(temporary);
+            }
+        }
+    }
+
+    private static FileLock acquireFileLock(FileChannel lockChannel) throws IOException {
+        while (true) {
+            try {
+                return lockChannel.lock();
+            } catch (OverlappingFileLockException ignored) {
+                try {
+                    Thread.sleep(LOCK_RETRY_MILLIS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while waiting for release descriptor lock", e);
+                }
             }
         }
     }
