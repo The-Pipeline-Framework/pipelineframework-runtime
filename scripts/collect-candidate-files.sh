@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 print(ET.parse(sys.argv[1]).getroot().findtext("{http://maven.apache.org/POM/4.0.0}version", ""))
 PY
 )
-for artifact_id in pipelineframework-runtime-parent pipelineframework pipelineframework-deployment pipelineframework-runtime-spring cache-plugin persistence-plugin repository-plugin; do
+for artifact_id in pipelineframework-runtime-parent pipelineframework pipelineframework-deployment pipelineframework-runtime-spring pipelineframework-release-maven-plugin cache-plugin persistence-plugin repository-plugin; do
   group_path=org/pipelineframework
   artifact_dir="$maven_repository/$group_path/$artifact_id/$version"
   [[ -d "$artifact_dir" ]] || { echo "missing installed candidate coordinate: $artifact_id:$version" >&2; exit 1; }

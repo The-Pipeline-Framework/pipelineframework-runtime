@@ -42,6 +42,15 @@ jobs:
         run: bash scripts/system-tests.sh candidate-version "$EVENT_NAME" "${PR_NUMBER:--}" "$SOURCE_SHA" && bash scripts/system-tests.sh reactor-coordinates && bash scripts/system-tests.sh reactor-dependencies
       - name: Verify and install candidate reactor
         run: ./mvnw -B clean install --no-transfer-progress -Dmaven.deploy.skip=true -Dgpg.skip=true -Dmaven.repo.local="$RUNNER_TEMP/tpf-candidate-maven-repository"
+      - name: Dump Maven Invoker diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          while IFS= read -r -d '' log; do
+            echo "::group::$log"
+            cat "$log"
+            echo "::endgroup::"
+          done < <(find release-maven-plugin/target -type f -name build.log -print0)
       - name: Collect Maven files and preliminary build metadata
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
