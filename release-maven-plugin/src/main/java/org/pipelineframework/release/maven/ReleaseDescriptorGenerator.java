@@ -2,10 +2,13 @@ package org.pipelineframework.release.maven;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -76,11 +79,11 @@ final class ReleaseDescriptorGenerator {
             }
             requireReadableFile(artifact.file(), "Release artifact " + artifactId);
             String uri = requireText(artifact.uri(), "uri");
-            List<String> stepIds = validatedStepIds(artifact.stepIds(), knownStepIds, artifactId);
-            List<String> capabilities = validatedValues(artifact.capabilities(), "capability", artifactId);
             if (kind.equals("jar")) {
                 validateEmbeddedContract(artifact.file(), contract);
             }
+            List<String> stepIds = validatedStepIds(artifact.stepIds(), knownStepIds, artifactId);
+            List<String> capabilities = validatedValues(artifact.capabilities(), "capability", artifactId);
             descriptors.add(new PipelineReleaseArtifactDescriptor(
                 artifactId,
                 kind,
@@ -111,24 +114,40 @@ final class ReleaseDescriptorGenerator {
 
     void write(Path outputFile, PipelineReleaseDescriptor descriptor) {
         byte[] content = serialize(descriptor);
-        if (Files.exists(outputFile)) {
-            validateExistingDescriptor(outputFile, descriptor, content);
-        }
-        Path parent = outputFile.toAbsolutePath().normalize().getParent();
+        Path target = outputFile.toAbsolutePath().normalize();
+        Path parent = target.getParent();
         if (parent == null) {
             throw new IllegalArgumentException("Release descriptor output must have a parent directory");
         }
         try {
             Files.createDirectories(parent);
-            Path temporary = Files.createTempFile(parent, outputFile.getFileName().toString(), ".tmp");
-            try {
-                Files.write(temporary, content);
-                moveIntoPlace(temporary, outputFile.toAbsolutePath().normalize());
-            } finally {
-                Files.deleteIfExists(temporary);
+            synchronized (ReleaseDescriptorGenerator.class) {
+                writeLocked(target, parent, descriptor, content);
             }
         } catch (IOException e) {
             throw new IllegalStateException("Failed to write Pipeline Release Descriptor " + outputFile + ": " + e.getMessage(), e);
+        }
+    }
+
+    private void writeLocked(
+        Path target,
+        Path parent,
+        PipelineReleaseDescriptor descriptor,
+        byte[] content
+    ) throws IOException {
+        Path lockFile = target.resolveSibling("." + target.getFileName() + ".lock");
+        try (FileChannel lockChannel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+             FileLock ignored = lockChannel.lock()) {
+            if (Files.exists(target)) {
+                validateExistingDescriptor(target, descriptor, content);
+            }
+            Path temporary = Files.createTempFile(parent, target.getFileName().toString(), ".tmp");
+            try {
+                Files.write(temporary, content);
+                moveIntoPlace(temporary, target);
+            } finally {
+                Files.deleteIfExists(temporary);
+            }
         }
     }
 
@@ -156,10 +175,9 @@ final class ReleaseDescriptorGenerator {
             try (InputStream input = jar.getInputStream(entry)) {
                 embedded = mapper.readValue(input, PipelineContractDescriptor.class);
             }
-            if (!expected.pipelineId().equals(embedded.pipelineId())
-                || !expected.contractVersion().equals(embedded.contractVersion())) {
+            if (!expected.equals(embedded)) {
                 throw new IllegalArgumentException(
-                    "Release JAR artifact " + artifact + " embeds a different Pipeline Contract identity");
+                    "Release JAR artifact " + artifact + " embeds different Pipeline Contract content");
             }
         } catch (IllegalArgumentException e) {
             throw e;

@@ -13,6 +13,9 @@ import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import org.junit.jupiter.api.BeforeEach;
@@ -117,6 +120,33 @@ class ReleaseDescriptorGeneratorTest {
     }
 
     @Test
+    void serializesCompetingWritesForTheSameImmutableIdentity() throws Exception {
+        Path firstJar = jar("first.jar", contract, "one");
+        Path secondJar = jar("second.jar", contract, "two");
+        PipelineReleaseDescriptor first = descriptor(firstJar, "release-1");
+        PipelineReleaseDescriptor second = descriptor(secondJar, "release-1");
+        Path output = temporaryDirectory.resolve("pipeline-release.json");
+        CountDownLatch start = new CountDownLatch(1);
+
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var firstWrite = executor.submit(() -> writeAfter(start, generator, output, first));
+            var secondWrite = executor.submit(() -> writeAfter(
+                start,
+                new ReleaseDescriptorGenerator(PipelineJson.mapper()),
+                output,
+                second));
+            start.countDown();
+            List<Optional<RuntimeException>> outcomes = List.of(firstWrite.get(), secondWrite.get());
+
+            assertEquals(1, outcomes.stream().filter(Optional::isEmpty).count());
+            assertEquals(1, outcomes.stream().flatMap(Optional::stream)
+                .filter(IllegalStateException.class::isInstance).count());
+            PipelineReleaseDescriptor written = PipelineJson.mapper().readValue(output.toFile(), PipelineReleaseDescriptor.class);
+            assertTrue(written.equals(first) || written.equals(second));
+        }
+    }
+
+    @Test
     void rejectsUnknownStepUnsupportedKindAndDuplicateArtifactIdentity() throws Exception {
         Path artifact = Files.writeString(temporaryDirectory.resolve("artifact.bin"), "artifact");
         assertThrows(IllegalArgumentException.class, () -> generator.generate(contract, "release-1", List.of(
@@ -162,6 +192,28 @@ class ReleaseDescriptorGeneratorTest {
 
         Path wrongContract = jar("wrong.jar", contract("other", "sha256:other"), "payload");
         assertThrows(IllegalArgumentException.class, () -> descriptor(wrongContract, "release-1"));
+
+        PipelineContractDescriptor alteredContent = contract(
+            contract.pipelineId(),
+            contract.contractVersion(),
+            List.of(step(0, "Altered")));
+        Path sameIdentity = jar("same-identity.jar", alteredContent, "payload");
+        assertThrows(IllegalArgumentException.class, () -> descriptor(sameIdentity, "release-1"));
+    }
+
+    private static Optional<RuntimeException> writeAfter(
+        CountDownLatch start,
+        ReleaseDescriptorGenerator writer,
+        Path output,
+        PipelineReleaseDescriptor descriptor
+    ) throws InterruptedException {
+        start.await();
+        try {
+            writer.write(output, descriptor);
+            return Optional.empty();
+        } catch (RuntimeException failure) {
+            return Optional.of(failure);
+        }
     }
 
     private PipelineReleaseDescriptor descriptor(Path jar, String releaseVersion) {
@@ -192,6 +244,14 @@ class ReleaseDescriptorGeneratorTest {
     }
 
     private static PipelineContractDescriptor contract(String pipelineId, String contractVersion) {
+        return contract(pipelineId, contractVersion, List.of(step(0, "Validate"), step(1, "Store")));
+    }
+
+    private static PipelineContractDescriptor contract(
+        String pipelineId,
+        String contractVersion,
+        List<PipelineBundleStepDescriptor> steps
+    ) {
         return new PipelineContractDescriptor(
             PipelineContractDescriptor.CURRENT_SCHEMA_VERSION,
             pipelineId,
@@ -202,9 +262,7 @@ class ReleaseDescriptorGeneratorTest {
             "orders-app",
             false,
             "monolith",
-            List.of(
-                step(0, "Validate"),
-                step(1, "Store")),
+            steps,
             new PipelineBundleCapabilities(true, List.of("rest", "grpc", "rest")));
     }
 
