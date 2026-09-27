@@ -76,6 +76,15 @@ class PipelineCompositionProductizationTest {
                   - { name: Finalize, service: com.example.routed.FinalizeService, cardinality: ONE_TO_ONE, input: Completion, output: FinalResult, accepts: [ApprovedHandled, RejectedHandled], terminal: true, java: { input: com.example.routed.domain.Completion, output: com.example.routed.domain.FinalResult } }
             steps:
               - { name: Call routed, pipeline: routed, cardinality: ONE_TO_ONE, input: Request, output: FinalResult, java: { input: com.example.routed.domain.Request, output: com.example.routed.domain.FinalResult } }
+            aspects:
+              persistence:
+                enabled: true
+                scope: STEPS
+                position: AFTER_STEP
+                config:
+                  targetSteps: [Handle approved, Handle rejected]
+                  pluginImplementationClass: com.example.routed.PersistenceService
+                  enabledTargets: [LOCAL_CLIENT_STEP]
             """;
         Map<String, String> sources = routedSources();
         Fixture fixture = compile("routed", yaml, sources);
@@ -94,20 +103,34 @@ class PipelineCompositionProductizationTest {
         assertTrue(contract.contains("\"RETURN\""));
         assertTrue(contract.contains("\"ROOT_TERMINAL\""));
         String invocation = Files.readString(fixture.generatedClass(invocationName));
+        String repeatedInvocation = Files.readString(repeated.generatedClass(invocationName));
+        assertEquals(invocation, repeatedInvocation,
+            "The named invocation's generated child order must be deterministic");
         assertTrue(invocation.contains("PipelineInvocationSteps.<Request, FinalResult>oneToOne"));
-        assertTrue(invocation.contains("java.util.List.of(child0, child1, child2, child3)"));
+        assertTrue(invocation.contains("java.util.List.of(child0, child1, child2, child3, child4, child5)"));
+        assertOrdered(invocation,
+            "ProcessHandleApprovedLocalClientStep child1",
+            "PersistenceApprovedHandledSideEffectLocalClientStep child2",
+            "ProcessHandleRejectedLocalClientStep child3",
+            "PersistenceRejectedHandledSideEffectLocalClientStep child4");
         assertFalse(invocation.contains("ExecutionRecord"));
         assertFalse(invocation.contains("admission"));
         String branching = fixture.metadata("branching.json");
         assertTrue(branching.contains("Handle approved"));
         assertTrue(branching.contains("Handle rejected"));
         assertTrue(branching.contains("ApprovedHandled"));
-        assertFalse(fixture.metadata("order.json").contains("ProcessHandleApprovedLocalClientStep"));
+        String rootOrder = fixture.metadata("order.json");
+        assertTrue(rootOrder.contains(invocationName));
+        assertFalse(rootOrder.contains("ProcessHandleApprovedLocalClientStep"));
+        assertFalse(rootOrder.contains("PersistenceApprovedHandledSideEffectLocalClientStep"));
+        assertFalse(rootOrder.contains("PersistenceRejectedHandledSideEffectLocalClientStep"));
 
         Path classes = compileGeneratedFixture(fixture, sources,
             List.of(invocationName, "ProcessClassifyLocalClientStep",
-                "ProcessHandleApprovedLocalClientStep", "ProcessHandleRejectedLocalClientStep",
-                "ProcessFinalizeLocalClientStep"));
+                "ProcessHandleApprovedLocalClientStep", "PersistenceApprovedHandledSideEffectLocalClientStep",
+                "ObservePersistenceApprovedHandledSideEffectService", "ProcessHandleRejectedLocalClientStep",
+                "PersistenceRejectedHandledSideEffectLocalClientStep",
+                "ObservePersistenceRejectedHandledSideEffectService", "ProcessFinalizeLocalClientStep"));
         Files.createDirectories(classes.resolve("META-INF/pipeline"));
         Files.writeString(classes.resolve("META-INF/pipeline/branching.json"), branching);
 
@@ -119,10 +142,15 @@ class PipelineCompositionProductizationTest {
                 "com.example.routed.pipeline." + invocationName,
                 List.of("com.example.routed.pipeline.ProcessClassifyLocalClientStep",
                     "com.example.routed.pipeline.ProcessHandleApprovedLocalClientStep",
+                    "com.example.routed.pipeline.PersistenceApprovedHandledSideEffectLocalClientStep",
                     "com.example.routed.pipeline.ProcessHandleRejectedLocalClientStep",
+                    "com.example.routed.pipeline.PersistenceRejectedHandledSideEffectLocalClientStep",
                     "com.example.routed.pipeline.ProcessFinalizeLocalClientStep"),
                 List.of("com.example.routed.ClassifyService", "com.example.routed.HandleApprovedService",
-                    "com.example.routed.HandleRejectedService", "com.example.routed.FinalizeService"));
+                    "com.example.routed.pipeline.ObservePersistenceApprovedHandledSideEffectService",
+                    "com.example.routed.HandleRejectedService",
+                    "com.example.routed.pipeline.ObservePersistenceRejectedHandledSideEffectService",
+                    "com.example.routed.FinalizeService"));
             Object request = loader.loadClass("com.example.routed.domain.Request").getConstructor(String.class).newInstance("42");
             PipelineContext context = new PipelineContext("release-7", "live", "default");
             AtomicInteger subscriptions = new AtomicInteger();
@@ -152,6 +180,10 @@ class PipelineCompositionProductizationTest {
             assertEquals(1, loader.loadClass("com.example.routed.HandleApprovedService").getField("calls").getInt(null));
             assertEquals(0, loader.loadClass("com.example.routed.HandleRejectedService").getField("calls").getInt(null));
             assertEquals(1, loader.loadClass("com.example.routed.FinalizeService").getField("calls").getInt(null));
+            assertEquals(1, loader.loadClass("com.example.routed.PersistenceService")
+                .getField("approvedCalls").getInt(null));
+            assertEquals(0, loader.loadClass("com.example.routed.PersistenceService")
+                .getField("rejectedCalls").getInt(null));
         } finally {
             Thread.currentThread().setContextClassLoader(previous);
         }
@@ -625,7 +657,30 @@ class PipelineCompositionProductizationTest {
         sources.put("com.example.routed.HandleApprovedService", unaryService("HandleApprovedService", "Approved", "ApprovedHandled", "new ApprovedHandled(input.id())", true));
         sources.put("com.example.routed.HandleRejectedService", unaryService("HandleRejectedService", "Rejected", "RejectedHandled", "new RejectedHandled(input.id())", true));
         sources.put("com.example.routed.FinalizeService", unaryService("FinalizeService", "Completion", "FinalResult", "new FinalResult(input.id())", true));
+        sources.put("com.example.routed.PersistenceService", """
+            package com.example.routed;
+            import io.smallrye.mutiny.Uni;
+            import org.pipelineframework.service.ReactiveService;
+            public class PersistenceService<T> implements ReactiveService<T, T> {
+              public static int approvedCalls;
+              public static int rejectedCalls;
+              public Uni<T> process(T input) {
+                if (input instanceof com.example.routed.domain.ApprovedHandled) approvedCalls++;
+                if (input instanceof com.example.routed.domain.RejectedHandled) rejectedCalls++;
+                return Uni.createFrom().item(input);
+              }
+            }
+            """);
         return Map.copyOf(sources);
+    }
+
+    private void assertOrdered(String source, String... fragments) {
+        int previous = -1;
+        for (String fragment : fragments) {
+            int current = source.indexOf(fragment);
+            assertTrue(current > previous, () -> "Expected generated source fragment in order: " + fragment);
+            previous = current;
+        }
     }
 
     private String unaryService(String name, String input, String output, String expression, boolean counter) {
