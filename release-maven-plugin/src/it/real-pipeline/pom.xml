@@ -11,19 +11,21 @@
     <properties>
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.outputTimestamp>2026-09-23T00:00:00Z</project.build.outputTimestamp>
-        <tpf.version>@project.version@</tpf.version>
+        <tpf.runtime.version>@project.version@</tpf.runtime.version>
+        <tpf.contracts.version>@tpf.contracts.version@</tpf.contracts.version>
+        <tpf.compiler.version>@tpf.compiler.version@</tpf.compiler.version>
     </properties>
 
     <dependencies>
         <dependency>
             <groupId>org.pipelineframework</groupId>
             <artifactId>pipelineframework-api</artifactId>
-            <version>${tpf.version}</version>
+            <version>${tpf.contracts.version}</version>
         </dependency>
         <dependency>
             <groupId>org.pipelineframework</groupId>
             <artifactId>pipelineframework-runtime-api</artifactId>
-            <version>${tpf.version}</version>
+            <version>${tpf.contracts.version}</version>
         </dependency>
     </dependencies>
 
@@ -38,7 +40,7 @@
                         <path>
                             <groupId>org.pipelineframework</groupId>
                             <artifactId>pipelineframework-compiler</artifactId>
-                            <version>${tpf.version}</version>
+                            <version>${tpf.compiler.version}</version>
                         </path>
                     </annotationProcessorPaths>
                     <compilerArgs>
@@ -56,7 +58,7 @@
             <plugin>
                 <groupId>org.pipelineframework</groupId>
                 <artifactId>pipelineframework-release-maven-plugin</artifactId>
-                <version>${tpf.version}</version>
+                <version>${tpf.runtime.version}</version>
                 <configuration>
                     <releaseVersion>it-release-1</releaseVersion>
                     <artifactUri>maven://org.pipelineframework.it:release-descriptor-real-pipeline-it:1.0.0</artifactUri>
