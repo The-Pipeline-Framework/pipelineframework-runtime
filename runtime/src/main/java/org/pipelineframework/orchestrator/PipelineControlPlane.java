@@ -41,6 +41,14 @@ public interface PipelineControlPlane {
 
     Uni<Object> getExecutionResultPayload(String tenantId, String executionId);
 
+    /**
+     * Executes one bounded timeout and due-execution sweep using the configured sweep limit.
+     *
+     * @param nowEpochMs caller-supplied current time in epoch milliseconds
+     * @return the successful timeout and dispatch counts for this sweep
+     */
+    Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs);
+
     Uni<ExecutionRedriveResult> redriveExecution(
         String tenantId,
         String executionId,

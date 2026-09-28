@@ -10,8 +10,6 @@ import java.util.OptionalInt;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.function.IntSupplier;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -32,6 +30,7 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionException;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionOperation;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
+import org.pipelineframework.orchestrator.CoordinatorSweepResult;
 import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
 import org.pipelineframework.telemetry.PipelineReplayTelemetry;
 import org.pipelineframework.orchestrator.DeadLetterPublisher;
@@ -135,90 +134,30 @@ class QueueAsyncCoordinator {
   @Inject
   PipelineReplayTelemetry telemetry;
 
-  private final ScheduledExecutorService queueSweepExecutor = Executors.newSingleThreadScheduledExecutor(
+  private final ScheduledExecutorService awaitContinuationRetryExecutor = Executors.newSingleThreadScheduledExecutor(
       runnable -> {
-        Thread thread = new Thread(runnable, "tpf-queue-sweeper");
+        Thread thread = new Thread(runnable, "tpf-await-continuation-retry");
         thread.setDaemon(true);
         return thread;
       });
 
-  private volatile ScheduledFuture<?> queueSweepFuture;
   volatile ExecutionStateStore executionStateStore;
   volatile WorkDispatcher workDispatcher;
   volatile DeadLetterPublisher deadLetterPublisher;
   private final String queueWorkerId = "worker-" + UUID.randomUUID();
 
-  private volatile boolean queueModeInitialized;
+  private volatile boolean queueProvidersInitialized;
 
   synchronized void initializeQueueMode() {
     if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
       return;
     }
-    if (queueModeInitialized) {
-      return;
-    }
-    executionStateStore = selectExecutionStateStore(orchestratorConfig.stateProvider());
-    workDispatcher = selectWorkDispatcher(orchestratorConfig.dispatcherProvider());
-    deadLetterPublisher = selectDeadLetterPublisher(orchestratorConfig.dlqProvider());
-    executionReadModel = null;
-    submissionFlow = null;
-    redriveFlow = null;
-    sweepFlow = null;
-
-    List<String> providerReadinessErrors = new ArrayList<>();
-    if (!executionStateStore.supportsLeaseRenewal()) {
-      providerReadinessErrors.add(
-          "ExecutionStateStore(" + executionStateStore.providerName() + "): live lease renewal is not supported");
-    }
-    if (localPagingPlan().isPresent()
-        && !executionStateStore.supportsPagedProgress()) {
-      providerReadinessErrors.add(
-          "ExecutionStateStore(" + executionStateStore.providerName()
-              + "): fenced paged progress is not supported");
-    }
-    executionStateStore.startupValidationError()
-        .ifPresent(error -> providerReadinessErrors
-            .add("ExecutionStateStore(" + executionStateStore.providerName() + "): " + error));
-    workDispatcher.startupValidationError()
-        .ifPresent(error -> providerReadinessErrors
-            .add("WorkDispatcher(" + workDispatcher.providerName() + "): " + error));
-    deadLetterPublisher.startupValidationError()
-        .ifPresent(error -> providerReadinessErrors
-            .add("DeadLetterPublisher(" + deadLetterPublisher.providerName() + "): " + error));
-    if (!providerReadinessErrors.isEmpty()) {
-      String readinessMessage = "Queue async provider startup validation failed: " + String.join("; ",
-          providerReadinessErrors);
-      if (orchestratorConfig.strictStartup()) {
-        throw new IllegalStateException(readinessMessage);
-      }
-      LOG.warn(readinessMessage);
-    }
-
-    if (orchestratorConfig.strictStartup()
-        && orchestratorConfig.idempotencyPolicy() == OrchestratorIdempotencyPolicy.OPTIONAL_CLIENT_KEY) {
-      throw new IllegalStateException(
-          "pipeline.orchestrator.idempotency-policy must be explicitly configured for queue mode when strict startup is enabled.");
-    }
-    Duration interval = orchestratorConfig.sweepInterval();
-    long intervalMs = Math.max(1000L, interval == null ? 30000L : interval.toMillis());
-    queueSweepFuture = queueSweepExecutor.scheduleAtFixedRate(
-        this::sweepDueExecutions,
-        intervalMs,
-        intervalMs,
-        TimeUnit.MILLISECONDS);
-    queueModeInitialized = true;
-    LOG.infof("Queue async mode enabled: stateProvider=%s dispatcherProvider=%s dlqProvider=%s",
-        executionStateStore.providerName(),
-        workDispatcher.providerName(),
-        deadLetterPublisher.providerName());
+    initializeQueueProviders();
   }
 
   @PreDestroy
-  void shutdownQueueSweepExecutor() {
-    if (queueSweepFuture != null) {
-      queueSweepFuture.cancel(false);
-    }
-    queueSweepExecutor.shutdownNow();
+  void shutdownAwaitContinuationRetryExecutor() {
+    awaitContinuationRetryExecutor.shutdownNow();
   }
 
   Uni<RunAsyncAcceptedDto> executePipelineAsync(
@@ -325,17 +264,18 @@ class QueueAsyncCoordinator {
     if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC || workItem == null) {
       return Uni.createFrom().voidItem();
     }
+    ensureQueueModeReady();
     if (worker == null) {
       return Uni.createFrom().failure(new IllegalArgumentException("PipelineTransitionWorker must not be null"));
     }
     return segmentPipeline().process(workItem, worker, itemContinuationHandler);
   }
 
-  void sweepDueExecutions() {
-    if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC || executionStateStore == null || workDispatcher == null) {
-      return;
+  Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs) {
+    if (!ensureQueueModeReady()) {
+      return Uni.createFrom().failure(queueModeDisabledException());
     }
-    sweepFlow().sweepDueExecutions();
+    return sweepFlow().sweepOnce(nowEpochMs);
   }
 
   Uni<AwaitCompletionResult> completeAwait(AwaitCompletionCommand command) {
@@ -345,6 +285,9 @@ class QueueAsyncCoordinator {
   Uni<AwaitCompletionResult> completeAwait(
       AwaitCompletionCommand command,
       AwaitItemContinuationHandler itemContinuationHandler) {
+    if (!ensureQueueModeReady()) {
+      return Uni.createFrom().failure(queueModeDisabledException());
+    }
     return awaitBoundaryAdmission().complete(command, itemContinuationHandler);
   }
 
@@ -355,9 +298,9 @@ class QueueAsyncCoordinator {
       String stepId,
       int limit) {
     if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
-      return Uni.createFrom().failure(new IllegalStateException(
-          "Async queue mode is disabled. Set pipeline.orchestrator.mode=QUEUE_ASYNC."));
+      return Uni.createFrom().failure(queueModeDisabledException());
     }
+    ensureQueueModeReady();
     String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
     RuntimeException admissionFailure = admissionFailure(admissionRequest(
         resolvedTenant,
@@ -489,14 +432,73 @@ class QueueAsyncCoordinator {
     if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
       return false;
     }
-    if (!queueModeInitialized && missingQueueProviders()) {
-      initializeQueueMode();
-    }
+    initializeQueueProviders();
     return true;
+  }
+
+  private synchronized void initializeQueueProviders() {
+    if (queueProvidersInitialized) {
+      return;
+    }
+    if (missingQueueProviders() || configuredQueueProviderNames()) {
+      executionStateStore = selectExecutionStateStore(orchestratorConfig.stateProvider());
+      workDispatcher = selectWorkDispatcher(orchestratorConfig.dispatcherProvider());
+      deadLetterPublisher = selectDeadLetterPublisher(orchestratorConfig.dlqProvider());
+    }
+    executionReadModel = null;
+    submissionFlow = null;
+    redriveFlow = null;
+    sweepFlow = null;
+
+    List<String> providerReadinessErrors = new ArrayList<>();
+    if (!executionStateStore.supportsLeaseRenewal()) {
+      providerReadinessErrors.add(
+          "ExecutionStateStore(" + executionStateStore.providerName() + "): live lease renewal is not supported");
+    }
+    if (localPagingPlan().isPresent()
+        && !executionStateStore.supportsPagedProgress()) {
+      providerReadinessErrors.add(
+          "ExecutionStateStore(" + executionStateStore.providerName()
+              + "): fenced paged progress is not supported");
+    }
+    executionStateStore.startupValidationError()
+        .ifPresent(error -> providerReadinessErrors
+            .add("ExecutionStateStore(" + executionStateStore.providerName() + "): " + error));
+    workDispatcher.startupValidationError()
+        .ifPresent(error -> providerReadinessErrors
+            .add("WorkDispatcher(" + workDispatcher.providerName() + "): " + error));
+    deadLetterPublisher.startupValidationError()
+        .ifPresent(error -> providerReadinessErrors
+            .add("DeadLetterPublisher(" + deadLetterPublisher.providerName() + "): " + error));
+    if (!providerReadinessErrors.isEmpty()) {
+      String readinessMessage = "Queue async provider startup validation failed: " + String.join("; ",
+          providerReadinessErrors);
+      if (orchestratorConfig.strictStartup()) {
+        throw new IllegalStateException(readinessMessage);
+      }
+      LOG.warn(readinessMessage);
+    }
+
+    if (orchestratorConfig.strictStartup()
+        && orchestratorConfig.idempotencyPolicy() == OrchestratorIdempotencyPolicy.OPTIONAL_CLIENT_KEY) {
+      throw new IllegalStateException(
+          "pipeline.orchestrator.idempotency-policy must be explicitly configured for queue mode when strict startup is enabled.");
+    }
+    queueProvidersInitialized = true;
   }
 
   private boolean missingQueueProviders() {
     return executionStateStore == null || workDispatcher == null || deadLetterPublisher == null;
+  }
+
+  private boolean configuredQueueProviderNames() {
+    return hasText(orchestratorConfig.stateProvider())
+        || hasText(orchestratorConfig.dispatcherProvider())
+        || hasText(orchestratorConfig.dlqProvider());
+  }
+
+  private static boolean hasText(String value) {
+    return value != null && !value.isBlank();
   }
 
   private static IllegalStateException queueModeDisabledException() {
@@ -709,7 +711,7 @@ class QueueAsyncCoordinator {
             workDispatcher,
             awaitCoordinator,
             transitionWorkerExecutor,
-            queueSweepExecutor,
+            awaitContinuationRetryExecutor,
             this::saturatedDelay,
             this::segmentBoundaryLedger,
             this::recordAwaitLifecycle,

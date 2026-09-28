@@ -22,12 +22,9 @@ import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import org.eclipse.microprofile.config.ConfigProvider;
 import org.jboss.logging.Logger;
-import org.pipelineframework.PipelineExecutionService;
-import org.pipelineframework.awaitable.AwaitCompletionAdmissionFailures;
-import org.pipelineframework.awaitable.AwaitCompletionCommand;
-import org.pipelineframework.awaitable.AwaitTelemetry;
-import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
+import org.pipelineframework.orchestrator.SqsInboundMessage;
+import org.pipelineframework.orchestrator.SqsMessageDisposition;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.sqs.SqsClient;
@@ -56,10 +53,7 @@ public class SqsAwaitCompletionPoller {
     PipelineOrchestratorConfig orchestratorConfig;
 
     @Inject
-    PipelineExecutionService executionService;
-
-    @Inject
-    AwaitTelemetry awaitTelemetry = AwaitTelemetry.disabled();
+    SqsAwaitCompletionAction completionAction;
 
     private volatile SqsClient client;
     private volatile ExecutorService pollExecutor;
@@ -75,11 +69,11 @@ public class SqsAwaitCompletionPoller {
 
     SqsAwaitCompletionPoller(
         PipelineOrchestratorConfig orchestratorConfig,
-        PipelineExecutionService executionService,
+        SqsAwaitCompletionAction completionAction,
         SqsClient client
     ) {
         this.orchestratorConfig = orchestratorConfig;
-        this.executionService = executionService;
+        this.completionAction = completionAction;
         this.client = client;
     }
 
@@ -87,8 +81,8 @@ public class SqsAwaitCompletionPoller {
         startPolling(SqsAwaitPollerConfig.fromRuntime());
     }
 
-    void startPolling(SqsAwaitPollerConfig config) {
-        if (!config.enabled()) {
+    synchronized void startPolling(SqsAwaitPollerConfig config) {
+        if (!config.enabled() || running) {
             return;
         }
         ensureExecutors(config.maxMessages());
@@ -202,53 +196,15 @@ public class SqsAwaitCompletionPoller {
         if (message == null || message.receiptHandle() == null) {
             return Uni.createFrom().voidItem();
         }
-        if (message.body() == null) {
-            LOG.warnf("Leaving SQS await completion message with null body for queue redrive id=%s", message.messageId());
-            return Uni.createFrom().voidItem();
-        }
-        SqsAwaitCompletionEnvelope envelope;
-        try {
-            envelope = PipelineJson.mapper().readValue(message.body(), SqsAwaitCompletionEnvelope.class);
-        } catch (Exception e) {
-            LOG.warnf(e, "Leaving malformed SQS await completion message for queue redrive id=%s", message.messageId());
-            return Uni.createFrom().voidItem();
-        }
-
-        return executionService.completeAwaitInteraction(new AwaitCompletionCommand(
-                envelope.tenantId(),
-                envelope.interactionId(),
-                envelope.correlationId(),
-                envelope.resumeToken(),
-                envelope.idempotencyKey(),
-                envelope.responsePayload(),
-                envelope.actor(),
-                System.currentTimeMillis()))
-            .ifNoItem().after(config.completionTimeout()).fail()
-            .onItem().transformToUni(ignored -> deleteMessageSafely(queueUrl, message.receiptHandle(), "processed"))
-            .onFailure().recoverWithUni(failure -> handleAdmissionFailure(
-                queueUrl,
-                message.receiptHandle(),
-                envelope,
-                failure))
-            .replaceWithVoid();
-    }
-
-    private Uni<Void> handleAdmissionFailure(
-        String queueUrl,
-        String receiptHandle,
-        SqsAwaitCompletionEnvelope envelope,
-        Throwable failure
-    ) {
-        if (AwaitCompletionAdmissionFailures.isDeterministic(failure)) {
-            String reason = AwaitCompletionAdmissionFailures.reason(failure);
-            awaitTelemetry.recordDroppedCompletion("sqs", reason);
-            LOG.warnf(failure, "Dropping deterministic SQS await completion message: reason=%s", reason);
-            return deleteMessageSafely(queueUrl, receiptHandle, "deterministic-" + reason);
-        }
-        LOG.errorf(failure, "Failed admitting SQS await completion interactionId=%s correlationId=%s",
-            envelope.interactionId(),
-            envelope.correlationId());
-        return Uni.createFrom().voidItem();
+        return completionAction.handle(SqsInboundMessage.from(message), config.completionTimeout())
+            .onItem().transformToUni(disposition -> disposition == SqsMessageDisposition.ACKNOWLEDGE
+                ? deleteMessageSafely(queueUrl, message.receiptHandle(), "acknowledged")
+                : Uni.createFrom().voidItem())
+            .onFailure().invoke(failure -> LOG.errorf(
+                failure,
+                "Failed invoking SQS await-completion action id=%s",
+                message.messageId()))
+            .onFailure().recoverWithUni(failure -> Uni.createFrom().voidItem());
     }
 
     private Uni<Void> deleteMessageSafely(String queueUrl, String receiptHandle, String disposition) {
