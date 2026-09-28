@@ -6,15 +6,13 @@ import java.util.Optional;
 
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
-import org.jboss.logging.Logger;
+import org.pipelineframework.orchestrator.CoordinatorSweepResult;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 
 class QueueAsyncSweepFlow {
-
-  private static final Logger LOG = Logger.getLogger(QueueAsyncSweepFlow.class);
 
   private final PipelineOrchestratorConfig orchestratorConfig;
   private final ExecutionStateStore executionStateStore;
@@ -32,31 +30,34 @@ class QueueAsyncSweepFlow {
     this.awaitTimeoutFlow = Objects.requireNonNull(awaitTimeoutFlow, "awaitTimeoutFlow must not be null");
   }
 
-  void sweepDueExecutions() {
-    sweepOnce(System.currentTimeMillis())
-        .subscribe()
-        .with(
-            ignored -> {
-            },
-            failure -> LOG.errorf(failure, "Failed sweeping due async executions"));
-  }
-
-  Uni<Void> sweepOnce(long nowEpochMs) {
+  Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs) {
+    if (nowEpochMs < 0) {
+      return Uni.createFrom().failure(new IllegalArgumentException("nowEpochMs must not be negative"));
+    }
     int limit = orchestratorConfig.sweepLimit();
+    if (limit <= 0) {
+      return Uni.createFrom().failure(new IllegalArgumentException("sweep limit must be positive"));
+    }
     return awaitTimeoutFlow.sweepTimedOut(nowEpochMs, limit)
-        .chain(() -> executionStateStore.findDueExecutions(nowEpochMs, limit))
-        .onItem().transform(DueExecutionDispatchPlan::from)
-        .onItem().transformToUni(this::dispatchDueExecutions);
+        .chain(timedOutAwaitCount -> executionStateStore.findDueExecutions(nowEpochMs, limit)
+            .onItem().transform(DueExecutionDispatchPlan::from)
+            .onItem().transformToUni(plan -> dispatchDueExecutions(plan)
+                .onItem().transform(dispatchedExecutionCount -> new CoordinatorSweepResult(
+                    nowEpochMs,
+                    limit,
+                    timedOutAwaitCount,
+                    dispatchedExecutionCount))));
   }
 
-  private Uni<Void> dispatchDueExecutions(DueExecutionDispatchPlan plan) {
+  private Uni<Integer> dispatchDueExecutions(DueExecutionDispatchPlan plan) {
     if (plan.empty()) {
-      return Uni.createFrom().voidItem();
+      return Uni.createFrom().item(0);
     }
     return Multi.createFrom().iterable(plan.workItems())
         .onItem().transformToUniAndConcatenate(this::enqueueDueExecution)
         .collect().asList()
-        .onItem().transformToUni(this::failIfAnyDispatchFailed);
+        .onItem().transformToUni(this::failIfAnyDispatchFailed)
+        .replaceWith(plan.workItems().size());
   }
 
   private Uni<Optional<Throwable>> enqueueDueExecution(ExecutionWorkItem item) {

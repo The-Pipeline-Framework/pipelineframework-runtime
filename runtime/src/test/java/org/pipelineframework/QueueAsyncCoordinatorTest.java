@@ -20,6 +20,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionOperation;
 import org.pipelineframework.orchestrator.ControlPlaneTransitionAdmission;
+import org.pipelineframework.orchestrator.CoordinatorSweepResult;
 import org.pipelineframework.orchestrator.CreateExecutionResult;
 import org.pipelineframework.orchestrator.DeadLetterPublisher;
 import org.pipelineframework.orchestrator.ExecutionInputShape;
@@ -84,6 +85,7 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.after;
 import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -245,7 +247,7 @@ class QueueAsyncCoordinatorTest {
     }
 
     @Test
-    void getExecutionStatusInitializesQueueProvidersBeforeCachingReadModel() {
+    void directActionAndQueueInitializationOnlyInitializeProviders() {
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         coordinator.executionStateStore = null;
         coordinator.workDispatcher = null;
@@ -268,6 +270,16 @@ class QueueAsyncCoordinatorTest {
         assertEquals("exec-1", dto.executionId());
         assertSame(executionStateStore, coordinator.executionStateStore);
         assertSame(workDispatcher, coordinator.workDispatcher);
+        try {
+            coordinator.initializeQueueMode();
+            coordinator.initializeQueueMode();
+
+            verify(executionStateStores, times(1)).stream();
+            verify(workDispatchers, times(1)).stream();
+            verify(deadLetterPublishers, times(1)).stream();
+        } finally {
+            coordinator.shutdownAwaitContinuationRetryExecutor();
+        }
     }
 
     @Test
@@ -432,7 +444,7 @@ class QueueAsyncCoordinatorTest {
     }
 
     @Test
-    void sweepRedispatchesPersistedDueExecutions() {
+    void sweepOnceRedispatchesPersistedDueExecutionsAndReturnsSummary() {
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         when(orchestratorConfig.sweepLimit()).thenReturn(100);
         when(awaitCoordinator.findTimedOut(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.eq(100)))
@@ -443,10 +455,11 @@ class QueueAsyncCoordinatorTest {
                 createRecord("tenant-b", "exec-6", "key-6"))));
         when(workDispatcher.enqueueNow(any())).thenReturn(Uni.createFrom().voidItem());
 
-        coordinator.sweepDueExecutions();
+        CoordinatorSweepResult result = coordinator.sweepOnce(1000L).await().indefinitely();
 
         ArgumentCaptor<ExecutionWorkItem> itemCaptor = ArgumentCaptor.forClass(ExecutionWorkItem.class);
-        verify(workDispatcher, timeout(500).times(2)).enqueueNow(itemCaptor.capture());
+        verify(workDispatcher, times(2)).enqueueNow(itemCaptor.capture());
+        assertEquals(new CoordinatorSweepResult(1000L, 100, 0, 2), result);
     }
 
     @Test
@@ -1901,9 +1914,9 @@ class QueueAsyncCoordinatorTest {
         when(executionStateStore.findDueExecutions(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.eq(100)))
             .thenReturn(Uni.createFrom().item(java.util.List.of()));
 
-        coordinator.sweepDueExecutions();
+        coordinator.sweepOnce(System.currentTimeMillis()).await().indefinitely();
 
-        verify(executionStateStore, timeout(500)).markTerminalFailure(
+        verify(executionStateStore).markTerminalFailure(
             org.mockito.ArgumentMatchers.eq("tenant-1"),
             org.mockito.ArgumentMatchers.eq("exec-1"),
             org.mockito.ArgumentMatchers.eq(7L),

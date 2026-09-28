@@ -17,8 +17,6 @@ import jakarta.inject.Inject;
 
 import io.quarkus.runtime.StartupEvent;
 import org.jboss.logging.Logger;
-import org.pipelineframework.PipelineExecutionService;
-import org.pipelineframework.config.pipeline.PipelineJson;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.sqs.SqsClient;
@@ -36,7 +34,6 @@ public class SqsWorkPoller {
     private static final Logger LOG = Logger.getLogger(SqsWorkPoller.class);
     private static final int MAX_MESSAGES_PER_POLL = 1;
     private static final int WAIT_TIME_SECONDS = 1;
-    private static final Duration PROCESS_TIMEOUT = Duration.ofMinutes(5);
     private static final Duration INITIAL_FAILURE_BACKOFF = Duration.ofSeconds(1);
     private static final Duration MAX_FAILURE_BACKOFF = Duration.ofSeconds(30);
     private static final Duration EXECUTOR_SHUTDOWN_TIMEOUT = Duration.ofSeconds(10);
@@ -50,7 +47,7 @@ public class SqsWorkPoller {
     PipelineOrchestratorConfig orchestratorConfig;
 
     @Inject
-    PipelineExecutionService pipelineExecutionService;
+    SqsWorkItemAction workItemAction;
 
     private volatile SqsClient client;
     private volatile ExecutorService pollExecutor;
@@ -67,16 +64,16 @@ public class SqsWorkPoller {
 
     SqsWorkPoller(
         PipelineOrchestratorConfig orchestratorConfig,
-        PipelineExecutionService pipelineExecutionService,
+        SqsWorkItemAction workItemAction,
         SqsClient client
     ) {
         this.orchestratorConfig = orchestratorConfig;
-        this.pipelineExecutionService = pipelineExecutionService;
+        this.workItemAction = workItemAction;
         this.client = client;
     }
 
-    void onStartup(@Observes StartupEvent event) {
-        if (!enabled()) {
+    synchronized void onStartup(@Observes StartupEvent event) {
+        if (!enabled() || running) {
             return;
         }
         ensureExecutors();
@@ -132,7 +129,6 @@ public class SqsWorkPoller {
             messages = sqsClient().receiveMessage(request).messages();
         } catch (RuntimeException e) {
             LOG.errorf(e, "Failed receiving SQS work items from queueUrl=%s", queueUrl);
-            sleepFailureBackoff();
             return false;
         }
         for (Message message : messages) {
@@ -146,6 +142,8 @@ public class SqsWorkPoller {
             try {
                 if (pollOnce()) {
                     consecutivePollFailures.set(0);
+                } else {
+                    sleepFailureBackoff();
                 }
             } catch (Exception e) {
                 LOG.error("SQS work poll failed.", e);
@@ -158,27 +156,15 @@ public class SqsWorkPoller {
         if (message == null || message.receiptHandle() == null) {
             return;
         }
-        if (message.body() == null) {
-            LOG.warnf("Dropping SQS work message with null body id=%s", message.messageId());
-            deleteMessage(queueUrl, message.receiptHandle());
-            return;
-        }
-        ExecutionWorkItem workItem;
-        try {
-            workItem = PipelineJson.mapper().readValue(message.body(), ExecutionWorkItem.class);
-        } catch (Exception e) {
-            LOG.warnf(e, "Dropping malformed SQS work message id=%s", message.messageId());
-            deleteMessage(queueUrl, message.receiptHandle());
-            return;
-        }
-
         ScheduledFuture<?> visibilityExtension = startVisibilityExtension(queueUrl, message.receiptHandle());
         try {
-            pipelineExecutionService.processExecutionWorkItem(workItem)
-                .await().atMost(PROCESS_TIMEOUT);
-            deleteMessage(queueUrl, message.receiptHandle());
+            SqsMessageDisposition disposition = workItemAction.handle(SqsInboundMessage.from(message))
+                .await().indefinitely();
+            if (disposition == SqsMessageDisposition.ACKNOWLEDGE) {
+                deleteMessage(queueUrl, message.receiptHandle());
+            }
         } catch (RuntimeException e) {
-            LOG.errorf(e, "Failed processing SQS work item executionId=%s", workItem.executionId());
+            LOG.errorf(e, "Failed invoking SQS work-item action id=%s", message.messageId());
         } finally {
             cancelVisibilityExtension(visibilityExtension);
         }

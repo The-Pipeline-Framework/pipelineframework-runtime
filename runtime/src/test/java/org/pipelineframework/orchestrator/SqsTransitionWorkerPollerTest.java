@@ -34,6 +34,7 @@ class SqsTransitionWorkerPollerTest {
     private PipelineOrchestratorConfig config;
     private PipelineOrchestratorConfig.SqsWorkerConfig sqsWorkerConfig;
     private PipelineOrchestratorConfig.SqsConfig sqsConfig;
+    private SqsTransitionWorkerAction transitionWorkerAction;
     private SqsTransitionWorkerPoller poller;
 
     @BeforeEach
@@ -55,7 +56,12 @@ class SqsTransitionWorkerPollerTest {
         when(sqsWorkerConfig.sharedSecretRef()).thenReturn(Optional.empty());
         when(sqsConfig.region()).thenReturn(Optional.empty());
         when(sqsConfig.endpointOverride()).thenReturn(Optional.empty());
-        poller = new SqsTransitionWorkerPoller(config, executionService, client);
+        transitionWorkerAction = new SqsTransitionWorkerAction(
+            config,
+            executionService,
+            new LocalControlPlaneSecretResolver(),
+            client);
+        poller = new SqsTransitionWorkerPoller(config, transitionWorkerAction, client);
     }
 
     @Test
