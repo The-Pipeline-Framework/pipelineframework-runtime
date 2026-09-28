@@ -66,6 +66,7 @@
                 <configuration>
                     <cloneProjectsTo>${project.build.directory}/it</cloneProjectsTo>
                     <filterProperties>
+                        <project.version>${project.version}</project.version>
                         <tpf.contracts.version>${tpf.contracts.version}</tpf.contracts.version>
                         <tpf.compiler.version>${tpf.compiler.version}</tpf.compiler.version>
                     </filterProperties>

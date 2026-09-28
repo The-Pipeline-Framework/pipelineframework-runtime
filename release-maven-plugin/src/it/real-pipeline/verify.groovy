@@ -11,9 +11,10 @@ assert releaseFile.isFile()
 def release = new JsonSlurper().parse(releaseFile)
 assert release.schemaVersion == 1
 assert release.releaseVersion == 'it-release-1'
+assert release.compiledTruthArtifactId == 'release-descriptor-real-pipeline-it'
 assert release.artifacts*.artifactId == ['release-descriptor-real-pipeline-it']
 assert release.artifacts*.kind == ['jar']
-assert release.artifacts[0].uri == 'maven://org.pipelineframework.it:release-descriptor-real-pipeline-it:1.0.0'
+assert release.artifacts[0].uri == 'maven:org.pipelineframework.it:release-descriptor-real-pipeline-it:1.0.0'
 assert release.artifacts[0].stepIds == ['Echo']
 
 def sha256 = MessageDigest.getInstance('SHA-256').digest(jar.bytes).encodeHex().toString()

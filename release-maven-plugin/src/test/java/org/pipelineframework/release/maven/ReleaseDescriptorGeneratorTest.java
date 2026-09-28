@@ -34,23 +34,26 @@ class ReleaseDescriptorGeneratorTest {
 
     private ReleaseDescriptorGenerator generator;
     private PipelineContractDescriptor contract;
+    private Path metadataDirectory;
 
     @BeforeEach
     void setUp() {
         generator = new ReleaseDescriptorGenerator(PipelineJson.mapper());
         contract = contract("orders", "sha256:contract");
+        metadataDirectory = temporaryDirectory.resolve("classes/META-INF/pipeline");
+        writeMetadata(contract);
     }
 
     @Test
     void producesSchemaOneDescriptorFromExactJarBytes() throws Exception {
         Path jar = jar("orders.jar", contract, "payload");
-        var descriptor = generator.generate(contract, "2026.09.23.1", List.of(new ReleaseArtifactInput(
+        var descriptor = generator.generate(contract, "2026.09.23.1", "orders", metadataDirectory, List.of(new ReleaseArtifactInput(
             "orders",
             "jar",
             jar,
             "file:///releases/orders.jar",
             ReleaseDescriptorGenerator.defaultStepIds(contract),
-            ReleaseDescriptorGenerator.defaultCapabilities(contract))));
+            ReleaseDescriptorGenerator.defaultCapabilities(contract))), true);
 
         assertEquals(PipelineReleaseDescriptor.CURRENT_SCHEMA_VERSION, descriptor.schemaVersion());
         assertEquals(contract.pipelineId(), descriptor.pipelineId());
@@ -62,18 +65,20 @@ class ReleaseDescriptorGeneratorTest {
     }
 
     @Test
-    void preservesConfiguredArtifactOrderAndExplicitAbsence() throws Exception {
+    void preservesConfiguredArtifactOrderAndRequiresCompleteCoverage() throws Exception {
         Path worker = Files.writeString(temporaryDirectory.resolve("worker.bin"), "worker");
-        Path archive = Files.writeString(temporaryDirectory.resolve("function.zip"), "archive");
+        Path archive = jar("function.zip", contract, "archive");
 
-        var descriptor = generator.generate(contract, "release-1", List.of(
-            new ReleaseArtifactInput("worker", "native-binary", worker, "s3://releases/worker", List.of("Store"), List.of("grpc")),
-            new ReleaseArtifactInput("function", "lambda-zip", archive, "s3://releases/function.zip", List.of(), List.of())));
+        var descriptor = generator.generate(contract, "release-1", "function", metadataDirectory, List.of(
+            new ReleaseArtifactInput(
+                "worker", "native-binary", worker, "maven:example:worker:bin:1", List.of("Store"), List.of("grpc")),
+            new ReleaseArtifactInput(
+                "function", "lambda-zip", archive, "maven:example:function:zip:1", List.of("Validate"), List.of("local", "rest"))),
+            false);
 
         assertEquals(List.of("worker", "function"), descriptor.artifacts().stream().map(value -> value.artifactId()).toList());
         assertEquals(List.of("Store"), descriptor.artifacts().getFirst().stepIds());
-        assertTrue(descriptor.artifacts().get(1).stepIds().isEmpty());
-        assertTrue(descriptor.artifacts().get(1).capabilities().isEmpty());
+        assertEquals(List.of("Validate"), descriptor.artifacts().get(1).stepIds());
     }
 
     @Test
@@ -149,13 +154,20 @@ class ReleaseDescriptorGeneratorTest {
     @Test
     void rejectsUnknownStepUnsupportedKindAndDuplicateArtifactIdentity() throws Exception {
         Path artifact = Files.writeString(temporaryDirectory.resolve("artifact.bin"), "artifact");
-        assertThrows(IllegalArgumentException.class, () -> generator.generate(contract, "release-1", List.of(
-            new ReleaseArtifactInput("worker", "native-binary", artifact, "file:///worker", List.of("Missing"), List.of()))));
-        assertThrows(IllegalArgumentException.class, () -> generator.generate(contract, "release-1", List.of(
-            new ReleaseArtifactInput("image", "container-image", artifact, "oci://image", List.of(), List.of()))));
-        assertThrows(IllegalArgumentException.class, () -> generator.generate(contract, "release-1", List.of(
-            new ReleaseArtifactInput("worker", "local-file", artifact, "file:///one", List.of(), List.of()),
-            new ReleaseArtifactInput("worker", "local-file", artifact, "file:///two", List.of(), List.of()))));
+        Path jar = jar("artifact.jar", contract, "artifact");
+        assertThrows(IllegalArgumentException.class, () -> generator.generate(
+            contract, "release-1", "worker", metadataDirectory, List.of(
+                new ReleaseArtifactInput(
+                    "worker", "jar", jar, jar.toUri().toASCIIString(), List.of("Missing"), List.of("local", "rest", "grpc"))), true));
+        assertThrows(IllegalArgumentException.class, () -> generator.generate(
+            contract, "release-1", "image", metadataDirectory, List.of(
+                new ReleaseArtifactInput(
+                    "image", "container-image", artifact, "oci://registry/image@sha256:" + "a".repeat(64),
+                    List.of("Validate", "Store"), List.of("local", "rest", "grpc"))), false));
+        assertThrows(IllegalArgumentException.class, () -> generator.generate(
+            contract, "release-1", "worker", metadataDirectory, List.of(
+                new ReleaseArtifactInput("worker", "local-file", artifact, artifact.toUri().toASCIIString(), List.of(), List.of()),
+                new ReleaseArtifactInput("worker", "local-file", artifact, artifact.toUri().toASCIIString(), List.of(), List.of())), true));
     }
 
     @Test
@@ -163,21 +175,23 @@ class ReleaseDescriptorGeneratorTest {
         Path artifact = Files.writeString(temporaryDirectory.resolve("artifact.bin"), "artifact");
         ReleaseArtifactInput input = new ReleaseArtifactInput(
             "worker",
-            "local-file",
-            artifact,
-            "file:///worker",
+            "jar",
+            jar("null.jar", contract, "payload"),
+            temporaryDirectory.resolve("null.jar").toUri().toASCIIString(),
             Collections.singletonList(null),
             null);
 
         assertTrue(input.capabilities().isEmpty());
-        assertThrows(IllegalArgumentException.class, () -> generator.generate(contract, "release-1", List.of(input)));
+        assertThrows(IllegalArgumentException.class, () -> generator.generate(
+            contract, "release-1", "worker", metadataDirectory, List.of(input), true));
     }
 
     @Test
     void rejectsBlankContractIdentityBeforeArtifactProcessing() {
         PipelineContractDescriptor invalid = contract(" ", "sha256:contract");
 
-        assertThrows(IllegalArgumentException.class, () -> generator.generate(invalid, "release-1", List.of()));
+        assertThrows(IllegalArgumentException.class, () -> generator.generate(
+            invalid, "release-1", "orders", metadataDirectory, List.of(), true));
     }
 
     @Test
@@ -201,6 +215,19 @@ class ReleaseDescriptorGeneratorTest {
         assertThrows(IllegalArgumentException.class, () -> descriptor(sameIdentity, "release-1"));
     }
 
+    @Test
+    void rejectsCarrierMissingAnyCompilerProducedMetadata() throws Exception {
+        Path incomplete = temporaryDirectory.resolve("incomplete.jar");
+        try (JarOutputStream output = new JarOutputStream(Files.newOutputStream(incomplete))) {
+            JarEntry contractEntry = new JarEntry(PipelineContractDescriptor.RESOURCE_PATH);
+            output.putNextEntry(contractEntry);
+            output.write(PipelineJson.mapper().writeValueAsBytes(contract));
+            output.closeEntry();
+        }
+
+        assertThrows(IllegalArgumentException.class, () -> descriptor(incomplete, "release-1"));
+    }
+
     private static Optional<RuntimeException> writeAfter(
         CountDownLatch start,
         ReleaseDescriptorGenerator writer,
@@ -217,13 +244,13 @@ class ReleaseDescriptorGeneratorTest {
     }
 
     private PipelineReleaseDescriptor descriptor(Path jar, String releaseVersion) {
-        return generator.generate(contract, releaseVersion, List.of(new ReleaseArtifactInput(
+        return generator.generate(contract, releaseVersion, "orders", metadataDirectory, List.of(new ReleaseArtifactInput(
             "orders",
             "jar",
             jar,
             jar.toUri().toASCIIString(),
             ReleaseDescriptorGenerator.defaultStepIds(contract),
-            ReleaseDescriptorGenerator.defaultCapabilities(contract))));
+            ReleaseDescriptorGenerator.defaultCapabilities(contract))), true);
     }
 
     private Path jar(String name, PipelineContractDescriptor embeddedContract, String content) throws IOException {
@@ -234,6 +261,13 @@ class ReleaseDescriptorGeneratorTest {
             output.putNextEntry(contractEntry);
             output.write(PipelineJson.mapper().writeValueAsBytes(embeddedContract));
             output.closeEntry();
+            for (String metadata : List.of("order.json", "telemetry.json")) {
+                JarEntry metadataEntry = new JarEntry("META-INF/pipeline/" + metadata);
+                metadataEntry.setTime(0L);
+                output.putNextEntry(metadataEntry);
+                output.write(Files.readAllBytes(metadataDirectory.resolve(metadata)));
+                output.closeEntry();
+            }
             JarEntry contentEntry = new JarEntry("content.txt");
             contentEntry.setTime(0L);
             output.putNextEntry(contentEntry);
@@ -241,6 +275,18 @@ class ReleaseDescriptorGeneratorTest {
             output.closeEntry();
         }
         return jar;
+    }
+
+    private void writeMetadata(PipelineContractDescriptor sourceContract) {
+        try {
+            Files.createDirectories(metadataDirectory);
+            Files.write(metadataDirectory.resolve("pipeline-contract.json"),
+                PipelineJson.mapper().writeValueAsBytes(sourceContract));
+            Files.writeString(metadataDirectory.resolve("order.json"), "[\"Validate\",\"Store\"]\n");
+            Files.writeString(metadataDirectory.resolve("telemetry.json"), "{\"pipeline\":\"orders\"}\n");
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     private static PipelineContractDescriptor contract(String pipelineId, String contractVersion) {

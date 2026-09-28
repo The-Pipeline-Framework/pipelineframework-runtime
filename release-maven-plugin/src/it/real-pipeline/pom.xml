@@ -61,7 +61,7 @@
                 <version>${tpf.runtime.version}</version>
                 <configuration>
                     <releaseVersion>it-release-1</releaseVersion>
-                    <artifactUri>maven://org.pipelineframework.it:release-descriptor-real-pipeline-it:1.0.0</artifactUri>
+                    <artifactUri>maven:org.pipelineframework.it:release-descriptor-real-pipeline-it:1.0.0</artifactUri>
                 </configuration>
                 <executions>
                     <execution>

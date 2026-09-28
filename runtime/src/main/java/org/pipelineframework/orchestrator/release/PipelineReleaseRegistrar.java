@@ -29,13 +29,15 @@ import org.pipelineframework.orchestrator.PipelineReleaseRuntimeBeans;
 public class PipelineReleaseRegistrar {
 
     private static final Set<String> SUPPORTED_KINDS = Set.of(
-        "local-file",
         "jar",
+        "application-archive",
         "native-binary",
+        "compiled-truth",
         "container-image",
         "lambda-zip",
-        "lambda-image",
-        "external-endpoint");
+        "lambda-image");
+
+    private final PipelineReleaseDescriptorValidator releaseValidator = new PipelineReleaseDescriptorValidator();
 
     @Inject
     PipelineReleaseDescriptorLoader descriptorLoader;
@@ -64,6 +66,10 @@ public class PipelineReleaseRegistrar {
         PipelineReleaseDescriptor descriptor = loader().load(descriptorPath);
         validateDescriptorIdentity(pipelineId, descriptor);
         ValidatedArtifact primary = validateArtifacts(descriptor);
+        PipelineContractDescriptor contract = primary.contract()
+            .orElseThrow(() -> new IllegalArgumentException(
+                "Compiled Truth artifact is missing " + PipelineContractDescriptor.RESOURCE_PATH));
+        releaseValidator.validate(descriptor, contract);
         return new PipelineReleaseRecord(
             tenantId.trim(),
             pipelineId.trim(),
@@ -76,7 +82,7 @@ public class PipelineReleaseRegistrar {
             primary.artifactUri(),
             primary.artifactSizeBytes(),
             primary.artifactChecksum(),
-            primary.contract().orElse(null),
+            contract,
             nowEpochMs,
             nowEpochMs,
             0L);
@@ -101,13 +107,9 @@ public class PipelineReleaseRegistrar {
     }
 
     private void validateDescriptorIdentity(String expectedPipelineId, PipelineReleaseDescriptor descriptor) {
+        releaseValidator.validate(descriptor);
         if (!expectedPipelineId.trim().equals(descriptor.pipelineId().trim())) {
             throw new IllegalArgumentException("Release descriptor pipelineId does not match request path");
-        }
-        validateRequired("contractVersion", descriptor.contractVersion());
-        validateRequired("releaseVersion", descriptor.releaseVersion());
-        if (descriptor.artifacts().isEmpty()) {
-            throw new IllegalArgumentException("Release descriptor must contain at least one artifact");
         }
     }
 
@@ -117,11 +119,12 @@ public class PipelineReleaseRegistrar {
             validateArtifactDescriptor(artifact);
             ValidatedArtifact validated = switch (artifact.kind().toLowerCase(Locale.ROOT)) {
                 case "jar" -> validateJarArtifact(descriptor, artifact);
-                case "local-file", "native-binary", "lambda-zip" -> validateLocalFileArtifact(descriptor, artifact);
-                case "container-image", "lambda-image", "external-endpoint" -> ValidatedArtifact.remote(artifact);
+                case "application-archive", "native-binary", "lambda-zip", "compiled-truth" ->
+                    validateLocalFileArtifact(descriptor, artifact);
+                case "container-image", "lambda-image" -> ValidatedArtifact.remote(artifact);
                 default -> throw new IllegalArgumentException("Unsupported release artifact kind " + artifact.kind());
             };
-            if (primary == null || validated.contract().isPresent()) {
+            if (artifact.artifactId().equals(descriptor.compiledTruthArtifactId())) {
                 primary = validated;
             }
         }

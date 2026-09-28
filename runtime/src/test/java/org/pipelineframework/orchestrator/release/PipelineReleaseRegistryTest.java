@@ -398,7 +398,7 @@ class PipelineReleaseRegistryTest {
     private Path releaseDescriptor(Path jar, PipelineContractDescriptor contract, String digest) throws Exception {
         Path descriptorPath = tempDir.resolve("pipeline-release.json");
         PipelineJson.mapper().writerWithDefaultPrettyPrinter()
-            .writeValue(descriptorPath.toFile(), descriptor(jar.toString(), digest, contract));
+            .writeValue(descriptorPath.toFile(), descriptor(jar.toUri().toString(), digest, contract));
         return descriptorPath;
     }
 
@@ -408,13 +408,14 @@ class PipelineReleaseRegistryTest {
             contract.pipelineId(),
             contract.contractVersion(),
             contract.contractVersion(),
+            "restaurant",
             List.of(new PipelineReleaseArtifactDescriptor(
                 "restaurant",
                 "jar",
                 uri,
                 digest,
                 List.of("Validate"),
-                List.of("rest"))));
+                List.of("local", "rest", "grpc", "sqs"))));
     }
 
     private Path jar(PipelineContractDescriptor contract) throws Exception {
