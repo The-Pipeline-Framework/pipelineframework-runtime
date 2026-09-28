@@ -27,6 +27,7 @@ final class ReleaseArtifactMaterializer {
     ) {
         Path outputDirectory = buildDirectory.resolve("pipeline-release-artifacts");
         List<ReleaseArtifactInput> materialized = new ArrayList<>();
+        Map<Path, String> archiveOwners = new LinkedHashMap<>();
         for (ReleaseArtifactInput input : inputs) {
             Path source = input.file();
             if (source == null || !Files.isDirectory(source)) {
@@ -40,6 +41,12 @@ final class ReleaseArtifactMaterializer {
                     "Directory release artifacts require kind application-archive or compiled-truth: " + input.artifactId());
             }
             Path archive = outputDirectory.resolve(safeFileName(input.artifactId()) + ".zip");
+            String previousArtifactId = archiveOwners.putIfAbsent(archive, input.artifactId());
+            if (previousArtifactId != null && !previousArtifactId.equals(input.artifactId())) {
+                throw new IllegalArgumentException(
+                    "Release artifact IDs " + previousArtifactId + " and " + input.artifactId()
+                        + " map to the same archive: " + archive);
+            }
             boolean carrier = input.artifactId().equals(compiledTruthArtifactId);
             createArchive(source, kind, carrier, metadataDirectory, archive);
             String uri = PipelineReleaseArtifactUri.parse(input.uri()).scheme() == PipelineReleaseArtifactUri.Scheme.FILE
