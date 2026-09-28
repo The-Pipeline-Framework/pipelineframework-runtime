@@ -137,6 +137,7 @@ class S3PipelineReleaseArtifactStoreTest {
             contract.pipelineId(),
             contract.contractVersion(),
             "release-1",
+            artifact.artifactId(),
             List.of(artifact));
         return new PipelineReleaseRecord(
             "tenant-1",

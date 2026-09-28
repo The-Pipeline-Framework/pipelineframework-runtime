@@ -13,21 +13,31 @@ import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.jar.JarFile;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.pipelineframework.orchestrator.PipelineBundleStepDescriptor;
 import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
 import org.pipelineframework.orchestrator.release.PipelineReleaseArtifactDescriptor;
+import org.pipelineframework.orchestrator.release.PipelineReleaseArtifactKind;
 import org.pipelineframework.orchestrator.release.PipelineReleaseDescriptor;
+import org.pipelineframework.orchestrator.release.PipelineReleaseDescriptorValidator;
 
 final class ReleaseDescriptorGenerator {
     private static final long LOCK_RETRY_MILLIS = 10L;
-    private static final Set<String> SUPPORTED_KINDS = Set.of("jar", "local-file", "native-binary", "lambda-zip");
+    private static final Set<PipelineReleaseArtifactKind> SUPPORTED_KINDS = EnumSet.of(
+        PipelineReleaseArtifactKind.JAR,
+        PipelineReleaseArtifactKind.APPLICATION_ARCHIVE,
+        PipelineReleaseArtifactKind.NATIVE_BINARY,
+        PipelineReleaseArtifactKind.LAMBDA_ZIP,
+        PipelineReleaseArtifactKind.COMPILED_TRUTH);
 
     private final ObjectMapper mapper;
 
@@ -47,7 +57,10 @@ final class ReleaseDescriptorGenerator {
     PipelineReleaseDescriptor generate(
         PipelineContractDescriptor contract,
         String releaseVersion,
-        List<ReleaseArtifactInput> artifacts
+        String compiledTruthArtifactId,
+        Path metadataDirectory,
+        List<ReleaseArtifactInput> artifacts,
+        boolean allowLocalUris
     ) {
         if (contract == null) {
             throw new IllegalArgumentException("Pipeline Contract is required");
@@ -58,6 +71,7 @@ final class ReleaseDescriptorGenerator {
             throw new IllegalArgumentException("Pipeline Contract steps are required");
         }
         String version = requireText(releaseVersion, "releaseVersion");
+        String carrierId = requireText(compiledTruthArtifactId, "compiledTruthArtifactId");
         if (artifacts == null || artifacts.isEmpty()) {
             throw new IllegalArgumentException("At least one release artifact is required");
         }
@@ -74,32 +88,46 @@ final class ReleaseDescriptorGenerator {
             if (!artifactIds.add(artifactId)) {
                 throw new IllegalArgumentException("Duplicate release artifactId " + artifactId);
             }
-            String kind = requireText(artifact.kind(), "kind").toLowerCase(Locale.ROOT);
+            String kindValue = requireText(artifact.kind(), "kind").toLowerCase(Locale.ROOT);
+            PipelineReleaseArtifactKind kind = PipelineReleaseArtifactKind.fromWireValue(kindValue);
             if (!SUPPORTED_KINDS.contains(kind)) {
                 throw new IllegalArgumentException(
-                    "Unsupported build-produced release artifact kind " + kind + "; supported kinds are " + SUPPORTED_KINDS);
+                    "Unsupported build-produced release artifact kind " + kindValue + "; supported kinds are " + SUPPORTED_KINDS);
             }
             requireReadableFile(artifact.file(), "Release artifact " + artifactId);
             String uri = requireText(artifact.uri(), "uri");
-            if (kind.equals("jar")) {
+            if (kind == PipelineReleaseArtifactKind.JAR) {
                 validateEmbeddedContract(artifact.file(), contract);
             }
             List<String> stepIds = validatedStepIds(artifact.stepIds(), knownStepIds, artifactId);
             List<String> capabilities = validatedValues(artifact.capabilities(), "capability", artifactId);
             descriptors.add(new PipelineReleaseArtifactDescriptor(
                 artifactId,
-                kind,
+                kindValue,
                 uri,
                 "sha256:" + sha256(artifact.file()),
                 stepIds,
                 capabilities));
         }
-        return new PipelineReleaseDescriptor(
+        PipelineReleaseDescriptor descriptor = new PipelineReleaseDescriptor(
             PipelineReleaseDescriptor.CURRENT_SCHEMA_VERSION,
             pipelineId,
             contractVersion,
             version,
+            carrierId,
             descriptors);
+        PipelineReleaseDescriptorValidator validator = new PipelineReleaseDescriptorValidator();
+        validator.validate(descriptor, contract);
+        if (!allowLocalUris) {
+            validator.validatePromotable(descriptor);
+        }
+        ReleaseArtifactInput carrier = artifacts.stream()
+            .filter(artifact -> carrierId.equals(artifact.artifactId()))
+            .findFirst()
+            .orElseThrow(() -> new IllegalArgumentException(
+                "compiledTruthArtifactId does not reference a configured artifact: " + carrierId));
+        validateCompiledTruthCarrier(carrier.file(), metadataDirectory);
+        return descriptor;
     }
 
     byte[] serialize(PipelineReleaseDescriptor descriptor) {
@@ -199,6 +227,55 @@ final class ReleaseDescriptorGenerator {
         } catch (IOException e) {
             throw new IllegalArgumentException("Failed to inspect release JAR artifact " + artifact + ": " + e.getMessage(), e);
         }
+    }
+
+    private static void validateCompiledTruthCarrier(Path artifact, Path metadataDirectory) {
+        if (metadataDirectory == null || !Files.isDirectory(metadataDirectory)) {
+            throw new IllegalArgumentException("Compiled Truth directory must point to META-INF/pipeline: " + metadataDirectory);
+        }
+        Map<String, byte[]> expected = new TreeMap<>();
+        try (var paths = Files.walk(metadataDirectory)) {
+            for (Path path : paths.sorted().toList()) {
+                if (Files.isSymbolicLink(path)) {
+                    throw new IllegalArgumentException("Compiled Truth directory must not contain symbolic links: " + path);
+                }
+                if (Files.isRegularFile(path)) {
+                    String entryName = "META-INF/pipeline/"
+                        + metadataDirectory.relativize(path).toString().replace(path.getFileSystem().getSeparator(), "/");
+                    expected.put(entryName, Files.readAllBytes(path));
+                }
+            }
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Failed to inspect compiler-produced Compiled Truth", e);
+        }
+        if (expected.isEmpty() || !expected.containsKey(PipelineContractDescriptor.RESOURCE_PATH)) {
+            throw new IllegalArgumentException(
+                "Compiled Truth directory is missing " + PipelineContractDescriptor.RESOURCE_PATH);
+        }
+
+        Map<String, byte[]> actual = new TreeMap<>();
+        try (JarFile archive = new JarFile(artifact.toFile())) {
+            var entries = archive.entries();
+            while (entries.hasMoreElements()) {
+                var entry = entries.nextElement();
+                if (!entry.isDirectory() && entry.getName().startsWith("META-INF/pipeline/")) {
+                    if (actual.put(entry.getName(), archive.getInputStream(entry).readAllBytes()) != null) {
+                        throw new IllegalArgumentException("Duplicate Compiled Truth archive entry " + entry.getName());
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Failed to inspect Compiled Truth carrier " + artifact, e);
+        }
+        if (!actual.keySet().equals(expected.keySet())) {
+            throw new IllegalArgumentException(
+                "Compiled Truth carrier does not contain the complete META-INF/pipeline resource set");
+        }
+        expected.forEach((name, content) -> {
+            if (!MessageDigest.isEqual(content, actual.get(name))) {
+                throw new IllegalArgumentException("Compiled Truth carrier resource differs from compiler output: " + name);
+            }
+        });
     }
 
     private void validateExistingDescriptor(Path outputFile, PipelineReleaseDescriptor descriptor, byte[] content) {

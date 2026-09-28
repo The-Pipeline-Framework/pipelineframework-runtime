@@ -546,6 +546,7 @@ class HostedPipelineControlPlaneResourceTest {
             "org.example.restaurant",
             "sha256:bundle",
             "sha256:bundle",
+            "restaurant",
             List.of(new PipelineReleaseArtifactDescriptor(
                 "restaurant",
                 "jar",

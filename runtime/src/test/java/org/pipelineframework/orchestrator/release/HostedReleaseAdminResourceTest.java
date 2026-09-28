@@ -123,13 +123,14 @@ class HostedReleaseAdminResourceTest {
             "pipelineId", PIPELINE_ID,
             "contractVersion", "sha256:contract",
             "releaseVersion", "sha256:contract",
+            "compiledTruthArtifactId", "restaurant",
             "artifacts", List.of(Map.of(
                 "artifactId", "restaurant",
                 "kind", "jar",
-                "uri", jar.toString(),
+                "uri", jar.toUri().toString(),
                 "digest", "sha256:" + sha256(jar),
                 "stepIds", List.of("Validate"),
-                "capabilities", List.of("rest")))));
+                "capabilities", List.of("local", "rest", "grpc", "sqs")))));
         return descriptor;
     }
 

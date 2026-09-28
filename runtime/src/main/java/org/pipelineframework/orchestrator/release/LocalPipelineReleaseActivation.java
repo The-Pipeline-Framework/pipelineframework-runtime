@@ -70,6 +70,7 @@ public class LocalPipelineReleaseActivation {
             pipelineId,
             contractVersion,
             releaseVersion,
+            pipelineId,
             java.util.List.of());
         PipelineReleaseRecord record = new PipelineReleaseRecord(
             tenantId,
