@@ -75,12 +75,16 @@ class QueueAsyncSweepLoopHost {
   }
 
   void sweepOnce() {
-    controlPlane.sweepOnce(currentTimeMillis.getAsLong())
-        .subscribe()
-        .with(
-            ignored -> {
-            },
-            failure -> LOG.errorf(failure, "Failed sweeping due async executions"));
+    try {
+      controlPlane.sweepOnce(currentTimeMillis.getAsLong())
+          .subscribe()
+          .with(
+              ignored -> {
+              },
+              failure -> LOG.errorf(failure, "Failed sweeping due async executions"));
+    } catch (RuntimeException failure) {
+      LOG.errorf(failure, "Failed sweeping due async executions");
+    }
   }
 
   @PreDestroy

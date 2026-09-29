@@ -53,6 +53,20 @@ public class SqsTransitionWorkerPoller {
                 "pipeline.orchestrator.worker.sqs.request-queue-url is required when "
                     + "pipeline.orchestrator.worker.sqs.server-enabled=true");
         }
+        if (orchestratorConfig.workerSqs().responseQueueUrl().filter(value -> !value.isBlank()).isEmpty()) {
+            throw new IllegalStateException(
+                "pipeline.orchestrator.worker.sqs.response-queue-url is required when "
+                    + "pipeline.orchestrator.worker.sqs.server-enabled=true");
+        }
+        WorkerSecretSupport.validationError(
+            orchestratorConfig.workerSqs().sharedSecret(),
+            orchestratorConfig.workerSqs().sharedSecretRef(),
+            "pipeline.orchestrator.worker.sqs.shared-secret",
+            "pipeline.orchestrator.worker.sqs.shared-secret-ref",
+            "pipeline.orchestrator.worker.sqs.server-enabled=true")
+            .ifPresent(message -> {
+                throw new IllegalStateException(message);
+            });
         if (visibilityTimeoutSeconds() < requestTimeoutSeconds()) {
             throw new IllegalStateException("pipeline.orchestrator.worker.sqs.visibility-timeout must be "
                 + "greater than or equal to pipeline.orchestrator.worker.sqs.request-timeout");
