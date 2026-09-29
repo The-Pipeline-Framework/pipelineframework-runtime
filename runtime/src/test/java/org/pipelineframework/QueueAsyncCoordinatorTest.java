@@ -278,6 +278,33 @@ class QueueAsyncCoordinatorTest {
     }
 
     @Test
+    void processExecutionWorkItemEmitsProviderReadinessFailureFromUni() {
+        configureProviderReadinessFailure();
+
+        Uni<Void> processing = assertDoesNotThrow(() -> coordinator.processExecutionWorkItem(
+            new ExecutionWorkItem("tenant-1", "execution-1"),
+            command -> Uni.createFrom().failure(new AssertionError("worker must not be invoked"))));
+        IllegalStateException error = assertThrows(
+            IllegalStateException.class,
+            () -> processing.await().indefinitely());
+
+        assertTrue(error.getMessage().contains("Queue async provider startup validation failed"));
+    }
+
+    @Test
+    void queryPendingAwaitInteractionsEmitsProviderReadinessFailureFromUni() {
+        configureProviderReadinessFailure();
+
+        Uni<List<AwaitInteractionRecord>> query = assertDoesNotThrow(
+            () -> coordinator.queryPendingAwaitInteractions("tenant-1", null, null, null, 10));
+        IllegalStateException error = assertThrows(
+            IllegalStateException.class,
+            () -> query.await().indefinitely());
+
+        assertTrue(error.getMessage().contains("Queue async provider startup validation failed"));
+    }
+
+    @Test
     void directActionAndQueueInitializationOnlyInitializeProviders() {
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         coordinator.executionStateStore = null;

@@ -261,14 +261,16 @@ class QueueAsyncCoordinator {
       ExecutionWorkItem workItem,
       PipelineTransitionWorker worker,
       AwaitItemContinuationHandler itemContinuationHandler) {
-    if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC || workItem == null) {
-      return Uni.createFrom().voidItem();
-    }
-    ensureQueueModeReady();
-    if (worker == null) {
-      return Uni.createFrom().failure(new IllegalArgumentException("PipelineTransitionWorker must not be null"));
-    }
-    return segmentPipeline().process(workItem, worker, itemContinuationHandler);
+    return Uni.createFrom().deferred(() -> {
+      if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC || workItem == null) {
+        return Uni.createFrom().voidItem();
+      }
+      ensureQueueModeReady();
+      if (worker == null) {
+        return Uni.createFrom().failure(new IllegalArgumentException("PipelineTransitionWorker must not be null"));
+      }
+      return segmentPipeline().process(workItem, worker, itemContinuationHandler);
+    });
   }
 
   Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs) {
@@ -301,21 +303,22 @@ class QueueAsyncCoordinator {
       String group,
       String stepId,
       int limit) {
-    if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
-      return Uni.createFrom().failure(queueModeDisabledException());
-    }
-    ensureQueueModeReady();
-    String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
-    RuntimeException admissionFailure = admissionFailure(admissionRequest(
-        resolvedTenant,
-        ControlPlaneAdmissionOperation.QUERY_PENDING_AWAIT,
-        null,
-        "api",
-        explicitTenant(tenantId)));
-    if (admissionFailure != null) {
-      return Uni.createFrom().failure(admissionFailure);
-    }
-    return awaitCoordinator.queryPending(resolvedTenant, assignee, group, stepId, limit <= 0 ? 100 : limit);
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) {
+        return Uni.createFrom().failure(queueModeDisabledException());
+      }
+      String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
+      RuntimeException admissionFailure = admissionFailure(admissionRequest(
+          resolvedTenant,
+          ControlPlaneAdmissionOperation.QUERY_PENDING_AWAIT,
+          null,
+          "api",
+          explicitTenant(tenantId)));
+      if (admissionFailure != null) {
+        return Uni.createFrom().failure(admissionFailure);
+      }
+      return awaitCoordinator.queryPending(resolvedTenant, assignee, group, stepId, limit <= 0 ? 100 : limit);
+    });
   }
 
   private Duration saturatedDelay() {
