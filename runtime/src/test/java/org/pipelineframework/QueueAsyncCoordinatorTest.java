@@ -72,6 +72,7 @@ import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
 import org.pipelineframework.telemetry.PipelineTelemetry;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -244,6 +245,36 @@ class QueueAsyncCoordinatorTest {
         IllegalStateException error = assertThrows(IllegalStateException.class, coordinator::initializeQueueMode);
 
         assertTrue(error.getMessage().contains("live lease renewal is not supported"));
+    }
+
+    @Test
+    void sweepOnceEmitsProviderReadinessFailureFromUni() {
+        configureProviderReadinessFailure();
+
+        Uni<CoordinatorSweepResult> sweep = assertDoesNotThrow(() -> coordinator.sweepOnce(123L));
+        IllegalStateException error = assertThrows(IllegalStateException.class, () -> sweep.await().indefinitely());
+
+        assertTrue(error.getMessage().contains("Queue async provider startup validation failed"));
+    }
+
+    @Test
+    void completeAwaitEmitsProviderReadinessFailureFromUni() {
+        configureProviderReadinessFailure();
+        AwaitCompletionCommand command = new AwaitCompletionCommand(
+            "tenant-1",
+            "interaction-1",
+            null,
+            null,
+            java.util.Map.of("value", "approved"),
+            "user-1",
+            System.currentTimeMillis());
+
+        Uni<AwaitCompletionResult> completion = assertDoesNotThrow(() -> coordinator.completeAwait(command));
+        IllegalStateException error = assertThrows(
+            IllegalStateException.class,
+            () -> completion.await().indefinitely());
+
+        assertTrue(error.getMessage().contains("Queue async provider startup validation failed"));
     }
 
     @Test
@@ -1960,6 +1991,12 @@ class QueueAsyncCoordinatorTest {
         when(orchestratorConfig.executionTtlDays()).thenReturn(7);
         when(orchestratorConfig.idempotencyPolicy()).thenReturn(OrchestratorIdempotencyPolicy.OPTIONAL_CLIENT_KEY);
         when(executionResultShapeResolver.resolve()).thenReturn(ExecutionResultShape.SINGLE);
+    }
+
+    private void configureProviderReadinessFailure() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        when(orchestratorConfig.strictStartup()).thenReturn(true);
+        when(executionStateStore.startupValidationError()).thenReturn(Optional.of("store unavailable"));
     }
 
     private ExecutionRecord<Object, Object> createRecord(String tenantId, String executionId, String executionKey) {

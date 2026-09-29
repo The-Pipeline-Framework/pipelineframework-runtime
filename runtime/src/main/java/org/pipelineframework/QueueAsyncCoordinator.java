@@ -272,10 +272,12 @@ class QueueAsyncCoordinator {
   }
 
   Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs) {
-    if (!ensureQueueModeReady()) {
-      return Uni.createFrom().failure(queueModeDisabledException());
-    }
-    return sweepFlow().sweepOnce(nowEpochMs);
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) {
+        return Uni.createFrom().failure(queueModeDisabledException());
+      }
+      return sweepFlow().sweepOnce(nowEpochMs);
+    });
   }
 
   Uni<AwaitCompletionResult> completeAwait(AwaitCompletionCommand command) {
@@ -285,10 +287,12 @@ class QueueAsyncCoordinator {
   Uni<AwaitCompletionResult> completeAwait(
       AwaitCompletionCommand command,
       AwaitItemContinuationHandler itemContinuationHandler) {
-    if (!ensureQueueModeReady()) {
-      return Uni.createFrom().failure(queueModeDisabledException());
-    }
-    return awaitBoundaryAdmission().complete(command, itemContinuationHandler);
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) {
+        return Uni.createFrom().failure(queueModeDisabledException());
+      }
+      return awaitBoundaryAdmission().complete(command, itemContinuationHandler);
+    });
   }
 
   Uni<List<AwaitInteractionRecord>> queryPendingAwaitInteractions(
