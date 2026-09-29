@@ -432,7 +432,9 @@ class QueueAsyncCoordinator {
     if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
       return false;
     }
-    initializeQueueProviders();
+    if (!queueProvidersInitialized) {
+      initializeQueueProviders();
+    }
     return true;
   }
 

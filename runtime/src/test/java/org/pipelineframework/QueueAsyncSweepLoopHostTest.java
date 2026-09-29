@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 
 import io.smallrye.mutiny.Uni;
 import org.junit.jupiter.api.Test;
@@ -78,15 +79,42 @@ class QueueAsyncSweepLoopHostTest {
     verify(controlPlane, times(2)).sweepOnce(456L);
   }
 
+  @Test
+  void synchronousClockAndSweepFailuresDoNotPreventLaterTicks() {
+    ScheduledExecutorService executor = mock(ScheduledExecutorService.class);
+    PipelineControlPlane controlPlane = mock(PipelineControlPlane.class);
+    LongSupplier clock = mock(LongSupplier.class);
+    when(controlPlane.sweepOnce(789L))
+        .thenThrow(new IllegalStateException("sweep setup failed"))
+        .thenReturn(Uni.createFrom().item(new CoordinatorSweepResult(789L, 100, 0, 0)));
+    when(clock.getAsLong()).thenThrow(new IllegalStateException("clock unavailable"))
+        .thenReturn(789L, 789L);
+    QueueAsyncSweepLoopHost host = host(executor, controlPlane, OrchestratorMode.QUEUE_ASYNC, clock);
+
+    assertDoesNotThrow(host::sweepOnce);
+    assertDoesNotThrow(host::sweepOnce);
+    assertDoesNotThrow(host::sweepOnce);
+
+    verify(controlPlane, times(2)).sweepOnce(789L);
+  }
+
   private static QueueAsyncSweepLoopHost host(
       ScheduledExecutorService executor,
       PipelineControlPlane controlPlane,
       OrchestratorMode mode,
       long nowEpochMs) {
+    return host(executor, controlPlane, mode, () -> nowEpochMs);
+  }
+
+  private static QueueAsyncSweepLoopHost host(
+      ScheduledExecutorService executor,
+      PipelineControlPlane controlPlane,
+      OrchestratorMode mode,
+      LongSupplier currentTimeMillis) {
     PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
     when(config.mode()).thenReturn(mode);
     when(config.sweepInterval()).thenReturn(Duration.ofSeconds(2));
-    QueueAsyncSweepLoopHost host = new QueueAsyncSweepLoopHost(executor, () -> nowEpochMs);
+    QueueAsyncSweepLoopHost host = new QueueAsyncSweepLoopHost(executor, currentTimeMillis);
     host.orchestratorConfig = config;
     host.controlPlane = controlPlane;
     return host;

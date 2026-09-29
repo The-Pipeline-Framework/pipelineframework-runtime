@@ -5,7 +5,6 @@ import java.time.Instant;
 import java.util.Objects;
 import java.util.UUID;
 
-import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -55,27 +54,6 @@ public class SqsTransitionWorkerAction {
         this.executionService = executionService;
         this.secretResolver = secretResolver;
         this.client = client;
-    }
-
-    @PostConstruct
-    void validateActionConfig() {
-        if (!orchestratorConfig.workerSqs().serverEnabled()) {
-            return;
-        }
-        if (orchestratorConfig.workerSqs().responseQueueUrl().filter(value -> !value.isBlank()).isEmpty()) {
-            throw new IllegalStateException(
-                "pipeline.orchestrator.worker.sqs.response-queue-url is required when "
-                    + "pipeline.orchestrator.worker.sqs.server-enabled=true");
-        }
-        WorkerSecretSupport.validationError(
-            orchestratorConfig.workerSqs().sharedSecret(),
-            orchestratorConfig.workerSqs().sharedSecretRef(),
-            "pipeline.orchestrator.worker.sqs.shared-secret",
-            "pipeline.orchestrator.worker.sqs.shared-secret-ref",
-            "pipeline.orchestrator.worker.sqs.server-enabled=true")
-            .ifPresent(message -> {
-                throw new IllegalStateException(message);
-            });
     }
 
     public Uni<SqsMessageDisposition> handle(SqsInboundMessage message) {
