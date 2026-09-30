@@ -45,7 +45,7 @@ sam validate --template-file aws-durable-proof/template.yaml --region us-east-2
 
 ## Disposable deployment
 
-Use a non-root deployment identity. The runner rejects account-root credentials before any mutation, optionally assumes a supplied least-privilege role, builds with the isolated Maven repository, uploads the artifacts, deploys the stack, runs the fast fault lane, writes `proof-report.json`, and deletes a successful stack by default. A failure preserves the stack for diagnosis.
+Use a non-root deployment identity. The runner rejects account-root credentials before any mutation, optionally assumes a supplied least-privilege role, builds with the isolated Maven repository, uploads the artifacts, deploys the stack, runs the fast fault lane, writes `proof-report.json`, and deletes the stack and artifact bucket on success or failure by default. Pass `--keep-on-success` or `--keep-on-failure` only when the corresponding resources must remain available for diagnosis.
 
 ```bash
 ./aws-durable-proof/scripts/run-deployed-proof.sh \
@@ -68,6 +68,6 @@ The architecture is promoted as the candidate initial AWS production coordinator
 6. the deployed functions executed under the scoped roles in the template; and
 7. the terminal-Await result passthrough defect was fixed and verified both locally and in the deployed promotion lane.
 
-Reject this architecture for initial TPF Cloud if active callback identity cannot be reconstructed from the supported history API, uncertain callback delivery cannot be classified, parked versions cannot finish, TPF semantic state cannot reconstruct/re-drive after provider-history loss, or least-privilege permissions require broad account access.
+Reject this architecture as the initial AWS `QUEUE_ASYNC` coordination host if active callback identity cannot be reconstructed from the supported history API, uncertain callback delivery cannot be classified, parked versions cannot finish, TPF semantic state cannot reconstruct/re-drive after provider-history loss, or least-privilege permissions require broad account access.
 
 See [PROMOTION-REPORT.md](./PROMOTION-REPORT.md) for the evidence and decision. This stack remains a proof, not production Lambda support. It intentionally omits production networking, KMS/customer key policy, multi-region disaster recovery, tenancy isolation, quotas, Terraform, and release automation.

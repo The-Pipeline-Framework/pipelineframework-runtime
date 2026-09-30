@@ -203,13 +203,16 @@ class DeployedAwsDurableProofIT {
         evidence("stream-reconciliation", () -> {
             setMapping(stack.output("AwaitStreamMappingId"), false);
             setMapping(stack.output("BindingStreamMappingId"), false);
-            ProofStartResponse start = start(input(suffix(), 1));
-            AwaitRequest await = awaitRequest(start);
-            complete(await, "completion-with-streams-disabled");
-            invoke(stack.output("ReconcilerFunctionName"), Map.of());
-            assertSucceeded(execution(start.durableExecutionName()));
-            setMapping(stack.output("AwaitStreamMappingId"), true);
-            setMapping(stack.output("BindingStreamMappingId"), true);
+            try {
+                ProofStartResponse start = start(input(suffix(), 1));
+                AwaitRequest await = awaitRequest(start);
+                complete(await, "completion-with-streams-disabled");
+                invoke(stack.output("ReconcilerFunctionName"), Map.of());
+                assertSucceeded(execution(start.durableExecutionName()));
+            } finally {
+                setMapping(stack.output("AwaitStreamMappingId"), true);
+                setMapping(stack.output("BindingStreamMappingId"), true);
+            }
         });
     }
 

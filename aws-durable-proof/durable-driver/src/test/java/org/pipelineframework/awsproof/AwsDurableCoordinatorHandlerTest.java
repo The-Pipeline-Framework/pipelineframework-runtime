@@ -63,7 +63,7 @@ class AwsDurableCoordinatorHandlerTest {
         };
         AwsDurableCoordinatorHandler handler = new AwsDurableCoordinatorHandler(actions);
         LocalDurableTestRunner<ProofExecutionInput, ProofExecutionOutput> runner =
-            LocalDurableTestRunner.create(ProofExecutionInput.class, handler::handleRequest)
+            LocalDurableTestRunner.create(ProofExecutionInput.class, handler)
                 .withOutputType(ProofExecutionOutput.class);
         ProofExecutionInput input = new ProofExecutionInput(
             "tenant-a", "stable-key", "pipeline-a", "contract-a", "release-a", "{}", Optional.empty(), 1);
@@ -110,10 +110,9 @@ class AwsDurableCoordinatorHandlerTest {
             case QUERY_PENDING_AWAIT, BIND_CALLBACK ->
                 throw new AssertionError("driver must register before resolving the TPF Await identity");
         };
+        AwsDurableCoordinatorHandler handler = new AwsDurableCoordinatorHandler(actions);
         LocalDurableTestRunner<ProofExecutionInput, ProofExecutionOutput> runner =
-            LocalDurableTestRunner.create(
-                    ProofExecutionInput.class,
-                    new AwsDurableCoordinatorHandler(actions)::handleRequest)
+            LocalDurableTestRunner.create(ProofExecutionInput.class, handler)
                 .withOutputType(ProofExecutionOutput.class);
         ProofExecutionInput input = new ProofExecutionInput(
             "tenant-a", "failed-key", "pipeline-a", "contract-a", "release-a", "{}", Optional.empty(), 1);
@@ -150,10 +149,9 @@ class AwsDurableCoordinatorHandlerTest {
         };
         ProofExecutionInput input = ProofExecutionInput.resume(
             previous, "pipeline-a", "contract-a", "release-a");
+        AwsDurableCoordinatorHandler handler = new AwsDurableCoordinatorHandler(actions);
         LocalDurableTestRunner<ProofExecutionInput, ProofExecutionOutput> runner =
-            LocalDurableTestRunner.create(
-                    ProofExecutionInput.class,
-                    new AwsDurableCoordinatorHandler(actions)::handleRequest)
+            LocalDurableTestRunner.create(ProofExecutionInput.class, handler)
                 .withOutputType(ProofExecutionOutput.class);
 
         var completed = runner.runUntilComplete(input);
