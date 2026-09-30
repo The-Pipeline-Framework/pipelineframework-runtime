@@ -1,0 +1,75 @@
+name: AWS Durable Proof
+
+on:
+  schedule:
+    - cron: '43 2 * * *'
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: Proof lane to run
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - promotion
+          - history
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aws-durable-proof
+  cancel-in-progress: false
+
+jobs:
+  deployed-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: aws-durable-proof
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-path: ${{ github.workspace }}/.m2/repository
+      - uses: aws-actions/setup-sam@f84ec7d548307efafe33230528756de3c5841a17 # v2
+      - name: Require protected AWS role configuration
+        env:
+          ROLE_ARN: ${{ vars.AWS_DURABLE_PROOF_ROLE_ARN }}
+        run: test -n "$ROLE_ARN"
+      - name: Configure short-lived AWS credentials
+        uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
+        with:
+          role-to-assume: ${{ vars.AWS_DURABLE_PROOF_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_DURABLE_PROOF_REGION || 'us-east-2' }}
+      - name: Run disposable deployed fault proof
+        env:
+          PROOF_REGION: ${{ vars.AWS_DURABLE_PROOF_REGION || 'us-east-2' }}
+          PROOF_LANE: ${{ github.event.inputs.lane || 'full' }}
+          PROOF_STACK: tpf-durable-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          lane_args=()
+          case "$PROOF_LANE" in
+            full) ;;
+            promotion) lane_args+=(--promotion-only) ;;
+            history) lane_args+=(--history-only) ;;
+            *) echo "Unsupported proof lane: $PROOF_LANE" >&2; exit 2 ;;
+          esac
+          ./aws-durable-proof/scripts/run-deployed-proof.sh \
+            --region "$PROOF_REGION" \
+            --stack-name "$PROOF_STACK" \
+            "${lane_args[@]}"
+      - name: Upload proof evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: aws-durable-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: aws-durable-proof/proof-report.json
+          if-no-files-found: warn
+          retention-days: 30
