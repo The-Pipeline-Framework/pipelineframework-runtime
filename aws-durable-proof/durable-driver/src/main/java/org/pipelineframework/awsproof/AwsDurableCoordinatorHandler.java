@@ -24,6 +24,8 @@ import software.amazon.lambda.durable.config.WaitForCallbackConfig;
 import software.amazon.lambda.durable.exception.CallbackTimeoutException;
 import software.amazon.lambda.durable.model.WaitForConditionResult;
 import software.amazon.lambda.durable.serde.JacksonSerDes;
+import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+import software.amazon.awssdk.http.apache.ApacheHttpClient;
 import software.amazon.awssdk.services.lambda.LambdaClient;
 
 /**
@@ -37,7 +39,12 @@ public final class AwsDurableCoordinatorHandler
 
     public AwsDurableCoordinatorHandler() {
         this(new LambdaProofActionInvoker(
-            LambdaClient.create(),
+            LambdaClient.builder()
+                .httpClientBuilder(ApacheHttpClient.builder().socketTimeout(Duration.ofSeconds(90)))
+                .overrideConfiguration(ClientOverrideConfiguration.builder()
+                    .apiCallAttemptTimeout(Duration.ofSeconds(90))
+                    .build())
+                .build(),
             requiredEnvironment(ACTION_FUNCTION_ENV)));
     }
 
@@ -139,7 +146,11 @@ public final class AwsDurableCoordinatorHandler
             if (!deadlineProbe(input)) {
                 throw timeout;
             }
-            actions.invoke(ProofActionRequest.sweep(checkpoint));
+            context.step(
+                "deadline-probe-sweep",
+                String.class,
+                ignored -> actions.invoke(ProofActionRequest.sweep(checkpoint))
+                    .executionStatus().orElse("SWEEPED"));
         }
     }
 

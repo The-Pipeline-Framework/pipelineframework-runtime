@@ -5,6 +5,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import jakarta.enterprise.context.ApplicationScoped;
@@ -99,21 +100,42 @@ final class ProofDurableBindingResolver {
     }
 
     private Optional<ProofAwaitIdentity> findSemanticAwait(ProofExecutionCheckpoint checkpoint) {
-        var response = dynamo.query(QueryRequest.builder()
-            .tableName(requiredEnvironment("PIPELINE_ORCHESTRATOR_DYNAMO_AWAIT_INTERACTION_TABLE"))
-            .keyConditionExpression("tenant_id = :tenant")
-            .filterExpression("execution_id = :execution")
-            .expressionAttributeValues(java.util.Map.of(
-                ":tenant", AttributeValue.fromS(checkpoint.tenantId()),
-                ":execution", AttributeValue.fromS(checkpoint.executionId())))
-            .consistentRead(true)
-            .build());
-        return response.items().stream().findFirst().map(item -> new ProofAwaitIdentity(
-            attribute(item, "tenant_id"),
-            attribute(item, "execution_id"),
-            attribute(item, "interaction_id"),
-            attribute(item, "correlation_id"),
-            checkpoint.generation()));
+        return findSemanticAwait(
+            checkpoint,
+            requiredEnvironment("PIPELINE_ORCHESTRATOR_DYNAMO_AWAIT_INTERACTION_TABLE"));
+    }
+
+    Optional<ProofAwaitIdentity> findSemanticAwait(
+        ProofExecutionCheckpoint checkpoint,
+        String tableName
+    ) {
+        Map<String, AttributeValue> startKey = Map.of();
+        do {
+            QueryRequest.Builder request = QueryRequest.builder()
+                .tableName(tableName)
+                .keyConditionExpression("tenant_id = :tenant")
+                .filterExpression("execution_id = :execution")
+                .expressionAttributeValues(Map.of(
+                    ":tenant", AttributeValue.fromS(checkpoint.tenantId()),
+                    ":execution", AttributeValue.fromS(checkpoint.executionId())))
+                .consistentRead(true);
+            if (!startKey.isEmpty()) {
+                request.exclusiveStartKey(startKey);
+            }
+            var response = dynamo.query(request.build());
+            Optional<ProofAwaitIdentity> identity = response.items().stream().findFirst()
+                .map(item -> new ProofAwaitIdentity(
+                    attribute(item, "tenant_id"),
+                    attribute(item, "execution_id"),
+                    attribute(item, "interaction_id"),
+                    attribute(item, "correlation_id"),
+                    checkpoint.generation()));
+            if (identity.isPresent()) {
+                return identity;
+            }
+            startKey = response.lastEvaluatedKey();
+        } while (startKey != null && !startKey.isEmpty());
+        return Optional.empty();
     }
 
     private static String attribute(java.util.Map<String, AttributeValue> item, String name) {

@@ -5,11 +5,12 @@ region="us-east-2"
 role_arn=""
 stack_name=""
 keep_success=false
+keep_failure=false
 promotion_only=false
 history_only=false
 
 usage() {
-  echo "usage: $0 --stack-name NAME [--region REGION] [--role-arn ARN] [--keep-on-success] [--promotion-only] [--history-only]" >&2
+  echo "usage: $0 --stack-name NAME [--region REGION] [--role-arn ARN] [--keep-on-success] [--keep-on-failure] [--promotion-only] [--history-only]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -18,6 +19,7 @@ while [[ $# -gt 0 ]]; do
     --role-arn) role_arn="$2"; shift 2 ;;
     --stack-name) stack_name="$2"; shift 2 ;;
     --keep-on-success) keep_success=true; shift ;;
+    --keep-on-failure) keep_failure=true; shift ;;
     --promotion-only) promotion_only=true; shift ;;
     --history-only) history_only=true; shift ;;
     *) usage; exit 2 ;;
@@ -56,6 +58,7 @@ fi
 account_id=$(aws sts get-caller-identity --region "$region" --query Account --output text)
 artifact_bucket="${stack_name}-artifacts-${account_id}-${region}"
 proof_tmp=$(mktemp -d "${TMPDIR:-/tmp}/tpf-issue-976.XXXXXX")
+run_succeeded=false
 packaged_template="$proof_tmp/packaged.yaml"
 driver_jar="$PWD/aws-durable-proof/durable-driver/target/pipelineframework-aws-durable-proof-driver-26.9.4-SNAPSHOT-lambda.jar"
 driver_key="${stack_name}/durable-driver.jar"
@@ -101,6 +104,39 @@ stop_running_durable_executions() {
   echo "timed out stopping active durable executions for $function_name" >&2
   return 1
 }
+
+cleanup() {
+  local exit_code=$?
+  trap - EXIT
+  local preserve=false
+  if [[ "$run_succeeded" == true && "$keep_success" == true ]]; then
+    preserve=true
+  elif [[ "$run_succeeded" == false && "$keep_failure" == true ]]; then
+    preserve=true
+  fi
+
+  if [[ "$preserve" == true ]]; then
+    echo "proof resources retained: $stack_name"
+  else
+    stop_running_durable_executions || true
+    if aws cloudformation describe-stacks \
+        --stack-name "$stack_name" --region "$region" >/dev/null 2>&1; then
+      sam delete --stack-name "$stack_name" --region "$region" --no-prompts || true
+    fi
+    if aws s3api head-bucket --bucket "$artifact_bucket" --region "$region" 2>/dev/null; then
+      aws s3 rm "s3://${artifact_bucket}" --recursive --region "$region" --only-show-errors || true
+      aws s3api delete-bucket --bucket "$artifact_bucket" --region "$region" || true
+    fi
+  fi
+
+  if [[ -d "$proof_tmp" ]]; then
+    find "$proof_tmp" -type f -delete
+    rmdir "$proof_tmp"
+  fi
+  exit "$exit_code"
+}
+
+trap cleanup EXIT
 
 ./mvnw \
   -pl :pipelineframework-aws-durable-proof-driver,:pipelineframework-aws-durable-proof-action-host \
@@ -171,14 +207,4 @@ sam deploy \
   --no-transfer-progress
 
 echo "proof report: $report_path"
-if [[ "$keep_success" == false ]]; then
-  stop_running_durable_executions
-  sam delete --stack-name "$stack_name" --region "$region" --no-prompts
-  aws s3 rm "s3://${artifact_bucket}" --recursive --region "$region" --only-show-errors
-  aws s3api delete-bucket --bucket "$artifact_bucket" --region "$region"
-else
-  echo "successful stack retained: $stack_name"
-fi
-
-find "$proof_tmp" -type f -delete
-rmdir "$proof_tmp"
+run_succeeded=true
