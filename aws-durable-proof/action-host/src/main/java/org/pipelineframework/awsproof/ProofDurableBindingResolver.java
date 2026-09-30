@@ -13,6 +13,7 @@ import jakarta.inject.Inject;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.jboss.logging.Logger;
 import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
 import org.pipelineframework.awsproof.model.ProofCallbackBinding;
 import org.pipelineframework.awsproof.model.ProofCallbackRegistration;
@@ -32,6 +33,7 @@ import software.amazon.awssdk.services.lambda.model.ListDurableExecutionsByFunct
 /** Reconstructs disposable callback bindings from active AWS durable state. */
 @ApplicationScoped
 final class ProofDurableBindingResolver {
+    private static final Logger LOG = Logger.getLogger(ProofDurableBindingResolver.class);
     private static final Duration ACTION_TIMEOUT = Duration.ofSeconds(30);
 
     @Inject
@@ -68,9 +70,19 @@ final class ProofDurableBindingResolver {
     }
 
     List<ProofCallbackBinding> reconstructOpenBindings() {
+        return reconstructOpenBindings(runningExecutions());
+    }
+
+    List<ProofCallbackBinding> reconstructOpenBindings(List<Execution> executions) {
         List<ProofCallbackBinding> recovered = new ArrayList<>();
-        for (Execution execution : runningExecutions()) {
-            reconstruct(execution).ifPresent(recovered::add);
+        for (Execution execution : executions) {
+            try {
+                reconstruct(execution).ifPresent(recovered::add);
+            } catch (RuntimeException failure) {
+                LOG.warnf(failure,
+                    "Open-binding reconstruction failed for execution=%s",
+                    execution.durableExecutionArn());
+            }
         }
         return List.copyOf(recovered);
     }

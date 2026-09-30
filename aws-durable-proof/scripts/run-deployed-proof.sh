@@ -109,6 +109,7 @@ cleanup() {
   local exit_code=$?
   trap - EXIT
   local preserve=false
+  local cleanup_failed=false
   if [[ "$run_succeeded" == true && "$keep_success" == true ]]; then
     preserve=true
   elif [[ "$run_succeeded" == false && "$keep_failure" == true ]]; then
@@ -118,20 +119,26 @@ cleanup() {
   if [[ "$preserve" == true ]]; then
     echo "proof resources retained: $stack_name"
   else
-    stop_running_durable_executions || true
+    stop_running_durable_executions || cleanup_failed=true
     if aws cloudformation describe-stacks \
         --stack-name "$stack_name" --region "$region" >/dev/null 2>&1; then
-      sam delete --stack-name "$stack_name" --region "$region" --no-prompts || true
+      sam delete --stack-name "$stack_name" --region "$region" --no-prompts || cleanup_failed=true
     fi
     if aws s3api head-bucket --bucket "$artifact_bucket" --region "$region" 2>/dev/null; then
-      aws s3 rm "s3://${artifact_bucket}" --recursive --region "$region" --only-show-errors || true
-      aws s3api delete-bucket --bucket "$artifact_bucket" --region "$region" || true
+      aws s3 rm "s3://${artifact_bucket}" --recursive --region "$region" --only-show-errors \
+        || cleanup_failed=true
+      aws s3api delete-bucket --bucket "$artifact_bucket" --region "$region" \
+        || cleanup_failed=true
     fi
   fi
 
   if [[ -d "$proof_tmp" ]]; then
     find "$proof_tmp" -type f -delete
     rmdir "$proof_tmp"
+  fi
+  if [[ "$exit_code" -eq 0 && "$cleanup_failed" == true ]]; then
+    echo "proof completed, but resource cleanup failed" >&2
+    exit_code=1
   fi
   exit "$exit_code"
 }
