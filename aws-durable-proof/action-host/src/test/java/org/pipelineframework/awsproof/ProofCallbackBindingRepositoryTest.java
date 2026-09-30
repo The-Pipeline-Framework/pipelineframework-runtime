@@ -7,6 +7,7 @@ import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
 import org.pipelineframework.awsproof.model.ProofBindingStatus;
 import org.pipelineframework.awsproof.model.ProofCallbackBinding;
 import org.pipelineframework.awsproof.model.ProofCallbackRegistration;
+import org.pipelineframework.awsproof.model.ProofDriverCheckpoint;
 import org.pipelineframework.awsproof.model.ProofExecutionCheckpoint;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 
@@ -69,8 +70,10 @@ class ProofCallbackBindingRepositoryTest {
 
     private static ProofCallbackRegistration registration(String callbackId, long createdAt, long expiresAt) {
         return new ProofCallbackRegistration(
-            new ProofExecutionCheckpoint(
-                "tenant-a", "execution-a", false, "pipeline-a", "1", "release-a", 1),
+            new ProofDriverCheckpoint(
+                new ProofExecutionCheckpoint(
+                    "tenant-a", "execution-a", "pipeline-a", "1", "release-a"),
+                1),
             "provider-execution-a",
             "arn:aws:lambda:us-east-2:123456789012:function:proof:1/durable-execution/execution-a",
             callbackId,

@@ -25,6 +25,7 @@ import org.pipelineframework.awsproof.model.ProofActionRequest;
 import org.pipelineframework.awsproof.model.ProofActionResponse;
 import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
 import org.pipelineframework.awsproof.model.ProofExecutionCheckpoint;
+import org.pipelineframework.awsproof.model.ProofDriverCheckpoint;
 import org.pipelineframework.awsproof.model.ProofExecutionInput;
 import org.pipelineframework.awsproof.model.ProofExecutionNames;
 import org.pipelineframework.awsproof.model.ProofExecutionOutput;
@@ -442,9 +443,11 @@ class DeployedAwsDurableProofIT {
             long version = Long.parseLong(failed.get("version").n());
             clearPersistent("pipeline-transition", suffix);
 
-            ProofExecutionCheckpoint checkpoint = new ProofExecutionCheckpoint(
-                input.tenantId(), executionId, true, input.pipelineId(), input.contractVersion(),
-                input.releaseVersion(), 1);
+            ProofDriverCheckpoint checkpoint = new ProofDriverCheckpoint(
+                new ProofExecutionCheckpoint(
+                    input.tenantId(), executionId, input.pipelineId(), input.contractVersion(),
+                    input.releaseVersion()),
+                1);
             ProofActionResponse redrive = invokeAction(ProofActionRequest.redrive(
                 checkpoint, version, "deployed proof retry exhaustion"));
             assertThat(redrive.executionStatus()).contains("QUEUED");

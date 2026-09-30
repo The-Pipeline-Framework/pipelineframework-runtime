@@ -4,7 +4,7 @@ import java.util.Objects;
 
 /** Provider-owned callback capability registered before a TPF Await identity exists. */
 public record ProofCallbackRegistration(
-    ProofExecutionCheckpoint checkpoint,
+    ProofDriverCheckpoint checkpoint,
     String providerExecutionName,
     String providerExecutionArn,
     String providerCallbackId,

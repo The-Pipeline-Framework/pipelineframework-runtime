@@ -11,6 +11,7 @@ import java.util.Objects;
 import org.pipelineframework.awsproof.model.ProofActionRequest;
 import org.pipelineframework.awsproof.model.ProofActionResponse;
 import org.pipelineframework.awsproof.model.ProofCallbackSignal;
+import org.pipelineframework.awsproof.model.ProofDriverCheckpoint;
 import org.pipelineframework.awsproof.model.ProofExecutionCheckpoint;
 import org.pipelineframework.awsproof.model.ProofExecutionInput;
 import org.pipelineframework.awsproof.model.ProofExecutionNames;
@@ -69,22 +70,24 @@ public final class AwsDurableCoordinatorHandler
         Objects.requireNonNull(input, "input");
         Objects.requireNonNull(context, "context");
 
-        ProofExecutionCheckpoint checkpoint = input.resumeExecutionId()
+        ProofDriverCheckpoint checkpoint = input.resumeExecutionId()
             .map(executionId -> context.step(
                 "resume-tpf-execution",
-                ProofExecutionCheckpoint.class,
-                ignored -> new ProofExecutionCheckpoint(
-                    input.tenantId(),
-                    executionId,
-                    true,
-                    input.pipelineId(),
-                    input.contractVersion(),
-                    input.releaseVersion(),
+                ProofDriverCheckpoint.class,
+                ignored -> new ProofDriverCheckpoint(
+                    new ProofExecutionCheckpoint(
+                        input.tenantId(),
+                        executionId,
+                        input.pipelineId(),
+                        input.contractVersion(),
+                        input.releaseVersion()),
                     input.generation())))
             .orElseGet(() -> context.step(
                 "submit-tpf-execution",
-                ProofExecutionCheckpoint.class,
-                ignored -> requiredCheckpoint(actions.invoke(ProofActionRequest.submit(input)))));
+                ProofDriverCheckpoint.class,
+                ignored -> new ProofDriverCheckpoint(
+                    requiredCheckpoint(actions.invoke(ProofActionRequest.submit(input))),
+                    input.generation())));
 
         boolean requiresAwaitWakeup = input.resumeExecutionId().isEmpty()
             || !new ProofExecutionStatusPoll(context.step(
@@ -121,7 +124,7 @@ public final class AwsDurableCoordinatorHandler
 
     private void waitForAwaitWakeup(
         ProofExecutionInput input,
-        ProofExecutionCheckpoint checkpoint,
+        ProofDriverCheckpoint checkpoint,
         DurableContext context
     ) {
         String providerExecutionName = ProofExecutionNames.durableExecutionName(
@@ -155,7 +158,7 @@ public final class AwsDurableCoordinatorHandler
     }
 
     private ProofExecutionStatusPoll waitForTerminal(
-        ProofExecutionCheckpoint checkpoint,
+        ProofDriverCheckpoint checkpoint,
         DurableContext context
     ) {
         return context.waitForCondition(
@@ -186,7 +189,7 @@ public final class AwsDurableCoordinatorHandler
         return deadlineProbe(input) || input.inputJson().contains("\"callbackExpiryProbe\":true");
     }
 
-    private static void verifySignal(ProofExecutionCheckpoint expected, ProofCallbackSignal actual) {
+    private static void verifySignal(ProofDriverCheckpoint expected, ProofCallbackSignal actual) {
         if (!expected.tenantId().equals(actual.tenantId())
             || !expected.executionId().equals(actual.executionId())
             || expected.generation() != actual.generation()) {

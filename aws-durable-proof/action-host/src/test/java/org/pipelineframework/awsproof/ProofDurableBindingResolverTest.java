@@ -12,6 +12,7 @@ import java.util.Map;
 
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.awsproof.model.ProofExecutionCheckpoint;
+import org.pipelineframework.awsproof.model.ProofDriverCheckpoint;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
@@ -41,8 +42,10 @@ class ProofDurableBindingResolverTest {
         resolver.dynamo = dynamo;
 
         var resolved = resolver.findSemanticAwait(
-            new ProofExecutionCheckpoint(
-                "tenant", "execution", false, "pipeline", "contract", "release", 2),
+            new ProofDriverCheckpoint(
+                new ProofExecutionCheckpoint(
+                    "tenant", "execution", "pipeline", "contract", "release"),
+                2),
             "await-table");
 
         assertThat(resolved).hasValueSatisfying(identity -> {
