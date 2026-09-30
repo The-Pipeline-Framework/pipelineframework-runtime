@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pipelineframework.org/schemas/aws-durable-proof-report-v1.json",
+  "title": "TPF deployed AWS Durable proof report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "issue", "stack", "region", "generatedAt", "evidence", "scenarioCatalog"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "issue": {"const": 976},
+    "stack": {"type": "string", "minLength": 1},
+    "region": {"type": "string", "minLength": 1},
+    "generatedAt": {"type": "string", "format": "date-time"},
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["group", "status", "durationMs", "detail"],
+        "properties": {
+          "group": {"type": "string", "minLength": 1},
+          "status": {"enum": ["PASSED", "FAILED"]},
+          "durationMs": {"type": "integer", "minimum": 0},
+          "detail": {"type": "string"}
+        }
+      }
+    },
+    "scenarioCatalog": {
+      "type": "array",
+      "minItems": 22,
+      "maxItems": 22,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "lane", "evidenceGroup"],
+        "properties": {
+          "id": {"type": "integer", "minimum": 1, "maximum": 22},
+          "name": {"type": "string", "minLength": 1},
+          "lane": {"enum": ["QUICK", "EXTENDED"]},
+          "evidenceGroup": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}
