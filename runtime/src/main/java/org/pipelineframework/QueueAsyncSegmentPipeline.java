@@ -1,6 +1,7 @@
 package org.pipelineframework;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.IntSupplier;
@@ -210,6 +211,11 @@ class QueueAsyncSegmentPipeline {
       ClaimedSegment segment,
       PipelineTransitionWorker worker) {
     if (isCoordinatorTerminalMaterialization(segment)) {
+      if (segment.resumesFromAwait()) {
+        return inputPayload(segment)
+            .onItem().transform(payload -> TransitionResultEnvelope.completedInProcess(
+                terminalOutputItems(segment, payload)));
+      }
       // The terminal cursor has no business step left to invoke. Keep its materialized input at
       // the coordinator so SegmentCommitPlan can publish it without serializing a large result
       // through an otherwise no-op remote worker call.
@@ -220,9 +226,19 @@ class QueueAsyncSegmentPipeline {
   }
 
   private boolean isCoordinatorTerminalMaterialization(ClaimedSegment segment) {
-    return segment.record().resultShape() == ExecutionResultShape.MATERIALIZED_MULTI
-        && !segment.resumesFromAwait()
+    return (segment.record().resultShape() == ExecutionResultShape.MATERIALIZED_MULTI
+        || segment.resumesFromAwait())
         && segment.record().currentStepIndex() == pipelineStepCount.getAsInt();
+  }
+
+  private static List<?> terminalOutputItems(ClaimedSegment segment, Object payload) {
+    if (segment.record().resultShape() == ExecutionResultShape.SINGLE) {
+      return List.of(payload);
+    }
+    if (payload instanceof Iterable<?> items) {
+      return java.util.stream.StreamSupport.stream(items.spliterator(), false).toList();
+    }
+    return List.of(payload);
   }
 
   private Uni<TransitionCommandEnvelope> transitionCommand(ClaimedSegment segment) {

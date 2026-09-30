@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 3,
+  "pipelineId": "aws-durable-proof",
+  "contractVersion": "1",
+  "contractHash": "aws-durable-proof-v1",
+  "platform": "FUNCTION",
+  "transport": "LOCAL",
+  "module": "aws-durable-proof",
+  "pluginHost": false,
+  "runtimeLayout": "QUEUE_ASYNC",
+  "steps": [
+    {
+      "index": 0,
+      "authoredName": "ProofAwaitApproval",
+      "kind": "SERVICE",
+      "cardinality": "ONE_TO_ONE",
+      "inputTypeId": "org.pipelineframework.awsproof.ProofPipelineInput",
+      "outputTypeId": "java.lang.String",
+      "runtimeClass": "org.pipelineframework.awsproof.ProofAwaitStep",
+      "clientClass": "",
+      "deferredCompletion": {
+        "type": "await",
+        "transport": "sqs"
+      },
+      "paging": {}
+    }
+  ],
+  "capabilities": {
+    "localTransitionExecution": true,
+    "transitionWorkerProtocols": ["SQS"]
+  },
+  "canonicalTypes": {
+    "ProofPipelineInput": {
+      "definition": {
+        "fields": [
+          {
+            "name": "callbackExpiryProbe",
+            "nullability": "NON_NULL",
+            "presence": "OPTIONAL",
+            "type": {"id": "boolean", "kind": "scalar"}
+          },
+          {
+            "name": "deadlineProbe",
+            "nullability": "NON_NULL",
+            "presence": "OPTIONAL",
+            "type": {"id": "boolean", "kind": "scalar"}
+          },
+          {
+            "name": "request",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {"id": "string", "kind": "scalar"}
+          }
+        ],
+        "id": "ProofPipelineInput",
+        "kind": "record"
+      },
+      "definitionFingerprint": "sha256:3acf0e08f0d1659fa7547cc90de891786bd6e9c4581905bf26540960a7b45b3a",
+      "runtimeClass": "org.pipelineframework.awsproof.ProofPipelineInput"
+    },
+    "ProofPipelineResult": {
+      "definition": {
+        "id": "ProofPipelineResult",
+        "kind": "wrapper",
+        "wraps": {"id": "string", "kind": "scalar"}
+      },
+      "definitionFingerprint": "sha256:68cbe52ec0afb89a69a8fd9235b298f398f85cc6868c581117a6582d63ce2565",
+      "runtimeClass": "java.lang.String"
+    }
+  },
+  "canonicalCatalogFingerprint": "sha256:0f3f0095caf69125e7cdf65b9b0d52d32e80be0c677da78bb4741e99884cce7c",
+  "composition": null,
+  "importedDefinitions": [],
+  "capabilityImports": []
+}

@@ -96,6 +96,7 @@
         <module>plugins</module>
         <module>spring-smoke-tests</module>
         <module>spring-blocking-smoke-tests</module>
+        <module>aws-durable-proof</module>
     </modules>
 
     <dependencyManagement>
