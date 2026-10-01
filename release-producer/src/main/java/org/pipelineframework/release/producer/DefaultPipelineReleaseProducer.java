@@ -1,4 +1,4 @@
-package org.pipelineframework.release.maven;
+package org.pipelineframework.release.producer;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -29,8 +29,10 @@ import org.pipelineframework.orchestrator.release.PipelineReleaseArtifactDescrip
 import org.pipelineframework.orchestrator.release.PipelineReleaseArtifactKind;
 import org.pipelineframework.orchestrator.release.PipelineReleaseDescriptor;
 import org.pipelineframework.orchestrator.release.PipelineReleaseDescriptorValidator;
+import org.pipelineframework.config.pipeline.PipelineJson;
 
-final class ReleaseDescriptorGenerator {
+/** Produces immutable Pipeline Release Descriptors without depending on a build tool. */
+public final class DefaultPipelineReleaseProducer implements PipelineReleaseProducer {
     private static final long LOCK_RETRY_MILLIS = 10L;
     private static final Set<PipelineReleaseArtifactKind> SUPPORTED_KINDS = EnumSet.of(
         PipelineReleaseArtifactKind.JAR,
@@ -41,17 +43,45 @@ final class ReleaseDescriptorGenerator {
 
     private final ObjectMapper mapper;
 
-    ReleaseDescriptorGenerator(ObjectMapper mapper) {
+    public DefaultPipelineReleaseProducer() {
+        this(PipelineJson.mapper());
+    }
+
+    DefaultPipelineReleaseProducer(ObjectMapper mapper) {
         this.mapper = mapper;
     }
 
-    PipelineContractDescriptor loadContract(Path contractFile) {
+    public PipelineContractDescriptor loadContract(Path contractFile) {
         requireReadableFile(contractFile, "Pipeline Contract");
         try (InputStream input = Files.newInputStream(contractFile)) {
             return mapper.readValue(input, PipelineContractDescriptor.class);
         } catch (IOException e) {
             throw new IllegalArgumentException("Failed to read Pipeline Contract " + contractFile + ": " + e.getMessage(), e);
         }
+    }
+
+    @Override
+    public PipelineReleaseDescriptor produce(ReleaseProductionRequest request) {
+        if (request == null) {
+            throw new IllegalArgumentException("Release production request is required");
+        }
+        return generate(
+            request.contract(),
+            request.releaseVersion(),
+            request.compiledTruthArtifactId(),
+            request.compiledTruthDirectory(),
+            request.artifacts(),
+            request.allowLocalUris());
+    }
+
+    public List<ReleaseArtifactInput> materialize(
+        List<ReleaseArtifactInput> artifacts,
+        String compiledTruthArtifactId,
+        Path compiledTruthDirectory,
+        Path buildDirectory
+    ) {
+        return new ReleaseArtifactMaterializer().materialize(
+            artifacts, compiledTruthArtifactId, compiledTruthDirectory, buildDirectory);
     }
 
     PipelineReleaseDescriptor generate(
@@ -130,7 +160,7 @@ final class ReleaseDescriptorGenerator {
         return descriptor;
     }
 
-    byte[] serialize(PipelineReleaseDescriptor descriptor) {
+    public byte[] serialize(PipelineReleaseDescriptor descriptor) {
         try {
             byte[] json = mapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(descriptor);
             byte[] output = new byte[json.length + 1];
@@ -142,7 +172,8 @@ final class ReleaseDescriptorGenerator {
         }
     }
 
-    void write(Path outputFile, PipelineReleaseDescriptor descriptor) {
+    @Override
+    public void write(Path outputFile, PipelineReleaseDescriptor descriptor) {
         byte[] content = serialize(descriptor);
         Path target = outputFile.toAbsolutePath().normalize();
         Path parent = target.getParent();
@@ -194,11 +225,11 @@ final class ReleaseDescriptorGenerator {
         }
     }
 
-    static List<String> defaultStepIds(PipelineContractDescriptor contract) {
+    public static List<String> defaultStepIds(PipelineContractDescriptor contract) {
         return contract.steps().stream().map(PipelineBundleStepDescriptor::authoredName).toList();
     }
 
-    static List<String> defaultCapabilities(PipelineContractDescriptor contract) {
+    public static List<String> defaultCapabilities(PipelineContractDescriptor contract) {
         LinkedHashSet<String> capabilities = new LinkedHashSet<>();
         if (contract.capabilities().localTransitionExecution()) {
             capabilities.add("local");

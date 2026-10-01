@@ -8,8 +8,10 @@ import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugins.annotations.LifecyclePhase;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
-import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
+import org.pipelineframework.release.producer.DefaultPipelineReleaseProducer;
+import org.pipelineframework.release.producer.ReleaseArtifactInput;
+import org.pipelineframework.release.producer.ReleaseProductionRequest;
 
 /** Produces {@code pipeline-release.json} from packaged artifact bytes and Compiled Truth. */
 @Mojo(name = "generate-release-descriptor", defaultPhase = LifecyclePhase.VERIFY, requiresProject = true, threadSafe = true)
@@ -50,18 +52,18 @@ public final class GenerateReleaseDescriptorMojo extends AbstractMojo {
     @Override
     public void execute() throws MojoExecutionException {
         try {
-            ReleaseDescriptorGenerator generator = new ReleaseDescriptorGenerator(PipelineJson.mapper());
-            PipelineContractDescriptor contract = generator.loadContract(contractFile.toPath());
+            DefaultPipelineReleaseProducer producer = new DefaultPipelineReleaseProducer();
+            PipelineContractDescriptor contract = producer.loadContract(contractFile.toPath());
             List<ReleaseArtifactInput> configured = configuredArtifacts(contract);
             String carrierId = compiledTruthArtifactId == null || compiledTruthArtifactId.isBlank()
                 ? inferredCompiledTruthArtifactId(configured)
                 : compiledTruthArtifactId.trim();
             Path metadataDirectory = contractFile.toPath().toAbsolutePath().normalize().getParent();
-            List<ReleaseArtifactInput> inputs = new ReleaseArtifactMaterializer()
-                .materialize(configured, carrierId, metadataDirectory, outputFile.toPath().toAbsolutePath().normalize().getParent());
-            var descriptor = generator.generate(
-                contract, releaseVersion, carrierId, metadataDirectory, inputs, allowLocalUris);
-            generator.write(outputFile.toPath(), descriptor);
+            List<ReleaseArtifactInput> inputs = producer.materialize(
+                configured, carrierId, metadataDirectory, outputFile.toPath().toAbsolutePath().normalize().getParent());
+            var descriptor = producer.produce(new ReleaseProductionRequest(
+                contract, releaseVersion, carrierId, metadataDirectory, inputs, allowLocalUris));
+            producer.write(outputFile.toPath(), descriptor);
             getLog().info("Produced Pipeline Release Descriptor " + outputFile.toPath().toAbsolutePath().normalize());
         } catch (IllegalArgumentException | IllegalStateException e) {
             throw new MojoExecutionException(e.getMessage(), e);
@@ -94,8 +96,8 @@ public final class GenerateReleaseDescriptorMojo extends AbstractMojo {
             artifactKind,
             primaryArtifact.toPath(),
             primaryUri,
-            ReleaseDescriptorGenerator.defaultStepIds(contract),
-            ReleaseDescriptorGenerator.defaultCapabilities(contract)));
+            DefaultPipelineReleaseProducer.defaultStepIds(contract),
+            DefaultPipelineReleaseProducer.defaultCapabilities(contract)));
     }
 
     private static String inferredCompiledTruthArtifactId(List<ReleaseArtifactInput> configured) {
