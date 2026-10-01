@@ -1,4 +1,4 @@
-package org.pipelineframework.release.maven;
+package org.pipelineframework.release.producer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;

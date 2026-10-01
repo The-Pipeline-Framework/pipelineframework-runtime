@@ -19,13 +19,8 @@
     <dependencies>
         <dependency>
             <groupId>org.pipelineframework</groupId>
-            <artifactId>pipelineframework-runtime-core</artifactId>
-            <version>${tpf.contracts.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>org.pipelineframework</groupId>
-            <artifactId>pipelineframework-runtime-serialization</artifactId>
-            <version>${tpf.contracts.version}</version>
+            <artifactId>pipelineframework-release-producer</artifactId>
+            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>org.apache.maven</groupId>

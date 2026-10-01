@@ -1,4 +1,4 @@
-package org.pipelineframework.release.maven;
+package org.pipelineframework.release.producer;
 
 import java.io.IOException;
 import java.nio.file.Files;

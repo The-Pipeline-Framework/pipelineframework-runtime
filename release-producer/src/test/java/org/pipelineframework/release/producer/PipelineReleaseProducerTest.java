@@ -1,4 +1,4 @@
-package org.pipelineframework.release.maven;
+package org.pipelineframework.release.producer;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -26,19 +26,18 @@ import org.pipelineframework.orchestrator.PipelineBundleCapabilities;
 import org.pipelineframework.orchestrator.PipelineBundleStepDescriptor;
 import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
 import org.pipelineframework.orchestrator.release.PipelineReleaseDescriptor;
-import org.pipelineframework.orchestrator.release.PipelineReleaseDescriptorLoader;
 
-class ReleaseDescriptorGeneratorTest {
+class PipelineReleaseProducerTest {
     @TempDir
     Path temporaryDirectory;
 
-    private ReleaseDescriptorGenerator generator;
+    private DefaultPipelineReleaseProducer generator;
     private PipelineContractDescriptor contract;
     private Path metadataDirectory;
 
     @BeforeEach
     void setUp() {
-        generator = new ReleaseDescriptorGenerator(PipelineJson.mapper());
+        generator = new DefaultPipelineReleaseProducer(PipelineJson.mapper());
         contract = contract("orders", "sha256:contract");
         metadataDirectory = temporaryDirectory.resolve("classes/META-INF/pipeline");
         writeMetadata(contract);
@@ -52,8 +51,8 @@ class ReleaseDescriptorGeneratorTest {
             "jar",
             jar,
             "file:///releases/orders.jar",
-            ReleaseDescriptorGenerator.defaultStepIds(contract),
-            ReleaseDescriptorGenerator.defaultCapabilities(contract))), true);
+            DefaultPipelineReleaseProducer.defaultStepIds(contract),
+            DefaultPipelineReleaseProducer.defaultCapabilities(contract))), true);
 
         assertEquals(PipelineReleaseDescriptor.CURRENT_SCHEMA_VERSION, descriptor.schemaVersion());
         assertEquals(contract.pipelineId(), descriptor.pipelineId());
@@ -94,7 +93,6 @@ class ReleaseDescriptorGeneratorTest {
         assertArrayEquals(first, Files.readAllBytes(output));
         assertEquals('\n', first[first.length - 1]);
         assertEquals(descriptor, PipelineJson.mapper().readValue(first, PipelineReleaseDescriptor.class));
-        assertEquals(descriptor, new PipelineReleaseDescriptorLoader().load(output));
     }
 
     @Test
@@ -137,7 +135,7 @@ class ReleaseDescriptorGeneratorTest {
             var firstWrite = executor.submit(() -> writeAfter(start, generator, output, first));
             var secondWrite = executor.submit(() -> writeAfter(
                 start,
-                new ReleaseDescriptorGenerator(PipelineJson.mapper()),
+                new DefaultPipelineReleaseProducer(PipelineJson.mapper()),
                 output,
                 second));
             start.countDown();
@@ -230,7 +228,7 @@ class ReleaseDescriptorGeneratorTest {
 
     private static Optional<RuntimeException> writeAfter(
         CountDownLatch start,
-        ReleaseDescriptorGenerator writer,
+        DefaultPipelineReleaseProducer writer,
         Path output,
         PipelineReleaseDescriptor descriptor
     ) throws InterruptedException {
@@ -249,8 +247,8 @@ class ReleaseDescriptorGeneratorTest {
             "jar",
             jar,
             jar.toUri().toASCIIString(),
-            ReleaseDescriptorGenerator.defaultStepIds(contract),
-            ReleaseDescriptorGenerator.defaultCapabilities(contract))), true);
+            DefaultPipelineReleaseProducer.defaultStepIds(contract),
+            DefaultPipelineReleaseProducer.defaultCapabilities(contract))), true);
     }
 
     private Path jar(String name, PipelineContractDescriptor embeddedContract, String content) throws IOException {

@@ -51,6 +51,11 @@ Repository setup requires repository-scoped dispatch credentials. If the workflo
 
 Require a green full train for formal BOM or release promotion.
 
+When adding a public Maven artifact, update candidate collection, metadata, trusted validation, upload lists,
+publication verification, and the coordinator's coordinate/BOM contracts together. See the
+[component onboarding checklist](https://github.com/The-Pipeline-Framework/pipelineframework/blob/main/docs/evolve/cross-repository-system-tests.md#adding-a-component-or-public-artifact).
+Candidate success must prove the complete owned dependency closure, not merely a successful reactor build.
+
 Always use the repository-local Maven cache:
 
 ```sh

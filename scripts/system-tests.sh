@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory(prefix="tpf-reactor-dependency-test-") as tempo
     (root / "consumer").mkdir()
     (root / "runtime").mkdir()
     (root / "deployment").mkdir()
-    (root / "consumer/pom.xml").write_text("""<project><groupId>org.pipelineframework</groupId><artifactId>consumer</artifactId><parent><groupId>org.pipelineframework</groupId><artifactId>pipelineframework-runtime-parent</artifactId><version>3.2.1-SNAPSHOT</version></parent><dependencies><dependency><groupId>org.pipelineframework</groupId><artifactId>pipelineframework</artifactId><version>3.2.1-SNAPSHOT</version></dependency><dependency><groupId>org.pipelineframework</groupId><artifactId>pipelineframework-deployment</artifactId><version>3.2.1-SNAPSHOT</version></dependency><dependency><groupId>org.pipelineframework</groupId><artifactId>pipelineframework-compiler</artifactId><version>26.9.4-SNAPSHOT</version></dependency><dependency><groupId>org.pipelineframework</groupId><artifactId>pipelineframework-runtime-spi</artifactId><version>26.9.4-SNAPSHOT</version></dependency></dependencies></project>""")
+    (root / "consumer/pom.xml").write_text("""<project><groupId>org.pipelineframework</groupId><artifactId>consumer</artifactId><parent><groupId>org.pipelineframework</groupId><artifactId>pipelineframework-runtime-parent</artifactId><version>3.2.1-SNAPSHOT</version></parent><dependencies><dependency><groupId>org.pipelineframework</groupId><artifactId>pipelineframework</artifactId><version>3.2.1-SNAPSHOT</version></dependency><dependency><groupId>org.pipelineframework</groupId><artifactId>pipelineframework-deployment</artifactId><version>3.2.1-SNAPSHOT</version></dependency><dependency><groupId>org.pipelineframework</groupId><artifactId>pipelineframework-compiler</artifactId><version>26.10.1-SNAPSHOT</version></dependency><dependency><groupId>org.pipelineframework</groupId><artifactId>pipelineframework-runtime-spi</artifactId><version>26.10.1-SNAPSHOT</version></dependency></dependencies></project>""")
     (root / "deployment/pom.xml").write_text("""<project><groupId>org.pipelineframework</groupId><artifactId>pipelineframework-deployment</artifactId><parent><groupId>org.pipelineframework</groupId><artifactId>pipelineframework-runtime-parent</artifactId><version>3.2.1-SNAPSHOT</version></parent></project>""")
     (root / "runtime/pom.xml").write_text("""<project><groupId>org.pipelineframework</groupId><artifactId>pipelineframework</artifactId><parent><groupId>org.pipelineframework</groupId><artifactId>pipelineframework-runtime-parent</artifactId><version>3.2.1-SNAPSHOT</version></parent></project>""")
     subprocess.run(["python3", str(pathlib.Path("scripts/rewrite-reactor-dependencies.py").resolve()), str(root), candidate], check=True)
@@ -78,8 +78,8 @@ with tempfile.TemporaryDirectory(prefix="tpf-reactor-dependency-test-") as tempo
     dependencies = pom.find("dependencies")
     assert dependencies[0].findtext("version") == candidate, ET.tostring(dependencies[0], encoding="unicode")
     assert dependencies[1].findtext("version") == candidate, ET.tostring(dependencies[1], encoding="unicode")
-    assert dependencies[2].findtext("version") == "26.9.4-SNAPSHOT", ET.tostring(dependencies[2], encoding="unicode")
-    assert dependencies[3].findtext("version") == "26.9.4-SNAPSHOT", ET.tostring(dependencies[3], encoding="unicode")
+    assert dependencies[2].findtext("version") == "26.10.1-SNAPSHOT", ET.tostring(dependencies[2], encoding="unicode")
+    assert dependencies[3].findtext("version") == "26.10.1-SNAPSHOT", ET.tostring(dependencies[3], encoding="unicode")
 PY
     ;;
   *) echo "usage: system-tests.sh candidate-version pr|main PR_NUMBER SHA | reactor-coordinates | reactor-dependencies" >&2; exit 2 ;;

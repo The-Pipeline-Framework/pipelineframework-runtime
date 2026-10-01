@@ -23,6 +23,9 @@ import org.pipelineframework.orchestrator.release.PipelineReleaseArtifactUri;
 import org.pipelineframework.orchestrator.release.PipelineReleaseClosureResolver;
 import org.pipelineframework.orchestrator.release.PipelineReleaseDescriptor;
 import org.pipelineframework.orchestrator.release.ResolvedPipelineRelease;
+import org.pipelineframework.release.producer.DefaultPipelineReleaseProducer;
+import org.pipelineframework.release.producer.ReleaseArtifactInput;
+import org.pipelineframework.release.producer.ReleaseProductionRequest;
 
 class IndependentReleaseConsumerConformanceTest {
     private static final long ZIP_TIMESTAMP_MILLIS = 315_532_800_000L;
@@ -125,13 +128,12 @@ class IndependentReleaseConsumerConformanceTest {
         List<ReleaseArtifactInput> inputs
     ) throws Exception {
         Path buildDirectory = temporaryDirectory.resolve("build/" + name);
-        List<ReleaseArtifactInput> materialized = new ReleaseArtifactMaterializer()
-            .materialize(inputs, carrierId, metadata, buildDirectory);
-        ReleaseDescriptorGenerator generator = new ReleaseDescriptorGenerator(PipelineJson.mapper());
-        PipelineReleaseDescriptor descriptor = generator.generate(
-            contract, "release-" + name, carrierId, metadata, materialized, false);
+        DefaultPipelineReleaseProducer producer = new DefaultPipelineReleaseProducer();
+        List<ReleaseArtifactInput> materialized = producer.materialize(inputs, carrierId, metadata, buildDirectory);
+        PipelineReleaseDescriptor descriptor = producer.produce(new ReleaseProductionRequest(
+            contract, "release-" + name, carrierId, metadata, materialized, false));
         Path descriptorFile = buildDirectory.resolve("pipeline-release.json");
-        generator.write(descriptorFile, descriptor);
+        producer.write(descriptorFile, descriptor);
         return new Scenario(name, descriptorFile, descriptor, materialized);
     }
 
