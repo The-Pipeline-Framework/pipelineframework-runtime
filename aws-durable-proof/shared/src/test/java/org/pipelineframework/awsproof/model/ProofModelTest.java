@@ -56,8 +56,9 @@ class ProofModelTest {
 
     @Test
     void callbackRegistrationIsKeyedBeforeAwaitIdentityAndBindsOnlyToItsCheckpoint() {
-        ProofExecutionCheckpoint checkpoint = new ProofExecutionCheckpoint(
-            "tenant-a", "execution-a", false, "pipeline-a", "1", "release-a", 3);
+        ProofExecutionCheckpoint execution = new ProofExecutionCheckpoint(
+            "tenant-a", "execution-a", "pipeline-a", "1", "release-a");
+        ProofDriverCheckpoint checkpoint = new ProofDriverCheckpoint(execution, 3);
         ProofCallbackRegistration registration = new ProofCallbackRegistration(
             checkpoint,
             "provider-execution",
@@ -75,6 +76,17 @@ class ProofModelTest {
             "tenant-a", "execution-b", "interaction-a", "correlation-a", 3)))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("does not belong");
+    }
+
+    @Test
+    void providerGenerationWrapsRatherThanPollutesTheTpfCheckpoint() {
+        ProofExecutionCheckpoint execution = new ProofExecutionCheckpoint(
+            "tenant-a", "execution-a", "pipeline-a", "1", "release-a");
+
+        assertThat(new ProofDriverCheckpoint(execution, 2).execution()).isSameAs(execution);
+        assertThat(execution.getClass().getRecordComponents())
+            .extracting(java.lang.reflect.RecordComponent::getName)
+            .containsExactly("tenantId", "executionId", "pipelineId", "contractVersion", "releaseVersion");
     }
 
     @Test

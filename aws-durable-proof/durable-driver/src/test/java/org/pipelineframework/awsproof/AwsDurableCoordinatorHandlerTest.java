@@ -44,12 +44,12 @@ class AwsDurableCoordinatorHandlerTest {
     @Test
     void callbackWakeupCarriesTheTpfIdentityAndPinnedRelease() throws Exception {
         ProofExecutionCheckpoint checkpoint = new ProofExecutionCheckpoint(
-            "tenant-a", "execution-a", false, "pipeline-a", "contract-a", "release-a", 1);
+            "tenant-a", "execution-a", "pipeline-a", "contract-a", "release-a");
         ProofAwaitIdentity await = new ProofAwaitIdentity(
             "tenant-a", "execution-a", "interaction-a", "correlation-a", 1);
         AtomicReference<String> callbackId = new AtomicReference<>();
         ProofActionInvoker actions = request -> switch (request.operation()) {
-            case SUBMIT -> ProofActionResponse.submitted(checkpoint);
+            case SUBMIT -> ProofActionResponse.submitted(checkpoint, false);
             case REGISTER_CALLBACK -> {
                 callbackId.set(request.providerCallbackId().orElseThrow());
                 yield ProofActionResponse.bound(true);
@@ -89,13 +89,13 @@ class AwsDurableCoordinatorHandlerTest {
     @Test
     void terminalTpfFailureStopsPollingAndFailsTheDurableExecution() throws Exception {
         ProofExecutionCheckpoint checkpoint = new ProofExecutionCheckpoint(
-            "tenant-a", "execution-failed", false, "pipeline-a", "contract-a", "release-a", 1);
+            "tenant-a", "execution-failed", "pipeline-a", "contract-a", "release-a");
         ProofAwaitIdentity await = new ProofAwaitIdentity(
             "tenant-a", "execution-failed", "interaction-a", "correlation-a", 1);
         AtomicReference<String> callbackId = new AtomicReference<>();
         AtomicBoolean resultRead = new AtomicBoolean();
         ProofActionInvoker actions = request -> switch (request.operation()) {
-            case SUBMIT -> ProofActionResponse.submitted(checkpoint);
+            case SUBMIT -> ProofActionResponse.submitted(checkpoint, false);
             case REGISTER_CALLBACK -> {
                 callbackId.set(request.providerCallbackId().orElseThrow());
                 yield ProofActionResponse.bound(true);

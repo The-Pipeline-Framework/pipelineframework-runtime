@@ -59,16 +59,16 @@ public record ProofActionRequest(
             input.generation());
     }
 
-    public static ProofActionRequest status(ProofExecutionCheckpoint checkpoint) {
+    public static ProofActionRequest status(ProofDriverCheckpoint checkpoint) {
         return forExecution(ProofOperation.STATUS, checkpoint);
     }
 
-    public static ProofActionRequest result(ProofExecutionCheckpoint checkpoint) {
+    public static ProofActionRequest result(ProofDriverCheckpoint checkpoint) {
         return forExecution(ProofOperation.RESULT, checkpoint);
     }
 
     public static ProofActionRequest redrive(
-        ProofExecutionCheckpoint checkpoint,
+        ProofDriverCheckpoint checkpoint,
         long expectedVersion,
         String reason
     ) {
@@ -83,11 +83,11 @@ public record ProofActionRequest(
             Optional.of(expectedVersion), Optional.of(ProofValidation.required(reason, "reason")), base.generation());
     }
 
-    public static ProofActionRequest sweep(ProofExecutionCheckpoint checkpoint) {
+    public static ProofActionRequest sweep(ProofDriverCheckpoint checkpoint) {
         return forExecution(ProofOperation.SWEEP, checkpoint);
     }
 
-    public static ProofActionRequest pendingAwait(ProofExecutionCheckpoint checkpoint) {
+    public static ProofActionRequest pendingAwait(ProofDriverCheckpoint checkpoint) {
         return forExecution(ProofOperation.QUERY_PENDING_AWAIT, checkpoint);
     }
 
@@ -116,7 +116,7 @@ public record ProofActionRequest(
     }
 
     public static ProofActionRequest register(
-        ProofExecutionCheckpoint checkpoint,
+        ProofDriverCheckpoint checkpoint,
         String providerExecutionName,
         String providerExecutionArn,
         String providerCallbackId
@@ -131,7 +131,7 @@ public record ProofActionRequest(
             base.expectedVersion(), base.reason(), base.generation());
     }
 
-    private static ProofActionRequest forExecution(ProofOperation operation, ProofExecutionCheckpoint checkpoint) {
+    private static ProofActionRequest forExecution(ProofOperation operation, ProofDriverCheckpoint checkpoint) {
         return new ProofActionRequest(
             operation,
             checkpoint.tenantId(),

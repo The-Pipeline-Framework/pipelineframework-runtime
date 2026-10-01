@@ -17,7 +17,7 @@ import org.jboss.logging.Logger;
 import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
 import org.pipelineframework.awsproof.model.ProofCallbackBinding;
 import org.pipelineframework.awsproof.model.ProofCallbackRegistration;
-import org.pipelineframework.awsproof.model.ProofExecutionCheckpoint;
+import org.pipelineframework.awsproof.model.ProofDriverCheckpoint;
 import org.pipelineframework.awaitable.AwaitCompletionDescriptorRegistry;
 import org.pipelineframework.orchestrator.PipelineControlPlane;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -93,7 +93,7 @@ final class ProofDurableBindingResolver {
             return Optional.empty();
         }
         descriptorRegistry.register(descriptorFactory.create());
-        ProofExecutionCheckpoint checkpoint = registration.orElseThrow().checkpoint();
+        ProofDriverCheckpoint checkpoint = registration.orElseThrow().checkpoint();
         Optional<ProofAwaitIdentity> identity = controlPlane.queryPendingAwaitInteractions(
                 checkpoint.tenantId(), "", "", "", 100)
             .await().atMost(ACTION_TIMEOUT).stream()
@@ -111,14 +111,14 @@ final class ProofDurableBindingResolver {
         return identity.map(registration.orElseThrow()::bind);
     }
 
-    private Optional<ProofAwaitIdentity> findSemanticAwait(ProofExecutionCheckpoint checkpoint) {
+    private Optional<ProofAwaitIdentity> findSemanticAwait(ProofDriverCheckpoint checkpoint) {
         return findSemanticAwait(
             checkpoint,
             requiredEnvironment("PIPELINE_ORCHESTRATOR_DYNAMO_AWAIT_INTERACTION_TABLE"));
     }
 
     Optional<ProofAwaitIdentity> findSemanticAwait(
-        ProofExecutionCheckpoint checkpoint,
+        ProofDriverCheckpoint checkpoint,
         String tableName
     ) {
         Map<String, AttributeValue> startKey = Map.of();
@@ -159,7 +159,7 @@ final class ProofDurableBindingResolver {
 
     private Optional<ProofCallbackRegistration> registration(Execution execution) {
         List<Event> events = history(execution.durableExecutionArn());
-        Optional<ProofExecutionCheckpoint> checkpoint = ProofDurableHistory
+        Optional<ProofDriverCheckpoint> checkpoint = ProofDurableHistory
             .successfulStepPayload(events, "submit-tpf-execution")
             .or(() -> ProofDurableHistory.successfulStepPayload(events, "resume-tpf-execution"))
             .flatMap(this::parseCheckpoint);
@@ -213,12 +213,12 @@ final class ProofDurableBindingResolver {
         return List.copyOf(events);
     }
 
-    private Optional<ProofExecutionCheckpoint> parseCheckpoint(String json) {
+    private Optional<ProofDriverCheckpoint> parseCheckpoint(String json) {
         if (json == null || json.isBlank()) {
             return Optional.empty();
         }
         try {
-            return Optional.of(mapper.readValue(json, ProofExecutionCheckpoint.class));
+            return Optional.of(mapper.readValue(json, ProofDriverCheckpoint.class));
         } catch (JsonProcessingException malformed) {
             return Optional.empty();
         }
