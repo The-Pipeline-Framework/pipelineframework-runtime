@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.pipelineframework</groupId>
+        <artifactId>pipelineframework-runtime-parent</artifactId>
+        <version>26.10.1-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+    <artifactId>pipelineframework-aws-durable-proof-parent</artifactId>
+    <packaging>pom</packaging>
+    <name>TPF AWS Durable Deployed Proof</name>
+    <description>Non-published fault-injection proof for AWS Lambda Durable coordination</description>
+    <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
+        <jacoco.skip>true</jacoco.skip>
+        <aws.sdk.version>2.55.0</aws.sdk.version>
+        <aws.durable.sdk.version>2.2.1</aws.durable.sdk.version>
+        <aws.lambda.events.version>3.16.1</aws.lambda.events.version>
+        <assertj.version>3.27.6</assertj.version>
+    </properties>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${aws.sdk.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.assertj</groupId>
+                <artifactId>assertj-core</artifactId>
+                <version>${assertj.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+    <modules>
+        <module>shared</module>
+        <module>durable-driver</module>
+        <module>action-host</module>
+        <module>fault-tests</module>
+    </modules>
+    <build>
+        <plugins>
+            <plugin>
+                <artifactId>maven-deploy-plugin</artifactId>
+                <configuration><skip>true</skip></configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.sonatype.central</groupId>
+                <artifactId>central-publishing-maven-plugin</artifactId>
+                <configuration><skipPublishing>true</skipPublishing></configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

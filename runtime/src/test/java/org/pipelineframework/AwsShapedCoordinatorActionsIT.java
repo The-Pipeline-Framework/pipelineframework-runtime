@@ -98,14 +98,27 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeDefinition;
+import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
+import software.amazon.awssdk.services.dynamodb.model.ConditionalCheckFailedException;
 import software.amazon.awssdk.services.dynamodb.model.CreateTableRequest;
+import software.amazon.awssdk.services.dynamodb.model.DescribeTableRequest;
+import software.amazon.awssdk.services.dynamodb.model.DescribeStreamRequest;
+import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.GetRecordsRequest;
+import software.amazon.awssdk.services.dynamodb.model.GetShardIteratorRequest;
 import software.amazon.awssdk.services.dynamodb.model.GlobalSecondaryIndex;
 import software.amazon.awssdk.services.dynamodb.model.KeySchemaElement;
 import software.amazon.awssdk.services.dynamodb.model.KeyType;
 import software.amazon.awssdk.services.dynamodb.model.Projection;
 import software.amazon.awssdk.services.dynamodb.model.ProjectionType;
 import software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughput;
+import software.amazon.awssdk.services.dynamodb.model.Record;
 import software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType;
+import software.amazon.awssdk.services.dynamodb.model.ShardIteratorType;
+import software.amazon.awssdk.services.dynamodb.model.StreamSpecification;
+import software.amazon.awssdk.services.dynamodb.model.StreamViewType;
+import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
+import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsClient;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.CreateQueueRequest;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
@@ -113,6 +126,8 @@ import software.amazon.awssdk.services.sqs.model.DeleteQueueRequest;
 import software.amazon.awssdk.services.sqs.model.Message;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
+import software.amazon.lambda.durable.DurableContext;
+import software.amazon.lambda.durable.testing.LocalDurableTestRunner;
 
 /**
  * AWS-shaped proof that coordinator actions survive replacement runtimes over DynamoDB and SQS.
@@ -127,24 +142,29 @@ class AwsShapedCoordinatorActionsIT {
     private static final String CONTRACT_VERSION = PipelineContractDescriptor.DEFAULT_CONTRACT_VERSION;
     private static final String RELEASE_VERSION = PipelineContractDescriptor.DEFAULT_CONTRACT_VERSION;
     private static final String WORKER_SECRET = "aws-shaped-worker-secret";
+    private static final String PROVIDER_CALLBACK_ID = "provider_callback_id";
+    private static final String PROVIDER_DRIVER_GENERATION = "provider_driver_generation";
 
     @Container
     static final LocalStackContainer LOCALSTACK = new LocalStackContainer(
         DockerImageName.parse("localstack/localstack:3.8"))
-        .withServices("dynamodb", "sqs");
+        .withServices("dynamodb", "dynamodbstreams", "sqs");
 
     private DynamoDbClient dynamoAdmin;
+    private DynamoDbStreamsClient dynamoStreams;
     private SqsClient sqsAdmin;
+    private String interactionStreamArn;
 
     @BeforeAll
     void createDurableSubstrates() {
         dynamoAdmin = dynamoClient();
+        dynamoStreams = dynamoStreamsClient();
         sqsAdmin = sqsClient();
         createTable(TABLE_PREFIX + "_execution", "tenant_id", Optional.of("execution_id"));
         createTable(TABLE_PREFIX + "_execution_key", "tenant_execution_key", Optional.empty());
         createTable(TABLE_PREFIX + "_execution_payload", "payload_id", Optional.of("payload_part"));
         createTable(TABLE_PREFIX + "_unit", "tenant_id", Optional.of("unit_id"));
-        createAwaitInteractionTable(TABLE_PREFIX + "_interaction");
+        interactionStreamArn = createAwaitInteractionTable(TABLE_PREFIX + "_interaction");
         createTable(TABLE_PREFIX + "_interaction_key", "lookup_key", Optional.empty());
     }
 
@@ -152,6 +172,9 @@ class AwsShapedCoordinatorActionsIT {
     void closeDurableSubstrates() {
         if (dynamoAdmin != null) {
             dynamoAdmin.close();
+        }
+        if (dynamoStreams != null) {
+            dynamoStreams.close();
         }
         if (sqsAdmin != null) {
             sqsAdmin.close();
@@ -341,6 +364,349 @@ class AwsShapedCoordinatorActionsIT {
         }
     }
 
+    @Test
+    void lambdaDurableDriverPreservesTpfAuthorityAcrossReplayAndCallback() throws Exception {
+        try (ScenarioQueues queues = createQueues("durable-driver");
+             RuntimeFixture runtime = runtime(queues, WorkerOutcome.WAIT_THEN_COMPLETE, 0)) {
+            String tenantId = "tenant-durable-" + suffix();
+            DurableDriverInput input = new DurableDriverInput(tenantId, "durable-key-" + suffix(), 1L);
+            AtomicReference<AwaitBridge> bridge = new AtomicReference<>();
+            LocalDurableTestRunner<DurableDriverInput, DurableDriverResult> runner =
+                durableRunner(runtime, bridge);
+
+            var pending = runner.run(input);
+
+            assertEquals(software.amazon.lambda.durable.model.ExecutionStatus.PENDING, pending.getStatus());
+            String executionId = pending.getOperation("submit").getStepResult(String.class);
+            AwaitBridge initialBridge = bridge.get();
+            assertNotNull(initialBridge);
+            assertEquals(executionId, initialBridge.executionId());
+            assertEquals("interaction-" + executionId, initialBridge.interactionId());
+            assertEquals("correlation-" + executionId, initialBridge.correlationId());
+            assertEquals(runner.getCallbackId("await-completion-callback"), initialBridge.providerCallbackId());
+            assertEquals(ExecutionStatus.WAITING_EXTERNAL,
+                runtime.controlPlane.getExecutionStatus(tenantId, executionId)
+                    .await().atMost(Duration.ofSeconds(10)).status());
+            assertEquals(AwaitInteractionStatus.DISPATCHED,
+                runtime.interactions.get(tenantId, initialBridge.interactionId())
+                    .await().atMost(Duration.ofSeconds(10)).orElseThrow().status());
+            assertEquals(1, runtime.transitionExecutions.get());
+
+            runner.simulateFireAndForgetCheckpointLoss("dispatch-to-await");
+            var replayedDispatch = runner.run(input);
+            assertEquals(software.amazon.lambda.durable.model.ExecutionStatus.PENDING,
+                replayedDispatch.getStatus());
+            assertEquals(1, runtime.transitionExecutions.get(),
+                "provider checkpoint loss after a TPF commit must not repeat the worker transition");
+
+            runner.simulateFireAndForgetCheckpointLoss("submit");
+            var replayed = runner.run(input);
+
+            assertEquals(software.amazon.lambda.durable.model.ExecutionStatus.PENDING, replayed.getStatus());
+            assertEquals(executionId, replayed.getOperation("submit").getStepResult(String.class));
+            assertEquals(1, runtime.transitionExecutions.get(),
+                "provider replay must not repeat a checkpointed TPF worker transition");
+            assertTrue(runtime.receive(queues.workQueueUrl(), 0, 1).isEmpty(),
+                "idempotent submit replay must not enqueue duplicate work");
+
+            String completionId = "completion-" + executionId;
+            runtime.send(queues.awaitQueueUrl(), PipelineJson.mapper().writeValueAsString(
+                new SqsAwaitCompletionEnvelope(
+                    tenantId,
+                    initialBridge.interactionId(),
+                    initialBridge.correlationId(),
+                    "",
+                    completionId,
+                    Map.of("decision", "approved"),
+                    "durable-driver-proof")));
+            assertEquals(SqsMessageDisposition.ACKNOWLEDGE,
+                runtime.invokeNext(queues.awaitQueueUrl(), message ->
+                    runtime.awaitAction.handle(message, Duration.ofSeconds(10))).disposition());
+            assertEquals(ExecutionStatus.QUEUED,
+                runtime.controlPlane.getExecutionStatus(tenantId, executionId)
+                    .await().atMost(Duration.ofSeconds(10)).status());
+
+            DurableAwaitChange completion = awaitCompletionChange(
+                tenantId, initialBridge.interactionId());
+            assertEquals(input.driverGeneration(), completion.driverGeneration());
+            DurableAwaitWakeupAction wakeupAction = new DurableAwaitWakeupAction(runtime, 1);
+            assertEquals(WakeupDisposition.RETRY, wakeupAction.handle(completion, runner),
+                "a provider callback delivery failure must remain retryable");
+            assertEquals(software.amazon.lambda.durable.model.ExecutionStatus.PENDING,
+                runner.run(input).getStatus());
+            assertEquals(WakeupDisposition.ACKNOWLEDGE, wakeupAction.handle(completion, runner));
+            assertEquals(WakeupDisposition.ACKNOWLEDGE, wakeupAction.handle(completion, runner),
+                "a duplicate stream delivery after callback completion must be acknowledged");
+            var completed = runner.runUntilComplete(input);
+
+            assertTrue(completed.isSucceeded());
+            DurableDriverResult result = completed.getResult();
+            assertEquals(executionId, result.executionId());
+            assertEquals(PIPELINE_ID, result.pipelineId());
+            assertEquals(CONTRACT_VERSION, result.contractVersion());
+            assertEquals(RELEASE_VERSION, result.releaseVersion());
+            assertEquals(ExecutionStatus.SUCCEEDED.name(), result.status());
+            assertEquals("approved-result", result.result());
+            assertEquals(String.class.getName(), result.rawPayloadTypeId());
+            assertEquals(2, runtime.transitionExecutions.get());
+            assertEquals(AwaitInteractionStatus.COMPLETED,
+                runtime.interactions.get(tenantId, initialBridge.interactionId())
+                    .await().atMost(Duration.ofSeconds(10)).orElseThrow().status());
+        }
+    }
+
+    @Test
+    void lambdaDurableDriverReconstructsFromTpfCheckpointAfterProviderHistoryLoss() throws Exception {
+        try (ScenarioQueues queues = createQueues("durable-recovery");
+             RuntimeFixture runtime = runtime(queues, WorkerOutcome.WAIT_THEN_COMPLETE, 0)) {
+            String tenantId = "tenant-durable-recovery-" + suffix();
+            String executionKey = "durable-recovery-key-" + suffix();
+            DurableDriverInput firstInput = new DurableDriverInput(tenantId, executionKey, 1L);
+            AtomicReference<AwaitBridge> firstBridge = new AtomicReference<>();
+            LocalDurableTestRunner<DurableDriverInput, DurableDriverResult> firstRunner =
+                durableRunner(runtime, firstBridge);
+
+            var firstPending = firstRunner.run(firstInput);
+            assertEquals(software.amazon.lambda.durable.model.ExecutionStatus.PENDING,
+                firstPending.getStatus());
+            String executionId = firstPending.getOperation("submit").getStepResult(String.class);
+            AwaitBridge abandonedBridge = firstBridge.get();
+            assertNotNull(abandonedBridge);
+            assertEquals(1, runtime.transitionExecutions.get());
+
+            DurableDriverInput replacementInput = new DurableDriverInput(tenantId, executionKey, 2L);
+            AtomicReference<AwaitBridge> replacementBridge = new AtomicReference<>();
+            LocalDurableTestRunner<DurableDriverInput, DurableDriverResult> replacementRunner =
+                durableRunner(runtime, replacementBridge);
+
+            var replacementPending = replacementRunner.run(replacementInput);
+            assertEquals(software.amazon.lambda.durable.model.ExecutionStatus.PENDING,
+                replacementPending.getStatus());
+            assertEquals(executionId,
+                replacementPending.getOperation("submit").getStepResult(String.class));
+            AwaitBridge activeBridge = replacementBridge.get();
+            assertNotNull(activeBridge);
+            assertFalse(abandonedBridge.providerCallbackId().equals(activeBridge.providerCallbackId()));
+            assertEquals(1, runtime.transitionExecutions.get(),
+                "replacement provider history must attach without redispatching TPF work");
+
+            runtime.completeAwait(
+                tenantId,
+                executionId,
+                activeBridge.interactionId(),
+                activeBridge.correlationId(),
+                "durable-recovery-proof");
+            DurableAwaitChange completion = awaitCompletionChange(tenantId, activeBridge.interactionId());
+            assertEquals(2L, completion.driverGeneration());
+            assertEquals(activeBridge.providerCallbackId(), completion.providerCallbackId());
+
+            DurableAwaitWakeupAction wakeupAction = new DurableAwaitWakeupAction(runtime, 0);
+            DurableAwaitChange staleChange = new DurableAwaitChange(
+                tenantId,
+                executionId,
+                abandonedBridge.interactionId(),
+                abandonedBridge.correlationId(),
+                abandonedBridge.providerCallbackId(),
+                1L);
+            assertEquals(WakeupDisposition.ACKNOWLEDGE,
+                wakeupAction.handle(staleChange, firstRunner));
+            assertFalse(firstRunner.getOperation("await-completion-callback").isCompleted(),
+                "a stale callback generation must not wake the abandoned provider execution");
+
+            assertEquals(WakeupDisposition.ACKNOWLEDGE,
+                wakeupAction.handle(completion, replacementRunner));
+            var completed = replacementRunner.runUntilComplete(replacementInput);
+            assertTrue(completed.isSucceeded());
+            assertEquals(executionId, completed.getResult().executionId());
+            assertEquals(2, runtime.transitionExecutions.get());
+
+            firstRunner.completeCallback(
+                abandonedBridge.providerCallbackId(),
+                PipelineJson.mapper().writeValueAsString(new DurableAwaitSignal(
+                    executionId,
+                    abandonedBridge.interactionId(),
+                    abandonedBridge.correlationId())));
+            var lateAbandonedReplay = firstRunner.runUntilComplete(firstInput);
+            assertTrue(lateAbandonedReplay.isSucceeded());
+            assertEquals(executionId, lateAbandonedReplay.getResult().executionId());
+            assertEquals(2, runtime.transitionExecutions.get(),
+                "a late abandoned driver replay must observe the terminal TPF checkpoint");
+        }
+    }
+
+    private DurableDriverResult driveWithLambdaDurability(
+        DurableDriverInput input,
+        DurableContext context,
+        RuntimeFixture runtime,
+        AtomicReference<AwaitBridge> bridge
+    ) {
+        String executionId = context.step("submit", String.class, () ->
+            runtime.controlPlane.executePipelineAsync(
+                    "durable-input",
+                    input.tenantId(),
+                    input.executionKey(),
+                    false,
+                    PIPELINE_ID,
+                    CONTRACT_VERSION,
+                    RELEASE_VERSION)
+                .await().atMost(Duration.ofSeconds(10)).executionId());
+        String interactionId = "interaction-" + executionId;
+        String correlationId = "correlation-" + executionId;
+
+        context.step("dispatch-to-await", Boolean.class, () -> {
+            SemanticCheckpoint checkpoint = runtime.semanticCheckpoint(
+                input.tenantId(), executionId, interactionId);
+            if (!checkpoint.awaitPresent() && checkpoint.executionStatus() == ExecutionStatus.QUEUED) {
+                runtime.seedScalarAwait(input.tenantId(), executionId, interactionId, correlationId);
+                invokeWorkUnchecked(runtime, executionId);
+            }
+            return Boolean.TRUE;
+        });
+
+        SemanticCheckpoint checkpoint = context.step(
+            "load-await-checkpoint",
+            SemanticCheckpoint.class,
+            () -> runtime.semanticCheckpoint(input.tenantId(), executionId, interactionId));
+        if (!checkpoint.executionStatus().terminal()
+            && !AwaitInteractionStatus.COMPLETED.name().equals(checkpoint.awaitStatus())) {
+            DurableAwaitSignal signal = context.waitForCallback(
+                "await-completion",
+                DurableAwaitSignal.class,
+                (providerCallbackId, ignored) -> {
+                    AwaitBridge candidate = new AwaitBridge(
+                        providerCallbackId, executionId, interactionId, correlationId);
+                    if (!runtime.bindProviderCallback(
+                        input.tenantId(), candidate, input.driverGeneration())) {
+                        throw new IllegalStateException(
+                            "Provider callback generation was superseded before it could be registered");
+                    }
+                    bridge.set(candidate);
+                });
+            if (!executionId.equals(signal.executionId())
+                || !interactionId.equals(signal.interactionId())
+                || !correlationId.equals(signal.correlationId())) {
+                throw new IllegalStateException("Provider callback did not correlate to the TPF Await interaction");
+            }
+            context.step("observe-completed-await", Boolean.class, () -> {
+                SemanticCheckpoint completed = runtime.semanticCheckpoint(
+                    input.tenantId(), executionId, interactionId);
+                if (!AwaitInteractionStatus.COMPLETED.name().equals(completed.awaitStatus())) {
+                    throw new IllegalStateException("Provider wake-up preceded TPF Await admission");
+                }
+                return Boolean.TRUE;
+            });
+        }
+
+        return context.step("resume-and-result", DurableDriverResult.class, () -> {
+            SemanticCheckpoint current = runtime.semanticCheckpoint(
+                input.tenantId(), executionId, interactionId);
+            if (!current.executionStatus().terminal()) {
+                if (current.executionStatus() != ExecutionStatus.QUEUED
+                    || !AwaitInteractionStatus.COMPLETED.name().equals(current.awaitStatus())) {
+                    throw new IllegalStateException("TPF checkpoint is not ready for resume");
+                }
+                invokeWorkUnchecked(runtime, executionId);
+            }
+            var status = runtime.controlPlane.getExecutionStatus(input.tenantId(), executionId)
+                .await().atMost(Duration.ofSeconds(10));
+            ExecutionRecord<Object, Object> execution = runtime.executionStore
+                .getExecution(input.tenantId(), executionId)
+                .await().atMost(Duration.ofSeconds(10)).orElseThrow();
+            String result = runtime.controlPlane.<String>getExecutionResult(
+                    input.tenantId(), executionId, String.class, false)
+                .await().atMost(Duration.ofSeconds(10));
+            Object rawResult = runtime.controlPlane.getExecutionResultPayload(input.tenantId(), executionId)
+                .await().atMost(Duration.ofSeconds(10));
+            if (!(rawResult instanceof SerializedTransitionPayload serialized)) {
+                throw new IllegalStateException("Expected serialized TPF transition result");
+            }
+            return new DurableDriverResult(
+                executionId,
+                execution.pipelineId(),
+                execution.contractVersion(),
+                execution.releaseVersion(),
+                status.status().name(),
+                result,
+                serialized.payloadTypeId());
+        });
+    }
+
+    private LocalDurableTestRunner<DurableDriverInput, DurableDriverResult> durableRunner(
+        RuntimeFixture runtime,
+        AtomicReference<AwaitBridge> bridge
+    ) {
+        return LocalDurableTestRunner.create(
+                DurableDriverInput.class,
+                (driverInput, context) -> driveWithLambdaDurability(
+                    driverInput, context, runtime, bridge))
+            .withOutputType(DurableDriverResult.class);
+    }
+
+    private DurableAwaitChange awaitCompletionChange(String tenantId, String interactionId) {
+        String shardIterator = dynamoStreams.describeStream(DescribeStreamRequest.builder()
+                .streamArn(interactionStreamArn)
+                .build())
+            .streamDescription()
+            .shards()
+            .stream()
+            .findFirst()
+            .map(shard -> dynamoStreams.getShardIterator(GetShardIteratorRequest.builder()
+                    .streamArn(interactionStreamArn)
+                    .shardId(shard.shardId())
+                    .shardIteratorType(ShardIteratorType.TRIM_HORIZON)
+                    .build())
+                .shardIterator())
+            .orElseThrow(() -> new IllegalStateException("Await interaction stream has no shard"));
+        long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
+        while (System.nanoTime() < deadline && shardIterator != null) {
+            var records = dynamoStreams.getRecords(GetRecordsRequest.builder()
+                .shardIterator(shardIterator)
+                .limit(100)
+                .build());
+            for (Record record : records.records()) {
+                Map<String, AttributeValue> image = record.dynamodb().newImage();
+                if (attributeEquals(image, "tenant_id", tenantId)
+                    && attributeEquals(image, "interaction_id", interactionId)
+                    && attributeEquals(image, "status", AwaitInteractionStatus.COMPLETED.name())
+                    && image.containsKey(PROVIDER_CALLBACK_ID)
+                    && image.containsKey(PROVIDER_DRIVER_GENERATION)) {
+                    return new DurableAwaitChange(
+                        tenantId,
+                        image.get("execution_id").s(),
+                        interactionId,
+                        image.get("correlation_id").s(),
+                        image.get(PROVIDER_CALLBACK_ID).s(),
+                        Long.parseLong(image.get(PROVIDER_DRIVER_GENERATION).n()));
+                }
+            }
+            shardIterator = records.nextShardIterator();
+            try {
+                Thread.sleep(25L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while reading Await completion stream", e);
+            }
+        }
+        throw new IllegalStateException("No completed Await stream record for " + interactionId);
+    }
+
+    private static boolean attributeEquals(
+        Map<String, AttributeValue> image,
+        String attribute,
+        String expected
+    ) {
+        return image.containsKey(attribute) && expected.equals(image.get(attribute).s());
+    }
+
+    private static void invokeWorkUnchecked(RuntimeFixture runtime, String executionId) {
+        try {
+            assertEquals(SqsMessageDisposition.ACKNOWLEDGE,
+                runtime.invokeWorkWithTransition(executionId).disposition());
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to invoke a bounded TPF work action", e);
+        }
+    }
+
     private RuntimeFixture runtime(ScenarioQueues queues, WorkerOutcome outcome, int maxRetries) throws Exception {
         return new RuntimeFixture(queues, outcome, maxRetries);
     }
@@ -361,6 +727,15 @@ class AwsShapedCoordinatorActionsIT {
 
     private DynamoDbClient dynamoClient() {
         return DynamoDbClient.builder()
+            .endpointOverride(LOCALSTACK.getEndpoint())
+            .region(Region.of(LOCALSTACK.getRegion()))
+            .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
+                LOCALSTACK.getAccessKey(), LOCALSTACK.getSecretKey())))
+            .build();
+    }
+
+    private DynamoDbStreamsClient dynamoStreamsClient() {
+        return DynamoDbStreamsClient.builder()
             .endpointOverride(LOCALSTACK.getEndpoint())
             .region(Region.of(LOCALSTACK.getRegion()))
             .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
@@ -399,7 +774,7 @@ class AwsShapedCoordinatorActionsIT {
         dynamoAdmin.waiter().waitUntilTableExists(request -> request.tableName(name));
     }
 
-    private void createAwaitInteractionTable(String name) {
+    private String createAwaitInteractionTable(String name) {
         ProvisionedThroughput throughput = ProvisionedThroughput.builder()
             .readCapacityUnits(10L)
             .writeCapacityUnits(10L)
@@ -428,9 +803,15 @@ class AwsShapedCoordinatorActionsIT {
                 .projection(Projection.builder().projectionType(ProjectionType.ALL).build())
                 .provisionedThroughput(throughput)
                 .build())
+            .streamSpecification(StreamSpecification.builder()
+                .streamEnabled(true)
+                .streamViewType(StreamViewType.NEW_AND_OLD_IMAGES)
+                .build())
             .provisionedThroughput(throughput)
             .build());
         dynamoAdmin.waiter().waitUntilTableExists(request -> request.tableName(name));
+        return dynamoAdmin.describeTable(DescribeTableRequest.builder().tableName(name).build())
+            .table().latestStreamArn();
     }
 
     private static String suffix() {
@@ -448,8 +829,112 @@ class AwsShapedCoordinatorActionsIT {
 
     private enum WorkerOutcome {
         WAIT,
+        WAIT_THEN_COMPLETE,
         COMPLETE,
         FAIL
+    }
+
+    private record DurableDriverInput(String tenantId, String executionKey, long driverGeneration) {
+    }
+
+    private record AwaitBridge(
+        String providerCallbackId,
+        String executionId,
+        String interactionId,
+        String correlationId
+    ) {
+    }
+
+    private record DurableAwaitSignal(
+        String executionId,
+        String interactionId,
+        String correlationId
+    ) {
+    }
+
+    private record DurableAwaitChange(
+        String tenantId,
+        String executionId,
+        String interactionId,
+        String correlationId,
+        String providerCallbackId,
+        long driverGeneration
+    ) {
+    }
+
+    private record ProviderCallbackBinding(String providerCallbackId, long driverGeneration) {
+    }
+
+    private record SemanticCheckpoint(
+        String executionId,
+        ExecutionStatus executionStatus,
+        int currentStepIndex,
+        long executionVersion,
+        boolean awaitPresent,
+        String awaitStatus
+    ) {
+    }
+
+    private record DurableDriverResult(
+        String executionId,
+        String pipelineId,
+        String contractVersion,
+        String releaseVersion,
+        String status,
+        String result,
+        String rawPayloadTypeId
+    ) {
+    }
+
+    private enum WakeupDisposition {
+        ACKNOWLEDGE,
+        RETRY
+    }
+
+    private static final class DurableAwaitWakeupAction {
+        private final RuntimeFixture runtime;
+        private final AtomicInteger failuresRemaining;
+
+        private DurableAwaitWakeupAction(RuntimeFixture runtime, int failuresBeforeSuccess) {
+            this.runtime = runtime;
+            this.failuresRemaining = new AtomicInteger(failuresBeforeSuccess);
+        }
+
+        private WakeupDisposition handle(
+            DurableAwaitChange change,
+            LocalDurableTestRunner<DurableDriverInput, DurableDriverResult> runner
+        ) {
+            ProviderCallbackBinding current = runtime.providerCallbackBinding(
+                    change.tenantId(), change.interactionId())
+                .orElseThrow(() -> new IllegalStateException("Await callback binding is missing"));
+            if (!current.providerCallbackId().equals(change.providerCallbackId())
+                || current.driverGeneration() != change.driverGeneration()) {
+                return WakeupDisposition.ACKNOWLEDGE;
+            }
+            AwaitInteractionStatus awaitStatus = runtime.interactions
+                .get(change.tenantId(), change.interactionId())
+                .await().atMost(Duration.ofSeconds(10))
+                .orElseThrow(() -> new IllegalStateException("Await interaction is missing"))
+                .status();
+            if (awaitStatus != AwaitInteractionStatus.COMPLETED) {
+                return WakeupDisposition.RETRY;
+            }
+            if (runner.getOperation("await-completion-callback").isCompleted()) {
+                return WakeupDisposition.ACKNOWLEDGE;
+            }
+            if (failuresRemaining.getAndUpdate(remaining -> Math.max(0, remaining - 1)) > 0) {
+                return WakeupDisposition.RETRY;
+            }
+            try {
+                runner.completeCallback(
+                    change.providerCallbackId(),
+                    PipelineJson.mapper().writeValueAsString(new DurableAwaitSignal(
+                        change.executionId(), change.interactionId(), change.correlationId())));
+                return WakeupDisposition.ACKNOWLEDGE;
+            } catch (Exception failure) {
+                return WakeupDisposition.RETRY;
+            }
+        }
     }
 
     private record HandledMessage(Message message, SqsMessageDisposition disposition) {
@@ -581,10 +1066,15 @@ class AwsShapedCoordinatorActionsIT {
             PipelineRunContext telemetryContext = mock(PipelineRunContext.class);
             when(runner.runFromStepUntilWithContext(any(), any(), anyInt(), anyInt()))
                 .thenAnswer(invocation -> {
-                    transitionExecutions.incrementAndGet();
+                    int executionNumber = transitionExecutions.incrementAndGet();
                     return switch (outcome) {
                         case WAIT -> new PipelineRunner.ExecutionResult(
                             Multi.createFrom().failure(awaitSuspension()), telemetryContext);
+                        case WAIT_THEN_COMPLETE -> executionNumber == 1
+                            ? new PipelineRunner.ExecutionResult(
+                                Multi.createFrom().failure(awaitSuspension()), telemetryContext)
+                            : new PipelineRunner.ExecutionResult(
+                                Multi.createFrom().item("approved-result"), telemetryContext);
                         case COMPLETE -> new PipelineRunner.ExecutionResult(
                             Multi.createFrom().item("approved-result"), telemetryContext);
                         case FAIL -> new PipelineRunner.ExecutionResult(
@@ -654,6 +1144,104 @@ class AwsShapedCoordinatorActionsIT {
                     ttl))
                 .await().atMost(Duration.ofSeconds(10));
             seededAwait.set(new AwaitSuspendedException(tenantId, executionId, unitId, 1));
+        }
+
+        private SemanticCheckpoint semanticCheckpoint(
+            String tenantId,
+            String executionId,
+            String interactionId
+        ) {
+            ExecutionRecord<Object, Object> execution = executionStore.getExecution(tenantId, executionId)
+                .await().atMost(Duration.ofSeconds(10))
+                .orElseThrow(() -> new IllegalStateException("Execution checkpoint is missing"));
+            Optional<AwaitInteractionRecord> interaction = interactions.get(tenantId, interactionId)
+                .await().atMost(Duration.ofSeconds(10));
+            return new SemanticCheckpoint(
+                executionId,
+                execution.status(),
+                execution.currentStepIndex(),
+                execution.version(),
+                interaction.isPresent(),
+                interaction.map(record -> record.status().name()).orElse(""));
+        }
+
+        private boolean bindProviderCallback(
+            String tenantId,
+            AwaitBridge bridge,
+            long driverGeneration
+        ) {
+            try {
+                dynamo.updateItem(UpdateItemRequest.builder()
+                    .tableName(TABLE_PREFIX + "_interaction")
+                    .key(Map.of(
+                        "tenant_id", AttributeValue.fromS(tenantId),
+                        "interaction_id", AttributeValue.fromS(bridge.interactionId())))
+                    .updateExpression("SET #callback = :callback, #generation = :generation")
+                    .conditionExpression("(#status = :dispatched OR #status = :completed) AND "
+                        + "(attribute_not_exists(#generation) OR #generation < :generation OR "
+                        + "(#generation = :generation AND #callback = :callback))")
+                    .expressionAttributeNames(Map.of(
+                        "#callback", PROVIDER_CALLBACK_ID,
+                        "#generation", PROVIDER_DRIVER_GENERATION,
+                        "#status", "status"))
+                    .expressionAttributeValues(Map.of(
+                        ":callback", AttributeValue.fromS(bridge.providerCallbackId()),
+                        ":generation", AttributeValue.fromN(Long.toString(driverGeneration)),
+                        ":dispatched", AttributeValue.fromS(AwaitInteractionStatus.DISPATCHED.name()),
+                        ":completed", AttributeValue.fromS(AwaitInteractionStatus.COMPLETED.name())))
+                    .build());
+                return true;
+            } catch (ConditionalCheckFailedException superseded) {
+                return false;
+            }
+        }
+
+        private Optional<ProviderCallbackBinding> providerCallbackBinding(
+            String tenantId,
+            String interactionId
+        ) {
+            Map<String, AttributeValue> item = dynamo.getItem(GetItemRequest.builder()
+                    .tableName(TABLE_PREFIX + "_interaction")
+                    .key(Map.of(
+                        "tenant_id", AttributeValue.fromS(tenantId),
+                        "interaction_id", AttributeValue.fromS(interactionId)))
+                    .consistentRead(true)
+                    .build())
+                .item();
+            if (!item.containsKey(PROVIDER_CALLBACK_ID)
+                || !item.containsKey(PROVIDER_DRIVER_GENERATION)) {
+                return Optional.empty();
+            }
+            return Optional.of(new ProviderCallbackBinding(
+                item.get(PROVIDER_CALLBACK_ID).s(),
+                Long.parseLong(item.get(PROVIDER_DRIVER_GENERATION).n())));
+        }
+
+        private void completeAwait(
+            String tenantId,
+            String executionId,
+            String interactionId,
+            String correlationId,
+            String actor
+        ) throws Exception {
+            send(queues.awaitQueueUrl(), PipelineJson.mapper().writeValueAsString(
+                new SqsAwaitCompletionEnvelope(
+                    tenantId,
+                    interactionId,
+                    correlationId,
+                    "",
+                    "completion-" + executionId,
+                    Map.of("decision", "approved"),
+                    actor)));
+            assertEquals(SqsMessageDisposition.ACKNOWLEDGE,
+                invokeNext(queues.awaitQueueUrl(), message ->
+                    awaitAction.handle(message, Duration.ofSeconds(10))).disposition());
+            assertEquals(ExecutionStatus.QUEUED,
+                controlPlane.getExecutionStatus(tenantId, executionId)
+                    .await().atMost(Duration.ofSeconds(10)).status());
+            assertEquals(AwaitInteractionStatus.COMPLETED,
+                interactions.get(tenantId, interactionId)
+                    .await().atMost(Duration.ofSeconds(10)).orElseThrow().status());
         }
 
         private HandledMessage invokeWorkWithTransition(String executionId) throws Exception {

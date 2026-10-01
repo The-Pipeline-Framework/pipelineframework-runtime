@@ -434,12 +434,11 @@ class QueueAsyncSegmentPipelineTest {
   }
 
   @Test
-  void terminalAwaitResumeLoadsCanonicalAwaitOutputBeforeWorkerDispatch() {
+  void terminalAwaitResumeMaterializesCanonicalAwaitOutputWithoutWorkerDispatch() {
     ExecutionRecord<Object, Object> claimed = withAwaitUnitId(
         withCurrentStep(record("exec-terminal-await", ExecutionResultShape.SINGLE), 1, "stale-input"),
         "unit-terminal-await");
     ExecutionRecord<Object, Object> succeeded = withStatus(claimed, ExecutionStatus.SUCCEEDED, 1L);
-    AtomicReference<TransitionCommandEnvelope> commandRef = new AtomicReference<>();
     when(executionStateStore.claimLease(eq("tenant-1"), eq("exec-terminal-await"), any(), anyLong(), eq(1000L)))
         .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
     when(awaitCoordinator.loadResumePayload(eq("tenant-1"), eq("unit-terminal-await")))
@@ -449,22 +448,25 @@ class QueueAsyncSegmentPipelineTest {
             eq("exec-terminal-await"),
             eq(0L),
             eq("exec-terminal-await:1:0"),
-            eq("canonical-await-output"),
+            eq(List.of("canonical-await-output")),
             anyLong()))
         .thenReturn(Uni.createFrom().item(Optional.of(succeeded)));
 
     pipeline(transitionWorkerExecutor, objectPublishCompletionService, () -> 1).process(
             new ExecutionWorkItem("tenant-1", "exec-terminal-await"),
-            command -> {
-              commandRef.set(command);
-              return Uni.createFrom().item(
-                  TransitionResultEnvelope.completedInProcess(List.of("canonical-await-output")));
-            },
+            command -> Uni.createFrom().failure(
+                new AssertionError("terminal Await resume must not dispatch a no-op worker transition")),
             AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER)
         .await().indefinitely();
 
     verify(awaitCoordinator).loadResumePayload("tenant-1", "unit-terminal-await");
-    assertEquals("canonical-await-output", commandRef.get().toCommand(payloadCodec).inputPayload());
+    verify(executionStateStore).markSucceeded(
+        eq("tenant-1"),
+        eq("exec-terminal-await"),
+        eq(0L),
+        eq("exec-terminal-await:1:0"),
+        eq(List.of("canonical-await-output")),
+        anyLong());
   }
 
   @Test

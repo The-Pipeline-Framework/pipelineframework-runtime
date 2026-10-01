@@ -1,0 +1,3 @@
+ignore_checks:
+  # YAML merge anchors are intentionally resolved by the required `sam package` step.
+  - W1100
