@@ -420,7 +420,43 @@ class PipelineReplayExecutionTest {
         assertEquals("2", event.attributes().get("tpf.await.expected_item_count"));
         assertEquals("1", event.attributes().get("tpf.await.completed_item_count"));
 
-        for (int index = 1; index < 1024; index++) {
+        Path firstFragment = replayFiles.getFirst();
+        Files.delete(firstFragment);
+        Files.createDirectory(firstFragment);
+        for (int index = 1; index < 513; index++) {
+            telemetry.recordAwaitLifecycle(new AwaitReplayLifecycleEvent(
+                AwaitReplayLifecycleEvent.UNIT_ITEM_COMPLETED,
+                "exec-1",
+                "unit-1",
+                "AwaitProvider",
+                1,
+                "WAITING_EXTERNAL",
+                "interaction-" + index,
+                "correlation-1",
+                "kafka",
+                0,
+                2,
+                1,
+                true));
+        }
+        Files.delete(firstFragment);
+        awaitControlEventCount(outputDir, 513);
+        telemetry.recordAwaitLifecycle(new AwaitReplayLifecycleEvent(
+            AwaitReplayLifecycleEvent.UNIT_ITEM_COMPLETED,
+            "exec-1",
+            "unit-1",
+            "AwaitProvider",
+            1,
+            "WAITING_EXTERNAL",
+            "interaction-513",
+            "correlation-1",
+            "kafka",
+            0,
+            2,
+            1,
+            true));
+        awaitControlEventCount(outputDir, 514);
+        for (int index = 514; index < 1024; index++) {
             telemetry.recordAwaitLifecycle(new AwaitReplayLifecycleEvent(
                 AwaitReplayLifecycleEvent.UNIT_ITEM_COMPLETED,
                 "exec-1",
@@ -447,6 +483,27 @@ class PipelineReplayExecutionTest {
             totalEvents += fragment.events().size();
         }
         assertEquals(1024, totalEvents);
+    }
+
+    private static void awaitControlEventCount(Path outputDir, int expected) throws Exception {
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (System.nanoTime() < deadline) {
+            try (var replayFileStream = Files.list(outputDir)) {
+                int persisted = 0;
+                for (Path replayFile : replayFileStream.filter(Files::isRegularFile).toList()) {
+                    PipelineReplayDocument fragment = PipelineJson.mapper()
+                        .readValue(replayFile.toFile(), PipelineReplayDocument.class);
+                    persisted += fragment.events().size();
+                }
+                if (persisted == expected) {
+                    return;
+                }
+            } catch (java.io.IOException ignored) {
+                // A scheduled flush can replace a fragment while the test reads it.
+            }
+            Thread.sleep(25);
+        }
+        throw new AssertionError("Timed out waiting for " + expected + " persisted control events.");
     }
 
     @Test
