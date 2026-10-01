@@ -419,6 +419,34 @@ class PipelineReplayExecutionTest {
         assertEquals("interaction-1", event.attributes().get("tpf.await.interaction_id"));
         assertEquals("2", event.attributes().get("tpf.await.expected_item_count"));
         assertEquals("1", event.attributes().get("tpf.await.completed_item_count"));
+
+        for (int index = 1; index < 1024; index++) {
+            telemetry.recordAwaitLifecycle(new AwaitReplayLifecycleEvent(
+                AwaitReplayLifecycleEvent.UNIT_ITEM_COMPLETED,
+                "exec-1",
+                "unit-1",
+                "AwaitProvider",
+                1,
+                "WAITING_EXTERNAL",
+                "interaction-" + index,
+                "correlation-1",
+                "kafka",
+                0,
+                2,
+                1,
+                true));
+        }
+        try (var replayFileStream = Files.list(outputDir)) {
+            replayFiles = replayFileStream.filter(path -> path.toString().endsWith(".json")).toList();
+        }
+        assertEquals(2, replayFiles.size(), "Control events should roll into bounded replay fragments.");
+        int totalEvents = 0;
+        for (Path replayFile : replayFiles) {
+            PipelineReplayDocument fragment = PipelineJson.mapper().readValue(replayFile.toFile(), PipelineReplayDocument.class);
+            assertEquals(512, fragment.events().size());
+            totalEvents += fragment.events().size();
+        }
+        assertEquals(1024, totalEvents);
     }
 
     @Test

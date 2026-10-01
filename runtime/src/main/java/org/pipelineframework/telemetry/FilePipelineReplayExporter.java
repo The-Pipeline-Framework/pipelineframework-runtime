@@ -50,6 +50,7 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
 
     private static final Logger LOG = Logger.getLogger(FilePipelineReplayExporter.class);
     private static final String REPLAY_FILE_PATH_KEY = "pipeline.telemetry.replay.file.path";
+    private static final int MAX_CONTROL_EVENTS_PER_FRAGMENT = 512;
 
     private final Path configuredOutputFile;
     private final ConcurrentMap<String, RunState> runStates = new ConcurrentHashMap<>();
@@ -114,20 +115,26 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
         Instant eventInstant = occurredAt == null ? Instant.now() : occurredAt;
         String resolvedPipeline = pipeline == null || pipeline.isBlank() ? topology.pipeline() : pipeline;
         String controlKey = sanitizeFileToken(resolvedPipeline == null ? "pipeline" : resolvedPipeline);
-        RunState runState = controlRunStates.computeIfAbsent(
-            controlKey,
-            ignored -> new RunState(
-                resolveControlOutputFile(resolvedPipeline, eventInstant),
-                resolvedPipeline,
-                eventInstant,
-                topology,
-                null));
-        runState.pipeline(resolvedPipeline);
-        runState.topology(topology);
-        runState.status("completed");
-        runState.durationMs(Math.max(0L, Duration.between(runState.startedAt(), eventInstant).toMillis()));
-        runState.addEvent(relativeControlEvent(runState, event, eventInstant));
-        writeDocument(runState);
+        controlRunStates.compute(controlKey, (ignored, previous) -> {
+            RunState runState = previous == null || previous.events().size() == MAX_CONTROL_EVENTS_PER_FRAGMENT
+                ? new RunState(
+                    resolveControlOutputFile(resolvedPipeline, eventInstant),
+                    resolvedPipeline,
+                    eventInstant,
+                    topology,
+                    null)
+                : previous;
+            runState.pipeline(resolvedPipeline);
+            runState.topology(topology);
+            runState.status("completed");
+            runState.durationMs(Math.max(0L, Duration.between(runState.startedAt(), eventInstant).toMillis()));
+            runState.addEvent(relativeControlEvent(runState, event, eventInstant));
+            int eventCount = runState.events().size();
+            if (eventCount == 1 || eventCount == MAX_CONTROL_EVENTS_PER_FRAGMENT) {
+                writeDocument(runState);
+            }
+            return runState;
+        });
     }
 
     @Override
