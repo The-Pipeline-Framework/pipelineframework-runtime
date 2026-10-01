@@ -20,6 +20,7 @@ import org.pipelineframework.awaitable.AwaitCompletionCommand;
 import org.pipelineframework.awaitable.AwaitCreateCommand;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
+import org.pipelineframework.awaitable.AwaitTelemetry;
 import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
 import org.pipelineframework.awaitable.store.DynamoAwaitLifecycleTestStores;
 import org.pipelineframework.config.pipeline.PipelineJson;
@@ -72,7 +73,9 @@ class SqsAwaitCompletionDynamoIT {
     SqsClient client = mock(SqsClient.class);
     String body = PipelineJson.mapper().writeValueAsString(new SqsAwaitCompletionEnvelope(pending.tenantId(), pending.interactionId(), pending.correlationId(), null, "completion-idem", Map.of("decision", "approved"), "provider"));
     when(client.receiveMessage(any(ReceiveMessageRequest.class))).thenReturn(ReceiveMessageResponse.builder().messages(Message.builder().messageId("message-1").receiptHandle("receipt-1").body(body).build()).build());
-    SqsAwaitCompletionPoller poller = new SqsAwaitCompletionPoller(mock(PipelineOrchestratorConfig.class), service, client);
+    SqsAwaitCompletionAction completionAction = new SqsAwaitCompletionAction(service, AwaitTelemetry.disabled());
+    SqsAwaitCompletionPoller poller = new SqsAwaitCompletionPoller(
+        mock(PipelineOrchestratorConfig.class), completionAction, client);
     try {
       poller.pollOnce(new SqsAwaitCompletionPoller.SqsAwaitPollerConfig(true, Optional.of("http://sqs.local/responses"), Duration.ZERO, Duration.ofSeconds(10), Duration.ofSeconds(5), 1, 1)).await().atMost(Duration.ofSeconds(10));
     } finally { poller.shutdown(); }

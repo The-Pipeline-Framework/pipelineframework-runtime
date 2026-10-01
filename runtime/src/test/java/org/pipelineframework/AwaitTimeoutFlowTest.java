@@ -19,6 +19,7 @@ import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
@@ -82,8 +83,9 @@ class AwaitTimeoutFlowTest {
             1000L))
         .thenReturn(Uni.createFrom().voidItem());
 
-    flow.sweepTimedOut(1000L, 100).await().indefinitely();
+    int timedOutCount = flow.sweepTimedOut(1000L, 100).await().indefinitely();
 
+    assertEquals(2, timedOutCount);
     InOrder order = inOrder(awaitCoordinator, segmentBoundaryLedger, executionStateStore);
     order.verify(awaitCoordinator).markTimedOut(earlier, 1000L);
     order.verify(segmentBoundaryLedger).recordInteractionTimedOut(earlier, 1000L);
@@ -118,8 +120,9 @@ class AwaitTimeoutFlowTest {
     when(executionStateStore.getExecution("tenant-1", "exec-1"))
         .thenReturn(Uni.createFrom().item(Optional.empty()));
 
-    flow.sweepTimedOut(1000L, 100).await().indefinitely();
+    int timedOutCount = flow.sweepTimedOut(1000L, 100).await().indefinitely();
 
+    assertEquals(1, timedOutCount);
     verify(executionStateStore).getExecution("tenant-1", "exec-1");
     verify(segmentBoundaryLedger).recordInteractionTimedOut(interaction, 1000L);
     verify(executionStateStore, never()).markTerminalFailure(
@@ -138,8 +141,9 @@ class AwaitTimeoutFlowTest {
     when(executionStateStore.getExecution("tenant-1", "exec-1"))
         .thenReturn(Uni.createFrom().item(Optional.of(parent(ExecutionStatus.WAITING_EXTERNAL, "other-unit"))));
 
-    flow.sweepTimedOut(1000L, 100).await().indefinitely();
+    int timedOutCount = flow.sweepTimedOut(1000L, 100).await().indefinitely();
 
+    assertEquals(1, timedOutCount);
     verify(executionStateStore).getExecution("tenant-1", "exec-1");
     verify(segmentBoundaryLedger).recordInteractionTimedOut(interaction, 1000L);
     verify(executionStateStore, never()).markTerminalFailure(
@@ -147,14 +151,15 @@ class AwaitTimeoutFlowTest {
   }
 
   @Test
-  void lostTimeoutAdmissionDoesNotLoadParent() {
+  void lostTimeoutAdmissionIsNotCountedAndDoesNotLoadParent() {
     AwaitInteractionRecord interaction = interaction("unit-1");
     when(awaitCoordinator.findTimedOut(1000L, 100)).thenReturn(Uni.createFrom().item(List.of(interaction)));
     when(awaitCoordinator.markTimedOut(interaction, 1000L))
         .thenReturn(Uni.createFrom().item(Optional.empty()));
 
-    flow.sweepTimedOut(1000L, 100).await().indefinitely();
+    int timedOutCount = flow.sweepTimedOut(1000L, 100).await().indefinitely();
 
+    assertEquals(0, timedOutCount);
     verify(executionStateStore, never()).getExecution(any(), any());
     verify(segmentBoundaryLedger, never()).recordInteractionTimedOut(any(), anyLong());
   }
@@ -163,8 +168,9 @@ class AwaitTimeoutFlowTest {
   void emptyTimeoutBatchIsNoOp() {
     when(awaitCoordinator.findTimedOut(1000L, 100)).thenReturn(Uni.createFrom().item(List.of()));
 
-    flow.sweepTimedOut(1000L, 100).await().indefinitely();
+    int timedOutCount = flow.sweepTimedOut(1000L, 100).await().indefinitely();
 
+    assertEquals(0, timedOutCount);
     verify(awaitCoordinator, never()).markTimedOut(any(), anyLong());
     verify(executionStateStore, never()).getExecution(any(), any());
   }

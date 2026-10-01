@@ -2,9 +2,7 @@ package org.pipelineframework.orchestrator;
 
 import java.net.URI;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -14,18 +12,14 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.runtime.StartupEvent;
 import org.jboss.logging.Logger;
-import org.pipelineframework.PipelineExecutionService;
-import org.pipelineframework.config.pipeline.PipelineJson;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
 import software.amazon.awssdk.services.sqs.model.Message;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
-import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
 
 /**
  * SQS request/reply poller for transition worker commands.
@@ -34,7 +28,6 @@ import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
 public class SqsTransitionWorkerPoller {
 
     private static final Logger LOG = Logger.getLogger(SqsTransitionWorkerPoller.class);
-    private static final ObjectMapper JSON = PipelineJson.mapper();
     private static final int MAX_MESSAGES_PER_POLL = 1;
     private static final int WAIT_TIME_SECONDS = 1;
     private static final Duration ERROR_POLL_DELAY = Duration.ofMillis(500);
@@ -43,16 +36,12 @@ public class SqsTransitionWorkerPoller {
     PipelineOrchestratorConfig orchestratorConfig;
 
     @Inject
-    PipelineExecutionService executionService;
-
-    @Inject
-    ControlPlaneSecretResolver secretResolver;
+    SqsTransitionWorkerAction transitionWorkerAction;
 
     private volatile SqsClient client;
     private volatile ExecutorService pollExecutor;
     private volatile Future<?> pollFuture;
     private volatile boolean running;
-    private final TransitionWorkerNonceReplayGuard nonceReplayGuard = new TransitionWorkerNonceReplayGuard();
 
     @PostConstruct
     void validateServerConfig() {
@@ -89,17 +78,16 @@ public class SqsTransitionWorkerPoller {
 
     SqsTransitionWorkerPoller(
         PipelineOrchestratorConfig orchestratorConfig,
-        PipelineExecutionService executionService,
+        SqsTransitionWorkerAction transitionWorkerAction,
         SqsClient client
     ) {
         this.orchestratorConfig = orchestratorConfig;
-        this.executionService = executionService;
+        this.transitionWorkerAction = transitionWorkerAction;
         this.client = client;
-        this.secretResolver = new LocalControlPlaneSecretResolver();
     }
 
-    void onStartup(@Observes StartupEvent event) {
-        if (!enabled()) {
+    synchronized void onStartup(@Observes StartupEvent event) {
+        if (!enabled() || running) {
             return;
         }
         running = true;
@@ -145,122 +133,14 @@ public class SqsTransitionWorkerPoller {
         if (message == null || message.receiptHandle() == null) {
             return;
         }
-        SqsTransitionWorkerRequest request;
         try {
-            request = JSON.readValue(message.body(), SqsTransitionWorkerRequest.class);
-        } catch (Exception e) {
-            LOG.warnf(e, "Dropping malformed SQS transition worker request id=%s", message.messageId());
-            deleteRequest(message.receiptHandle());
-            return;
-        }
-        if (!authenticate(request, false)) {
-            LOG.warnf("Dropping unauthenticated SQS transition worker request id=%s requestId=%s",
-                message.messageId(),
-                request.requestId());
-            deleteRequest(message.receiptHandle());
-            return;
-        }
-        TransitionCommandEnvelope command;
-        try {
-            command = JSON.readValue(request.commandEnvelope(), TransitionCommandEnvelope.class);
-        } catch (Exception e) {
-            LOG.warnf(e, "Dropping malformed SQS transition worker command requestId=%s", request.requestId());
-            deleteRequest(message.receiptHandle());
-            return;
-        }
-        TransitionResultEnvelope result;
-        try {
-            result = executionService.executePortableTransition(command)
-                .await().atMost(orchestratorConfig.workerSqs().requestTimeout());
-        } catch (RuntimeException e) {
-            LOG.errorf(e, "Failed processing SQS transition worker requestId=%s executionId=%s",
-                request.requestId(),
-                command.executionId());
-            try {
-                sendResponse(request.requestId(), TransitionResultEnvelope.failed(e));
-                recordAuthenticatedNonce(request);
+            SqsMessageDisposition disposition = transitionWorkerAction.handle(SqsInboundMessage.from(message))
+                .await().indefinitely();
+            if (disposition == SqsMessageDisposition.ACKNOWLEDGE) {
                 deleteRequest(message.receiptHandle());
-            } catch (RuntimeException responseFailure) {
-                LOG.errorf(responseFailure, "Failed sending SQS transition worker failure response requestId=%s",
-                    request.requestId());
             }
-            return;
-        }
-        try {
-            sendResponse(request.requestId(), result);
-            recordAuthenticatedNonce(request);
-            deleteRequest(message.receiptHandle());
-        } catch (RuntimeException responseFailure) {
-            LOG.errorf(responseFailure, "Failed sending SQS transition worker response requestId=%s executionId=%s",
-                request.requestId(),
-                command.executionId());
-        }
-    }
-
-    private void sendResponse(String requestId, TransitionResultEnvelope result) {
-        try {
-            String resultJson = JSON.writeValueAsString(result.toWireResult());
-            String timestamp = Instant.now().toString();
-            String nonce = UUID.randomUUID().toString();
-            String signature = TransitionWorkerSignature.sign(
-                sharedSecret(),
-                SqsTransitionWorkerProtocol.SIGNATURE_METHOD,
-                SqsTransitionWorkerProtocol.RESPONSE_SIGNATURE_PATH,
-                timestamp,
-                nonce,
-                SqsTransitionWorkerProtocol.signedBytes(requestId, resultJson));
-            SqsTransitionWorkerResponse response = new SqsTransitionWorkerResponse(
-                requestId,
-                SqsTransitionWorkerProtocol.PROTOCOL_VERSION,
-                SqsTransitionWorkerProtocol.PAYLOAD_ENCODING,
-                resultJson,
-                timestamp,
-                nonce,
-                signature);
-            sqsClient().sendMessage(SendMessageRequest.builder()
-                .queueUrl(responseQueueUrl())
-                .messageBody(JSON.writeValueAsString(response))
-                .build());
-        } catch (Exception e) {
-            throw new TransitionWorkerFailureException("Failed sending SQS transition worker response", e);
-        }
-    }
-
-    private boolean authenticate(SqsTransitionWorkerRequest request, boolean recordNonce) {
-        if (!SqsTransitionWorkerProtocol.PROTOCOL_VERSION.equals(request.protocolVersion())
-            || !SqsTransitionWorkerProtocol.PAYLOAD_ENCODING.equals(request.commandEncoding())) {
-            return false;
-        }
-        long timestampEpochMs;
-        try {
-            timestampEpochMs = TransitionWorkerSignature.parseTimestamp(request.timestamp());
-        } catch (IllegalArgumentException e) {
-            return false;
-        }
-        long now = System.currentTimeMillis();
-        long toleranceMs = Math.max(0L, orchestratorConfig.workerSqs().signatureTolerance().toMillis());
-        if (Math.abs(now - timestampEpochMs) > toleranceMs) {
-            return false;
-        }
-        String expected = TransitionWorkerSignature.sign(
-            sharedSecret(),
-            SqsTransitionWorkerProtocol.SIGNATURE_METHOD,
-            SqsTransitionWorkerProtocol.REQUEST_SIGNATURE_PATH,
-            request.timestamp(),
-            request.nonce(),
-            SqsTransitionWorkerProtocol.signedBytes(request.requestId(), request.commandEnvelope()));
-        if (!TransitionWorkerSignature.matches(expected, request.signature())) {
-            return false;
-        }
-        if (recordNonce) {
-            return nonceReplayGuard.accept(request.nonce(), timestampEpochMs, now, toleranceMs);
-        }
-        return !nonceReplayGuard.seen(request.nonce(), now, toleranceMs);
-    }
-
-    private void recordAuthenticatedNonce(SqsTransitionWorkerRequest request) {
-        if (!authenticate(request, true)) {
-            LOG.warnf("SQS transition worker request nonce was already recorded requestId=%s", request.requestId());
+        } catch (RuntimeException e) {
+            LOG.errorf(e, "Failed invoking SQS transition-worker action id=%s", message.messageId());
         }
     }
 
@@ -289,22 +169,6 @@ public class SqsTransitionWorkerPoller {
             .filter(url -> !url.isBlank())
             .orElseThrow(() -> new IllegalStateException(
                 "pipeline.orchestrator.worker.sqs.request-queue-url is required"));
-    }
-
-    private String responseQueueUrl() {
-        return orchestratorConfig.workerSqs().responseQueueUrl()
-            .filter(url -> !url.isBlank())
-            .orElseThrow(() -> new IllegalStateException(
-                "pipeline.orchestrator.worker.sqs.response-queue-url is required"));
-    }
-
-    private String sharedSecret() {
-        return WorkerSecretSupport.resolve(
-            orchestratorConfig.workerSqs().sharedSecret(),
-            orchestratorConfig.workerSqs().sharedSecretRef(),
-            secretResolver,
-            "pipeline.orchestrator.worker.sqs.shared-secret",
-            "pipeline.orchestrator.worker.sqs.shared-secret-ref");
     }
 
     private int visibilityTimeoutSeconds() {

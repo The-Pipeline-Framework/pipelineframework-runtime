@@ -6,8 +6,6 @@ import java.util.Optional;
 
 import io.smallrye.mutiny.Uni;
 import org.junit.jupiter.api.Test;
-import org.pipelineframework.PipelineExecutionService;
-import org.pipelineframework.config.pipeline.PipelineJson;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
 import software.amazon.awssdk.services.sqs.model.Message;
@@ -24,17 +22,16 @@ class SqsWorkPollerTest {
     @Test
     void pollOnceDeletesMessageAfterSuccessfulProcessing() {
         SqsClient client = mock(SqsClient.class);
-        PipelineExecutionService pipelineExecutionService = mock(PipelineExecutionService.class);
+        SqsWorkItemAction workItemAction = mock(SqsWorkItemAction.class);
         when(client.receiveMessage(any(ReceiveMessageRequest.class))).thenReturn(ReceiveMessageResponse.builder()
             .messages(validMessage("receipt-1", "exec-1"))
             .build());
-        when(pipelineExecutionService.processExecutionWorkItem(new ExecutionWorkItem("tenant-a", "exec-1")))
-            .thenReturn(Uni.createFrom().voidItem());
-        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), pipelineExecutionService, client);
+        when(workItemAction.handle(any())).thenReturn(Uni.createFrom().item(SqsMessageDisposition.ACKNOWLEDGE));
+        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), workItemAction, client);
 
         assertDoesNotThrow(poller::pollOnce);
 
-        verify(pipelineExecutionService).processExecutionWorkItem(new ExecutionWorkItem("tenant-a", "exec-1"));
+        verify(workItemAction).handle(argThat(message -> message.messageId().orElseThrow().equals("exec-1")));
         verify(client).receiveMessage(argThat((ReceiveMessageRequest request) ->
             request.visibilityTimeout() != null && request.visibilityTimeout().equals(30)));
         verify(client).deleteMessage(argThat((DeleteMessageRequest request) ->
@@ -45,24 +42,23 @@ class SqsWorkPollerTest {
     @Test
     void pollOnceKeepsMessageWhenProcessingFails() {
         SqsClient client = mock(SqsClient.class);
-        PipelineExecutionService pipelineExecutionService = mock(PipelineExecutionService.class);
+        SqsWorkItemAction workItemAction = mock(SqsWorkItemAction.class);
         when(client.receiveMessage(any(ReceiveMessageRequest.class))).thenReturn(ReceiveMessageResponse.builder()
             .messages(validMessage("receipt-2", "exec-2"))
             .build());
-        when(pipelineExecutionService.processExecutionWorkItem(new ExecutionWorkItem("tenant-a", "exec-2")))
-            .thenReturn(Uni.createFrom().failure(new IllegalStateException("boom")));
-        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), pipelineExecutionService, client);
+        when(workItemAction.handle(any())).thenReturn(Uni.createFrom().item(SqsMessageDisposition.RETRY));
+        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), workItemAction, client);
 
         assertDoesNotThrow(poller::pollOnce);
 
-        verify(pipelineExecutionService).processExecutionWorkItem(new ExecutionWorkItem("tenant-a", "exec-2"));
+        verify(workItemAction).handle(any());
         verify(client, never()).deleteMessage(any(DeleteMessageRequest.class));
     }
 
     @Test
     void pollOnceDeletesMalformedMessages() {
         SqsClient client = mock(SqsClient.class);
-        PipelineExecutionService pipelineExecutionService = mock(PipelineExecutionService.class);
+        SqsWorkItemAction workItemAction = mock(SqsWorkItemAction.class);
         when(client.receiveMessage(any(ReceiveMessageRequest.class))).thenReturn(ReceiveMessageResponse.builder()
             .messages(Message.builder()
                 .messageId("malformed")
@@ -70,11 +66,12 @@ class SqsWorkPollerTest {
                 .body("{not-json")
                 .build())
             .build());
-        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), pipelineExecutionService, client);
+        when(workItemAction.handle(any())).thenReturn(Uni.createFrom().item(SqsMessageDisposition.ACKNOWLEDGE));
+        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), workItemAction, client);
 
         assertDoesNotThrow(poller::pollOnce);
 
-        verifyNoInteractions(pipelineExecutionService);
+        verify(workItemAction).handle(any());
         verify(client).deleteMessage(argThat((DeleteMessageRequest request) ->
             request.queueUrl().equals("http://elasticmq.local/queue/work")
                 && request.receiptHandle().equals("receipt-3")));
@@ -83,18 +80,19 @@ class SqsWorkPollerTest {
     @Test
     void pollOnceDeletesNullBodyMessagesWhenReceiptHandleIsPresent() {
         SqsClient client = mock(SqsClient.class);
-        PipelineExecutionService pipelineExecutionService = mock(PipelineExecutionService.class);
+        SqsWorkItemAction workItemAction = mock(SqsWorkItemAction.class);
         when(client.receiveMessage(any(ReceiveMessageRequest.class))).thenReturn(ReceiveMessageResponse.builder()
             .messages(Message.builder()
                 .messageId("null-body")
                 .receiptHandle("receipt-null")
                 .build())
             .build());
-        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), pipelineExecutionService, client);
+        when(workItemAction.handle(any())).thenReturn(Uni.createFrom().item(SqsMessageDisposition.ACKNOWLEDGE));
+        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), workItemAction, client);
 
         assertDoesNotThrow(poller::pollOnce);
 
-        verifyNoInteractions(pipelineExecutionService);
+        verify(workItemAction).handle(argThat(message -> message.body().isEmpty()));
         verify(client).deleteMessage(argThat((DeleteMessageRequest request) ->
             request.queueUrl().equals("http://elasticmq.local/queue/work")
                 && request.receiptHandle().equals("receipt-null")));
@@ -103,46 +101,46 @@ class SqsWorkPollerTest {
     @Test
     void pollOnceSkipsWhenLocalLoopbackIsEnabled() {
         SqsClient client = mock(SqsClient.class);
-        PipelineExecutionService pipelineExecutionService = mock(PipelineExecutionService.class);
-        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(false), pipelineExecutionService, client);
+        SqsWorkItemAction workItemAction = mock(SqsWorkItemAction.class);
+        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(false), workItemAction, client);
 
         assertDoesNotThrow(poller::pollOnce);
 
         verifyNoInteractions(client);
-        verifyNoInteractions(pipelineExecutionService);
+        verifyNoInteractions(workItemAction);
     }
 
     @Test
     void pollOnceDoesNothingWhenReceiveReturnsNoMessages() {
         SqsClient client = mock(SqsClient.class);
-        PipelineExecutionService pipelineExecutionService = mock(PipelineExecutionService.class);
+        SqsWorkItemAction workItemAction = mock(SqsWorkItemAction.class);
         when(client.receiveMessage(any(ReceiveMessageRequest.class)))
             .thenReturn(ReceiveMessageResponse.builder().messages(List.of()).build());
-        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), pipelineExecutionService, client);
+        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), workItemAction, client);
 
         assertDoesNotThrow(poller::pollOnce);
 
         verify(client, never()).deleteMessage(any(DeleteMessageRequest.class));
-        verifyNoInteractions(pipelineExecutionService);
+        verifyNoInteractions(workItemAction);
     }
 
     @Test
     void pollOnceSwallowsReceiveFailures() {
         SqsClient client = mock(SqsClient.class);
-        PipelineExecutionService pipelineExecutionService = mock(PipelineExecutionService.class);
+        SqsWorkItemAction workItemAction = mock(SqsWorkItemAction.class);
         when(client.receiveMessage(any(ReceiveMessageRequest.class))).thenThrow(new IllegalStateException("receive failed"));
-        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), pipelineExecutionService, client);
+        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), workItemAction, client);
 
         assertDoesNotThrow(poller::pollOnce);
 
         verify(client, never()).deleteMessage(any(DeleteMessageRequest.class));
-        verifyNoInteractions(pipelineExecutionService);
+        verifyNoInteractions(workItemAction);
     }
 
     @Test
     void pollOnceProcessesValidAndMalformedMessagesAndDeletesHandledAndMalformed() {
         SqsClient client = mock(SqsClient.class);
-        PipelineExecutionService pipelineExecutionService = mock(PipelineExecutionService.class);
+        SqsWorkItemAction workItemAction = mock(SqsWorkItemAction.class);
         Message first = validMessage("receipt-4", "exec-4");
         Message malformed = Message.builder()
             .messageId("malformed")
@@ -153,16 +151,12 @@ class SqsWorkPollerTest {
         when(client.receiveMessage(any(ReceiveMessageRequest.class))).thenReturn(ReceiveMessageResponse.builder()
             .messages(first, malformed, second)
             .build());
-        when(pipelineExecutionService.processExecutionWorkItem(new ExecutionWorkItem("tenant-a", "exec-4")))
-            .thenReturn(Uni.createFrom().voidItem());
-        when(pipelineExecutionService.processExecutionWorkItem(new ExecutionWorkItem("tenant-a", "exec-6")))
-            .thenReturn(Uni.createFrom().voidItem());
-        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), pipelineExecutionService, client);
+        when(workItemAction.handle(any())).thenReturn(Uni.createFrom().item(SqsMessageDisposition.ACKNOWLEDGE));
+        SqsWorkPoller poller = new SqsWorkPoller(mockConfig(true), workItemAction, client);
 
         assertDoesNotThrow(poller::pollOnce);
 
-        verify(pipelineExecutionService).processExecutionWorkItem(new ExecutionWorkItem("tenant-a", "exec-4"));
-        verify(pipelineExecutionService).processExecutionWorkItem(new ExecutionWorkItem("tenant-a", "exec-6"));
+        verify(workItemAction, times(3)).handle(any());
         verify(client).deleteMessage(argThat((DeleteMessageRequest request) ->
             request.queueUrl().equals("http://elasticmq.local/queue/work")
                 && request.receiptHandle().equals("receipt-4")));
@@ -175,16 +169,10 @@ class SqsWorkPollerTest {
     }
 
     private static Message validMessage(String receiptHandle, String executionId) {
-        String body;
-        try {
-            body = PipelineJson.mapper().writeValueAsString(new ExecutionWorkItem("tenant-a", executionId));
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed creating test SQS message JSON.", e);
-        }
         return Message.builder()
             .messageId(executionId)
             .receiptHandle(receiptHandle)
-            .body(body)
+            .body("{}")
             .build();
     }
 
