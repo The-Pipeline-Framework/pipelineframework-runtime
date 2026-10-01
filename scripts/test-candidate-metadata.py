@@ -8,13 +8,14 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-VERSION = "26.9.4"
+VERSION = ET.parse(ROOT / "pom.xml").getroot().findtext("{http://maven.apache.org/POM/4.0.0}version").removesuffix("-SNAPSHOT")
 COORDS = [
     ("org.pipelineframework", "pipelineframework-runtime-parent", "pom"),
     ("org.pipelineframework", "pipelineframework", "jar"),
     ("org.pipelineframework", "pipelineframework-deployment", "jar"),
     ("org.pipelineframework", "pipelineframework-runtime-spring", "jar"),
     ("org.pipelineframework", "pipelineframework-release-maven-plugin", "jar"),
+    ("org.pipelineframework", "pipelineframework-release-producer", "jar"),
     ("org.pipelineframework", "cache-plugin", "jar"),
     ("org.pipelineframework", "persistence-plugin", "jar"),
     ("org.pipelineframework", "repository-plugin", "jar"),
@@ -54,7 +55,15 @@ for event, candidate_type, number in [("pull_request", "pr", "42"), ("push", "ma
         metadata = json.loads((candidate_root / "build-metadata.json").read_text())
         assert metadata["candidateVersion"] == candidate
         assert metadata["pullRequestNumber"] == (42 if number else None)
-        assert len(metadata["mavenArtifacts"]) == 8
+        assert len(metadata["mavenArtifacts"]) == len(COORDS)
+        assert any(item["artifactId"] == "pipelineframework-release-producer" for item in metadata["mavenArtifacts"])
+        producer_pom = repository / "org/pipelineframework/pipelineframework-release-producer" / candidate / f"pipelineframework-release-producer-{candidate}.pom"
+        producer_bytes = producer_pom.read_bytes()
+        producer_pom.unlink()
+        rejected = subprocess.run(["python3", str(ROOT / "scripts/create-build-metadata.py"), str(candidate_root)],
+                                  cwd=ROOT, env=env, capture_output=True)
+        assert rejected.returncode != 0, "missing release-producer POM must fail before publication"
+        producer_pom.write_bytes(producer_bytes)
         for artifact in metadata["mavenArtifacts"]:
             for item in artifact["files"]:
                 path = repository / pathlib.Path(*artifact["groupId"].split(".")) / artifact["artifactId"] / candidate / item["name"]

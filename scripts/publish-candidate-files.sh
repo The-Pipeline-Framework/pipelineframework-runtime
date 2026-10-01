@@ -26,6 +26,7 @@ coordinates=(
   "org.pipelineframework:pipelineframework-deployment:jar"
   "org.pipelineframework:pipelineframework-runtime-spring:jar"
   "org.pipelineframework:pipelineframework-release-maven-plugin:jar"
+  "org.pipelineframework:pipelineframework-release-producer:jar"
   "org.pipelineframework:cache-plugin:jar"
   "org.pipelineframework:persistence-plugin:jar"
   "org.pipelineframework:repository-plugin:jar"

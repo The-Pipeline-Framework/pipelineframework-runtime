@@ -21,6 +21,10 @@ jobs:
           java-version: '21'
           cache: maven
           cache-path: ${{ github.workspace }}/.m2/repository
+      - name: Verify candidate publication contracts
+        run: |
+          python3 scripts/test-candidate-metadata.py
+          python3 scripts/test-published-candidate.py
       - run: ./mvnw clean verify --no-transfer-progress -Dmaven.repo.local="$PWD/.m2/repository"
       - name: Summarize Surefire unit coverage
         if: always()

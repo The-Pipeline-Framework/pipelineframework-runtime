@@ -9,6 +9,7 @@ export const expectedDeployability = new Map([
   ['pipelineframework-deployment', true],
   ['pipelineframework-runtime-spring', true],
   ['pipelineframework-release-maven-plugin', true],
+  ['pipelineframework-release-producer', true],
   ['persistence-plugin', true],
   ['cache-plugin', true],
   ['repository-plugin', true],
