@@ -82,6 +82,7 @@ class PipelineReplayExecutionTest {
     private SdkTracerProvider tracerProvider;
     private InMemoryMetricReader metricReader;
     private SdkMeterProvider meterProvider;
+    private final List<FilePipelineReplayExporter> fileExporters = new ArrayList<>();
 
     @BeforeEach
     void setUp() {
@@ -103,9 +104,16 @@ class PipelineReplayExecutionTest {
 
     @AfterEach
     void tearDown() {
+        fileExporters.forEach(FilePipelineReplayExporter::close);
         tracerProvider.shutdown();
         meterProvider.shutdown();
         GlobalOpenTelemetry.resetForTest();
+    }
+
+    private FilePipelineReplayExporter fileExporter(Path output) {
+        FilePipelineReplayExporter exporter = new FilePipelineReplayExporter(output);
+        fileExporters.add(exporter);
+        return exporter;
     }
 
     @Test
@@ -302,7 +310,7 @@ class PipelineReplayExecutionTest {
         Path output = tempDir.resolve("success-replay.json");
         PipelineTelemetry telemetry = new PipelineTelemetry(
             new ReplayEnabledPipelineStepConfig(output.toString()),
-            new FilePipelineReplayExporter(output),
+            fileExporter(output),
             topology());
 
         Payload inputPayload = new Payload("alpha");
@@ -328,7 +336,7 @@ class PipelineReplayExecutionTest {
         Path output = tempDir.resolve("failed-replay.json");
         PipelineTelemetry telemetry = new PipelineTelemetry(
             new ReplayEnabledPipelineStepConfig(output.toString()),
-            new FilePipelineReplayExporter(output),
+            fileExporter(output),
             failureTopology());
 
         Uni<Payload> input = Uni.createFrom().item(new Payload("delta"));
@@ -353,7 +361,7 @@ class PipelineReplayExecutionTest {
         Path outputDir = tempDir.resolve("replay-runs");
         PipelineTelemetry telemetry = new PipelineTelemetry(
             new ReplayEnabledPipelineStepConfig(outputDir.toString()),
-            new FilePipelineReplayExporter(outputDir),
+            fileExporter(outputDir),
             topology());
 
         for (String value : List.of("alpha", "beta")) {
@@ -384,7 +392,7 @@ class PipelineReplayExecutionTest {
         Path outputDir = tempDir.resolve("await-control-runs");
         PipelineTelemetry telemetry = new PipelineTelemetry(
             new ReplayEnabledPipelineStepConfig(outputDir.toString()),
-            new FilePipelineReplayExporter(outputDir),
+            fileExporter(outputDir),
             awaitTopology());
 
         telemetry.recordAwaitLifecycle(new AwaitReplayLifecycleEvent(
@@ -419,6 +427,120 @@ class PipelineReplayExecutionTest {
         assertEquals("interaction-1", event.attributes().get("tpf.await.interaction_id"));
         assertEquals("2", event.attributes().get("tpf.await.expected_item_count"));
         assertEquals("1", event.attributes().get("tpf.await.completed_item_count"));
+
+        Path firstFragment = replayFiles.getFirst();
+        Files.delete(firstFragment);
+        Files.createDirectory(firstFragment);
+        for (int index = 1; index < 513; index++) {
+            telemetry.recordAwaitLifecycle(new AwaitReplayLifecycleEvent(
+                AwaitReplayLifecycleEvent.UNIT_ITEM_COMPLETED,
+                "exec-1",
+                "unit-1",
+                "AwaitProvider",
+                1,
+                "WAITING_EXTERNAL",
+                "interaction-" + index,
+                "correlation-1",
+                "kafka",
+                0,
+                2,
+                1,
+                true));
+        }
+        Files.delete(firstFragment);
+        awaitControlEventCount(outputDir, 513);
+        telemetry.recordAwaitLifecycle(new AwaitReplayLifecycleEvent(
+            AwaitReplayLifecycleEvent.UNIT_ITEM_COMPLETED,
+            "exec-1",
+            "unit-1",
+            "AwaitProvider",
+            1,
+            "WAITING_EXTERNAL",
+            "interaction-513",
+            "correlation-1",
+            "kafka",
+            0,
+            2,
+            1,
+            true));
+        awaitControlEventCount(outputDir, 514);
+        for (int index = 514; index < 1024; index++) {
+            telemetry.recordAwaitLifecycle(new AwaitReplayLifecycleEvent(
+                AwaitReplayLifecycleEvent.UNIT_ITEM_COMPLETED,
+                "exec-1",
+                "unit-1",
+                "AwaitProvider",
+                1,
+                "WAITING_EXTERNAL",
+                "interaction-" + index,
+                "correlation-1",
+                "kafka",
+                0,
+                2,
+                1,
+                true));
+        }
+        try (var replayFileStream = Files.list(outputDir)) {
+            replayFiles = replayFileStream.filter(path -> path.toString().endsWith(".json")).sorted().toList();
+        }
+        assertEquals(2, replayFiles.size(), "Control events should roll into bounded replay fragments.");
+        int totalEvents = 0;
+        long expectedSequence = 1;
+        for (Path replayFile : replayFiles) {
+            PipelineReplayDocument fragment = PipelineJson.mapper().readValue(replayFile.toFile(), PipelineReplayDocument.class);
+            assertEquals(512, fragment.events().size());
+            for (PipelineExecutionEvent fragmentEvent : fragment.events()) {
+                assertEquals(Long.valueOf(expectedSequence++), fragmentEvent.sequence());
+            }
+            totalEvents += fragment.events().size();
+        }
+        assertEquals(1024, totalEvents);
+    }
+
+    private static void awaitControlEventCount(Path outputDir, int expected) throws Exception {
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (System.nanoTime() < deadline) {
+            try (var replayFileStream = Files.list(outputDir)) {
+                int persisted = 0;
+                for (Path replayFile : replayFileStream.filter(Files::isRegularFile).toList()) {
+                    PipelineReplayDocument fragment = PipelineJson.mapper()
+                        .readValue(replayFile.toFile(), PipelineReplayDocument.class);
+                    persisted += fragment.events().size();
+                }
+                if (persisted == expected) {
+                    return;
+                }
+            } catch (java.io.IOException ignored) {
+                // A scheduled flush can replace a fragment while the test reads it.
+            }
+            Thread.sleep(25);
+        }
+        throw new AssertionError("Timed out waiting for " + expected + " persisted control events.");
+    }
+
+    @Test
+    void controlFragmentsKeepOrderWhenEventsShareTimestamp() throws Exception {
+        Path outputDir = tempDir.resolve("same-time-control");
+        FilePipelineReplayExporter exporter = fileExporter(outputDir);
+        Instant occurredAt = Instant.parse("2026-10-01T12:00:00Z");
+        PipelineExecutionEvent event = new PipelineExecutionEvent(
+            "trace", "span", "parent", "item", "payments", "Await", "provider",
+            "unit_item_completed", 0d, 0d, 0L, "source", "await", "ONE_TO_MANY",
+            List.of(), 0L, 0, "", "", Map.of());
+        for (int index = 0; index < 513; index++) {
+            exporter.emitControlEvent("payments", occurredAt, awaitTopology(), event);
+        }
+        List<Path> files;
+        try (var paths = Files.list(outputDir)) {
+            files = paths.sorted().toList();
+        }
+        assertEquals(2, files.size());
+        PipelineReplayDocument first = PipelineJson.mapper().readValue(files.getFirst().toFile(), PipelineReplayDocument.class);
+        PipelineReplayDocument second = PipelineJson.mapper().readValue(files.getLast().toFile(), PipelineReplayDocument.class);
+        assertEquals(512, first.events().size());
+        assertEquals(1, second.events().size());
+        assertEquals(Long.valueOf(1L), first.events().getFirst().sequence());
+        assertEquals(Long.valueOf(513L), second.events().getFirst().sequence());
     }
 
     @Test
@@ -426,7 +548,7 @@ class PipelineReplayExecutionTest {
         Path output = tempDir.resolve("disabled-replay.json");
         PipelineTelemetry telemetry = new PipelineTelemetry(
             new ReplayDisabledPipelineStepConfig(output.toString()),
-            new FilePipelineReplayExporter(output),
+            fileExporter(output),
             topology());
 
         Uni<Payload> input = Uni.createFrom().item(new Payload("zeta"));
@@ -445,7 +567,7 @@ class PipelineReplayExecutionTest {
         Path output = tempDir.resolve("misconfigured-replay.json");
         PipelineTelemetry telemetry = new PipelineTelemetry(
             new ReplayMissingPrerequisitesPipelineStepConfig(output.toString()),
-            new FilePipelineReplayExporter(output),
+            fileExporter(output),
             topology());
 
         Uni<Payload> input = Uni.createFrom().item(new Payload("eta"));
@@ -495,7 +617,7 @@ class PipelineReplayExecutionTest {
         Path output = tempDir.resolve("reject-replay.json");
         PipelineTelemetry telemetry = new PipelineTelemetry(
             new ReplayEnabledPipelineStepConfig(output.toString()),
-            new FilePipelineReplayExporter(output),
+            fileExporter(output),
             rejectTopology());
 
         Uni<Payload> input = Uni.createFrom().item(new Payload("reject-me"));
