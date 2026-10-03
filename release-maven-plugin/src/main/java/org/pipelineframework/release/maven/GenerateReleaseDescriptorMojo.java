@@ -16,7 +16,10 @@ import org.pipelineframework.release.producer.ReleaseProductionRequest;
 /** Produces {@code pipeline-release.json} from packaged artifact bytes and Compiled Truth. */
 @Mojo(name = "generate-release-descriptor", defaultPhase = LifecyclePhase.VERIFY, requiresProject = true, threadSafe = true)
 public final class GenerateReleaseDescriptorMojo extends AbstractMojo {
-    @Parameter(property = "tpf.release.version", required = true)
+    @Parameter(property = "tpf.release.skip", defaultValue = "false")
+    private boolean skip;
+
+    @Parameter(property = "tpf.release.version")
     private String releaseVersion;
 
     @Parameter(property = "tpf.release.output", defaultValue = "${project.build.directory}/pipeline-release.json", required = true)
@@ -51,6 +54,13 @@ public final class GenerateReleaseDescriptorMojo extends AbstractMojo {
 
     @Override
     public void execute() throws MojoExecutionException {
+        if (skip) {
+            getLog().info("Skipping Pipeline Release Descriptor production (tpf.release.skip=true)");
+            return;
+        }
+        if (releaseVersion == null || releaseVersion.isBlank()) {
+            throw new MojoExecutionException("tpf.release.version is required when release production is enabled");
+        }
         try {
             DefaultPipelineReleaseProducer producer = new DefaultPipelineReleaseProducer();
             PipelineContractDescriptor contract = producer.loadContract(contractFile.toPath());
