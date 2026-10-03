@@ -11,10 +11,12 @@ import io.grpc.Status;
 import io.grpc.StatusException;
 import io.grpc.StatusRuntimeException;
 import jakarta.ws.rs.WebApplicationException;
+import org.jboss.logging.Logger;
 import org.pipelineframework.step.NonRetryableException;
 
 /** One remote subscription with one extra frame credit for terminal page metadata. */
 final class RemotePagedSourceClient<F, T> {
+  private static final Logger LOG = Logger.getLogger(RemotePagedSourceClient.class);
   private final PagedSourceRequest<?> request;
   private final Flow.Publisher<F> remote;
   private final Function<F, RemotePageFrame<T>> decode;
@@ -144,6 +146,8 @@ final class RemotePagedSourceClient<F, T> {
           try {
             end.value().validateAgainst(request);
             terminal = end.value();
+            LOG.infof("event=remote_page_client_completion_frame consumedRecords=%d exhausted=%s",
+                terminal.consumedRecords(), terminal.exhausted());
           } catch (Throwable error) {
             failure = error;
           }
@@ -176,6 +180,7 @@ final class RemotePagedSourceClient<F, T> {
           return;
         }
         remoteDone = true;
+        LOG.info("event=remote_page_client_rpc_complete");
         if (terminal == null) {
           failure = new IllegalStateException("remote page ended without completion frame");
         }
