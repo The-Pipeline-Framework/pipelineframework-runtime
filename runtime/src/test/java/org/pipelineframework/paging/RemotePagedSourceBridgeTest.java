@@ -49,7 +49,7 @@ class RemotePagedSourceBridgeTest {
     remote.emit(new RemotePageFrame.Completion<>(
         new PagedSourceCompletion(2, Optional.of("next"), false)));
     assertFalse(page.completion().toCompletableFuture().isDone());
-    remote.complete();
+    remote.completeWhenCredit();
     assertTrue(items.completed);
     assertEquals("next", page.completion().toCompletableFuture().join()
         .nextCheckpoint().orElseThrow());
@@ -288,6 +288,11 @@ class RemotePagedSourceBridgeTest {
       subscriber.onComplete();
     }
 
+    void completeWhenCredit() {
+      assertEquals(1, credits, "one bounded transport credit releases RPC closure");
+      subscriber.onComplete();
+    }
+
     void fail(Throwable error) {
       subscriber.onError(error);
     }
@@ -314,9 +319,9 @@ class RemotePagedSourceBridgeTest {
             if (emitted < count) {
               subscriber.onNext(new RemotePageFrame.Item<>(Integer.toString(++emitted)));
             } else {
+              closed = true;
               subscriber.onNext(new RemotePageFrame.Completion<>(
                   new PagedSourceCompletion(count, Optional.empty(), true)));
-              closed = true;
               subscriber.onComplete();
             }
           }

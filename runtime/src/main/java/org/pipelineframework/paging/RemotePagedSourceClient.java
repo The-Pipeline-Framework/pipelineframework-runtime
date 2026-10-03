@@ -14,7 +14,7 @@ import jakarta.ws.rs.WebApplicationException;
 import org.jboss.logging.Logger;
 import org.pipelineframework.step.NonRetryableException;
 
-/** One remote subscription with one extra frame credit for terminal page metadata. */
+/** One remote subscription with at most one outstanding transport credit and one buffered item. */
 final class RemotePagedSourceClient<F, T> {
   private static final Logger LOG = Logger.getLogger(RemotePagedSourceClient.class);
   private final PagedSourceRequest<?> request;
@@ -266,9 +266,11 @@ final class RemotePagedSourceClient<F, T> {
         Flow.Subscription current;
         synchronized (this) {
           if (cancelled || signalled || upstream == null || buffered != null
-              || creditOutstanding || terminal != null || remoteDone) {
+              || creditOutstanding || remoteDone) {
             current = null;
           } else {
+            // After the completion frame, one final credit permits a demand-gated
+            // transport to deliver normal closure. Any additional frame fails above.
             current = upstream;
             creditOutstanding = true;
           }
