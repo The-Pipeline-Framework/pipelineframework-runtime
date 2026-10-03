@@ -489,8 +489,8 @@ class PipelineReplayExecutionTest {
         for (Path replayFile : replayFiles) {
             PipelineReplayDocument fragment = PipelineJson.mapper().readValue(replayFile.toFile(), PipelineReplayDocument.class);
             assertEquals(512, fragment.events().size());
-            for (PipelineExecutionEvent event : fragment.events()) {
-                assertEquals(Long.valueOf(expectedSequence++), event.sequence());
+            for (PipelineExecutionEvent fragmentEvent : fragment.events()) {
+                assertEquals(Long.valueOf(expectedSequence++), fragmentEvent.sequence());
             }
             totalEvents += fragment.events().size();
         }
