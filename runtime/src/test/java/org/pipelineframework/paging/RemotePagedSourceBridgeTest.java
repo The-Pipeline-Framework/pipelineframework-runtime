@@ -2,13 +2,16 @@ package org.pipelineframework.paging;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.Flow;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import io.grpc.Status;
 import io.smallrye.mutiny.Multi;
 import org.pipelineframework.step.NonRetryableException;
@@ -196,6 +199,67 @@ class RemotePagedSourceBridgeTest {
     }
     assertEquals(List.of("1", "2", "3", "4", "5"), received);
     assertTrue(checkpoint.isEmpty());
+  }
+
+  @Test
+  void completionAfterSourceClosureReachesClientWithoutMoreItemDemand() {
+    int count = 12;
+    PagedSourceRequest<String> pageRequest = new PagedSourceRequest<>(
+        "input", "snapshot", Optional.empty(), 1000);
+    CompletableFuture<PagedSourceCompletion> sourceCompletion = new CompletableFuture<>();
+    Flow.Publisher<String> sourceItems = subscriber -> subscriber.onSubscribe(new Flow.Subscription() {
+      private int emitted;
+      private boolean closed;
+
+      @Override public void request(long amount) {
+        for (long sent = 0; sent < amount && !closed; sent++) {
+          if (emitted < count) {
+            subscriber.onNext(Integer.toString(++emitted));
+          } else {
+            closed = true;
+            subscriber.onComplete();
+            sourceCompletion.complete(new PagedSourceCompletion(count, Optional.empty(), true));
+          }
+        }
+      }
+
+      @Override public void cancel() { closed = true; }
+    });
+    PagedSourceStream<String> source = new PagedSourceStream<>(sourceItems, sourceCompletion);
+    PagedSourceStream<String> client = bridge.open(pageRequest,
+        bridge.serve(source, pageRequest,
+            RemotePageFrame.Item<String>::new, RemotePageFrame.Completion<String>::new),
+        frame -> frame);
+    List<String> items = Multi.createFrom().publisher(client.items())
+        .collect().asList().await().atMost(Duration.ofSeconds(3));
+    assertEquals(count, items.size());
+    assertEquals(count, client.completion().toCompletableFuture().join().consumedRecords());
+  }
+
+  @Test
+  void downstreamCompletionCanObserveConfirmedPageCompletion() {
+    ControlledRemote remote = new ControlledRemote();
+    PagedSourceStream<String> page = bridge.open(request, remote, frame -> frame);
+    AtomicReference<Throwable> callbackFailure = new AtomicReference<>();
+    page.items().subscribe(new Flow.Subscriber<>() {
+      @Override public void onSubscribe(Flow.Subscription subscription) {
+        subscription.request(1);
+      }
+      @Override public void onNext(String item) { }
+      @Override public void onError(Throwable failure) { callbackFailure.set(failure); }
+      @Override public void onComplete() {
+        try {
+          page.completion().toCompletableFuture().get(200, TimeUnit.MILLISECONDS);
+        } catch (Exception failure) {
+          callbackFailure.set(failure);
+        }
+      }
+    });
+    remote.emit(new RemotePageFrame.Item<>("one"));
+    remote.emit(new RemotePageFrame.Completion<>(
+        new PagedSourceCompletion(1, Optional.empty(), true)));
+    remote.complete();
+    assertNull(callbackFailure.get());
   }
 
   private static final class ControlledRemote implements Flow.Publisher<RemotePageFrame<String>> {

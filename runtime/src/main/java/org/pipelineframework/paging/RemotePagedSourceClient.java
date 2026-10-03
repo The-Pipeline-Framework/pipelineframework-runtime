@@ -242,12 +242,10 @@ final class RemotePagedSourceClient<F, T> {
               fail(callbackFailure);
             }
           } else {
-            try {
-              downstream.onComplete();
-              completion.complete(result);
-            } catch (Throwable callbackFailure) {
-              completion.completeExceptionally(callbackFailure);
-            }
+            // The RPC has closed normally. Publish its page result before invoking
+            // downstream completion, whose terminal path may await that result.
+            completion.complete(result);
+            downstream.onComplete();
             break;
           }
         }
