@@ -60,6 +60,7 @@
                 <artifactId>pipelineframework-release-maven-plugin</artifactId>
                 <version>${tpf.runtime.version}</version>
                 <configuration>
+                    <skip>false</skip>
                     <releaseVersion>it-release-1</releaseVersion>
                     <artifactUri>maven:org.pipelineframework.it:release-descriptor-real-pipeline-it:1.0.0</artifactUri>
                 </configuration>

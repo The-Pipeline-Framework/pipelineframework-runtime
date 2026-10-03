@@ -3,7 +3,6 @@
   <groupId>org.pipelineframework.release.it</groupId>
   <artifactId>skipped-release</artifactId>
   <version>1.0.0</version>
-  <properties><tpf.release.skip>true</tpf.release.skip></properties>
   <build><plugins><plugin>
     <groupId>org.pipelineframework</groupId>
     <artifactId>pipelineframework-release-maven-plugin</artifactId>

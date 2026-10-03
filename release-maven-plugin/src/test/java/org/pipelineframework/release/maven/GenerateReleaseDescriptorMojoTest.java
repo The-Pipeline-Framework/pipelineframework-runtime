@@ -9,6 +9,11 @@ import org.junit.jupiter.api.Test;
 
 class GenerateReleaseDescriptorMojoTest {
     @Test
+    void defaultSkipNeedsNeitherVersionNorBuildOutputs() {
+        assertDoesNotThrow(new GenerateReleaseDescriptorMojo()::execute);
+    }
+
+    @Test
     void explicitSkipNeedsNeitherVersionNorBuildOutputs() throws Exception {
         var mojo = new GenerateReleaseDescriptorMojo();
         var skip = GenerateReleaseDescriptorMojo.class.getDeclaredField("skip");
@@ -18,8 +23,12 @@ class GenerateReleaseDescriptorMojoTest {
     }
 
     @Test
-    void enabledProductionStillRequiresExplicitVersionBeforeReadingBuildOutputs() {
-        var error = assertThrows(MojoExecutionException.class, new GenerateReleaseDescriptorMojo()::execute);
+    void enabledProductionStillRequiresExplicitVersionBeforeReadingBuildOutputs() throws Exception {
+        var mojo = new GenerateReleaseDescriptorMojo();
+        var skip = GenerateReleaseDescriptorMojo.class.getDeclaredField("skip");
+        skip.setAccessible(true);
+        skip.setBoolean(mojo, false);
+        var error = assertThrows(MojoExecutionException.class, mojo::execute);
         assertTrue(error.getMessage().contains("tpf.release.version is required"));
     }
 }
