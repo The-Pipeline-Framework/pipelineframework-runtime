@@ -1,0 +1,12 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.pipelineframework.release.it</groupId>
+  <artifactId>skipped-release</artifactId>
+  <version>1.0.0</version>
+  <build><plugins><plugin>
+    <groupId>org.pipelineframework</groupId>
+    <artifactId>pipelineframework-release-maven-plugin</artifactId>
+    <version>@project.version@</version>
+    <executions><execution><phase>verify</phase><goals><goal>generate-release-descriptor</goal></goals></execution></executions>
+  </plugin></plugins></build>
+</project>
