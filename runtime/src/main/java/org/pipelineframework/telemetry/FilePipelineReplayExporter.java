@@ -51,16 +51,18 @@ import org.pipelineframework.config.pipeline.PipelineJson;
  */
 @ApplicationScoped
 @Unremovable
-public class FilePipelineReplayExporter implements PipelineReplayExporter {
+public class FilePipelineReplayExporter implements PipelineReplayExporter, AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(FilePipelineReplayExporter.class);
     private static final String REPLAY_FILE_PATH_KEY = "pipeline.telemetry.replay.file.path";
     private static final int MAX_CONTROL_EVENTS_PER_FRAGMENT = 512;
+    private static final int MAX_FAILED_CONTROL_FRAGMENTS = 16;
 
     private final Path configuredOutputFile;
     private final ConcurrentMap<String, RunState> runStates = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, RunState> controlRunStates = new ConcurrentHashMap<>();
     private final List<RunState> failedControlFragments = Collections.synchronizedList(new ArrayList<>());
+    private final ConcurrentMap<String, AtomicLong> controlSequences = new ConcurrentHashMap<>();
     private final Optional<ScheduledExecutorService> controlFlushExecutor;
     private final AtomicBoolean controlSingleFileWarningLogged = new AtomicBoolean();
 
@@ -140,14 +142,16 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
         String resolvedPipeline = pipeline == null || pipeline.isBlank() ? topology.pipeline() : pipeline;
         String controlKey = sanitizeFileToken(resolvedPipeline == null ? "pipeline" : resolvedPipeline);
         controlRunStates.compute(controlKey, (ignored, previous) -> {
+            long sequence = controlSequences.computeIfAbsent(controlKey, key -> new AtomicLong())
+                .incrementAndGet();
             RunState runState = previous;
             if (runState == null || runState.events().size() == MAX_CONTROL_EVENTS_PER_FRAGMENT) {
                 if (runState != null && runState.persistedEventCount() < MAX_CONTROL_EVENTS_PER_FRAGMENT
                         && !writeDocument(runState)) {
-                    failedControlFragments.add(runState);
+                    retainFailedFragment(runState);
                 }
                 runState = new RunState(
-                    resolveControlOutputFile(resolvedPipeline, eventInstant),
+                    resolveControlOutputFile(resolvedPipeline, eventInstant, sequence),
                     resolvedPipeline,
                     eventInstant,
                     topology,
@@ -157,7 +161,7 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
             runState.topology(topology);
             runState.status("completed");
             runState.durationMs(Math.max(0L, Duration.between(runState.startedAt(), eventInstant).toMillis()));
-            runState.addEvent(relativeControlEvent(runState, event, eventInstant));
+            runState.addEvent(relativeControlEvent(runState, event, eventInstant, sequence));
             int eventCount = runState.events().size();
             if (eventCount == 1 || eventCount == MAX_CONTROL_EVENTS_PER_FRAGMENT) {
                 writeDocument(runState);
@@ -195,9 +199,20 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
             failure == null ? null : failure.getMessage());
     }
 
+    @Override
     @PreDestroy
-    void flushOnShutdown() {
-        controlFlushExecutor.ifPresent(ScheduledExecutorService::shutdown);
+    public void close() {
+        controlFlushExecutor.ifPresent(executor -> {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException interrupted) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        });
         for (Map.Entry<String, RunState> entry : runStates.entrySet()) {
             RunState runState = entry.getValue();
             if (runState.durationMs() == null && runState.startedAt() != null) {
@@ -209,6 +224,20 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
             writeDocument(runState);
         }
         flushControlFragments();
+        synchronized (failedControlFragments) {
+            failedControlFragments.removeIf(this::writeDocument);
+        }
+    }
+
+    private void retainFailedFragment(RunState fragment) {
+        synchronized (failedControlFragments) {
+            if (failedControlFragments.size() == MAX_FAILED_CONTROL_FRAGMENTS) {
+                RunState discarded = failedControlFragments.removeFirst();
+                LOG.warnf("Replay control fragment retry capacity reached; discarding unwritten fragment %s.",
+                    discarded.outputFile());
+            }
+            failedControlFragments.add(fragment);
+        }
     }
 
     private void flushControlFragments() {
@@ -221,7 +250,9 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
             });
         }
         synchronized (failedControlFragments) {
-            failedControlFragments.removeIf(this::writeDocument);
+            if (!failedControlFragments.isEmpty() && writeDocument(failedControlFragments.getFirst())) {
+                failedControlFragments.removeFirst();
+            }
         }
     }
 
@@ -317,16 +348,19 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
         return configuredOutputFile.resolve(sanitizedPipeline + "-" + startedAtToken + "-" + UUID.randomUUID() + ".json");
     }
 
-    private Path resolveControlOutputFile(String pipeline, Instant startedAt) {
+    private Path resolveControlOutputFile(String pipeline, Instant startedAt, long firstSequence) {
         String sanitizedPipeline = sanitizeFileToken(pipeline == null ? "pipeline" : pipeline);
         String startedAtToken = startedAt == null ? "unknown" : String.valueOf(startedAt.toEpochMilli());
-        return configuredOutputFile.resolve(sanitizedPipeline + "-await-control-" + startedAtToken + "-" + UUID.randomUUID() + ".json");
+        return configuredOutputFile.resolve(sanitizedPipeline + "-await-control-"
+            + String.format(Locale.ROOT, "%020d", firstSequence) + "-" + startedAtToken + "-"
+            + UUID.randomUUID() + ".json");
     }
 
     private static PipelineExecutionEvent relativeControlEvent(
         RunState runState,
         PipelineExecutionEvent event,
-        Instant occurredAt) {
+        Instant occurredAt,
+        long sequence) {
         double timeSeconds = Duration.between(runState.startedAt(), occurredAt).toNanos() / 1_000_000_000d;
         return new PipelineExecutionEvent(
             event.traceId(),
@@ -344,7 +378,7 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
             event.to(),
             event.cardinality(),
             event.parentItemIds(),
-            runState.nextSequence(),
+            sequence,
             event.attempt(),
             event.errorType(),
             event.errorMessage(),
@@ -367,7 +401,6 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
     private static final class RunState {
         private final Path outputFile;
         private final List<PipelineExecutionEvent> events = java.util.Collections.synchronizedList(new ArrayList<>());
-        private final AtomicLong eventSequence = new AtomicLong();
         private volatile String pipeline;
         private volatile Instant startedAt;
         private volatile PipelineReplayTopology topology;
@@ -395,7 +428,6 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
         Path outputFile() { return outputFile; }
         List<PipelineExecutionEvent> events() { return events; }
         void addEvent(PipelineExecutionEvent event) { events.add(event); }
-        Long nextSequence() { return eventSequence.incrementAndGet(); }
         String pipeline() { return pipeline; }
         void pipeline(String pipeline) { this.pipeline = pipeline; }
         Instant startedAt() { return startedAt; }
