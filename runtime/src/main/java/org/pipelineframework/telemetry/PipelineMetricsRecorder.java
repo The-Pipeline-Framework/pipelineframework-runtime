@@ -16,6 +16,10 @@
 
 package org.pipelineframework.telemetry;
 
+import java.util.List;
+import java.util.ArrayList;
+import io.opentelemetry.api.metrics.ObservableLongGauge;
+
 import org.pipelineframework.telemetry.PipelineRunContext;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.DoubleHistogram;
@@ -33,7 +37,8 @@ import org.pipelineframework.telemetry.derivation.StepTelemetryDerivation;
 import org.pipelineframework.telemetry.derivation.RetryTelemetryDerivation;
 
 /** Imperative metric adapter for pipeline observations. It owns no spans or replay state. */
-final class PipelineMetricsRecorder {
+final class PipelineMetricsRecorder implements AutoCloseable {
+    private final List<ObservableLongGauge> gauges = new ArrayList<>();
     private final boolean enabled;
     private final PipelineMetricAttributes attributes;
     private final ConcurrentMap<String, AtomicLong> inflightByStep = new ConcurrentHashMap<>();
@@ -95,10 +100,18 @@ final class PipelineMetricsRecorder {
         pipelineRunDuration = histogram(meter, "tpf.pipeline.run.duration", "Pipeline run duration");
         stepDuration = histogram(meter, "tpf.step.duration", "Pipeline step duration");
         transitionLatency = histogram(meter, "tpf.transition.latency", "Pipeline transition latency");
-        meter.gaugeBuilder("tpf.step.inflight").setDescription("In-flight items per step").setUnit("items")
-            .ofLongs().buildWithCallback(this::recordInflightGauge);
-        meter.gaugeBuilder("tpf.pipeline.max_concurrency").setDescription("Configured max concurrency for the pipeline run")
-            .setUnit("items").ofLongs().buildWithCallback(this::recordMaxConcurrencyGauge);
+        gauges.add(meter.gaugeBuilder("tpf.step.inflight").setDescription("In-flight items per step").setUnit("items")
+            .ofLongs().buildWithCallback(this::recordInflightGauge));
+        gauges.add(meter.gaugeBuilder("tpf.pipeline.max_concurrency").setDescription("Configured max concurrency for the pipeline run")
+            .setUnit("items").ofLongs().buildWithCallback(this::recordMaxConcurrencyGauge));
+    }
+
+    @Override
+    public void close() {
+        gauges.forEach(ObservableLongGauge::close);
+        gauges.clear();
+        inflightByStep.clear();
+        maxConcurrency.set(0);
     }
 
     void record(RunTelemetryDerivation.MetricStarted signal) {

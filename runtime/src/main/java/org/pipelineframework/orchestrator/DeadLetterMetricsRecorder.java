@@ -1,10 +1,15 @@
 package org.pipelineframework.orchestrator;
 
 import jakarta.inject.Singleton;
+import io.quarkus.arc.Unremovable;
+import jakarta.inject.Inject;
+import java.util.function.Supplier;
+import org.pipelineframework.telemetry.TelemetryRuntime;
+import org.pipelineframework.telemetry.TelemetryPolicySource;
+import org.pipelineframework.telemetry.NoopTelemetryRuntime;
 
 import org.pipelineframework.telemetry.TelemetryCompatibilityAccess;
 
-import org.pipelineframework.telemetry.TelemetryRuntimes;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.LongCounter;
@@ -13,6 +18,7 @@ import io.opentelemetry.api.metrics.LongCounter;
  * Dead-letter observability metrics helper.
  */
 @Singleton
+@Unremovable
 public final class DeadLetterMetricsRecorder {
 
     private final AttributeKey<String> PROVIDER = AttributeKey.stringKey("tpf.dlq.provider");
@@ -24,7 +30,16 @@ public final class DeadLetterMetricsRecorder {
     private final AttributeKey<Boolean> RETRYABLE = AttributeKey.booleanKey("tpf.error.retryable");
     private final AttributeKey<String> RESOURCE_TYPE = AttributeKey.stringKey("tpf.resource.type");
 
+    private final Supplier<TelemetryRuntime> telemetryRuntime;
+
     DeadLetterMetricsRecorder() {
+        telemetryRuntime = TelemetryCompatibilityAccess::metricsRuntime;
+    }
+
+    @Inject
+    DeadLetterMetricsRecorder(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        boolean enabled = source.telemetryPolicy().metricsEnabled();
+        telemetryRuntime = enabled ? () -> runtime : NoopTelemetryRuntime::new;
     }
 
     /**
@@ -51,7 +66,7 @@ public final class DeadLetterMetricsRecorder {
     }
 
     private LongCounter counter() {
-        return TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework")
+        return telemetryRuntime.get().meter("org.pipelineframework")
             .counterBuilder("tpf.execution.dlq.publish.total")
             .setDescription("Total terminal execution failures published to dead-letter destinations")
             .setUnit("events")

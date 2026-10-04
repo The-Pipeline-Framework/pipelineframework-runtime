@@ -17,6 +17,14 @@
 package org.pipelineframework.telemetry;
 
 import jakarta.inject.Singleton;
+import io.quarkus.arc.Unremovable;
+import jakarta.inject.Inject;
+import java.util.function.Supplier;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Optional;
+import jakarta.annotation.PreDestroy;
+import io.opentelemetry.api.metrics.ObservableLongGauge;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -37,6 +45,7 @@ import org.pipelineframework.config.pipeline.PipelineTelemetryResourceLoader;
  * Emits backpressure buffer depth metrics around Mutiny overflow buffers.
  */
 @Singleton
+@Unremovable
 final class BackpressureBufferMetricsRecorder {
 
     private final AttributeKey<String> STEP_CLASS = AttributeKey.stringKey("tpf.step.class");
@@ -49,12 +58,25 @@ final class BackpressureBufferMetricsRecorder {
     private final String METRICS_ENABLED_KEY = "pipeline.telemetry.metrics.enabled";
     private final ConcurrentMap<String, AtomicLong> QUEUED_BY_STEP = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, AtomicLong> CAPACITY_BY_STEP = new ConcurrentHashMap<>();
+    private final List<ObservableLongGauge> gauges = new ArrayList<>();
     private final AtomicBoolean GAUGES_REGISTERED = new AtomicBoolean(false);
     private volatile Map<String, String> STEP_PARENTS;
     private volatile Map<String, PipelineReplayTopology.Step> TOPOLOGY_STEPS;
     private volatile String PIPELINE_NAME;
 
+    private final Supplier<TelemetryRuntime> telemetryRuntime;
+    private final Optional<TelemetryPolicy> policy;
+
     BackpressureBufferMetricsRecorder() {
+        telemetryRuntime = TelemetryCompatibilityAccess::metricsRuntime;
+        policy = Optional.empty();
+    }
+
+    @Inject
+    BackpressureBufferMetricsRecorder(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        boolean enabled = source.telemetryPolicy().metricsEnabled();
+        telemetryRuntime = enabled ? () -> runtime : NoopTelemetryRuntime::new;
+        policy = Optional.of(source.telemetryPolicy());
     }
 
     /**
@@ -103,21 +125,29 @@ final class BackpressureBufferMetricsRecorder {
             });
     }
 
-    private void registerGauges() {
+    private synchronized void registerGauges() {
         if (!GAUGES_REGISTERED.compareAndSet(false, true)) {
             return;
         }
-        Meter meter = TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework");
-        meter.gaugeBuilder("tpf.step.buffer.queued")
+        Meter meter = telemetryRuntime.get().meter("org.pipelineframework");
+        gauges.add(meter.gaugeBuilder("tpf.step.buffer.queued")
             .setDescription("Queued items in the backpressure buffer per step")
             .setUnit("items")
             .ofLongs()
-            .buildWithCallback(this::recordQueuedGauge);
-        meter.gaugeBuilder("tpf.step.buffer.capacity")
+            .buildWithCallback(this::recordQueuedGauge));
+        gauges.add(meter.gaugeBuilder("tpf.step.buffer.capacity")
             .setDescription("Configured backpressure buffer capacity per step")
             .setUnit("items")
             .ofLongs()
-            .buildWithCallback(this::recordCapacityGauge);
+            .buildWithCallback(this::recordCapacityGauge));
+    }
+
+    @PreDestroy
+    synchronized void close() {
+        gauges.forEach(ObservableLongGauge::close);
+        gauges.clear();
+        QUEUED_BY_STEP.clear();
+        CAPACITY_BY_STEP.clear();
     }
 
     private void recordQueuedGauge(ObservableLongMeasurement measurement) {
@@ -212,6 +242,9 @@ final class BackpressureBufferMetricsRecorder {
     }
 
     private boolean metricsEnabled() {
+        if (policy.isPresent()) {
+            return policy.orElseThrow().metricsEnabled();
+        }
         try {
             boolean enabled = ConfigProvider.getConfig()
                 .getOptionalValue(TELEMETRY_ENABLED_KEY, Boolean.class)

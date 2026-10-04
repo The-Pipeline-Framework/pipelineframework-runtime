@@ -17,10 +17,15 @@
 package org.pipelineframework.reject;
 
 import jakarta.inject.Singleton;
+import io.quarkus.arc.Unremovable;
+import jakarta.inject.Inject;
+import java.util.function.Supplier;
+import org.pipelineframework.telemetry.TelemetryRuntime;
+import org.pipelineframework.telemetry.TelemetryPolicySource;
+import org.pipelineframework.telemetry.NoopTelemetryRuntime;
 
 import org.pipelineframework.telemetry.TelemetryCompatibilityAccess;
 
-import org.pipelineframework.telemetry.TelemetryRuntimes;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.LongCounter;
@@ -29,6 +34,7 @@ import io.opentelemetry.api.metrics.LongCounter;
  * Item reject sink metrics helper.
  */
 @Singleton
+@Unremovable
 final class ItemRejectMetricsRecorder {
 
     private final AttributeKey<String> PROVIDER = AttributeKey.stringKey("tpf.reject.provider");
@@ -39,7 +45,16 @@ final class ItemRejectMetricsRecorder {
     /**
      * Prevents instantiation of this utility class.
      */
+    private final Supplier<TelemetryRuntime> telemetryRuntime;
+
     ItemRejectMetricsRecorder() {
+        telemetryRuntime = TelemetryCompatibilityAccess::metricsRuntime;
+    }
+
+    @Inject
+    ItemRejectMetricsRecorder(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        boolean enabled = source.telemetryPolicy().metricsEnabled();
+        telemetryRuntime = enabled ? () -> runtime : NoopTelemetryRuntime::new;
     }
 
     /**
@@ -64,7 +79,7 @@ final class ItemRejectMetricsRecorder {
     }
 
     private LongCounter counter() {
-        return TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework")
+        return telemetryRuntime.get().meter("org.pipelineframework")
             .counterBuilder("tpf.step.reject.total")
             .setDescription("Total rejected step items routed to item reject sinks")
             .setUnit("items")

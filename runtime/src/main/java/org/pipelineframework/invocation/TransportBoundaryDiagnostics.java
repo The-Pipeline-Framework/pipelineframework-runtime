@@ -4,13 +4,18 @@ import org.pipelineframework.telemetry.TelemetryCompatibilityAccess;
 
 import java.util.Objects;
 
-import org.pipelineframework.telemetry.TelemetryRuntimes;
+import jakarta.inject.Singleton;
+import jakarta.inject.Inject;
+import org.pipelineframework.telemetry.TelemetryRuntime;
+import org.pipelineframework.telemetry.TelemetryPolicySource;
+import org.pipelineframework.telemetry.NoopTelemetryRuntime;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.DoubleHistogram;
 import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.Meter;
 
+@Singleton
 final class TransportBoundaryDiagnostics {
     private static final AttributeKey<String> PROTOCOL = AttributeKey.stringKey("tpf.boundary.protocol");
     private static final AttributeKey<String> TARGET = AttributeKey.stringKey("tpf.boundary.target");
@@ -21,6 +26,13 @@ final class TransportBoundaryDiagnostics {
     private final LongCounter invocations;
     private final LongCounter circuitRejections;
     private final DoubleHistogram duration;
+
+    @Inject
+    TransportBoundaryDiagnostics(TelemetryPolicySource source,
+                                 TelemetryRuntime runtime) {
+        this(new TransportBoundaryFailureClassifier(), (source.telemetryPolicy().metricsEnabled() ? runtime
+            : new NoopTelemetryRuntime()).meter("org.pipelineframework.invocation"));
+    }
 
     TransportBoundaryDiagnostics() {
         this(new TransportBoundaryFailureClassifier(), TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework.invocation"));

@@ -50,12 +50,12 @@ public class ObjectPublishReplayTelemetry implements ObjectPublishTelemetry {
             Duration.ofSeconds(30), 10d, 3, RetryAmplificationGuardMode.FAIL_FAST), null);
     }
 
-    private ObjectPublishReplayTelemetry(
+    public ObjectPublishReplayTelemetry(
         TelemetryRuntime runtime, TelemetryPolicy policy, PipelineReplayTelemetry replayTelemetry) {
         this.runtime = runtime;
         this.policy = policy;
         this.replayTelemetry = replayTelemetry;
-        var meter = runtime.meter("org.pipelineframework");
+        var meter = (policy.metricsEnabled() ? runtime : new NoopTelemetryRuntime()).meter("org.pipelineframework");
         groupedCounter = meter.counterBuilder("tpf.object_publish.grouped.total")
             .setDescription("Total Object Publish grouping operations")
             .setUnit("events")

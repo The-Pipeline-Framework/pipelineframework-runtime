@@ -17,6 +17,9 @@
 package org.pipelineframework.telemetry;
 
 import jakarta.inject.Singleton;
+import io.quarkus.arc.Unremovable;
+import jakarta.inject.Inject;
+import java.util.function.Supplier;
 
 import java.util.concurrent.CancellationException;
 import jakarta.ws.rs.WebApplicationException;
@@ -33,6 +36,7 @@ import io.smallrye.mutiny.Uni;
  * Records OpenTelemetry HTTP metrics for REST calls using SLO-friendly counters.
  */
 @Singleton
+@Unremovable
 final class HttpMetricsRecorder {
 
     private final AttributeKey<String> RPC_SYSTEM = AttributeKey.stringKey("rpc.system");
@@ -40,7 +44,16 @@ final class HttpMetricsRecorder {
     private final AttributeKey<String> RPC_METHOD = AttributeKey.stringKey("rpc.method");
     private final AttributeKey<Long> HTTP_STATUS = AttributeKey.longKey("http.status_code");
 
+    private final Supplier<TelemetryRuntime> telemetryRuntime;
+
     HttpMetricsRecorder() {
+        telemetryRuntime = TelemetryCompatibilityAccess::metricsRuntime;
+    }
+
+    @Inject
+    HttpMetricsRecorder(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        boolean enabled = source.telemetryPolicy().metricsEnabled();
+        telemetryRuntime = enabled ? () -> runtime : NoopTelemetryRuntime::new;
     }
 
     /**
@@ -175,7 +188,7 @@ final class HttpMetricsRecorder {
     }
 
     private Instruments instruments() {
-        Meter meter = TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework.http");
+        Meter meter = telemetryRuntime.get().meter("org.pipelineframework.http");
         return new Instruments(
             meter.counterBuilder("rpc.server.requests").build(), meter.counterBuilder("rpc.server.responses").build(),
             meter.histogramBuilder("rpc.server.duration").setUnit("ms").build(),

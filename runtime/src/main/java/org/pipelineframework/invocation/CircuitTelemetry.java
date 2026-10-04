@@ -33,6 +33,13 @@ final class CircuitTelemetry implements CircuitBreakerListener {
     private final LongCounter admissions;
     private final LongCounter transitions;
 
+    @jakarta.inject.Inject
+    CircuitTelemetry(org.pipelineframework.telemetry.TelemetryPolicySource source,
+                     org.pipelineframework.telemetry.TelemetryRuntime runtime) {
+        this((source.telemetryPolicy().metricsEnabled() ? runtime
+            : new org.pipelineframework.telemetry.NoopTelemetryRuntime()).meter("org.pipelineframework.resilience"));
+    }
+
     CircuitTelemetry() {
         this(TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework.resilience"));
     }

@@ -1,15 +1,28 @@
 package org.pipelineframework.telemetry;
 
 import java.util.Objects;
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
 
 import org.pipelineframework.connector.ConnectorOperationIdentity;
 import org.pipelineframework.connector.QueryObservation;
 import org.pipelineframework.telemetry.derivation.QueryObservationDerivation;
 
 /** Coordinates independent metric and tracing adapters at the Query invocation/capture boundary. */
+@Singleton
 public final class QueryObservationTelemetry {
     private final QueryObservationMetrics metrics;
     private final QueryObservationTracing tracing;
+
+    @Inject
+    public QueryObservationTelemetry(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        this(source.telemetryPolicy(), runtime);
+    }
+
+    public QueryObservationTelemetry(TelemetryPolicy policy, TelemetryRuntime runtime) {
+        this(policy.metricsEnabled() ? runtime : new NoopTelemetryRuntime(),
+            policy.tracingEnabled() ? runtime : new NoopTelemetryRuntime());
+    }
 
     public QueryObservationTelemetry(TelemetryRuntime runtime) {
         Objects.requireNonNull(runtime, "telemetry runtime must not be null");

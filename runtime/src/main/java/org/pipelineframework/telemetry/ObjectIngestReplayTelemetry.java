@@ -41,11 +41,11 @@ public class ObjectIngestReplayTelemetry implements ObjectIngestTelemetry {
             java.time.Duration.ofSeconds(30), 10d, 3, RetryAmplificationGuardMode.FAIL_FAST), null);
     }
 
-    private ObjectIngestReplayTelemetry(
+    public ObjectIngestReplayTelemetry(
         TelemetryRuntime runtime, TelemetryPolicy policy, PipelineReplayTelemetry replayTelemetry) {
         this.policy = policy;
         this.replayTelemetry = replayTelemetry;
-        var meter = runtime.meter("org.pipelineframework");
+        var meter = (policy.metricsEnabled() ? runtime : new NoopTelemetryRuntime()).meter("org.pipelineframework");
         listedCounter = meter.counterBuilder("tpf.object_ingest.list.total")
             .setDescription("Total Object Ingest listing attempts")
             .setUnit("events")

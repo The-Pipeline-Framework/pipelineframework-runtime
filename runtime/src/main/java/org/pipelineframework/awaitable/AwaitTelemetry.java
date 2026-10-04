@@ -40,6 +40,7 @@ import org.pipelineframework.telemetry.derivation.AwaitTelemetryDerivation;
 import org.pipelineframework.telemetry.PipelineTracingSupport;
 import org.pipelineframework.telemetry.NoopTelemetryRuntime;
 import org.pipelineframework.telemetry.TelemetryPolicy;
+import org.pipelineframework.telemetry.TelemetryPolicySource;
 import org.pipelineframework.telemetry.TelemetryRuntime;
 import org.pipelineframework.telemetry.TelemetrySdkAttributes;
 
@@ -51,6 +52,10 @@ public class AwaitTelemetry {
     private final Instruments instruments;
 
     @Inject
+    public AwaitTelemetry(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        this(source.telemetryPolicy(), runtime);
+    }
+
     public AwaitTelemetry(PipelineStepConfig config, TelemetryRuntime runtime) {
         this(TelemetryPolicy.from(config, false), runtime);
     }

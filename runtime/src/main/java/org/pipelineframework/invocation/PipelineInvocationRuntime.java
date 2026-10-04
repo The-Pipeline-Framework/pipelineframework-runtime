@@ -49,8 +49,14 @@ public class PipelineInvocationRuntime {
     PipelineInvocationRuntime(
         CircuitBreaker circuitBreaker,
         CircuitPolicyResolver circuitPolicyResolver,
-        CircuitTelemetry circuitTelemetry
+        CircuitTelemetry circuitTelemetry,
+        TransportBoundaryDiagnostics transportBoundaryDiagnostics
     ) {
+        this(circuitBreaker, circuitPolicyResolver, transportBoundaryDiagnostics, circuitTelemetry);
+    }
+
+    PipelineInvocationRuntime(CircuitBreaker circuitBreaker, CircuitPolicyResolver circuitPolicyResolver,
+                              CircuitTelemetry circuitTelemetry) {
         this(circuitBreaker, circuitPolicyResolver, new TransportBoundaryDiagnostics(), circuitTelemetry);
     }
 
