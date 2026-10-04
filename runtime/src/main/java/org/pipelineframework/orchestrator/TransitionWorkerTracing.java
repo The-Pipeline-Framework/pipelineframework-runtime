@@ -12,6 +12,8 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.pipelineframework.telemetry.NoopTelemetryRuntime;
 import org.pipelineframework.telemetry.TelemetryRuntime;
+import org.pipelineframework.telemetry.TelemetryPolicySource;
+import org.pipelineframework.telemetry.TelemetryPolicy;
 import org.pipelineframework.telemetry.TelemetrySdkAttributes;
 import org.pipelineframework.telemetry.derivation.TransitionTelemetryDerivation;
 
@@ -21,6 +23,14 @@ final class TransitionWorkerTracing {
     private final TelemetryRuntime runtime;
 
     @Inject
+    TransitionWorkerTracing(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        this(source.telemetryPolicy(), runtime);
+    }
+
+    TransitionWorkerTracing(TelemetryPolicy policy, TelemetryRuntime runtime) {
+        this(policy.tracingEnabled() ? runtime : new NoopTelemetryRuntime());
+    }
+
     TransitionWorkerTracing(TelemetryRuntime runtime) {
         this.runtime = runtime;
     }

@@ -17,8 +17,12 @@
 package org.pipelineframework.telemetry;
 
 import jakarta.inject.Singleton;
+import io.quarkus.arc.Unremovable;
+import jakarta.inject.Inject;
+import java.util.function.Supplier;
 
 import java.util.Collections;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicReference;
@@ -38,6 +42,7 @@ import org.eclipse.microprofile.config.ConfigProvider;
  * Adds OpenTelemetry gRPC client spans around reactive calls.
  */
 @Singleton
+@Unremovable
 final class GrpcClientTracingRecorder {
 
     private final AttributeKey<String> RPC_SYSTEM = AttributeKey.stringKey("rpc.system");
@@ -50,7 +55,25 @@ final class GrpcClientTracingRecorder {
     private final boolean FORCE_CLIENT_SPANS = readForceClientSpans();
     private final Set<String> ALLOWLIST = readAllowlist();
 
+    private final Supplier<TelemetryRuntime> telemetryRuntime;
+    private final boolean tracingEnabled;
+    private final Optional<RpcMetricsRecorder> metrics;
+
     GrpcClientTracingRecorder() {
+        telemetryRuntime = TelemetryCompatibilityAccess::tracingRuntime;
+        tracingEnabled = true;
+        metrics = Optional.empty();
+    }
+
+    @Inject
+    GrpcClientTracingRecorder(TelemetryPolicySource source, TelemetryRuntime runtime, RpcMetricsRecorder metrics) {
+        tracingEnabled = source.telemetryPolicy().tracingEnabled();
+        telemetryRuntime = tracingEnabled ? () -> runtime : NoopTelemetryRuntime::new;
+        this.metrics = Optional.of(metrics);
+    }
+
+    GrpcClientTracingRecorder(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        this(source, runtime, new RpcMetricsRecorder(source, runtime));
     }
 
     /**
@@ -68,8 +91,8 @@ final class GrpcClientTracingRecorder {
         }
         return Uni.createFrom().deferred(() -> {
             long startNanos = System.nanoTime();
-            Span span = startSpan(service, method);
-            Scope scope = span.makeCurrent();
+            Span span = tracingEnabled ? startSpan(service, method) : Span.getInvalid();
+            Scope scope = tracingEnabled ? span.makeCurrent() : Scope.noop();
             return uni.onTermination().invoke((item, failure, cancelled) -> {
                 recordClientMetrics(service, method, failure, startNanos);
                 endSpan(span, failure);
@@ -93,8 +116,8 @@ final class GrpcClientTracingRecorder {
         }
         return Multi.createFrom().deferred(() -> {
             long startNanos = System.nanoTime();
-            Span span = startSpan(service, method);
-            Scope scope = span.makeCurrent();
+            Span span = tracingEnabled ? startSpan(service, method) : Span.getInvalid();
+            Scope scope = tracingEnabled ? span.makeCurrent() : Scope.noop();
             AtomicReference<Throwable> failureRef = new AtomicReference<>();
             return multi.onFailure().invoke(failureRef::set)
                 .onTermination().invoke(() -> {
@@ -120,8 +143,8 @@ final class GrpcClientTracingRecorder {
         }
         return Uni.createFrom().deferred(() -> {
             long startNanos = System.nanoTime();
-            Span span = startSpan(service, method);
-            Scope scope = span.makeCurrent();
+            Span span = tracingEnabled ? startSpan(service, method) : Span.getInvalid();
+            Scope scope = tracingEnabled ? span.makeCurrent() : Scope.noop();
             AtomicReference<Throwable> sourceFailure = new AtomicReference<>();
             Multi<I> tracedInput = input.onFailure().invoke(sourceFailure::set);
             Uni<O> result = invocation.apply(tracedInput)
@@ -149,8 +172,8 @@ final class GrpcClientTracingRecorder {
         }
         return Multi.createFrom().deferred(() -> {
             long startNanos = System.nanoTime();
-            Span span = startSpan(service, method);
-            Scope scope = span.makeCurrent();
+            Span span = tracingEnabled ? startSpan(service, method) : Span.getInvalid();
+            Scope scope = tracingEnabled ? span.makeCurrent() : Scope.noop();
             AtomicReference<Throwable> failureRef = new AtomicReference<>();
             AtomicReference<Throwable> sourceFailure = new AtomicReference<>();
             Multi<I> tracedInput = input.onFailure().invoke(sourceFailure::set);
@@ -179,7 +202,7 @@ final class GrpcClientTracingRecorder {
     }
 
     private Tracer tracer() {
-        return TelemetryCompatibilityAccess.tracingRuntime().tracer("org.pipelineframework.grpc.client");
+        return telemetryRuntime.get().tracer("org.pipelineframework.grpc.client");
     }
 
     private void endSpan(Span span, Throwable failure) {
@@ -201,7 +224,11 @@ final class GrpcClientTracingRecorder {
         if (failure != null) {
             statusCode = Status.fromThrowable(failure).getCode();
         }
-        RpcMetrics.recordGrpcClient(service, method, statusCode, System.nanoTime() - startNanos);
+        if (metrics.isPresent()) {
+            metrics.orElseThrow().recordGrpcClient(service, method, statusCode, System.nanoTime() - startNanos);
+        } else {
+            RpcMetrics.recordGrpcClient(service, method, statusCode, System.nanoTime() - startNanos);
+        }
     }
 
     private Throwable restoreSourceFailure(Throwable transportFailure, Throwable sourceFailure) {

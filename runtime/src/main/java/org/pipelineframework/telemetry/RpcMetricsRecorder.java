@@ -17,6 +17,9 @@
 package org.pipelineframework.telemetry;
 
 import jakarta.inject.Singleton;
+import io.quarkus.arc.Unremovable;
+import jakarta.inject.Inject;
+import java.util.function.Supplier;
 
 import io.grpc.Status;
 import io.opentelemetry.api.common.AttributeKey;
@@ -29,6 +32,7 @@ import io.opentelemetry.api.metrics.Meter;
  * Records OpenTelemetry RPC server metrics for gRPC requests.
  */
 @Singleton
+@Unremovable
 final class RpcMetricsRecorder {
 
     private final AttributeKey<String> RPC_SYSTEM = AttributeKey.stringKey("rpc.system");
@@ -36,7 +40,16 @@ final class RpcMetricsRecorder {
     private final AttributeKey<String> RPC_METHOD = AttributeKey.stringKey("rpc.method");
     private final AttributeKey<Long> RPC_GRPC_STATUS = AttributeKey.longKey("rpc.grpc.status_code");
 
+    private final Supplier<TelemetryRuntime> telemetryRuntime;
+
     RpcMetricsRecorder() {
+        telemetryRuntime = TelemetryCompatibilityAccess::metricsRuntime;
+    }
+
+    @Inject
+    RpcMetricsRecorder(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        boolean enabled = source.telemetryPolicy().metricsEnabled();
+        telemetryRuntime = enabled ? () -> runtime : NoopTelemetryRuntime::new;
     }
 
     /**
@@ -133,7 +146,7 @@ final class RpcMetricsRecorder {
     }
 
     private Instruments instruments() {
-        Meter meter = TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework.rpc");
+        Meter meter = telemetryRuntime.get().meter("org.pipelineframework.rpc");
         return new Instruments(
             meter.counterBuilder("rpc.server.requests").build(), meter.counterBuilder("rpc.server.responses").build(),
             meter.histogramBuilder("rpc.server.duration").setUnit("ms").build(),

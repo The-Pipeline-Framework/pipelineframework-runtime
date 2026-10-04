@@ -17,6 +17,9 @@
 package org.pipelineframework.telemetry;
 
 import jakarta.inject.Singleton;
+import io.quarkus.arc.Unremovable;
+import jakarta.inject.Inject;
+import java.util.function.Supplier;
 
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
@@ -31,12 +34,22 @@ import io.opentelemetry.api.metrics.Meter;
  * synthesize APM transactions for short-lived orchestrator runs.</p>
  */
 @Singleton
+@Unremovable
 final class ApmCompatibilityMetricsRecorder {
 
     private final AttributeKey<String> TRANSACTION_TYPE = AttributeKey.stringKey("transaction.type");
     private final AttributeKey<String> TRANSACTION_NAME = AttributeKey.stringKey("transaction.name");
 
+    private final Supplier<TelemetryRuntime> telemetryRuntime;
+
     ApmCompatibilityMetricsRecorder() {
+        telemetryRuntime = TelemetryCompatibilityAccess::metricsRuntime;
+    }
+
+    @Inject
+    ApmCompatibilityMetricsRecorder(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        boolean enabled = source.telemetryPolicy().metricsEnabled();
+        telemetryRuntime = enabled ? () -> runtime : NoopTelemetryRuntime::new;
     }
 
     /**
@@ -71,7 +84,7 @@ final class ApmCompatibilityMetricsRecorder {
     }
 
     private Instruments instruments() {
-        Meter meter = TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework.apm");
+        Meter meter = telemetryRuntime.get().meter("org.pipelineframework.apm");
         return new Instruments(meter.counterBuilder("apm.service.transaction.count").build(),
             meter.counterBuilder("apm.service.error.count").build(),
             meter.histogramBuilder("apm.service.transaction.duration").setUnit("ms").build());

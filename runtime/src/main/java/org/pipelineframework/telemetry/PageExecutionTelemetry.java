@@ -27,6 +27,14 @@ public final class PageExecutionTelemetry {
     private final DoubleHistogram demandStallDuration;
 
     @Inject
+    public PageExecutionTelemetry(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        this(source.telemetryPolicy(), runtime);
+    }
+
+    public PageExecutionTelemetry(TelemetryPolicy policy, TelemetryRuntime runtime) {
+        this(policy.metricsEnabled() ? runtime : new NoopTelemetryRuntime());
+    }
+
     public PageExecutionTelemetry(TelemetryRuntime runtime) {
         Meter meter = runtime.meter("org.pipelineframework.paging");
         completed = meter.counterBuilder("tpf.page.completed.total")

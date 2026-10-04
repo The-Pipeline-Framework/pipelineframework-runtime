@@ -31,6 +31,7 @@ import static com.google.testing.compile.CompilationSubject.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@org.junit.jupiter.api.parallel.Isolated("Bootstraps runtime context providers under a generated class loader")
 class DirectRootBranchingProductizationTest {
 
     @TempDir

@@ -1,12 +1,17 @@
 package org.pipelineframework.command;
 
 import jakarta.inject.Singleton;
+import io.quarkus.arc.Unremovable;
+import jakarta.inject.Inject;
+import java.util.function.Supplier;
+import org.pipelineframework.telemetry.TelemetryRuntime;
+import org.pipelineframework.telemetry.TelemetryPolicySource;
+import org.pipelineframework.telemetry.NoopTelemetryRuntime;
 
 import org.pipelineframework.telemetry.TelemetryCompatibilityAccess;
 
 import java.util.Locale;
 
-import org.pipelineframework.telemetry.TelemetryRuntimes;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.DoubleHistogram;
@@ -16,6 +21,7 @@ import io.opentelemetry.api.metrics.LongCounter;
  * Command effect observability helpers.
  */
 @Singleton
+@Unremovable
 final class CommandEffectMetricsRecorder {
 
     static final String TRANSITION_TOTAL = "tpf.command.effect.transition.total";
@@ -30,7 +36,16 @@ final class CommandEffectMetricsRecorder {
     private final AttributeKey<String> DUPLICATE_RESULT = AttributeKey.stringKey("tpf.command.duplicate_result");
     private final AttributeKey<String> ADMISSION = AttributeKey.stringKey("tpf.command.admission");
 
+    private final Supplier<TelemetryRuntime> telemetryRuntime;
+
     CommandEffectMetricsRecorder() {
+        telemetryRuntime = TelemetryCompatibilityAccess::metricsRuntime;
+    }
+
+    @Inject
+    CommandEffectMetricsRecorder(TelemetryPolicySource source, TelemetryRuntime runtime) {
+        boolean enabled = source.telemetryPolicy().metricsEnabled();
+        telemetryRuntime = enabled ? () -> runtime : NoopTelemetryRuntime::new;
     }
 
     public long startNanos() {
@@ -89,17 +104,17 @@ final class CommandEffectMetricsRecorder {
     }
 
     private LongCounter transitionCounter() {
-        return TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework").counterBuilder(TRANSITION_TOTAL)
+        return telemetryRuntime.get().meter("org.pipelineframework").counterBuilder(TRANSITION_TOTAL)
             .setDescription("Total command effect lifecycle transitions recorded by TPF").setUnit("events").build();
     }
 
     private LongCounter duplicateCounter() {
-        return TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework").counterBuilder(DUPLICATE_TOTAL)
+        return telemetryRuntime.get().meter("org.pipelineframework").counterBuilder(DUPLICATE_TOTAL)
             .setDescription("Total duplicate command ids resolved by TPF duplicate policy").setUnit("events").build();
     }
 
     private LongCounter admissionCounter() {
-        return TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework")
+        return telemetryRuntime.get().meter("org.pipelineframework")
             .counterBuilder(ADMISSION_TOTAL)
             .setDescription("Total initial, replay, retry, and reissue Command admissions")
             .setUnit("events")
@@ -107,7 +122,7 @@ final class CommandEffectMetricsRecorder {
     }
 
     private DoubleHistogram durationHistogram() {
-        return TelemetryCompatibilityAccess.metricsRuntime().meter("org.pipelineframework").histogramBuilder(DURATION)
+        return telemetryRuntime.get().meter("org.pipelineframework").histogramBuilder(DURATION)
             .setDescription("Command effect duration from pending record creation to terminal effect state").setUnit("ms").build();
     }
 

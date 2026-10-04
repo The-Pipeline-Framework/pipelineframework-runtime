@@ -25,6 +25,7 @@ import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.enterprise.inject.Instance;
+import jakarta.enterprise.inject.Typed;
 
 import org.jboss.logging.Logger;
 import io.quarkus.arc.Unremovable;
@@ -40,6 +41,8 @@ import org.pipelineframework.telemetry.PipelineRunContext;
  */
 @ApplicationScoped
 @Unremovable
+@Typed({PipelineTelemetryRuntime.class, PipelineRunTelemetry.class,
+    PipelineStepTelemetry.Seam.class, RetryAmplificationTelemetry.class, PipelineReplayTelemetry.class})
 public class PipelineTelemetryRuntime implements PipelineRunTelemetry, PipelineStepTelemetry.Seam,
     RetryAmplificationTelemetry, PipelineReplayTelemetry, TelemetryPolicySource {
 
@@ -60,7 +63,13 @@ public class PipelineTelemetryRuntime implements PipelineRunTelemetry, PipelineS
      */
     @Inject
     public PipelineTelemetryRuntime(PipelineStepConfig stepConfig, Instance<PipelineReplayExporter> replayExporters,
-                             TelemetryRuntime telemetryRuntime) {
+                                    TelemetryRuntime telemetryRuntime, TelemetryPolicySource policySource) {
+        this(stepConfig, resolveReplayExporter(replayExporters), PipelineReplayTopologyLoader.load(),
+            telemetryRuntime, policySource.telemetryPolicy());
+    }
+
+    public PipelineTelemetryRuntime(PipelineStepConfig stepConfig, Instance<PipelineReplayExporter> replayExporters,
+                                    TelemetryRuntime telemetryRuntime) {
         this(stepConfig, resolveReplayExporter(replayExporters), PipelineReplayTopologyLoader.load(), telemetryRuntime);
     }
 
@@ -99,8 +108,15 @@ public class PipelineTelemetryRuntime implements PipelineRunTelemetry, PipelineS
         PipelineReplayExporter replayExporter,
         Optional<PipelineReplayTopology> replayTopology,
         TelemetryRuntime telemetryRuntime) {
+        this(stepConfig, replayExporter, replayTopology, telemetryRuntime,
+            TelemetryPolicy.from(stepConfig, replayTopology.isPresent()));
+    }
+
+    PipelineTelemetryRuntime(
+        PipelineStepConfig stepConfig, PipelineReplayExporter replayExporter,
+        Optional<PipelineReplayTopology> replayTopology, TelemetryRuntime telemetryRuntime, TelemetryPolicy policy) {
         PipelineStepConfig.TelemetryConfig telemetry = stepConfig.telemetry();
-        this.telemetryPolicy = TelemetryPolicy.from(stepConfig, replayTopology.isPresent());
+        this.telemetryPolicy = policy;
         PipelineStepConfig.ReplayConfig replayConfig = telemetry == null ? null : telemetry.replay();
         boolean replayRequested = replayConfig != null && Boolean.TRUE.equals(replayConfig.enabled());
         if (replayRequested && !telemetryPolicy.replayEnabled()) {
@@ -497,6 +513,7 @@ public class PipelineTelemetryRuntime implements PipelineRunTelemetry, PipelineS
     void shutdownRetryAmplificationScheduler() {
         lifecycle.shutdown(retryTelemetry);
         retryTelemetry.shutdown();
+        metrics.close();
     }
 
 }

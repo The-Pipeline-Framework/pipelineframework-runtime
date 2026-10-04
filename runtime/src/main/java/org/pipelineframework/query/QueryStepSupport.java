@@ -61,11 +61,16 @@ public class QueryStepSupport {
         Instance<FrameworkQueryConnector> connectors,
         Instance<QueryCaptureStore> stores,
         ConnectorBindingRegistry bindingRegistry,
-        ConnectorRuntimeContext runtimeContext
+        ConnectorRuntimeContext runtimeContext,
+        QueryObservationTelemetry observationTelemetry
     ) {
-        this(
-            toList(connectors), toList(stores), Optional.of(bindingRegistry), runtimeContext,
-            QueryObservationTelemetry.global(), false);
+        this(toList(connectors), toList(stores), Optional.of(bindingRegistry), runtimeContext,
+            observationTelemetry, false);
+    }
+
+    public QueryStepSupport(Instance<FrameworkQueryConnector> connectors, Instance<QueryCaptureStore> stores,
+                            ConnectorBindingRegistry bindingRegistry, ConnectorRuntimeContext runtimeContext) {
+        this(connectors, stores, bindingRegistry, runtimeContext, QueryObservationTelemetry.global());
     }
 
     public QueryStepSupport(Collection<FrameworkQueryConnector> connectors, Collection<QueryCaptureStore> stores) {
