@@ -388,6 +388,9 @@ class ObjectPublishRunnerTest {
             return Map.of("recordCount", String.valueOf(prior + current));
         }
         @Override public ObjectPublishGroupRenderer<TestOutput> openGroup(String groupKey, TestOutput firstItem) {
+            throw new IllegalStateException("Paged output must use openPageGroup");
+        }
+        @Override public ObjectPublishGroupRenderer<TestOutput> openPageGroup(String groupKey, TestOutput firstItem) {
             return new ObjectPublishGroupRenderer<>() {
                 private int count;
                 @Override public String contentType() { return "text/plain"; }

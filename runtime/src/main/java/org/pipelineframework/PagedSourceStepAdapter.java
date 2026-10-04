@@ -27,6 +27,7 @@ final class PagedSourceStepAdapter extends ConfigurableStep implements StepOneTo
   private final boolean replay;
   private final Configurable sourceConfig;
   private final boolean transportBoundary;
+  private final Class<?> sourceStepClass;
 
   @SuppressWarnings("unchecked")
   PagedSourceStepAdapter(
@@ -46,6 +47,7 @@ final class PagedSourceStepAdapter extends ConfigurableStep implements StepOneTo
     this.replay = replay;
     this.sourceConfig = sourceStep instanceof Configurable configurable ? configurable : this;
     this.transportBoundary = sourceStep instanceof TransportBoundaryInvocation;
+    this.sourceStepClass = sourceStep.getClass();
   }
 
   @Override
@@ -80,6 +82,10 @@ final class PagedSourceStepAdapter extends ConfigurableStep implements StepOneTo
   @Override
   public StepConfig effectiveConfig() {
     return sourceConfig == this ? super.effectiveConfig() : sourceConfig.effectiveConfig();
+  }
+
+  Class<?> sourceStepClass() {
+    return sourceStepClass;
   }
 
   @Override

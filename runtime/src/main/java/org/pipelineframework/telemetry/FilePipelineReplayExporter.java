@@ -23,12 +23,17 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -46,15 +51,21 @@ import org.pipelineframework.config.pipeline.PipelineJson;
  */
 @ApplicationScoped
 @Unremovable
-public class FilePipelineReplayExporter implements PipelineReplayExporter {
+public class FilePipelineReplayExporter implements PipelineReplayExporter, AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(FilePipelineReplayExporter.class);
     private static final String REPLAY_FILE_PATH_KEY = "pipeline.telemetry.replay.file.path";
+    private static final int MAX_CONTROL_EVENTS_PER_FRAGMENT = 512;
+    private static final int MAX_FAILED_CONTROL_FRAGMENTS = 16;
 
     private final Path configuredOutputFile;
     private final ConcurrentMap<String, RunState> runStates = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, RunState> controlRunStates = new ConcurrentHashMap<>();
+    private final List<RunState> failedControlFragments = Collections.synchronizedList(new ArrayList<>());
+    private final ConcurrentMap<String, AtomicLong> controlSequences = new ConcurrentHashMap<>();
+    private Optional<ScheduledExecutorService> controlFlushExecutor = Optional.empty();
     private final AtomicBoolean controlSingleFileWarningLogged = new AtomicBoolean();
+    private boolean closed;
 
     public FilePipelineReplayExporter() {
         this(resolveConfiguredOutputFile());
@@ -111,23 +122,39 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
             }
             return;
         }
+        if (!startControlFlushIfNeeded()) {
+            return;
+        }
         Instant eventInstant = occurredAt == null ? Instant.now() : occurredAt;
         String resolvedPipeline = pipeline == null || pipeline.isBlank() ? topology.pipeline() : pipeline;
         String controlKey = sanitizeFileToken(resolvedPipeline == null ? "pipeline" : resolvedPipeline);
-        RunState runState = controlRunStates.computeIfAbsent(
-            controlKey,
-            ignored -> new RunState(
-                resolveControlOutputFile(resolvedPipeline, eventInstant),
-                resolvedPipeline,
-                eventInstant,
-                topology,
-                null));
-        runState.pipeline(resolvedPipeline);
-        runState.topology(topology);
-        runState.status("completed");
-        runState.durationMs(Math.max(0L, Duration.between(runState.startedAt(), eventInstant).toMillis()));
-        runState.addEvent(relativeControlEvent(runState, event, eventInstant));
-        writeDocument(runState);
+        controlRunStates.compute(controlKey, (ignored, previous) -> {
+            long sequence = controlSequences.computeIfAbsent(controlKey, key -> new AtomicLong())
+                .incrementAndGet();
+            RunState runState = previous;
+            if (runState == null || runState.events().size() == MAX_CONTROL_EVENTS_PER_FRAGMENT) {
+                if (runState != null && runState.persistedEventCount() < MAX_CONTROL_EVENTS_PER_FRAGMENT
+                        && !writeDocument(runState)) {
+                    retainFailedFragment(runState);
+                }
+                runState = new RunState(
+                    resolveControlOutputFile(resolvedPipeline, eventInstant, sequence),
+                    resolvedPipeline,
+                    eventInstant,
+                    topology,
+                    null);
+            }
+            runState.pipeline(resolvedPipeline);
+            runState.topology(topology);
+            runState.status("completed");
+            runState.durationMs(Math.max(0L, Duration.between(runState.startedAt(), eventInstant).toMillis()));
+            runState.addEvent(relativeControlEvent(runState, event, eventInstant, sequence));
+            int eventCount = runState.events().size();
+            if (eventCount == 1 || eventCount == MAX_CONTROL_EVENTS_PER_FRAGMENT) {
+                writeDocument(runState);
+            }
+            return runState;
+        });
     }
 
     @Override
@@ -159,8 +186,26 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
             failure == null ? null : failure.getMessage());
     }
 
+    @Override
     @PreDestroy
-    void flushOnShutdown() {
+    public void close() {
+        Optional<ScheduledExecutorService> executorToStop;
+        synchronized (this) {
+            closed = true;
+            executorToStop = controlFlushExecutor;
+            controlFlushExecutor = Optional.empty();
+        }
+        executorToStop.ifPresent(executor -> {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException interrupted) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        });
         for (Map.Entry<String, RunState> entry : runStates.entrySet()) {
             RunState runState = entry.getValue();
             if (runState.durationMs() == null && runState.startedAt() != null) {
@@ -171,10 +216,62 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
             }
             writeDocument(runState);
         }
-        for (RunState runState : controlRunStates.values()) {
-            if (!runState.events().isEmpty()) {
-                runState.status("completed");
-                writeDocument(runState);
+        flushControlFragments();
+        synchronized (failedControlFragments) {
+            failedControlFragments.removeIf(this::writeDocument);
+        }
+    }
+
+    synchronized boolean controlFlushScheduled() {
+        return controlFlushExecutor.isPresent();
+    }
+
+    private synchronized boolean startControlFlushIfNeeded() {
+        if (closed) {
+            return false;
+        }
+        if (controlFlushExecutor.isPresent()) {
+            return true;
+        }
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(task -> {
+            Thread thread = new Thread(task, "tpf-replay-control-flush");
+            thread.setDaemon(true);
+            return thread;
+        });
+        executor.scheduleWithFixedDelay(() -> {
+            try {
+                flushControlFragments();
+            } catch (RuntimeException failure) {
+                LOG.warn("Failed to flush replay control fragments; will retry on the next interval.", failure);
+            }
+        }, 1, 1, TimeUnit.SECONDS);
+        controlFlushExecutor = Optional.of(executor);
+        return true;
+    }
+
+    private void retainFailedFragment(RunState fragment) {
+        synchronized (failedControlFragments) {
+            if (failedControlFragments.size() == MAX_FAILED_CONTROL_FRAGMENTS) {
+                RunState discarded = failedControlFragments.removeFirst();
+                LOG.warnf("Replay control fragment retry capacity reached; discarding unwritten fragment %s.",
+                    discarded.outputFile());
+            }
+            failedControlFragments.add(fragment);
+        }
+    }
+
+    private void flushControlFragments() {
+        for (String controlKey : controlRunStates.keySet()) {
+            controlRunStates.computeIfPresent(controlKey, (ignored, runState) -> {
+                if (!runState.events().isEmpty() && runState.persistedEventCount() < runState.events().size()) {
+                    writeDocument(runState);
+                }
+                return runState;
+            });
+        }
+        synchronized (failedControlFragments) {
+            if (!failedControlFragments.isEmpty() && writeDocument(failedControlFragments.getFirst())) {
+                failedControlFragments.removeFirst();
             }
         }
     }
@@ -206,13 +303,13 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
         runStates.remove(runId, runState);
     }
 
-    private void writeDocument(RunState runState) {
+    private boolean writeDocument(RunState runState) {
         if (runState == null
             || runState.outputFile() == null
             || runState.pipeline() == null
             || runState.startedAt() == null
             || runState.topology() == null) {
-            return;
+            return false;
         }
         try {
             Path outputFile = runState.outputFile();
@@ -236,9 +333,12 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
                 .writerWithDefaultPrettyPrinter()
                 .writeValueAsString(document);
             Files.writeString(outputFile, json + System.lineSeparator(), StandardCharsets.UTF_8);
+            runState.persistedEventCount(eventsSnapshot.size());
             LOG.infof("Wrote replay JSON with %d events to %s.", eventsSnapshot.size(), outputFile);
+            return true;
         } catch (IOException e) {
             LOG.warnf(e, "Failed to write replay JSON to %s.", runState.outputFile());
+            return false;
         }
     }
 
@@ -268,16 +368,19 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
         return configuredOutputFile.resolve(sanitizedPipeline + "-" + startedAtToken + "-" + UUID.randomUUID() + ".json");
     }
 
-    private Path resolveControlOutputFile(String pipeline, Instant startedAt) {
+    private Path resolveControlOutputFile(String pipeline, Instant startedAt, long firstSequence) {
         String sanitizedPipeline = sanitizeFileToken(pipeline == null ? "pipeline" : pipeline);
         String startedAtToken = startedAt == null ? "unknown" : String.valueOf(startedAt.toEpochMilli());
-        return configuredOutputFile.resolve(sanitizedPipeline + "-await-control-" + startedAtToken + "-" + UUID.randomUUID() + ".json");
+        return configuredOutputFile.resolve(sanitizedPipeline + "-await-control-"
+            + String.format(Locale.ROOT, "%020d", firstSequence) + "-" + startedAtToken + "-"
+            + UUID.randomUUID() + ".json");
     }
 
     private static PipelineExecutionEvent relativeControlEvent(
         RunState runState,
         PipelineExecutionEvent event,
-        Instant occurredAt) {
+        Instant occurredAt,
+        long sequence) {
         double timeSeconds = Duration.between(runState.startedAt(), occurredAt).toNanos() / 1_000_000_000d;
         return new PipelineExecutionEvent(
             event.traceId(),
@@ -295,7 +398,7 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
             event.to(),
             event.cardinality(),
             event.parentItemIds(),
-            runState.nextSequence(),
+            sequence,
             event.attempt(),
             event.errorType(),
             event.errorMessage(),
@@ -318,7 +421,6 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
     private static final class RunState {
         private final Path outputFile;
         private final List<PipelineExecutionEvent> events = java.util.Collections.synchronizedList(new ArrayList<>());
-        private final AtomicLong eventSequence = new AtomicLong();
         private volatile String pipeline;
         private volatile Instant startedAt;
         private volatile PipelineReplayTopology topology;
@@ -327,6 +429,7 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
         private volatile String status = "running";
         private volatile String failureType;
         private volatile String failureMessage;
+        private volatile int persistedEventCount;
 
         private RunState(
             Path outputFile,
@@ -345,7 +448,6 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
         Path outputFile() { return outputFile; }
         List<PipelineExecutionEvent> events() { return events; }
         void addEvent(PipelineExecutionEvent event) { events.add(event); }
-        Long nextSequence() { return eventSequence.incrementAndGet(); }
         String pipeline() { return pipeline; }
         void pipeline(String pipeline) { this.pipeline = pipeline; }
         Instant startedAt() { return startedAt; }
@@ -361,5 +463,7 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter {
         void failureType(String failureType) { this.failureType = failureType; }
         String failureMessage() { return failureMessage; }
         void failureMessage(String failureMessage) { this.failureMessage = failureMessage; }
+        int persistedEventCount() { return persistedEventCount; }
+        void persistedEventCount(int persistedEventCount) { this.persistedEventCount = persistedEventCount; }
     }
 }

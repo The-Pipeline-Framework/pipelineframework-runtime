@@ -1205,9 +1205,11 @@ class PipelineStepExecutor {
         PipelineStepTelemetry telemetry,
         PipelineContext contextSnapshot,
         AwaitExecutionContext awaitContextSnapshot) {
+        Class<?> telemetryStepClass = step instanceof PagedSourceStepAdapter paged
+            ? paged.sourceStepClass() : step.getClass();
         if (current instanceof Uni<?>) {
-            Uni<I> input = telemetry.consume(step.getClass(), (Uni<I>) current);
-            var replayScope = telemetry.beginPendingReplayStep(step.getClass(), false);
+            Uni<I> input = telemetry.consume(telemetryStepClass, (Uni<I>) current);
+            var replayScope = telemetry.beginPendingReplayStep(telemetryStepClass, false);
             Uni<I> finalInput = telemetry.recordInput(replayScope, input);
             Uni<I> replayInput = scopedUniInput(finalInput, contextSnapshot, awaitContextSnapshot);
             Multi<O> result = withStepExecutionMulti(
@@ -1218,20 +1220,20 @@ class PipelineStepExecutor {
                     : applyOneToManyForAwaitParent(step, replayInput))
                 .onItem().invoke(output -> telemetry.recordOutput(replayScope, output));
             return telemetry.instrument(
-                step.getClass(), telemetry.produce(step.getClass(), result), false, replayScope);
+                telemetryStepClass, telemetry.produce(telemetryStepClass, result), false, replayScope);
         } else if (current instanceof Multi<?>) {
-            Multi<I> multi = telemetry.consume(step.getClass(), (Multi<I>) current);
+            Multi<I> multi = telemetry.consume(telemetryStepClass, (Multi<I>) current);
             if (parallel) {
                 logger.debugf("Applying step %s (merge)", step.getClass());
                 return multi
                     .onItem()
                     .transformToMulti(item -> {
-                        var replayScope = telemetry.beginReplayStep(step.getClass(), true, item);
+                        var replayScope = telemetry.beginReplayStep(telemetryStepClass, true, item);
                         Multi<O> result = withStepExecutionMulti(contextSnapshot, awaitContextSnapshot,
                             () -> step.apply(Uni.createFrom().item(item)))
                             .onItem().invoke(output -> telemetry.recordOutput(replayScope, output));
                         return telemetry.instrument(
-                            step.getClass(), telemetry.produce(step.getClass(), result), true, replayScope);
+                            telemetryStepClass, telemetry.produce(telemetryStepClass, result), true, replayScope);
                     })
                     .merge(maxConcurrency);
             }
@@ -1239,12 +1241,12 @@ class PipelineStepExecutor {
             return multi
                 .onItem()
                 .transformToMulti(item -> {
-                    var replayScope = telemetry.beginReplayStep(step.getClass(), true, item);
+                    var replayScope = telemetry.beginReplayStep(telemetryStepClass, true, item);
                     Multi<O> result = withStepExecutionMulti(contextSnapshot, awaitContextSnapshot,
                         () -> step.apply(Uni.createFrom().item(item)))
                         .onItem().invoke(output -> telemetry.recordOutput(replayScope, output));
                     return telemetry.instrument(
-                        step.getClass(), telemetry.produce(step.getClass(), result), true, replayScope);
+                        telemetryStepClass, telemetry.produce(telemetryStepClass, result), true, replayScope);
                 })
                 .concatenate();
         }

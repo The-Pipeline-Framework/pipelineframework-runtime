@@ -608,7 +608,9 @@ public final class ObjectPublishRunner {
         }
 
         private StreamingGroupState openGroup(String groupKey, Object firstItem) {
-            ObjectPublishGroupRenderer<Object> renderer = mapper.openGroup(groupKey, firstItem);
+            ObjectPublishGroupRenderer<Object> renderer = page.isPresent()
+                ? ((PagedStreamingObjectPublishMapper<Object>) mapper).openPageGroup(groupKey, firstItem)
+                : mapper.openGroup(groupKey, firstItem);
             if (renderer == null) {
                 throw new IllegalStateException("Object publish mapper returned null renderer for group: " + groupKey);
             }

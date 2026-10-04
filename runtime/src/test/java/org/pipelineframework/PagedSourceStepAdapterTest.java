@@ -78,6 +78,7 @@ class PagedSourceStepAdapterTest {
 
         assertEquals(1, opens.get());
         assertSame(config, adapter.effectiveConfig());
+        assertSame(source.getClass(), adapter.sourceStepClass());
         assertEquals(9, adapter.retryLimit());
         assertThrows(IllegalStateException.class,
             () -> duplicate.collect().asList().await().indefinitely());
