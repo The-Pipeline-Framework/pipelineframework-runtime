@@ -63,8 +63,9 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter, AutoC
     private final ConcurrentMap<String, RunState> controlRunStates = new ConcurrentHashMap<>();
     private final List<RunState> failedControlFragments = Collections.synchronizedList(new ArrayList<>());
     private final ConcurrentMap<String, AtomicLong> controlSequences = new ConcurrentHashMap<>();
-    private final Optional<ScheduledExecutorService> controlFlushExecutor;
+    private Optional<ScheduledExecutorService> controlFlushExecutor = Optional.empty();
     private final AtomicBoolean controlSingleFileWarningLogged = new AtomicBoolean();
+    private boolean closed;
 
     public FilePipelineReplayExporter() {
         this(resolveConfiguredOutputFile());
@@ -72,23 +73,6 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter, AutoC
 
     public FilePipelineReplayExporter(Path configuredOutputFile) {
         this.configuredOutputFile = configuredOutputFile == null ? null : configuredOutputFile.toAbsolutePath().normalize();
-        if (this.configuredOutputFile != null && isDirectoryMode(this.configuredOutputFile)) {
-            ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(task -> {
-                Thread thread = new Thread(task, "tpf-replay-control-flush");
-                thread.setDaemon(true);
-                return thread;
-            });
-            executor.scheduleWithFixedDelay(() -> {
-                try {
-                    flushControlFragments();
-                } catch (RuntimeException failure) {
-                    LOG.warn("Failed to flush replay control fragments; will retry on the next interval.", failure);
-                }
-            }, 1, 1, TimeUnit.SECONDS);
-            controlFlushExecutor = Optional.of(executor);
-        } else {
-            controlFlushExecutor = Optional.empty();
-        }
     }
 
     @Override
@@ -136,6 +120,9 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter, AutoC
             if (controlSingleFileWarningLogged.compareAndSet(false, true)) {
                 LOG.warn("Replay control-plane events require directory-mode replay output; skipping await lifecycle events.");
             }
+            return;
+        }
+        if (!startControlFlushIfNeeded()) {
             return;
         }
         Instant eventInstant = occurredAt == null ? Instant.now() : occurredAt;
@@ -202,7 +189,13 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter, AutoC
     @Override
     @PreDestroy
     public void close() {
-        controlFlushExecutor.ifPresent(executor -> {
+        Optional<ScheduledExecutorService> executorToStop;
+        synchronized (this) {
+            closed = true;
+            executorToStop = controlFlushExecutor;
+            controlFlushExecutor = Optional.empty();
+        }
+        executorToStop.ifPresent(executor -> {
             executor.shutdown();
             try {
                 if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -227,6 +220,33 @@ public class FilePipelineReplayExporter implements PipelineReplayExporter, AutoC
         synchronized (failedControlFragments) {
             failedControlFragments.removeIf(this::writeDocument);
         }
+    }
+
+    synchronized boolean controlFlushScheduled() {
+        return controlFlushExecutor.isPresent();
+    }
+
+    private synchronized boolean startControlFlushIfNeeded() {
+        if (closed) {
+            return false;
+        }
+        if (controlFlushExecutor.isPresent()) {
+            return true;
+        }
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(task -> {
+            Thread thread = new Thread(task, "tpf-replay-control-flush");
+            thread.setDaemon(true);
+            return thread;
+        });
+        executor.scheduleWithFixedDelay(() -> {
+            try {
+                flushControlFragments();
+            } catch (RuntimeException failure) {
+                LOG.warn("Failed to flush replay control fragments; will retry on the next interval.", failure);
+            }
+        }, 1, 1, TimeUnit.SECONDS);
+        controlFlushExecutor = Optional.of(executor);
+        return true;
     }
 
     private void retainFailedFragment(RunState fragment) {
