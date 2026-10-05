@@ -37,5 +37,7 @@
     </dependencyManagement>
     <modules>
         <module>model</module>
+        <module>host</module>
+        <module>deployment</module>
     </modules>
 </project>

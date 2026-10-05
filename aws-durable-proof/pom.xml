@@ -38,7 +38,6 @@
         </dependencies>
     </dependencyManagement>
     <modules>
-        <module>shared</module>
         <module>durable-driver</module>
         <module>action-host</module>
         <module>fault-tests</module>

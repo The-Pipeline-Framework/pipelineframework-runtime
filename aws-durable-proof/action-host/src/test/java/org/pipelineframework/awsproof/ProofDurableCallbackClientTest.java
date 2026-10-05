@@ -2,9 +2,9 @@ package org.pipelineframework.awsproof;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
-import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
-import org.pipelineframework.awsproof.model.ProofBindingStatus;
-import org.pipelineframework.awsproof.model.ProofCallbackBinding;
+import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
+import org.pipelineframework.aws.durable.model.AwsDurableBindingStatus;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding;
 import software.amazon.awssdk.services.lambda.LambdaClient;
 import software.amazon.awssdk.services.lambda.model.GetDurableExecutionHistoryRequest;
 import software.amazon.awssdk.services.lambda.model.ResourceNotFoundException;
@@ -28,13 +28,13 @@ class ProofDurableCallbackClientTest {
         assertThat(client.state(binding())).isEqualTo(ProofProviderCallbackState.CLOSED);
     }
 
-    private static ProofCallbackBinding binding() {
-        return new ProofCallbackBinding(
-            new ProofAwaitIdentity("tenant-1", "execution-1", "interaction-1", "correlation-1", 1),
+    private static AwsDurableCallbackBinding binding() {
+        return new AwsDurableCallbackBinding(
+            new AwsDurableAwaitIdentity("tenant-1", "execution-1", "interaction-1", "correlation-1", 1),
             "durable-name-1",
             "arn:aws:lambda:us-east-2:111122223333:function:proof:1/durable-execution/one",
             "callback-1",
-            ProofBindingStatus.OPEN,
+            AwsDurableBindingStatus.OPEN,
             1L,
             999_999L);
     }

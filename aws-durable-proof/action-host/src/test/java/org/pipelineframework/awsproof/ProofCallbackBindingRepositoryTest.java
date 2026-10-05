@@ -3,24 +3,24 @@ package org.pipelineframework.awsproof;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
-import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
-import org.pipelineframework.awsproof.model.ProofBindingStatus;
-import org.pipelineframework.awsproof.model.ProofCallbackBinding;
-import org.pipelineframework.awsproof.model.ProofCallbackRegistration;
-import org.pipelineframework.awsproof.model.ProofDriverCheckpoint;
-import org.pipelineframework.awsproof.model.ProofExecutionCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
+import org.pipelineframework.aws.durable.model.AwsDurableBindingStatus;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackRegistration;
+import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ProofCallbackBindingRepositoryTest {
-    private static final ProofAwaitIdentity AWAIT = new ProofAwaitIdentity(
+    private static final AwsDurableAwaitIdentity AWAIT = new AwsDurableAwaitIdentity(
         "tenant-a", "execution-a", "interaction-a", "correlation-a", 1);
 
     @Test
     void replayedAuthorityIgnoresReconstructedHousekeepingTimestamps() {
-        ProofCallbackBinding original = binding("callback-a", 100, 1_000);
-        ProofCallbackBinding reconstructed = binding("callback-a", 200, 2_000);
+        AwsDurableCallbackBinding original = binding("callback-a", 100, 1_000);
+        AwsDurableCallbackBinding reconstructed = binding("callback-a", 200, 2_000);
 
         assertThat(ProofCallbackBindingRepository.sameBindingAuthority(original, reconstructed)).isTrue();
     }
@@ -34,8 +34,8 @@ class ProofCallbackBindingRepositoryTest {
 
     @Test
     void replayedRegistrationAuthorityIgnoresHousekeepingTimestamps() {
-        ProofCallbackRegistration original = registration("callback-a", 100, 1_000);
-        ProofCallbackRegistration replayed = registration("callback-a", 200, 2_000);
+        AwsDurableCallbackRegistration original = registration("callback-a", 100, 1_000);
+        AwsDurableCallbackRegistration replayed = registration("callback-a", 200, 2_000);
 
         assertThat(ProofCallbackBindingRepository.sameRegistrationAuthority(original, replayed)).isTrue();
     }
@@ -57,21 +57,21 @@ class ProofCallbackBindingRepositoryTest {
         assertThat(ProofCallbackBindingRepository.decodeBinding(malformed)).isEmpty();
     }
 
-    private static ProofCallbackBinding binding(String callbackId, long createdAt, long expiresAt) {
-        return new ProofCallbackBinding(
+    private static AwsDurableCallbackBinding binding(String callbackId, long createdAt, long expiresAt) {
+        return new AwsDurableCallbackBinding(
             AWAIT,
             "provider-execution-a",
             "arn:aws:lambda:us-east-2:123456789012:function:proof:1/durable-execution/execution-a",
             callbackId,
-            ProofBindingStatus.OPEN,
+            AwsDurableBindingStatus.OPEN,
             createdAt,
             expiresAt);
     }
 
-    private static ProofCallbackRegistration registration(String callbackId, long createdAt, long expiresAt) {
-        return new ProofCallbackRegistration(
-            new ProofDriverCheckpoint(
-                new ProofExecutionCheckpoint(
+    private static AwsDurableCallbackRegistration registration(String callbackId, long createdAt, long expiresAt) {
+        return new AwsDurableCallbackRegistration(
+            new AwsDurableDriverCheckpoint(
+                new AwsDurableExecutionCheckpoint(
                     "tenant-a", "execution-a", "pipeline-a", "1", "release-a"),
                 1),
             "provider-execution-a",

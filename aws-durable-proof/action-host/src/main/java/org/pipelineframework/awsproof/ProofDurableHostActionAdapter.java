@@ -7,14 +7,14 @@ import java.util.Optional;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
-import org.pipelineframework.awsproof.model.ProofActionRequest;
-import org.pipelineframework.awsproof.model.ProofActionResponse;
-import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
-import org.pipelineframework.awsproof.model.ProofBindingStatus;
-import org.pipelineframework.awsproof.model.ProofCallbackBinding;
-import org.pipelineframework.awsproof.model.ProofCallbackRegistration;
-import org.pipelineframework.awsproof.model.ProofDriverCheckpoint;
-import org.pipelineframework.awsproof.model.ProofExecutionCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableActionRequest;
+import org.pipelineframework.aws.durable.model.AwsDurableActionResponse;
+import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
+import org.pipelineframework.aws.durable.model.AwsDurableBindingStatus;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackRegistration;
+import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
 
 /** Owns AWS Durable callback mechanics without admitting TPF semantic transitions. */
 @ApplicationScoped
@@ -28,37 +28,38 @@ final class ProofDurableHostActionAdapter {
     @Inject
     ProofFaultInjector faults;
 
-    ProofActionResponse handle(ProofActionRequest request) {
+    AwsDurableActionResponse handle(AwsDurableActionRequest request) {
         return switch (request.operation()) {
             case REGISTER_CALLBACK -> registerCallback(request);
             case BIND_CALLBACK -> bindCallback(request);
-            case SUBMIT, STATUS, RESULT, REDRIVE, SWEEP, QUERY_PENDING_AWAIT ->
+            case SUBMIT, STATUS, RESULT, REDRIVE, SWEEP, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT,
+                READ_EXECUTION_AWAITS ->
                 throw new IllegalArgumentException(request.operation() + " is a TPF control-plane operation");
         };
     }
 
-    private ProofActionResponse bindCallback(ProofActionRequest request) {
-        ProofAwaitIdentity identity = request.awaitIdentity()
+    private AwsDurableActionResponse bindCallback(AwsDurableActionRequest request) {
+        AwsDurableAwaitIdentity identity = request.awaitIdentity()
             .orElseThrow(() -> new IllegalArgumentException("awaitIdentity is required"));
         long now = Instant.now().toEpochMilli();
-        ProofCallbackBinding binding = new ProofCallbackBinding(
+        AwsDurableCallbackBinding binding = new AwsDurableCallbackBinding(
             identity,
             required(request.providerExecutionName(), "providerExecutionName"),
             required(request.providerExecutionArn(), "providerExecutionArn"),
             required(request.providerCallbackId(), "providerCallbackId"),
-            ProofBindingStatus.OPEN,
+            AwsDurableBindingStatus.OPEN,
             now,
             Instant.ofEpochMilli(now).plus(400, ChronoUnit.DAYS).getEpochSecond());
         faults.failIfArmed("bind-before-provider-binding", identity.executionId());
         boolean created = bindings.bind(binding);
         faults.failIfArmed("bind-after-provider-binding", identity.executionId());
         wakeups.wake(identity);
-        return ProofActionResponse.bound(created);
+        return AwsDurableActionResponse.bound(created);
     }
 
-    private ProofActionResponse registerCallback(ProofActionRequest request) {
-        ProofDriverCheckpoint checkpoint = new ProofDriverCheckpoint(
-            new ProofExecutionCheckpoint(
+    private AwsDurableActionResponse registerCallback(AwsDurableActionRequest request) {
+        AwsDurableDriverCheckpoint checkpoint = new AwsDurableDriverCheckpoint(
+            new AwsDurableExecutionCheckpoint(
                 request.tenantId(),
                 required(request.executionId(), "executionId"),
                 required(request.pipelineId(), "pipelineId"),
@@ -66,7 +67,7 @@ final class ProofDurableHostActionAdapter {
                 required(request.releaseVersion(), "releaseVersion")),
             request.generation());
         long now = Instant.now().toEpochMilli();
-        ProofCallbackRegistration registration = new ProofCallbackRegistration(
+        AwsDurableCallbackRegistration registration = new AwsDurableCallbackRegistration(
             checkpoint,
             required(request.providerExecutionName(), "providerExecutionName"),
             required(request.providerExecutionArn(), "providerExecutionArn"),
@@ -76,7 +77,7 @@ final class ProofDurableHostActionAdapter {
         faults.failIfArmed("bind-before-provider-binding", checkpoint.executionId());
         boolean created = bindings.register(registration);
         faults.failIfArmed("bind-after-provider-binding", checkpoint.executionId());
-        return ProofActionResponse.bound(created);
+        return AwsDurableActionResponse.bound(created);
     }
 
     private static String required(Optional<String> value, String name) {

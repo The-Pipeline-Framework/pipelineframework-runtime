@@ -13,7 +13,7 @@
     <dependencies>
         <dependency>
             <groupId>org.pipelineframework</groupId>
-            <artifactId>pipelineframework-aws-durable-proof-shared</artifactId>
+            <artifactId>pipelineframework-aws-durable-coordination-host</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>
