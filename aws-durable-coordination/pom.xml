@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.pipelineframework</groupId>
+        <artifactId>pipelineframework-runtime-parent</artifactId>
+        <version>26.10.1-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+    <artifactId>pipelineframework-aws-durable-coordination-parent</artifactId>
+    <packaging>pom</packaging>
+    <name>TPF AWS Durable Coordination</name>
+    <description>Published AWS Lambda Durable coordination host for QUEUE_ASYNC</description>
+    <properties>
+        <aws.sdk.version>2.55.0</aws.sdk.version>
+        <aws.durable.sdk.version>2.2.1</aws.durable.sdk.version>
+        <aws.lambda.events.version>3.16.1</aws.lambda.events.version>
+        <assertj.version>3.27.6</assertj.version>
+    </properties>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${aws.sdk.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.assertj</groupId>
+                <artifactId>assertj-core</artifactId>
+                <version>${assertj.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+    <modules>
+        <module>model</module>
+    </modules>
+</project>

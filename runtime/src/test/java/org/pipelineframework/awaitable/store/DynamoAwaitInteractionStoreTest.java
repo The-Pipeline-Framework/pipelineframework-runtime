@@ -40,6 +40,51 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemResponse;
 class DynamoAwaitInteractionStoreTest {
 
     @Test
+    void reconstructsAwaitInteractionsThroughExecutionIndex() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
+        Map<String, AttributeValue> interaction = item(
+            "tenant-a", "interaction-1", "unit-1", 0,
+            AwaitInteractionStatus.COMPLETED, 20_000L, "alice", "finance");
+        when(client.query(any(QueryRequest.class)))
+            .thenReturn(QueryResponse.builder().items(interaction).build());
+
+        var records = store.findByExecution("tenant-a", "execution-interaction-1", 10).await().indefinitely();
+
+        assertEquals(1, records.size());
+        ArgumentCaptor<QueryRequest> query = ArgumentCaptor.forClass(QueryRequest.class);
+        verify(client).query(query.capture());
+        assertEquals("await-interaction-by-execution", query.getValue().indexName());
+        assertEquals(scoped("tenant-a", "execution-interaction-1"), query.getValue().expressionAttributeValues()
+            .get(":executionKey").s());
+        verify(client, never()).scan(any(ScanRequest.class));
+    }
+
+    @Test
+    void queriesContinuationProjectionWithoutScanningInteractions() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
+        Map<String, AttributeValue> work = new java.util.HashMap<>(item(
+            "tenant-a", "interaction-1", "unit-1", 0,
+            AwaitInteractionStatus.COMPLETED, 20_000L, "alice", "finance"));
+        work.put("query_continuation_key", avS("ready"));
+        work.put("query_continuation_due_epoch_ms", AttributeValue.builder().n("1000").build());
+        work.put("continuation_attempt", AttributeValue.builder().n("2").build());
+        when(client.query(any(QueryRequest.class)))
+            .thenReturn(QueryResponse.builder().items(work).build());
+
+        var commands = store.findDueItemContinuations(2_000L, 10).await().indefinitely();
+
+        assertEquals(1, commands.size());
+        assertEquals(2, commands.getFirst().attempt());
+        ArgumentCaptor<QueryRequest> query = ArgumentCaptor.forClass(QueryRequest.class);
+        verify(client).query(query.capture());
+        assertEquals("await-interaction-continuation-work", query.getValue().indexName());
+        assertTrue(query.getValue().keyConditionExpression().contains("#continuationDue <= :now"));
+        verify(client, never()).scan(any(ScanRequest.class));
+    }
+
+    @Test
     void callbackObservationRetainsDeadlineIndexesUntilCommandSettlement() {
         DynamoDbClient client = mock(DynamoDbClient.class);
         DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
@@ -126,6 +171,8 @@ class DynamoAwaitInteractionStoreTest {
         ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
         verify(client).updateItem(update.capture());
         assertEquals(typedResponse, update.getValue().expressionAttributeValues().get(":response").s());
+        assertEquals("ready", update.getValue().expressionAttributeValues().get(":continuationKey").s());
+        assertTrue(update.getValue().updateExpression().contains("#continuationDue = :continuationDue"));
         assertEquals(decision, completion.record().responsePayload());
         verify(payloads).encode(any(), eq(AwaitDurablePayloadResolver.Slot.REQUEST), any());
         verify(payloads).encode(any(), eq(AwaitDurablePayloadResolver.Slot.RESPONSE), eq(decision));

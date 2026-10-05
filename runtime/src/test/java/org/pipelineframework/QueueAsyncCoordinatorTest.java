@@ -188,6 +188,10 @@ class QueueAsyncCoordinatorTest {
         lenient().when(workerConfig.saturatedDelay()).thenReturn(Duration.ofSeconds(1));
         lenient().when(executionStateStore.supportsLeaseRenewal()).thenReturn(true);
         lenient().when(awaitCoordinator.importSuspension(any())).thenReturn(Uni.createFrom().voidItem());
+        lenient().when(awaitCoordinator.completeItemContinuation(any())).thenReturn(Uni.createFrom().voidItem());
+        lenient().when(awaitCoordinator.rescheduleItemContinuation(
+                any(), org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.anyLong()))
+            .thenReturn(Uni.createFrom().voidItem());
         lenient().when(awaitLiveCompletionRegistry.signal(any()))
             .thenReturn(Uni.createFrom().item(false));
     }
@@ -328,16 +332,12 @@ class QueueAsyncCoordinatorTest {
         assertEquals("exec-1", dto.executionId());
         assertSame(executionStateStore, coordinator.executionStateStore);
         assertSame(workDispatcher, coordinator.workDispatcher);
-        try {
-            coordinator.initializeQueueMode();
-            coordinator.initializeQueueMode();
+        coordinator.initializeQueueMode();
+        coordinator.initializeQueueMode();
 
-            verify(executionStateStores, times(1)).stream();
-            verify(workDispatchers, times(1)).stream();
-            verify(deadLetterPublishers, times(1)).stream();
-        } finally {
-            coordinator.shutdownAwaitContinuationRetryExecutor();
-        }
+        verify(executionStateStores, times(1)).stream();
+        verify(workDispatchers, times(1)).stream();
+        verify(deadLetterPublishers, times(1)).stream();
     }
 
     @Test

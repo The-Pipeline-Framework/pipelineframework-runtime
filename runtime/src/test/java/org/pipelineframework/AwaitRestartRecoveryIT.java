@@ -48,6 +48,8 @@ import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
 import org.pipelineframework.awaitable.spi.AwaitUnitStore;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
 import org.pipelineframework.orchestrator.CreateExecutionResult;
+import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
+import org.pipelineframework.orchestrator.AwaitItemContinuationDisposition;
 import org.pipelineframework.orchestrator.DynamoAwaitLifecycleTestStores;
 import org.pipelineframework.orchestrator.ExecutionCreateCommand;
 import org.pipelineframework.orchestrator.ExecutionInputShape;
@@ -747,8 +749,6 @@ class AwaitRestartRecoveryIT {
         dispatcher,
         durableCoordinator(),
         new TransitionWorkerExecutor(null, new PipelineInvocationRuntime()),
-        scheduler,
-        () -> Duration.ofMillis(10),
         () -> new SegmentBoundaryLedger(new InMemoryControlPlaneJournal()),
         ignored -> {
         },
@@ -813,8 +813,12 @@ class AwaitRestartRecoveryIT {
         AwaitUnitStatus.COMPLETED, null, 1, 1, Set.of("item:0"), true, 1L, 2L, ttl);
     AwaitInteractionRecord interaction = interaction(waitingParent.executionId(), 0, "tenant-admission");
     AwaitCoordinator coordinator = mock(AwaitCoordinator.class);
+    when(coordinator.getUnit("tenant-admission", "unit-admission"))
+        .thenReturn(Uni.createFrom().item(unit));
     when(coordinator.findByUnit("tenant-admission", "unit-admission"))
         .thenReturn(Uni.createFrom().item(List.of(interaction)));
+    when(coordinator.completeItemContinuation(any()))
+        .thenReturn(Uni.createFrom().voidItem());
     CountDownLatch admitted = new CountDownLatch(1);
     AwaitItemContinuationHandler blockedHandler = new AwaitItemContinuationHandler() {
       @Override
@@ -830,10 +834,17 @@ class AwaitRestartRecoveryIT {
         return Uni.createFrom().voidItem();
       }
     };
-    replaceScheduler();
-    flow(workerAStore, mock(WorkDispatcher.class), coordinator).afterParentWaiting(
-            waitingParent, unit, 2, blockedHandler, now)
-        .await().indefinitely();
+    AwaitItemContinuationCommand command = new AwaitItemContinuationCommand(
+        "tenant-admission",
+        waitingParent.executionId(),
+        unit.unitId(),
+        interaction.interactionId(),
+        0,
+        1,
+        now);
+    var workerASubscription = flow(workerAStore, mock(WorkDispatcher.class), coordinator)
+        .processOne(command, blockedHandler, 10L)
+        .subscribe().with(ignored -> { }, failure -> { });
     try {
       assertTrue(admitted.await(10, java.util.concurrent.TimeUnit.SECONDS));
     } catch (InterruptedException interrupted) {
@@ -842,7 +853,7 @@ class AwaitRestartRecoveryIT {
     }
 
     // Worker A disappears after it has admitted the transition.  Worker B has no A-local claim or permit.
-    scheduler.shutdownNow();
+    workerASubscription.cancel();
     AtomicInteger recoveredCalls = new AtomicInteger();
     CountDownLatch recovered = new CountDownLatch(1);
     AwaitItemContinuationHandler recoveredHandler = new AwaitItemContinuationHandler() {
@@ -861,9 +872,11 @@ class AwaitRestartRecoveryIT {
         return Uni.createFrom().voidItem();
       }
     };
-    replaceScheduler();
-    flow(DynamoAwaitLifecycleTestStores.executionStoreForExistingState(dynamo, TABLE_PREFIX), mock(WorkDispatcher.class), coordinator)
-        .afterParentWaiting(waitingParent, unit, 2, recoveredHandler, now + 1L)
+    var recoveredResult = flow(
+            DynamoAwaitLifecycleTestStores.executionStoreForExistingState(dynamo, TABLE_PREFIX),
+            mock(WorkDispatcher.class),
+            coordinator)
+        .processOne(command.nextAttempt(now + 1L), recoveredHandler, 10L)
         .await().indefinitely();
     try {
       assertTrue(recovered.await(10, java.util.concurrent.TimeUnit.SECONDS));
@@ -871,6 +884,7 @@ class AwaitRestartRecoveryIT {
       Thread.currentThread().interrupt();
       throw new IllegalStateException("Interrupted waiting for recovered item continuation", interrupted);
     }
+    assertEquals(AwaitItemContinuationDisposition.COMPLETED, recoveredResult.disposition());
     assertEquals(1, recoveredCalls.get());
   }
 
@@ -969,8 +983,6 @@ class AwaitRestartRecoveryIT {
         dispatcher,
         coordinator,
         new TransitionWorkerExecutor(null, new PipelineInvocationRuntime()),
-        scheduler,
-        () -> Duration.ofMillis(10),
         () -> new SegmentBoundaryLedger(new InMemoryControlPlaneJournal()),
         ignored -> {
         },

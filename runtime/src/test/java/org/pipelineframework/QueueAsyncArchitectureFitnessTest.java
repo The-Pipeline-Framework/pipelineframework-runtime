@@ -90,8 +90,11 @@ class QueueAsyncArchitectureFitnessTest {
         coordinator.contains("return redriveFlow().redrive(tenantId, executionId, expectedVersion, allowFailed, reason);"),
         "redriveExecution must delegate to QueueAsyncRedriveFlow");
     assertTrue(
-        coordinator.contains("return sweepFlow().sweepOnce(nowEpochMs);"),
+        coordinator.contains("Uni<CoordinatorSweepResult> sweep = sweepFlow().sweepOnce(nowEpochMs);"),
         "sweepOnce must delegate to QueueAsyncSweepFlow");
+    assertTrue(
+        coordinator.contains("awaitContinuations().sweepDueItemContinuations("),
+        "native sweep hosting must rediscover durable itemized-Await continuation work");
   }
 
   @Test
@@ -144,6 +147,21 @@ class QueueAsyncArchitectureFitnessTest {
         "native loop hosting must depend on the action contract");
     assertFalse(loopHost.contains("QueueAsyncCoordinator coordinator"),
         "native loop hosting must not depend on the local coordinator implementation");
+  }
+
+  @Test
+  void itemizedAwaitContinuationIsABoundedSubscriptionFreeAction() throws IOException {
+    String flow = Files.readString(source("ItemizedAwaitContinuationFlow"));
+    String coordinator = Files.readString(source("QueueAsyncCoordinator"));
+
+    assertFalse(flow.contains(".subscribe("),
+        "ItemizedAwaitContinuationFlow must return its Uni to the host");
+    assertFalse(flow.contains("ScheduledExecutorService"),
+        "ItemizedAwaitContinuationFlow must not own retry scheduling");
+    assertFalse(flow.contains(".schedule("),
+        "ItemizedAwaitContinuationFlow must not schedule retry attempts");
+    assertFalse(coordinator.contains("awaitContinuationRetryExecutor"),
+        "QueueAsyncCoordinator must not own an Await continuation retry executor");
   }
 
   @Test

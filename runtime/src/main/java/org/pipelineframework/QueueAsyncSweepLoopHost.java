@@ -15,6 +15,7 @@ import jakarta.inject.Inject;
 import io.quarkus.runtime.StartupEvent;
 import org.jboss.logging.Logger;
 import org.pipelineframework.orchestrator.OrchestratorMode;
+import org.pipelineframework.orchestrator.CoordinationHost;
 import org.pipelineframework.orchestrator.PipelineControlPlane;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 
@@ -59,7 +60,11 @@ class QueueAsyncSweepLoopHost {
   }
 
   synchronized void start() {
-    if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC || started) {
+    CoordinationHost host = orchestratorConfig.coordinationHost();
+    if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC
+        || orchestratorConfig.processLoopsDisabled()
+        || (host != null && host != CoordinationHost.NATIVE)
+        || started) {
       return;
     }
     controlPlane.initializeQueueMode();

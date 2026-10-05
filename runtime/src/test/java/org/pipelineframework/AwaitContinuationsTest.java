@@ -443,8 +443,6 @@ class AwaitContinuationsTest {
         dispatcher,
         coordinator,
         new TransitionWorkerExecutor(null, new PipelineInvocationRuntime()),
-        scheduler,
-        () -> Duration.ofMillis(10),
         () -> new SegmentBoundaryLedger(journal),
         ignored -> {
         });

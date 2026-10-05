@@ -1,9 +1,7 @@
 package org.pipelineframework;
 
-import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -13,6 +11,8 @@ import org.pipelineframework.awaitable.AwaitCoordinator;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.awaitable.AwaitUnitRecord;
 import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
+import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
+import org.pipelineframework.orchestrator.AwaitItemContinuationResult;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
@@ -59,8 +59,6 @@ class AwaitContinuations {
       WorkDispatcher workDispatcher,
       AwaitCoordinator awaitCoordinator,
       TransitionWorkerExecutor transitionWorkerExecutor,
-      ScheduledExecutorService queueSweepExecutor,
-      Supplier<Duration> saturatedDelay,
       Supplier<SegmentBoundaryLedger> segmentBoundaryLedger,
       Consumer<AwaitReplayLifecycleEvent> lifecycleRecorder) {
     this(
@@ -68,8 +66,6 @@ class AwaitContinuations {
         workDispatcher,
         awaitCoordinator,
         transitionWorkerExecutor,
-        queueSweepExecutor,
-        saturatedDelay,
         segmentBoundaryLedger,
         lifecycleRecorder,
         org.pipelineframework.orchestrator.JsonTransitionPayloadCodec::new);
@@ -80,8 +76,6 @@ class AwaitContinuations {
       WorkDispatcher workDispatcher,
       AwaitCoordinator awaitCoordinator,
       TransitionWorkerExecutor transitionWorkerExecutor,
-      ScheduledExecutorService queueSweepExecutor,
-      Supplier<Duration> saturatedDelay,
       Supplier<SegmentBoundaryLedger> segmentBoundaryLedger,
       Consumer<AwaitReplayLifecycleEvent> lifecycleRecorder,
       Supplier<TransitionPayloadCodec> payloadCodec) {
@@ -99,13 +93,30 @@ class AwaitContinuations {
         workDispatcher,
         awaitCoordinator,
         transitionWorkerExecutor,
-        queueSweepExecutor,
-        saturatedDelay,
         segmentBoundaryLedger,
         lifecycleRecorder,
         planner,
         claims,
         payloadCodec);
+  }
+
+  Uni<AwaitItemContinuationResult> processItemContinuation(
+      AwaitItemContinuationCommand command,
+      AwaitItemContinuationHandler itemContinuationHandler,
+      long saturatedDelayMs) {
+    return itemizedFlow.processOne(command, itemContinuationHandler, saturatedDelayMs);
+  }
+
+  Uni<Void> sweepDueItemContinuations(
+      long nowEpochMs,
+      int limit,
+      AwaitItemContinuationHandler itemContinuationHandler,
+      long saturatedDelayMs) {
+    return itemizedFlow.sweepDue(
+        nowEpochMs,
+        limit,
+        itemContinuationHandler,
+        saturatedDelayMs);
   }
 
   Uni<AwaitCompletionResult> afterRecordedCompletion(

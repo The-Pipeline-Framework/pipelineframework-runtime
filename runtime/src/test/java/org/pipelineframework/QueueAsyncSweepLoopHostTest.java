@@ -9,6 +9,7 @@ import java.util.function.LongSupplier;
 import io.smallrye.mutiny.Uni;
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.orchestrator.CoordinatorSweepResult;
+import org.pipelineframework.orchestrator.CoordinationHost;
 import org.pipelineframework.orchestrator.OrchestratorMode;
 import org.pipelineframework.orchestrator.PipelineControlPlane;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
@@ -56,6 +57,43 @@ class QueueAsyncSweepLoopHostTest {
     ScheduledExecutorService executor = mock(ScheduledExecutorService.class);
     PipelineControlPlane controlPlane = mock(PipelineControlPlane.class);
     QueueAsyncSweepLoopHost host = host(executor, controlPlane, OrchestratorMode.SYNC, 123L);
+
+    host.start();
+
+    assertFalse(host.started());
+    verify(controlPlane, never()).initializeQueueMode();
+    verify(executor, never()).scheduleAtFixedRate(any(), anyLong(), anyLong(), any());
+  }
+
+  @Test
+  void awsDurableHostDoesNotStartNativeSweepScheduler() {
+    ScheduledExecutorService executor = mock(ScheduledExecutorService.class);
+    PipelineControlPlane controlPlane = mock(PipelineControlPlane.class);
+    PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
+    when(config.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(config.coordinationHost()).thenReturn(CoordinationHost.AWS_DURABLE);
+    QueueAsyncSweepLoopHost host = new QueueAsyncSweepLoopHost(executor, () -> 123L);
+    host.orchestratorConfig = config;
+    host.controlPlane = controlPlane;
+
+    host.start();
+
+    assertFalse(host.started());
+    verify(controlPlane, never()).initializeQueueMode();
+    verify(executor, never()).scheduleAtFixedRate(any(), anyLong(), anyLong(), any());
+  }
+
+  @Test
+  void eventSourceArtifactDoesNotStartProcessSweepScheduler() {
+    ScheduledExecutorService executor = mock(ScheduledExecutorService.class);
+    PipelineControlPlane controlPlane = mock(PipelineControlPlane.class);
+    PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
+    when(config.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(config.coordinationHost()).thenReturn(CoordinationHost.NATIVE);
+    when(config.processLoopsDisabled()).thenReturn(true);
+    QueueAsyncSweepLoopHost host = new QueueAsyncSweepLoopHost(executor, () -> 123L);
+    host.orchestratorConfig = config;
+    host.controlPlane = controlPlane;
 
     host.start();
 

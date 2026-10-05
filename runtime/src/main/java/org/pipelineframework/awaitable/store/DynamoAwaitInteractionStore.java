@@ -29,6 +29,7 @@ import org.pipelineframework.awaitable.AwaitInteractionTerminalException;
 import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
+import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 import org.pipelineframework.orchestrator.TypedDurablePayload;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
@@ -55,7 +56,10 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
  * or due active deadline instead of scanning the interaction table.
  */
 @ApplicationScoped
-public class DynamoAwaitInteractionStore implements AwaitInteractionStore {
+public class DynamoAwaitInteractionStore implements
+    AwaitInteractionStore,
+    AwaitItemContinuationWorkStore,
+    AwaitInteractionExecutionLookup {
     private static final Logger LOG = Logger.getLogger(DynamoAwaitInteractionStore.class);
 
     private static final String UNIT_INDEX = "await-interaction-by-unit";
@@ -64,7 +68,10 @@ public class DynamoAwaitInteractionStore implements AwaitInteractionStore {
     private static final String PENDING_GROUP_INDEX = "await-interaction-pending-by-group";
     private static final String PENDING_STEP_INDEX = "await-interaction-pending-by-step";
     private static final String PENDING_DEADLINE_INDEX = "await-interaction-pending-by-deadline";
+    private static final String CONTINUATION_WORK_INDEX = "await-interaction-continuation-work";
+    private static final String EXECUTION_INDEX = "await-interaction-by-execution";
     private static final String ACTIVE_DEADLINE_PARTITION = "active";
+    private static final String READY_CONTINUATION_PARTITION = "ready";
 
     private static final String TENANT_ID = "tenant_id";
     private static final String INTERACTION_ID = "interaction_id";
@@ -102,6 +109,11 @@ public class DynamoAwaitInteractionStore implements AwaitInteractionStore {
     private static final String QUERY_PENDING_DEADLINE_SORT = "query_pending_deadline_sort";
     private static final String QUERY_DEADLINE_KEY = "query_deadline_key";
     private static final String QUERY_DEADLINE_SORT = "query_deadline_sort";
+    private static final String QUERY_CONTINUATION_KEY = "query_continuation_key";
+    private static final String QUERY_CONTINUATION_DUE = "query_continuation_due_epoch_ms";
+    private static final String QUERY_EXECUTION_KEY = "query_execution_key";
+    private static final String QUERY_EXECUTION_SORT = "query_execution_sort";
+    private static final String CONTINUATION_ATTEMPT = "continuation_attempt";
     private static final String ENCODED_JAVA_CLASS = "_tpf_java_class";
     private static final String ENCODED_PAYLOAD = "_tpf_payload";
 
@@ -240,6 +252,38 @@ public class DynamoAwaitInteractionStore implements AwaitInteractionStore {
                 .thenComparing(record -> nullToEmpty(record.causationId()))
                 .thenComparing(AwaitInteractionRecord::interactionId));
             return List.copyOf(records);
+        });
+    }
+
+    @Override
+    public Uni<List<AwaitInteractionRecord>> findByExecution(
+        String tenantId,
+        String executionId,
+        int limit
+    ) {
+        return blocking(() -> {
+            if (limit <= 0) {
+                return List.of();
+            }
+            var response = dynamoClient().query(QueryRequest.builder()
+                .tableName(interactionTable())
+                .indexName(EXECUTION_INDEX)
+                .keyConditionExpression("#executionKey = :executionKey")
+                .filterExpression("attribute_not_exists(#ttl) OR #ttl > :nowSec")
+                .expressionAttributeNames(Map.of(
+                    "#executionKey", QUERY_EXECUTION_KEY,
+                    "#ttl", TTL_EPOCH_S))
+                .expressionAttributeValues(Map.of(
+                    ":executionKey", avS(scopedKey(tenantId, executionId)),
+                    ":nowSec", avN(Instant.now().getEpochSecond())))
+                .scanIndexForward(false)
+                .limit(limit)
+                .build());
+            return response.items().stream()
+                .map(this::toRecord)
+                .filter(record -> Objects.equals(record.tenantId(), tenantId))
+                .filter(record -> Objects.equals(record.executionId(), executionId))
+                .toList();
         });
     }
 
@@ -642,11 +686,13 @@ public class DynamoAwaitInteractionStore implements AwaitInteractionStore {
             current.tenantId(),
             current.interactionId(),
             current.version(),
+            null,
             current.observedCompletionStatus(),
             serializePayload(current, AwaitDurablePayloadResolver.Slot.RESPONSE, command.responsePayload()),
             command.actor(),
             null,
-            command.nowEpochMs());
+            command.nowEpochMs(),
+            current.itemInteraction());
         if (completed.isPresent()) {
             return new AwaitCompletionResult(completed.get(), false);
         }
@@ -695,7 +741,8 @@ public class DynamoAwaitInteractionStore implements AwaitInteractionStore {
             responsePayloadJson,
             actor,
             transportMetadata,
-            nowEpochMs);
+            nowEpochMs,
+            false);
     }
 
     private Optional<AwaitInteractionRecord> transitionStatus(
@@ -708,6 +755,30 @@ public class DynamoAwaitInteractionStore implements AwaitInteractionStore {
         String actor,
         Map<String, Object> transportMetadata,
         long nowEpochMs) {
+        return transitionStatus(
+            tenantId,
+            interactionId,
+            expectedVersion,
+            requiredStatus,
+            status,
+            responsePayloadJson,
+            actor,
+            transportMetadata,
+            nowEpochMs,
+            false);
+    }
+
+    private Optional<AwaitInteractionRecord> transitionStatus(
+        String tenantId,
+        String interactionId,
+        long expectedVersion,
+        AwaitInteractionStatus requiredStatus,
+        AwaitInteractionStatus status,
+        String responsePayloadJson,
+        String actor,
+        Map<String, Object> transportMetadata,
+        long nowEpochMs,
+        boolean projectItemContinuation) {
         Map<String, String> names = new HashMap<>();
         names.put("#version", VERSION);
         names.put("#status", STATUS);
@@ -734,6 +805,14 @@ public class DynamoAwaitInteractionStore implements AwaitInteractionStore {
             names.put("#metadata", TRANSPORT_METADATA_JSON);
             values.put(":metadata", avS(toJson(transportMetadata)));
         }
+        if (projectItemContinuation) {
+            names.put("#continuationKey", QUERY_CONTINUATION_KEY);
+            names.put("#continuationDue", QUERY_CONTINUATION_DUE);
+            names.put("#continuationAttempt", CONTINUATION_ATTEMPT);
+            values.put(":continuationKey", avS(READY_CONTINUATION_PARTITION));
+            values.put(":continuationDue", avN(nowEpochMs));
+            values.put(":continuationAttempt", avN(1));
+        }
         if (status.terminal()) {
             names.put("#pendingTenantKey", QUERY_PENDING_TENANT_KEY);
             names.put("#pendingAssigneeKey", QUERY_PENDING_ASSIGNEE_KEY);
@@ -752,6 +831,11 @@ public class DynamoAwaitInteractionStore implements AwaitInteractionStore {
         }
         if (transportMetadata != null) {
             update.append(", #metadata = :metadata");
+        }
+        if (projectItemContinuation) {
+            update.append(", #continuationKey = :continuationKey")
+                .append(", #continuationDue = :continuationDue")
+                .append(", #continuationAttempt = :continuationAttempt");
         }
         if (status.terminal()) {
             update.append(" REMOVE #pendingTenantKey, #pendingAssigneeKey, #pendingGroupKey, #pendingStepKey, ")
@@ -782,6 +866,115 @@ public class DynamoAwaitInteractionStore implements AwaitInteractionStore {
         } catch (ConditionalCheckFailedException ignored) {
             return Optional.empty();
         }
+    }
+
+    @Override
+    public Uni<List<AwaitItemContinuationCommand>> findDueItemContinuations(long nowEpochMs, int limit) {
+        return blocking(() -> {
+            if (limit <= 0) {
+                return List.of();
+            }
+            Map<String, String> names = Map.of(
+                "#continuationKey", QUERY_CONTINUATION_KEY,
+                "#continuationDue", QUERY_CONTINUATION_DUE,
+                "#ttl", TTL_EPOCH_S);
+            Map<String, AttributeValue> values = Map.of(
+                ":continuationKey", avS(READY_CONTINUATION_PARTITION),
+                ":now", avN(nowEpochMs),
+                ":nowSec", avN(Instant.ofEpochMilli(nowEpochMs).getEpochSecond()));
+            List<AwaitItemContinuationCommand> commands = new ArrayList<>();
+            Map<String, AttributeValue> lastEvaluatedKey = null;
+            do {
+                QueryRequest.Builder request = QueryRequest.builder()
+                    .tableName(interactionTable())
+                    .indexName(CONTINUATION_WORK_INDEX)
+                    .keyConditionExpression("#continuationKey = :continuationKey AND #continuationDue <= :now")
+                    .filterExpression("attribute_not_exists(#ttl) OR #ttl > :nowSec")
+                    .expressionAttributeNames(names)
+                    .expressionAttributeValues(values)
+                    .limit(queryPageLimit(limit));
+                if (lastEvaluatedKey != null && !lastEvaluatedKey.isEmpty()) {
+                    request.exclusiveStartKey(lastEvaluatedKey);
+                }
+                var response = dynamoClient().query(request.build());
+                if (response.items() != null) {
+                    for (Map<String, AttributeValue> item : response.items()) {
+                        AwaitInteractionRecord record = toMetadataRecord(item);
+                        if (record.itemIndex() != null) {
+                            commands.add(new AwaitItemContinuationCommand(
+                                record.tenantId(),
+                                record.executionId(),
+                                record.unitId(),
+                                record.interactionId(),
+                                record.itemIndex(),
+                                Optional.ofNullable(readInteger(item, CONTINUATION_ATTEMPT)).orElse(1),
+                                nowEpochMs));
+                        }
+                        if (commands.size() >= limit) {
+                            break;
+                        }
+                    }
+                }
+                lastEvaluatedKey = response.lastEvaluatedKey();
+            } while (commands.size() < limit && lastEvaluatedKey != null && !lastEvaluatedKey.isEmpty());
+            return List.copyOf(commands);
+        });
+    }
+
+    @Override
+    public Uni<Void> rescheduleItemContinuation(
+        AwaitItemContinuationCommand command,
+        int nextAttempt,
+        long dueEpochMs) {
+        return updateContinuationProjection(command, nextAttempt, dueEpochMs, false);
+    }
+
+    @Override
+    public Uni<Void> completeItemContinuation(AwaitItemContinuationCommand command) {
+        return updateContinuationProjection(command, command.attempt(), command.nowEpochMs(), true);
+    }
+
+    private Uni<Void> updateContinuationProjection(
+        AwaitItemContinuationCommand command,
+        int nextAttempt,
+        long dueEpochMs,
+        boolean complete) {
+        return blocking(() -> {
+            Map<String, String> names = Map.of(
+                "#continuationKey", QUERY_CONTINUATION_KEY,
+                "#continuationDue", QUERY_CONTINUATION_DUE,
+                "#continuationAttempt", CONTINUATION_ATTEMPT,
+                "#execution", EXECUTION_ID,
+                "#unit", UNIT_ID,
+                "#item", ITEM_INDEX);
+            Map<String, AttributeValue> values = new HashMap<>(Map.of(
+                ":ready", avS(READY_CONTINUATION_PARTITION),
+                ":execution", avS(command.executionId()),
+                ":unit", avS(command.unitId()),
+                ":item", avN(command.itemIndex())));
+            String update;
+            if (complete) {
+                update = "REMOVE #continuationKey, #continuationDue, #continuationAttempt";
+            } else {
+                values.put(":due", avN(dueEpochMs));
+                values.put(":attempt", avN(nextAttempt));
+                update = "SET #continuationDue = :due, #continuationAttempt = :attempt";
+            }
+            try {
+                dynamoClient().updateItem(UpdateItemRequest.builder()
+                    .tableName(interactionTable())
+                    .key(primaryKey(command.tenantId(), command.interactionId()))
+                    .conditionExpression("#continuationKey = :ready AND #execution = :execution "
+                        + "AND #unit = :unit AND #item = :item")
+                    .updateExpression(update)
+                    .expressionAttributeNames(names)
+                    .expressionAttributeValues(values)
+                    .build());
+            } catch (ConditionalCheckFailedException ignored) {
+                // A duplicate host may have already advanced or completed this projection.
+            }
+            return Boolean.TRUE;
+        }).replaceWithVoid();
     }
 
     private Optional<AwaitInteractionRecord> getBlocking(String tenantId, String interactionId, long nowEpochMs) {
@@ -1076,6 +1269,8 @@ public class DynamoAwaitInteractionStore implements AwaitInteractionStore {
     }
 
     private static void putQueryKeys(Map<String, AttributeValue> item, AwaitInteractionRecord record) {
+        item.put(QUERY_EXECUTION_KEY, avS(scopedKey(record.tenantId(), record.executionId())));
+        item.put(QUERY_EXECUTION_SORT, avS(deadlineSortKey(record.createdAtEpochMs(), record.interactionId())));
         if (record.unitId() != null && !record.unitId().isBlank()) {
             item.put(QUERY_UNIT_KEY, avS(scopedKey(record.tenantId(), record.unitId())));
             item.put(QUERY_UNIT_SORT, avS(itemSortKey(record.itemIndex(), record.causationId(), record.interactionId())));

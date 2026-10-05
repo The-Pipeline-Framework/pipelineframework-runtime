@@ -8,10 +8,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.UUID;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.IntSupplier;
-import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -31,6 +28,9 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionOperation;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
 import org.pipelineframework.orchestrator.CoordinatorSweepResult;
+import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
+import org.pipelineframework.orchestrator.AwaitItemContinuationResult;
+import org.pipelineframework.orchestrator.AwaitSemanticCheckpoint;
 import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
 import org.pipelineframework.telemetry.PipelineReplayTelemetry;
 import org.pipelineframework.orchestrator.DeadLetterPublisher;
@@ -134,13 +134,6 @@ class QueueAsyncCoordinator {
   @Inject
   PipelineReplayTelemetry telemetry;
 
-  private final ScheduledExecutorService awaitContinuationRetryExecutor = Executors.newSingleThreadScheduledExecutor(
-      runnable -> {
-        Thread thread = new Thread(runnable, "tpf-await-continuation-retry");
-        thread.setDaemon(true);
-        return thread;
-      });
-
   volatile ExecutionStateStore executionStateStore;
   volatile WorkDispatcher workDispatcher;
   volatile DeadLetterPublisher deadLetterPublisher;
@@ -153,11 +146,6 @@ class QueueAsyncCoordinator {
       return;
     }
     initializeQueueProviders();
-  }
-
-  @PreDestroy
-  void shutdownAwaitContinuationRetryExecutor() {
-    awaitContinuationRetryExecutor.shutdownNow();
   }
 
   Uni<RunAsyncAcceptedDto> executePipelineAsync(
@@ -274,11 +262,28 @@ class QueueAsyncCoordinator {
   }
 
   Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs) {
+    return sweepOnce(nowEpochMs, NOOP_ITEM_CONTINUATION_HANDLER);
+  }
+
+  Uni<CoordinatorSweepResult> sweepOnce(
+      long nowEpochMs,
+      AwaitItemContinuationHandler itemContinuationHandler) {
     return Uni.createFrom().deferred(() -> {
       if (!ensureQueueModeReady()) {
         return Uni.createFrom().failure(queueModeDisabledException());
       }
-      return sweepFlow().sweepOnce(nowEpochMs);
+      int limit = orchestratorConfig.sweepLimit();
+      Uni<CoordinatorSweepResult> sweep = sweepFlow().sweepOnce(nowEpochMs);
+      if (itemContinuationHandler == NOOP_ITEM_CONTINUATION_HANDLER) {
+        return sweep;
+      }
+      return sweep
+          .onItem().transformToUni(result -> awaitContinuations().sweepDueItemContinuations(
+                  nowEpochMs,
+                  limit,
+                  itemContinuationHandler,
+                  saturatedDelay().toMillis())
+              .replaceWith(result));
     });
   }
 
@@ -318,6 +323,75 @@ class QueueAsyncCoordinator {
         return Uni.createFrom().failure(admissionFailure);
       }
       return awaitCoordinator.queryPending(resolvedTenant, assignee, group, stepId, limit <= 0 ? 100 : limit);
+    });
+  }
+
+  Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(
+      String tenantId,
+      String interactionId) {
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) {
+        return Uni.createFrom().failure(queueModeDisabledException());
+      }
+      String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
+      return awaitCoordinator.getInteraction(resolvedTenant, interactionId)
+          .onItem().transformToUni(interaction -> interaction
+              .map(record -> executionStateStore.getExecution(resolvedTenant, record.executionId())
+                  .onItem().transform(execution -> execution.map(parent -> new AwaitSemanticCheckpoint(
+                      record.tenantId(),
+                      record.executionId(),
+                      record.interactionId(),
+                      record.correlationId(),
+                      record.unitId(),
+                      record.stepId(),
+                      record.status(),
+                      parent.pipelineId(),
+                      parent.contractVersion(),
+                      parent.releaseVersion()))))
+              .orElseGet(() -> Uni.createFrom().item(Optional.empty())));
+    });
+  }
+
+  Uni<List<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoints(
+      String tenantId,
+      String executionId,
+      int limit) {
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) {
+        return Uni.createFrom().failure(queueModeDisabledException());
+      }
+      if (executionId == null || executionId.isBlank()) {
+        return Uni.createFrom().failure(new IllegalArgumentException("executionId must not be blank"));
+      }
+      String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
+      return executionStateStore.getExecution(resolvedTenant, executionId)
+          .onItem().transformToUni(execution -> execution
+              .map(parent -> awaitCoordinator.findByExecution(resolvedTenant, executionId, limit <= 0 ? 100 : limit)
+                  .onItem().transform(records -> records.stream()
+                      .map(record -> new AwaitSemanticCheckpoint(
+                          record.tenantId(), record.executionId(), record.interactionId(), record.correlationId(),
+                          record.unitId(), record.stepId(), record.status(), parent.pipelineId(),
+                          parent.contractVersion(), parent.releaseVersion()))
+                      .toList()))
+              .orElseGet(() -> Uni.createFrom().item(List.of())));
+    });
+  }
+
+  Uni<AwaitItemContinuationResult> processAwaitItemContinuation(
+      AwaitItemContinuationCommand command,
+      AwaitItemContinuationHandler itemContinuationHandler) {
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) {
+        return Uni.createFrom().failure(queueModeDisabledException());
+      }
+      if (command == null) {
+        return Uni.createFrom().failure(new IllegalArgumentException(
+            "AwaitItemContinuationCommand must not be null"));
+      }
+      return awaitContinuations().processItemContinuation(
+          command,
+          itemContinuationHandler,
+          saturatedDelay().toMillis());
     });
   }
 
@@ -720,8 +794,6 @@ class QueueAsyncCoordinator {
             workDispatcher,
             awaitCoordinator,
             transitionWorkerExecutor,
-            awaitContinuationRetryExecutor,
-            this::saturatedDelay,
             this::segmentBoundaryLedger,
             this::recordAwaitLifecycle,
             this::payloadCodec);

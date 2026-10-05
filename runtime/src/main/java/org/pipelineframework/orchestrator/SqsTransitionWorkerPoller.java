@@ -45,7 +45,8 @@ public class SqsTransitionWorkerPoller {
 
     @PostConstruct
     void validateServerConfig() {
-        if (!orchestratorConfig.workerSqs().serverEnabled()) {
+        if (orchestratorConfig.processLoopsDisabled()
+            || !orchestratorConfig.workerSqs().serverEnabled()) {
             return;
         }
         if (orchestratorConfig.workerSqs().requestQueueUrl().filter(value -> !value.isBlank()).isEmpty()) {
@@ -87,7 +88,7 @@ public class SqsTransitionWorkerPoller {
     }
 
     synchronized void onStartup(@Observes StartupEvent event) {
-        if (!enabled() || running) {
+        if (orchestratorConfig.processLoopsDisabled() || !enabled() || running) {
             return;
         }
         running = true;
