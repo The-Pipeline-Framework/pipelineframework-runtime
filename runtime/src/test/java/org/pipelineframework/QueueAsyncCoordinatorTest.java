@@ -20,6 +20,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionOperation;
 import org.pipelineframework.orchestrator.ControlPlaneTransitionAdmission;
+import org.pipelineframework.orchestrator.CoordinatorSweepResult;
 import org.pipelineframework.orchestrator.CreateExecutionResult;
 import org.pipelineframework.orchestrator.DeadLetterPublisher;
 import org.pipelineframework.orchestrator.ExecutionInputShape;
@@ -71,6 +72,7 @@ import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
 import org.pipelineframework.telemetry.PipelineTelemetry;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -84,6 +86,7 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.after;
 import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -245,7 +248,64 @@ class QueueAsyncCoordinatorTest {
     }
 
     @Test
-    void getExecutionStatusInitializesQueueProvidersBeforeCachingReadModel() {
+    void sweepOnceEmitsProviderReadinessFailureFromUni() {
+        configureProviderReadinessFailure();
+
+        Uni<CoordinatorSweepResult> sweep = assertDoesNotThrow(() -> coordinator.sweepOnce(123L));
+        IllegalStateException error = assertThrows(IllegalStateException.class, () -> sweep.await().indefinitely());
+
+        assertTrue(error.getMessage().contains("Queue async provider startup validation failed"));
+    }
+
+    @Test
+    void completeAwaitEmitsProviderReadinessFailureFromUni() {
+        configureProviderReadinessFailure();
+        AwaitCompletionCommand command = new AwaitCompletionCommand(
+            "tenant-1",
+            "interaction-1",
+            null,
+            null,
+            java.util.Map.of("value", "approved"),
+            "user-1",
+            System.currentTimeMillis());
+
+        Uni<AwaitCompletionResult> completion = assertDoesNotThrow(() -> coordinator.completeAwait(command));
+        IllegalStateException error = assertThrows(
+            IllegalStateException.class,
+            () -> completion.await().indefinitely());
+
+        assertTrue(error.getMessage().contains("Queue async provider startup validation failed"));
+    }
+
+    @Test
+    void processExecutionWorkItemEmitsProviderReadinessFailureFromUni() {
+        configureProviderReadinessFailure();
+
+        Uni<Void> processing = assertDoesNotThrow(() -> coordinator.processExecutionWorkItem(
+            new ExecutionWorkItem("tenant-1", "execution-1"),
+            command -> Uni.createFrom().failure(new AssertionError("worker must not be invoked"))));
+        IllegalStateException error = assertThrows(
+            IllegalStateException.class,
+            () -> processing.await().indefinitely());
+
+        assertTrue(error.getMessage().contains("Queue async provider startup validation failed"));
+    }
+
+    @Test
+    void queryPendingAwaitInteractionsEmitsProviderReadinessFailureFromUni() {
+        configureProviderReadinessFailure();
+
+        Uni<List<AwaitInteractionRecord>> query = assertDoesNotThrow(
+            () -> coordinator.queryPendingAwaitInteractions("tenant-1", null, null, null, 10));
+        IllegalStateException error = assertThrows(
+            IllegalStateException.class,
+            () -> query.await().indefinitely());
+
+        assertTrue(error.getMessage().contains("Queue async provider startup validation failed"));
+    }
+
+    @Test
+    void directActionAndQueueInitializationOnlyInitializeProviders() {
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         coordinator.executionStateStore = null;
         coordinator.workDispatcher = null;
@@ -268,6 +328,16 @@ class QueueAsyncCoordinatorTest {
         assertEquals("exec-1", dto.executionId());
         assertSame(executionStateStore, coordinator.executionStateStore);
         assertSame(workDispatcher, coordinator.workDispatcher);
+        try {
+            coordinator.initializeQueueMode();
+            coordinator.initializeQueueMode();
+
+            verify(executionStateStores, times(1)).stream();
+            verify(workDispatchers, times(1)).stream();
+            verify(deadLetterPublishers, times(1)).stream();
+        } finally {
+            coordinator.shutdownAwaitContinuationRetryExecutor();
+        }
     }
 
     @Test
@@ -432,7 +502,7 @@ class QueueAsyncCoordinatorTest {
     }
 
     @Test
-    void sweepRedispatchesPersistedDueExecutions() {
+    void sweepOnceRedispatchesPersistedDueExecutionsAndReturnsSummary() {
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         when(orchestratorConfig.sweepLimit()).thenReturn(100);
         when(awaitCoordinator.findTimedOut(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.eq(100)))
@@ -443,10 +513,11 @@ class QueueAsyncCoordinatorTest {
                 createRecord("tenant-b", "exec-6", "key-6"))));
         when(workDispatcher.enqueueNow(any())).thenReturn(Uni.createFrom().voidItem());
 
-        coordinator.sweepDueExecutions();
+        CoordinatorSweepResult result = coordinator.sweepOnce(1000L).await().indefinitely();
 
         ArgumentCaptor<ExecutionWorkItem> itemCaptor = ArgumentCaptor.forClass(ExecutionWorkItem.class);
-        verify(workDispatcher, timeout(500).times(2)).enqueueNow(itemCaptor.capture());
+        verify(workDispatcher, times(2)).enqueueNow(itemCaptor.capture());
+        assertEquals(new CoordinatorSweepResult(1000L, 100, 0, 2), result);
     }
 
     @Test
@@ -1901,9 +1972,9 @@ class QueueAsyncCoordinatorTest {
         when(executionStateStore.findDueExecutions(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.eq(100)))
             .thenReturn(Uni.createFrom().item(java.util.List.of()));
 
-        coordinator.sweepDueExecutions();
+        coordinator.sweepOnce(System.currentTimeMillis()).await().indefinitely();
 
-        verify(executionStateStore, timeout(500)).markTerminalFailure(
+        verify(executionStateStore).markTerminalFailure(
             org.mockito.ArgumentMatchers.eq("tenant-1"),
             org.mockito.ArgumentMatchers.eq("exec-1"),
             org.mockito.ArgumentMatchers.eq(7L),
@@ -1947,6 +2018,12 @@ class QueueAsyncCoordinatorTest {
         when(orchestratorConfig.executionTtlDays()).thenReturn(7);
         when(orchestratorConfig.idempotencyPolicy()).thenReturn(OrchestratorIdempotencyPolicy.OPTIONAL_CLIENT_KEY);
         when(executionResultShapeResolver.resolve()).thenReturn(ExecutionResultShape.SINGLE);
+    }
+
+    private void configureProviderReadinessFailure() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        when(orchestratorConfig.strictStartup()).thenReturn(true);
+        when(executionStateStore.startupValidationError()).thenReturn(Optional.of("store unavailable"));
     }
 
     private ExecutionRecord<Object, Object> createRecord(String tenantId, String executionId, String executionKey) {

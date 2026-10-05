@@ -19,6 +19,8 @@ import software.amazon.awssdk.services.sqs.model.ReceiveMessageResponse;
 import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
@@ -34,6 +36,7 @@ class SqsTransitionWorkerPollerTest {
     private PipelineOrchestratorConfig config;
     private PipelineOrchestratorConfig.SqsWorkerConfig sqsWorkerConfig;
     private PipelineOrchestratorConfig.SqsConfig sqsConfig;
+    private SqsTransitionWorkerAction transitionWorkerAction;
     private SqsTransitionWorkerPoller poller;
 
     @BeforeEach
@@ -55,7 +58,12 @@ class SqsTransitionWorkerPollerTest {
         when(sqsWorkerConfig.sharedSecretRef()).thenReturn(Optional.empty());
         when(sqsConfig.region()).thenReturn(Optional.empty());
         when(sqsConfig.endpointOverride()).thenReturn(Optional.empty());
-        poller = new SqsTransitionWorkerPoller(config, executionService, client);
+        transitionWorkerAction = new SqsTransitionWorkerAction(
+            config,
+            executionService,
+            new LocalControlPlaneSecretResolver(),
+            client);
+        poller = new SqsTransitionWorkerPoller(config, transitionWorkerAction, client);
     }
 
     @Test
@@ -216,6 +224,25 @@ class SqsTransitionWorkerPollerTest {
 
         verify(client).receiveMessage(argThat((ReceiveMessageRequest request) ->
             request.visibilityTimeout().equals(45)));
+    }
+
+    @Test
+    void serverValidationRejectsMissingResponseQueue() {
+        when(sqsWorkerConfig.responseQueueUrl()).thenReturn(Optional.empty());
+
+        IllegalStateException error = assertThrows(IllegalStateException.class, poller::validateServerConfig);
+
+        assertTrue(error.getMessage().contains("pipeline.orchestrator.worker.sqs.response-queue-url"));
+    }
+
+    @Test
+    void serverValidationRejectsMissingSharedSecret() {
+        when(sqsWorkerConfig.sharedSecret()).thenReturn(Optional.empty());
+        when(sqsWorkerConfig.sharedSecretRef()).thenReturn(Optional.empty());
+
+        IllegalStateException error = assertThrows(IllegalStateException.class, poller::validateServerConfig);
+
+        assertTrue(error.getMessage().contains("pipeline.orchestrator.worker.sqs.shared-secret"));
     }
 
     private TransitionCommandEnvelope envelope() {

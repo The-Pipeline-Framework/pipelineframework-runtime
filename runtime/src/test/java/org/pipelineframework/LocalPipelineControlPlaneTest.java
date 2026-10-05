@@ -12,6 +12,7 @@ import org.pipelineframework.awaitable.AwaitCompletionCommand;
 import org.pipelineframework.awaitable.AwaitCompletionResult;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
+import org.pipelineframework.orchestrator.CoordinatorSweepResult;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
 import org.pipelineframework.orchestrator.ExecutionRedriveResult;
@@ -63,14 +64,30 @@ class LocalPipelineControlPlaneTest {
         .thenReturn(Uni.createFrom().item(status));
     when(queueAsyncCoordinator.getExecutionResult("tenant-1", "exec-2", String.class, false))
         .thenReturn(Uni.createFrom().item("result"));
+    when(queueAsyncCoordinator.getExecutionResultPayload("tenant-1", "exec-2"))
+        .thenReturn(Uni.createFrom().item("raw-result"));
 
     assertEquals("exec-2", controlPlane.getExecutionStatus("tenant-1", "exec-2")
         .await().indefinitely().executionId());
     assertEquals("result", controlPlane.getExecutionResult("tenant-1", "exec-2", String.class, false)
         .await().indefinitely());
+    assertEquals("raw-result", controlPlane.getExecutionResultPayload("tenant-1", "exec-2")
+        .await().indefinitely());
 
     verify(queueAsyncCoordinator).getExecutionStatus("tenant-1", "exec-2");
     verify(queueAsyncCoordinator).getExecutionResult("tenant-1", "exec-2", String.class, false);
+    verify(queueAsyncCoordinator).getExecutionResultPayload("tenant-1", "exec-2");
+  }
+
+  @Test
+  void sweepOnceDelegatesToCoordinator() {
+    CoordinatorSweepResult expected = new CoordinatorSweepResult(1000L, 50, 2, 3);
+    when(queueAsyncCoordinator.sweepOnce(1000L)).thenReturn(Uni.createFrom().item(expected));
+
+    CoordinatorSweepResult actual = controlPlane.sweepOnce(1000L).await().indefinitely();
+
+    assertEquals(expected, actual);
+    verify(queueAsyncCoordinator).sweepOnce(1000L);
   }
 
   @Test

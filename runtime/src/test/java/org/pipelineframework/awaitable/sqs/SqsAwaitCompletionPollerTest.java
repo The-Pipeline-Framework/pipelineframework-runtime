@@ -31,6 +31,7 @@ import org.pipelineframework.PipelineExecutionService;
 import org.pipelineframework.awaitable.AwaitCompletionCommand;
 import org.pipelineframework.awaitable.AwaitCompletionResult;
 import org.pipelineframework.awaitable.AwaitInteractionNotFoundException;
+import org.pipelineframework.awaitable.AwaitTelemetry;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import software.amazon.awssdk.services.sqs.SqsClient;
@@ -48,13 +49,15 @@ class SqsAwaitCompletionPollerTest {
 
     private SqsClient client;
     private PipelineExecutionService executionService;
+    private SqsAwaitCompletionAction completionAction;
     private SqsAwaitCompletionPoller poller;
 
     @BeforeEach
     void setUp() {
         client = mock(SqsClient.class);
         executionService = mock(PipelineExecutionService.class);
-        poller = new SqsAwaitCompletionPoller(config(), executionService, client);
+        completionAction = new SqsAwaitCompletionAction(executionService, AwaitTelemetry.disabled());
+        poller = new SqsAwaitCompletionPoller(config(), completionAction, client);
     }
 
     @AfterEach
@@ -289,7 +292,7 @@ class SqsAwaitCompletionPollerTest {
         CountDownLatch releaseReceives = new CountDownLatch(1);
         SqsAwaitCompletionPoller loopingPoller = new SqsAwaitCompletionPoller(
             config(),
-            executionService,
+            completionAction,
             blockingReceiveClient(receivesStarted, releaseReceives));
         loopingPoller.startPolling(enabledConfig());
         try {

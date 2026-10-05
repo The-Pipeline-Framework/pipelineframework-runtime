@@ -27,21 +27,21 @@ class AwaitTimeoutFlow {
         Objects.requireNonNull(segmentBoundaryLedger, "segmentBoundaryLedger must not be null");
   }
 
-  Uni<Void> sweepTimedOut(long nowEpochMs, int limit) {
+  Uni<Integer> sweepTimedOut(long nowEpochMs, int limit) {
     return awaitCoordinator.findTimedOut(nowEpochMs, limit)
         .onItem().transform(records -> TimedOutAwaitInteractionsPlan.from(records, limit))
         .onItem().transformToUni(plan -> {
           if (plan.empty()) {
-            return Uni.createFrom().voidItem();
+            return Uni.createFrom().item(0);
           }
           return Multi.createFrom().iterable(plan.interactions())
               .onItem().transformToUniAndConcatenate(record -> admitTimeout(record, nowEpochMs))
               .collect().asList()
-              .replaceWithVoid();
+              .onItem().transform(counts -> counts.stream().mapToInt(Integer::intValue).sum());
         });
   }
 
-  private Uni<Void> admitTimeout(AwaitInteractionRecord interaction, long nowEpochMs) {
+  private Uni<Integer> admitTimeout(AwaitInteractionRecord interaction, long nowEpochMs) {
     return awaitCoordinator.markTimedOut(interaction, nowEpochMs)
         .onItem().transformToUni(updated -> updated.map(record ->
                 segmentBoundaryLedger.get().recordInteractionTimedOut(record, nowEpochMs)
@@ -49,8 +49,9 @@ class AwaitTimeoutFlow {
                     .onItem().transform(parent -> AwaitTimeoutPlan.from(record, parent))
                     .onItem().transformToUni(plan -> plan.failParent()
                         ? failParent(plan, nowEpochMs)
-                        : Uni.createFrom().voidItem()))
-            .orElseGet(() -> Uni.createFrom().voidItem()));
+                        : Uni.createFrom().voidItem())
+                    .replaceWith(1))
+            .orElseGet(() -> Uni.createFrom().item(0)));
   }
 
   private Uni<Void> failParent(AwaitTimeoutPlan plan, long nowEpochMs) {

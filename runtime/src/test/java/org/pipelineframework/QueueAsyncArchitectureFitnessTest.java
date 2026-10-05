@@ -90,8 +90,8 @@ class QueueAsyncArchitectureFitnessTest {
         coordinator.contains("return redriveFlow().redrive(tenantId, executionId, expectedVersion, allowFailed, reason);"),
         "redriveExecution must delegate to QueueAsyncRedriveFlow");
     assertTrue(
-        coordinator.contains("sweepFlow().sweepDueExecutions();"),
-        "sweepDueExecutions must delegate to QueueAsyncSweepFlow");
+        coordinator.contains("return sweepFlow().sweepOnce(nowEpochMs);"),
+        "sweepOnce must delegate to QueueAsyncSweepFlow");
   }
 
   @Test
@@ -125,6 +125,43 @@ class QueueAsyncArchitectureFitnessTest {
         occurrences(pipeline, "Uni.createFrom().deferred("),
         "QueueAsyncSegmentPipeline should have exactly one per-subscription deferred boundary");
     assertFalse(pipeline.contains(".subscribe("), "QueueAsyncSegmentPipeline must not subscribe manually");
+  }
+
+  @Test
+  void sweepFlowIsReactiveAndLoopHostOwnsSchedulerSubscription() throws IOException {
+    String sweepFlow = Files.readString(source("QueueAsyncSweepFlow"));
+    String coordinator = Files.readString(source("QueueAsyncCoordinator"));
+    String loopHost = Files.readString(source("QueueAsyncSweepLoopHost"));
+
+    assertFalse(sweepFlow.contains(".subscribe("), "QueueAsyncSweepFlow must not subscribe manually");
+    assertFalse(coordinator.contains(".subscribe("), "QueueAsyncCoordinator must not subscribe manually");
+    assertFalse(coordinator.contains("scheduleAtFixedRate("), "QueueAsyncCoordinator must not host the sweep loop");
+    assertEquals(
+        1,
+        occurrences(loopHost, ".subscribe()"),
+        "QueueAsyncSweepLoopHost must own the single periodic sweep subscription");
+  }
+
+  @Test
+  void sqsMessageActionsStayBoundedAndSubscriptionFree() throws IOException {
+    for (Path action : List.of(
+        sourceRoot().resolve("org/pipelineframework/orchestrator/SqsWorkItemAction.java"),
+        sourceRoot().resolve("org/pipelineframework/awaitable/sqs/SqsAwaitCompletionAction.java"),
+        sourceRoot().resolve("org/pipelineframework/orchestrator/SqsTransitionWorkerAction.java"))) {
+      String code = stripComments(Files.readString(action));
+      assertFalse(code.contains(".subscribe("), action + " must not subscribe manually");
+      assertFalse(code.contains("receiveMessage("), action + " must not receive from SQS");
+      assertFalse(code.contains("deleteMessage("), action + " must not acknowledge SQS messages");
+      assertFalse(code.contains("Thread.sleep("), action + " must not host backoff delays");
+      assertFalse(code.contains("scheduleAtFixedRate("), action + " must not host loops");
+    }
+
+    assertTrue(Files.readString(sourceRoot().resolve(
+        "org/pipelineframework/orchestrator/SqsWorkPoller.java")).contains("workItemAction.handle("));
+    assertTrue(Files.readString(sourceRoot().resolve(
+        "org/pipelineframework/awaitable/sqs/SqsAwaitCompletionPoller.java")).contains("completionAction.handle("));
+    assertTrue(Files.readString(sourceRoot().resolve(
+        "org/pipelineframework/orchestrator/SqsTransitionWorkerPoller.java")).contains("transitionWorkerAction.handle("));
   }
 
   @Test

@@ -10,6 +10,7 @@ import io.smallrye.mutiny.Uni;
 import org.pipelineframework.awaitable.AwaitCompletionCommand;
 import org.pipelineframework.awaitable.AwaitCompletionResult;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
+import org.pipelineframework.orchestrator.CoordinatorSweepResult;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.ExecutionRedriveResult;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
@@ -78,6 +79,11 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     @Override
     public Uni<Object> getExecutionResultPayload(String tenantId, String executionId) {
         return queueAsyncCoordinator.getExecutionResultPayload(tenantId, executionId);
+    }
+
+    @Override
+    public Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs) {
+        return queueAsyncCoordinator.sweepOnce(nowEpochMs);
     }
 
     @Override
