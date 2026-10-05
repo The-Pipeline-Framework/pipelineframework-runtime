@@ -51,7 +51,8 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
  * <p>The interaction table uses primary key {@code tenant_id, interaction_id} and expects ALL-projected GSIs:
  * {@code await-interaction-by-unit}, {@code await-interaction-pending-by-tenant},
  * {@code await-interaction-pending-by-assignee}, {@code await-interaction-pending-by-group},
- * {@code await-interaction-pending-by-step}, and {@code await-interaction-pending-by-deadline}.
+ * {@code await-interaction-pending-by-step}, {@code await-interaction-pending-by-deadline},
+ * {@code await-interaction-continuation-work}, and {@code await-interaction-by-execution}.
  * Runtime lookup paths query those indexes by await unit, tenant pending queue, tenant filter bucket,
  * or due active deadline instead of scanning the interaction table.
  */
@@ -114,6 +115,7 @@ public class DynamoAwaitInteractionStore implements
     private static final String QUERY_EXECUTION_KEY = "query_execution_key";
     private static final String QUERY_EXECUTION_SORT = "query_execution_sort";
     private static final String CONTINUATION_ATTEMPT = "continuation_attempt";
+    private static final String CONTINUATION_COMPLETED = "continuation_completed";
     private static final String ENCODED_JAVA_CLASS = "_tpf_java_class";
     private static final String ENCODED_PAYLOAD = "_tpf_payload";
 
@@ -265,25 +267,41 @@ public class DynamoAwaitInteractionStore implements
             if (limit <= 0) {
                 return List.of();
             }
-            var response = dynamoClient().query(QueryRequest.builder()
-                .tableName(interactionTable())
-                .indexName(EXECUTION_INDEX)
-                .keyConditionExpression("#executionKey = :executionKey")
-                .filterExpression("attribute_not_exists(#ttl) OR #ttl > :nowSec")
-                .expressionAttributeNames(Map.of(
-                    "#executionKey", QUERY_EXECUTION_KEY,
-                    "#ttl", TTL_EPOCH_S))
-                .expressionAttributeValues(Map.of(
-                    ":executionKey", avS(scopedKey(tenantId, executionId)),
-                    ":nowSec", avN(Instant.now().getEpochSecond())))
-                .scanIndexForward(false)
-                .limit(limit)
-                .build());
-            return response.items().stream()
-                .map(this::toRecord)
-                .filter(record -> Objects.equals(record.tenantId(), tenantId))
-                .filter(record -> Objects.equals(record.executionId(), executionId))
-                .toList();
+            List<AwaitInteractionRecord> records = new ArrayList<>();
+            Map<String, AttributeValue> lastEvaluatedKey = null;
+            do {
+                QueryRequest.Builder request = QueryRequest.builder()
+                    .tableName(interactionTable())
+                    .indexName(EXECUTION_INDEX)
+                    .keyConditionExpression("#executionKey = :executionKey")
+                    .filterExpression("attribute_not_exists(#ttl) OR #ttl > :nowSec")
+                    .expressionAttributeNames(Map.of(
+                        "#executionKey", QUERY_EXECUTION_KEY,
+                        "#ttl", TTL_EPOCH_S))
+                    .expressionAttributeValues(Map.of(
+                        ":executionKey", avS(scopedKey(tenantId, executionId)),
+                        ":nowSec", avN(Instant.now().getEpochSecond())))
+                    .scanIndexForward(false)
+                    .limit(queryPageLimit(limit));
+                if (lastEvaluatedKey != null && !lastEvaluatedKey.isEmpty()) {
+                    request.exclusiveStartKey(lastEvaluatedKey);
+                }
+                var response = dynamoClient().query(request.build());
+                if (response.items() != null) {
+                    for (Map<String, AttributeValue> item : response.items()) {
+                        AwaitInteractionRecord record = toRecord(item);
+                        if (Objects.equals(record.tenantId(), tenantId)
+                            && Objects.equals(record.executionId(), executionId)) {
+                            records.add(record);
+                        }
+                        if (records.size() >= limit) {
+                            break;
+                        }
+                    }
+                }
+                lastEvaluatedKey = response.lastEvaluatedKey();
+            } while (records.size() < limit && lastEvaluatedKey != null && !lastEvaluatedKey.isEmpty());
+            return List.copyOf(records);
         });
     }
 
@@ -654,7 +672,11 @@ public class DynamoAwaitInteractionStore implements
 
     private AwaitCompletionResult completeResolvedBlocking(AwaitInteractionRecord current,
         AwaitCompletionCommand command, int remainingRaces) {
-        if (current.status() == AwaitInteractionStatus.COMPLETED || current.status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
+        if (current.status() == AwaitInteractionStatus.COMPLETED) {
+            ensureItemContinuationProjection(current, command.nowEpochMs());
+            return new AwaitCompletionResult(current, true);
+        }
+        if (current.status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
             return new AwaitCompletionResult(current, true);
         }
         if (current.status().terminal()) {
@@ -698,7 +720,11 @@ public class DynamoAwaitInteractionStore implements
         }
         AwaitInteractionRecord refreshed = getBlocking(current.tenantId(), current.interactionId(), command.nowEpochMs())
             .orElseThrow(() -> new IllegalStateException("Await completion transition lost OCC race and interaction disappeared"));
-        if (refreshed.status() == AwaitInteractionStatus.COMPLETED || refreshed.status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
+        if (refreshed.status() == AwaitInteractionStatus.COMPLETED) {
+            ensureItemContinuationProjection(refreshed, command.nowEpochMs());
+            return new AwaitCompletionResult(refreshed, true);
+        }
+        if (refreshed.status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
             return new AwaitCompletionResult(refreshed, true);
         }
         if (refreshed.status().terminal()) {
@@ -934,6 +960,35 @@ public class DynamoAwaitInteractionStore implements
         return updateContinuationProjection(command, command.attempt(), command.nowEpochMs(), true);
     }
 
+    private void ensureItemContinuationProjection(AwaitInteractionRecord record, long nowEpochMs) {
+        if (!record.itemInteraction()) {
+            return;
+        }
+        try {
+            dynamoClient().updateItem(UpdateItemRequest.builder()
+                .tableName(interactionTable())
+                .key(primaryKey(record.tenantId(), record.interactionId()))
+                .conditionExpression("#status = :completed AND attribute_not_exists(#continuationKey) "
+                    + "AND attribute_not_exists(#continuationCompleted)")
+                .updateExpression("SET #continuationKey = :ready, #continuationDue = :due, "
+                    + "#continuationAttempt = :attempt")
+                .expressionAttributeNames(Map.of(
+                    "#status", STATUS,
+                    "#continuationKey", QUERY_CONTINUATION_KEY,
+                    "#continuationDue", QUERY_CONTINUATION_DUE,
+                    "#continuationAttempt", CONTINUATION_ATTEMPT,
+                    "#continuationCompleted", CONTINUATION_COMPLETED))
+                .expressionAttributeValues(Map.of(
+                    ":completed", avS(AwaitInteractionStatus.COMPLETED.name()),
+                    ":ready", avS(READY_CONTINUATION_PARTITION),
+                    ":due", avN(nowEpochMs),
+                    ":attempt", avN(1)))
+                .build());
+        } catch (ConditionalCheckFailedException ignored) {
+            // Existing work or a durable completion marker already owns this item.
+        }
+    }
+
     private Uni<Void> updateContinuationProjection(
         AwaitItemContinuationCommand command,
         int nextAttempt,
@@ -944,6 +999,7 @@ public class DynamoAwaitInteractionStore implements
                 "#continuationKey", QUERY_CONTINUATION_KEY,
                 "#continuationDue", QUERY_CONTINUATION_DUE,
                 "#continuationAttempt", CONTINUATION_ATTEMPT,
+                "#continuationCompleted", CONTINUATION_COMPLETED,
                 "#execution", EXECUTION_ID,
                 "#unit", UNIT_ID,
                 "#item", ITEM_INDEX);
@@ -954,18 +1010,25 @@ public class DynamoAwaitInteractionStore implements
                 ":item", avN(command.itemIndex())));
             String update;
             if (complete) {
-                update = "REMOVE #continuationKey, #continuationDue, #continuationAttempt";
+                values.put(":completed", AttributeValue.builder().bool(true).build());
+                update = "SET #continuationCompleted = :completed "
+                    + "REMOVE #continuationKey, #continuationDue, #continuationAttempt";
             } else {
                 values.put(":due", avN(dueEpochMs));
                 values.put(":attempt", avN(nextAttempt));
-                update = "SET #continuationDue = :due, #continuationAttempt = :attempt";
+                update = "SET #continuationDue = :due, #continuationAttempt = :attempt "
+                    + "REMOVE #continuationCompleted";
             }
             try {
+                String projectionCondition = complete
+                    ? "(#continuationKey = :ready OR attribute_not_exists(#continuationKey)) "
+                        + "AND #execution = :execution AND #unit = :unit AND #item = :item"
+                    : "#continuationKey = :ready AND #execution = :execution "
+                        + "AND #unit = :unit AND #item = :item";
                 dynamoClient().updateItem(UpdateItemRequest.builder()
                     .tableName(interactionTable())
                     .key(primaryKey(command.tenantId(), command.interactionId()))
-                    .conditionExpression("#continuationKey = :ready AND #execution = :execution "
-                        + "AND #unit = :unit AND #item = :item")
+                    .conditionExpression(projectionCondition)
                     .updateExpression(update)
                     .expressionAttributeNames(names)
                     .expressionAttributeValues(values)
@@ -1271,6 +1334,11 @@ public class DynamoAwaitInteractionStore implements
     private static void putQueryKeys(Map<String, AttributeValue> item, AwaitInteractionRecord record) {
         item.put(QUERY_EXECUTION_KEY, avS(scopedKey(record.tenantId(), record.executionId())));
         item.put(QUERY_EXECUTION_SORT, avS(deadlineSortKey(record.createdAtEpochMs(), record.interactionId())));
+        if (record.itemInteraction() && record.status() == AwaitInteractionStatus.COMPLETED) {
+            item.put(QUERY_CONTINUATION_KEY, avS(READY_CONTINUATION_PARTITION));
+            item.put(QUERY_CONTINUATION_DUE, avN(record.updatedAtEpochMs()));
+            item.put(CONTINUATION_ATTEMPT, avN(1));
+        }
         if (record.unitId() != null && !record.unitId().isBlank()) {
             item.put(QUERY_UNIT_KEY, avS(scopedKey(record.tenantId(), record.unitId())));
             item.put(QUERY_UNIT_SORT, avS(itemSortKey(record.itemIndex(), record.causationId(), record.interactionId())));

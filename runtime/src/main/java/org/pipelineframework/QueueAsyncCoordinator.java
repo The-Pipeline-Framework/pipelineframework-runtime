@@ -334,6 +334,15 @@ class QueueAsyncCoordinator {
         return Uni.createFrom().failure(queueModeDisabledException());
       }
       String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
+      RuntimeException admissionFailure = admissionFailure(admissionRequest(
+          resolvedTenant,
+          ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT,
+          null,
+          "api",
+          explicitTenant(tenantId)));
+      if (admissionFailure != null) {
+        return Uni.createFrom().failure(admissionFailure);
+      }
       return awaitCoordinator.getInteraction(resolvedTenant, interactionId)
           .onItem().transformToUni(interaction -> interaction
               .map(record -> executionStateStore.getExecution(resolvedTenant, record.executionId())
@@ -364,6 +373,15 @@ class QueueAsyncCoordinator {
         return Uni.createFrom().failure(new IllegalArgumentException("executionId must not be blank"));
       }
       String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
+      RuntimeException admissionFailure = admissionFailure(admissionRequest(
+          resolvedTenant,
+          ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT,
+          executionId,
+          "api",
+          explicitTenant(tenantId)));
+      if (admissionFailure != null) {
+        return Uni.createFrom().failure(admissionFailure);
+      }
       return executionStateStore.getExecution(resolvedTenant, executionId)
           .onItem().transformToUni(execution -> execution
               .map(parent -> awaitCoordinator.findByExecution(resolvedTenant, executionId, limit <= 0 ? 100 : limit)

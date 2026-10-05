@@ -95,6 +95,11 @@ class AwaitContinuationsTest {
           durableUnitsById.put(updated.unitId(), updated);
           return Uni.createFrom().item(updated);
         });
+    org.mockito.Mockito.lenient().when(awaitCoordinator.completeItemContinuation(any()))
+        .thenReturn(Uni.createFrom().voidItem());
+    org.mockito.Mockito.lenient().when(awaitCoordinator.rescheduleItemContinuation(
+            any(), org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.anyLong()))
+        .thenReturn(Uni.createFrom().voidItem());
     continuations = continuations(executionStateStore, workDispatcher, awaitCoordinator);
   }
 

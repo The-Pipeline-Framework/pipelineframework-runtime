@@ -9,6 +9,7 @@ public record AwaitItemContinuationResult(
     AwaitItemContinuationCommand command,
     AwaitItemContinuationDisposition disposition,
     long retryAtEpochMs,
+    boolean retryConsumesAttempt,
     Optional<String> failureMessage) {
 
     public AwaitItemContinuationResult {
@@ -26,17 +27,17 @@ public record AwaitItemContinuationResult(
 
     public static AwaitItemContinuationResult completed(AwaitItemContinuationCommand command) {
         return new AwaitItemContinuationResult(
-            command, AwaitItemContinuationDisposition.COMPLETED, 0, Optional.empty());
+            command, AwaitItemContinuationDisposition.COMPLETED, 0, false, Optional.empty());
     }
 
     public static AwaitItemContinuationResult alreadyCompleted(AwaitItemContinuationCommand command) {
         return new AwaitItemContinuationResult(
-            command, AwaitItemContinuationDisposition.ALREADY_COMPLETED, 0, Optional.empty());
+            command, AwaitItemContinuationDisposition.ALREADY_COMPLETED, 0, false, Optional.empty());
     }
 
     public static AwaitItemContinuationResult notReady(AwaitItemContinuationCommand command) {
         return new AwaitItemContinuationResult(
-            command, AwaitItemContinuationDisposition.NOT_READY, 0, Optional.empty());
+            command, AwaitItemContinuationDisposition.NOT_READY, 0, false, Optional.empty());
     }
 
     public static AwaitItemContinuationResult retry(
@@ -47,7 +48,19 @@ public record AwaitItemContinuationResult(
             command,
             AwaitItemContinuationDisposition.RETRY,
             retryAtEpochMs,
+            true,
             Optional.ofNullable(failure == null ? null : failure.getMessage()));
+    }
+
+    public static AwaitItemContinuationResult retryWithoutConsumingAttempt(
+        AwaitItemContinuationCommand command,
+        long retryAtEpochMs) {
+        return new AwaitItemContinuationResult(
+            command,
+            AwaitItemContinuationDisposition.RETRY,
+            retryAtEpochMs,
+            false,
+            Optional.empty());
     }
 
     public static AwaitItemContinuationResult terminalFailure(
@@ -57,6 +70,7 @@ public record AwaitItemContinuationResult(
             command,
             AwaitItemContinuationDisposition.TERMINAL_FAILURE,
             0,
+            false,
             Optional.ofNullable(failure == null ? null : failure.getMessage()));
     }
 

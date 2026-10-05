@@ -27,6 +27,7 @@ import org.pipelineframework.invocation.PipelineInvocationRuntime;
 import org.pipelineframework.orchestrator.CreateExecutionResult;
 import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 import org.pipelineframework.orchestrator.AwaitItemContinuationDisposition;
+import org.pipelineframework.orchestrator.AwaitItemContinuationResult;
 import org.pipelineframework.orchestrator.ExecutionCreateCommand;
 import org.pipelineframework.orchestrator.ExecutionInputShape;
 import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
@@ -395,6 +396,49 @@ class ItemizedAwaitContinuationFlowTest {
 
     verify(handler).continueAwaitItem(eq(completed), eq(unit), eq(3), any(), eq(2_000L));
     verify(awaitCoordinator).completeItemContinuation(command);
+  }
+
+  @Test
+  void inlineDispatchPersistsRetryAndContinuesWithLaterItems() {
+    AwaitInteractionRecord first = itemAwaitRecord("exec-1", 0, AwaitInteractionStatus.COMPLETED, "first");
+    AwaitInteractionRecord second = itemAwaitRecord("exec-1", 1, AwaitInteractionStatus.COMPLETED, "second");
+    AwaitUnitRecord unit = awaitUnit("exec-1", AwaitUnitStatus.COMPLETED, 2, 2, true);
+    ExecutionRecord<Object, Object> parent = record("exec-1", "key-1", ExecutionStatus.WAITING_EXTERNAL, 7L);
+    AwaitItemContinuationHandler handler = org.mockito.Mockito.mock(AwaitItemContinuationHandler.class);
+    when(awaitCoordinator.findByUnit("tenant-1", "unit-1"))
+        .thenReturn(Uni.createFrom().item(List.of(first, second)));
+    when(executionStateStore.getExecution("tenant-1", "exec-1"))
+        .thenReturn(Uni.createFrom().item(Optional.of(parent)));
+    when(handler.continueAwaitItem(eq(first), eq(unit), eq(3), any(), eq(1234L)))
+        .thenReturn(Uni.createFrom().failure(new IllegalStateException()))
+        .thenReturn(Uni.createFrom().voidItem());
+    when(handler.continueAwaitItem(eq(second), eq(unit), eq(3), any(), eq(1234L)))
+        .thenReturn(Uni.createFrom().voidItem());
+
+    flow(executionStateStore, workDispatcher, awaitCoordinator)
+        .afterRecordedCompletion(second, unit, handler, 1234L)
+        .await().indefinitely();
+
+    ArgumentCaptor<AwaitItemContinuationCommand> retried =
+        ArgumentCaptor.forClass(AwaitItemContinuationCommand.class);
+    verify(awaitCoordinator).rescheduleItemContinuation(retried.capture(), eq(2), any(Long.class));
+    assertEquals(first.interactionId(), retried.getValue().interactionId());
+    verify(handler).continueAwaitItem(eq(second), eq(unit), eq(3), any(), eq(1234L));
+  }
+
+  @Test
+  void retryAttemptAccountingDoesNotDependOnFailureMessage() {
+    AwaitItemContinuationCommand command = new AwaitItemContinuationCommand(
+        "tenant-1", "exec-1", "unit-1", "interaction-1", 0, 3, 1_000L);
+
+    AwaitItemContinuationResult failed = AwaitItemContinuationResult.retry(
+        command, 2_000L, new IllegalStateException());
+    AwaitItemContinuationResult saturated = AwaitItemContinuationResult.retryWithoutConsumingAttempt(
+        command, 2_000L);
+
+    assertTrue(failed.retryConsumesAttempt());
+    assertTrue(failed.failureMessage().isEmpty());
+    assertFalse(saturated.retryConsumesAttempt());
   }
 
   private ItemizedAwaitContinuationFlow flow(

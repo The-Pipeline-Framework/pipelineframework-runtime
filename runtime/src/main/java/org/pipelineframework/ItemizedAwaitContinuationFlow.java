@@ -295,8 +295,9 @@ class ItemizedAwaitContinuationFlow {
         .select().where(record -> record.itemInteraction()
             && record.itemIndex() != null
             && record.status() == AwaitInteractionStatus.COMPLETED)
-        .onItem().transformToUniAndConcatenate(record -> processToTerminal(
-            command(record, 1, nowEpochMs), record, unit, itemContinuationHandler))
+        .onItem().transformToUniAndConcatenate(record -> processResolved(
+                command(record, 1, nowEpochMs), record, unit, itemContinuationHandler, 1L)
+            .onItem().transformToUni(result -> recordWorkDisposition(result, 1L)))
         .collect().last()
         .replaceWithVoid();
   }
@@ -344,7 +345,7 @@ class ItemizedAwaitContinuationFlow {
           .replaceWith(result);
       case RETRY -> awaitCoordinator.rescheduleItemContinuation(
               result.command(),
-              result.failureMessage().isPresent()
+              result.retryConsumesAttempt()
                   ? result.command().attempt() + 1
                   : result.command().attempt(),
               result.retryAtEpochMs())
@@ -373,8 +374,8 @@ class ItemizedAwaitContinuationFlow {
     Optional<TransitionWorkerExecutor.TransitionAdmission> admission = transitionWorkerExecutor.tryAdmit();
     if (admission.isEmpty()) {
       claims.releaseDispatch(key);
-      return Uni.createFrom().item(AwaitItemContinuationResult.retry(
-          command, command.nowEpochMs() + Math.max(1L, saturatedDelayMs), null));
+      return Uni.createFrom().item(AwaitItemContinuationResult.retryWithoutConsumingAttempt(
+          command, command.nowEpochMs() + Math.max(1L, saturatedDelayMs)));
     }
     TransitionWorkerExecutor.TransitionAdmission permit = admission.orElseThrow();
     return executionStateStore.getExecution(record.tenantId(), record.executionId())
@@ -402,25 +403,6 @@ class ItemizedAwaitContinuationFlow {
         })
         .onFailure().invoke(() -> claims.releaseDispatch(key))
         .onTermination().invoke(permit::close);
-  }
-
-  private Uni<AwaitItemContinuationResult> processToTerminal(
-      AwaitItemContinuationCommand command,
-      AwaitInteractionRecord record,
-      AwaitUnitRecord unit,
-      AwaitItemContinuationHandler handler) {
-    return processResolved(command, record, unit, handler, 1L)
-        .onItem().transformToUni(result -> {
-          if (result.disposition() != org.pipelineframework.orchestrator.AwaitItemContinuationDisposition.RETRY) {
-            return Uni.createFrom().item(result);
-          }
-          if (result.failureMessage().isEmpty()) {
-            return Uni.createFrom().failure(new IllegalStateException(
-                "Await item continuation worker capacity is saturated"));
-          }
-          return processToTerminal(
-              command.nextAttempt(result.retryAtEpochMs()), record, unit, handler);
-        });
   }
 
   private static AwaitItemContinuationCommand command(

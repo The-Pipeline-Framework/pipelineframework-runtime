@@ -19,6 +19,9 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionOperation;
+import org.pipelineframework.orchestrator.ControlPlaneAdmissionDecision;
+import org.pipelineframework.orchestrator.ControlPlaneAdmissionException;
+import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ControlPlaneTransitionAdmission;
 import org.pipelineframework.orchestrator.CoordinatorSweepResult;
 import org.pipelineframework.orchestrator.CreateExecutionResult;
@@ -88,6 +91,7 @@ import static org.mockito.Mockito.after;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -213,6 +217,31 @@ class QueueAsyncCoordinatorTest {
         assertEquals("local-pipeline", captor.getValue().pipelineId());
         assertEquals("local-contract", captor.getValue().contractVersion());
         assertEquals("local-contract", captor.getValue().releaseVersion());
+    }
+
+    @Test
+    void semanticCheckpointReadsApplyTenantAdmissionBeforeStorageAccess() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        ControlPlaneAdmissionPolicy policy = mock(ControlPlaneAdmissionPolicy.class);
+        coordinator.controlPlaneAdmissionPolicy = policy;
+        when(policy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.deny(
+            ControlPlaneAdmissionDecision.TENANT_NOT_ALLOWED,
+            "tenant denied"));
+
+        assertThrows(ControlPlaneAdmissionException.class, () -> coordinator
+            .getAwaitSemanticCheckpoint("tenant-denied", "interaction-1")
+            .await().indefinitely());
+        assertThrows(ControlPlaneAdmissionException.class, () -> coordinator
+            .getAwaitSemanticCheckpoints("tenant-denied", "exec-1", 10)
+            .await().indefinitely());
+
+        ArgumentCaptor<ControlPlaneAdmissionRequest> requests =
+            ArgumentCaptor.forClass(ControlPlaneAdmissionRequest.class);
+        verify(policy, times(2)).admit(requests.capture());
+        assertTrue(requests.getAllValues().stream().allMatch(request ->
+            request.operation() == ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT));
+        verifyNoInteractions(awaitCoordinator);
+        verify(executionStateStore, never()).getExecution(any(), any());
     }
 
     @Test
@@ -1710,7 +1739,7 @@ class QueueAsyncCoordinatorTest {
     }
 
     @Test
-    void completeAwaitMarksParentFailedWhenItemContinuationKeepsFailing() {
+    void completeAwaitDurablySchedulesFailedItemContinuation() {
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         AwaitInteractionRecord completed = itemAwaitRecord(0, AwaitInteractionStatus.COMPLETED, "approved");
         AwaitCompletionCommand command = new AwaitCompletionCommand(
@@ -1771,27 +1800,14 @@ class QueueAsyncCoordinatorTest {
 	            .thenReturn(Uni.createFrom().item(List.of(completed)));
 	        when(executionStateStore.getExecution("tenant-1", "exec-1"))
 	            .thenReturn(Uni.createFrom().item(Optional.of(waiting)));
-        when(executionStateStore.markTerminalFailure(
-                org.mockito.ArgumentMatchers.eq("tenant-1"),
-                org.mockito.ArgumentMatchers.eq("exec-1"),
-                org.mockito.ArgumentMatchers.eq(7L),
-                org.mockito.ArgumentMatchers.eq(ExecutionStatus.FAILED),
-                org.mockito.ArgumentMatchers.eq("await-item-continuation-failed:unit-1:0"),
-                org.mockito.ArgumentMatchers.eq("AWAIT_ITEM_CONTINUATION_FAILED"),
-                org.mockito.ArgumentMatchers.contains("segment failed"),
-                org.mockito.ArgumentMatchers.anyLong()))
-            .thenReturn(Uni.createFrom().item(Optional.of(waiting)));
-
         coordinator.completeAwait(command, failingHandler).await().indefinitely();
 
-        verify(executionStateStore, timeout(1000)).markTerminalFailure(
-            org.mockito.ArgumentMatchers.eq("tenant-1"),
-            org.mockito.ArgumentMatchers.eq("exec-1"),
-            org.mockito.ArgumentMatchers.eq(7L),
-            org.mockito.ArgumentMatchers.eq(ExecutionStatus.FAILED),
-            org.mockito.ArgumentMatchers.eq("await-item-continuation-failed:unit-1:0"),
-            org.mockito.ArgumentMatchers.eq("AWAIT_ITEM_CONTINUATION_FAILED"),
-            org.mockito.ArgumentMatchers.contains("segment failed"),
+        verify(awaitCoordinator).rescheduleItemContinuation(
+            org.mockito.ArgumentMatchers.argThat(retry -> retry.interactionId().equals(completed.interactionId())),
+            org.mockito.ArgumentMatchers.eq(2),
+            org.mockito.ArgumentMatchers.anyLong());
+        verify(executionStateStore, never()).markTerminalFailure(
+            any(), any(), org.mockito.ArgumentMatchers.anyLong(), any(), any(), any(), any(),
             org.mockito.ArgumentMatchers.anyLong());
         verify(workDispatcher, never()).enqueueNow(any());
     }
