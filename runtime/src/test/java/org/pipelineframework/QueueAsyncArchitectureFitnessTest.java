@@ -140,6 +140,10 @@ class QueueAsyncArchitectureFitnessTest {
         1,
         occurrences(loopHost, ".subscribe()"),
         "QueueAsyncSweepLoopHost must own the single periodic sweep subscription");
+    assertTrue(loopHost.contains("PipelineControlPlane controlPlane"),
+        "native loop hosting must depend on the action contract");
+    assertFalse(loopHost.contains("QueueAsyncCoordinator coordinator"),
+        "native loop hosting must not depend on the local coordinator implementation");
   }
 
   @Test

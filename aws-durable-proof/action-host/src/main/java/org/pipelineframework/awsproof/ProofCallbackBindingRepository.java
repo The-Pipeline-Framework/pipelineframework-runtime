@@ -16,6 +16,7 @@ import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
 import org.pipelineframework.awsproof.model.ProofBindingStatus;
 import org.pipelineframework.awsproof.model.ProofCallbackBinding;
 import org.pipelineframework.awsproof.model.ProofCallbackRegistration;
+import org.pipelineframework.awsproof.model.ProofDriverCheckpoint;
 import org.pipelineframework.awsproof.model.ProofExecutionCheckpoint;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
@@ -72,7 +73,7 @@ final class ProofCallbackBindingRepository {
                 .build());
             return true;
         } catch (ConditionalCheckFailedException conflict) {
-            ProofExecutionCheckpoint checkpoint = registration.checkpoint();
+            ProofDriverCheckpoint checkpoint = registration.checkpoint();
             ProofCallbackRegistration existing = findRegistration(
                 checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation())
                 .orElseThrow(() -> conflict);
@@ -230,7 +231,7 @@ final class ProofCallbackBindingRepository {
     }
 
     private Map<String, AttributeValue> toItem(ProofCallbackRegistration registration) {
-        ProofExecutionCheckpoint checkpoint = registration.checkpoint();
+        ProofDriverCheckpoint checkpoint = registration.checkpoint();
         return Map.ofEntries(
             Map.entry(PK, string(registration.partitionKey())),
             Map.entry(SK, string(registration.sortKey())),
@@ -277,13 +278,13 @@ final class ProofCallbackBindingRepository {
     }
 
     private ProofCallbackRegistration registrationFromItem(Map<String, AttributeValue> item) {
-        ProofExecutionCheckpoint checkpoint = new ProofExecutionCheckpoint(
-            text(item, "tenant_id"),
-            text(item, "execution_id"),
-            true,
-            text(item, "pipeline_id"),
-            text(item, "contract_version"),
-            text(item, "release_version"),
+        ProofDriverCheckpoint checkpoint = new ProofDriverCheckpoint(
+            new ProofExecutionCheckpoint(
+                text(item, "tenant_id"),
+                text(item, "execution_id"),
+                text(item, "pipeline_id"),
+                text(item, "contract_version"),
+                text(item, "release_version")),
             longValue(item, "generation"));
         return new ProofCallbackRegistration(
             checkpoint,

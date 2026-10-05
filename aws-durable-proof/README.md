@@ -10,6 +10,8 @@ This non-published reactor proves the candidate AWS production boundary from
 
 The proof is deliberately isolated from production packaging. `shared` contains proof messages, `durable-driver` is the plain Java durable Lambda, `action-host` is the Quarkus TPF action/worker host, and `fault-tests` is an opt-in real-AWS gate. A normal Maven build never deploys cloud resources.
 
+The coordination-host seam is the existing `PipelineControlPlane`: native loop hosts invoke it directly, while the proof action gateway adapts its remote messages through `ProofControlPlaneActionAdapter`. AWS callback registration and generation fencing are isolated in `ProofDurableHostActionAdapter`. `ProofExecutionCheckpoint` contains only reconstructable TPF identity; `ProofDriverCheckpoint` wraps it with the AWS driver generation. No parallel control-plane API is introduced.
+
 ## Callback binding protocol
 
 The provider callback ID is disposable mechanical state in `BindingTable`, not TPF Await state. `waitForCallback` creates the durable callback first; its submitter conditionally records a provider registration keyed by the already-stable TPF execution checkpoint and generation. The TPF Await stream later joins that registration to the authoritative interaction and correlation identities. A missing registration makes the stream batch retry instead of losing the wake-up, and the scheduled reconciler repairs either event ordering. If a registration or binding row is deleted, the reconciler rebuilds it from public `GetDurableExecutionHistory` plus the read-only TPF semantic checkpoint. It does not use `GetDurableExecutionState`, which requires an SDK checkpoint token and is not an external reconciliation API.
