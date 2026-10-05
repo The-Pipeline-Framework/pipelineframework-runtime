@@ -1991,10 +1991,26 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
             record.tenantId(),
             record.executionId(),
             "result:" + (record.lastTransitionKey() == null ? "terminal" : record.lastTransitionKey()),
-            serializePayload(record, ExecutionDurablePayloadResolver.Slot.RESULT, resultPayload),
+            serializePayload(record, ExecutionDurablePayloadResolver.Slot.RESULT,
+                canonicalResultPayload(resultPayload)),
             record.resultShape() == ExecutionResultShape.MATERIALIZED_MULTI,
             record.updatedAtEpochMs(),
             record.ttlEpochS());
+    }
+
+    private Object canonicalResultPayload(Object resultPayload) {
+        if (resultPayload instanceof Iterable<?> items) {
+            return java.util.stream.StreamSupport.stream(items.spliterator(), false)
+                .map(this::canonicalResultItem)
+                .toList();
+        }
+        return canonicalResultItem(resultPayload);
+    }
+
+    private Object canonicalResultItem(Object resultItem) {
+        return resultItem instanceof SerializedTransitionPayload serialized
+            ? transitionPayloadCodec.decode(serialized)
+            : resultItem;
     }
 
     private StoredPayload storeResultPayload(

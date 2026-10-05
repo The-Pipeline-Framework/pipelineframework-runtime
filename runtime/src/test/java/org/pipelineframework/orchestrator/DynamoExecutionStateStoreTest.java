@@ -149,6 +149,42 @@ class DynamoExecutionStateStoreTest {
     }
 
     @Test
+    void decodesRemoteTransitionResultsBeforeTypedDurablePersistence() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoExecutionStateStore store = new DynamoExecutionStateStore(
+            client, mockConfig("tpf_execution", "tpf_execution_key"));
+        ExecutionDurablePayloadResolver payloads = mock(ExecutionDurablePayloadResolver.class);
+        store.durablePayloadResolver = payloads;
+        long now = System.currentTimeMillis();
+        long ttl = now / 1000 + 3600;
+        PaymentOutput output = new PaymentOutput("payment-1", "approved");
+        SerializedTransitionPayload remoteOutput = store.transitionPayloadCodec.encode(output);
+        List<PaymentOutput> canonicalOutputs = List.of(output);
+        String typedResult = typed("List<PaymentOutput>");
+
+        Map<String, AttributeValue> running = new java.util.HashMap<>(executionItem(
+            "tenant-a", "exec-remote-result", "key-remote-result", ttl, ExecutionStatus.RUNNING));
+        Map<String, AttributeValue> completed = new java.util.HashMap<>(running);
+        completed.put("status", AttributeValue.builder().s(ExecutionStatus.SUCCEEDED.name()).build());
+        completed.put("result_payload_json", AttributeValue.builder().s(typedResult).build());
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(running).build());
+        when(client.updateItem(any(UpdateItemRequest.class)))
+            .thenReturn(UpdateItemResponse.builder().attributes(completed).build());
+        when(payloads.supportsTypedPayloads(any())).thenReturn(true);
+        when(payloads.encode(any(), eq(ExecutionDurablePayloadResolver.Slot.RESULT), eq(canonicalOutputs)))
+            .thenReturn(typedResult);
+        when(payloads.decode(any(), eq(ExecutionDurablePayloadResolver.Slot.RESULT), eq(typedResult)))
+            .thenReturn(canonicalOutputs);
+
+        Optional<ExecutionRecord<Object, Object>> restored = store.markSucceeded(
+            "tenant-a", "exec-remote-result", 0L, "remote-transition", List.of(remoteOutput), now)
+            .await().indefinitely();
+
+        assertEquals(canonicalOutputs, restored.orElseThrow().resultPayload());
+        verify(payloads).encode(any(), eq(ExecutionDurablePayloadResolver.Slot.RESULT), eq(canonicalOutputs));
+    }
+
+    @Test
     void writesAnAwaitItemChildInputUsingItsContinuationContract() {
         DynamoDbClient client = mock(DynamoDbClient.class);
         DynamoExecutionStateStore store = new DynamoExecutionStateStore(client, mockConfig("tpf_execution", "tpf_execution_key"));

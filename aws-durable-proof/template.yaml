@@ -1,0 +1,644 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Disposable real-AWS fault proof for the TPF AWS Durable coordinator candidate (issue 976)
+
+Parameters:
+  ProofName:
+    Type: String
+    Default: issue-976
+    AllowedPattern: '[a-z0-9-]+'
+  ResumeTokenSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+  WorkerSharedSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+  ArtifactBucket:
+    Type: String
+  DurableArtifactKey:
+    Type: String
+  DurableCodeSha256:
+    Type: String
+  ActionArtifactDigest:
+    Type: String
+    AllowedPattern: '^sha256:[0-9a-f]{64}$'
+
+Globals:
+  Function:
+    Runtime: java21
+    Architectures: [arm64]
+    Tracing: Active
+    Tags:
+      issue: '976'
+      purpose: aws-durable-proof
+      proof: !Ref ProofName
+
+Resources:
+  ExecutionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-execution'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: tenant_id, AttributeType: S}
+        - {AttributeName: execution_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: tenant_id, KeyType: HASH}
+        - {AttributeName: execution_id, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: ttl_epoch_s, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      Tags: &ProofTags
+        - {Key: issue, Value: '976'}
+        - {Key: purpose, Value: aws-durable-proof}
+
+  ExecutionKeyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-execution-key'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: tenant_execution_key, AttributeType: S}
+      KeySchema:
+        - {AttributeName: tenant_execution_key, KeyType: HASH}
+      TimeToLiveSpecification: {AttributeName: ttl_epoch_s, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      Tags: *ProofTags
+
+  ExecutionPayloadTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-execution-payload'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: payload_id, AttributeType: S}
+        - {AttributeName: payload_part, AttributeType: S}
+      KeySchema:
+        - {AttributeName: payload_id, KeyType: HASH}
+        - {AttributeName: payload_part, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: ttl_epoch_s, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      Tags: *ProofTags
+
+  ReleaseTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-release'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: registry_key, AttributeType: S}
+        - {AttributeName: registry_sort, AttributeType: S}
+      KeySchema:
+        - {AttributeName: registry_key, KeyType: HASH}
+        - {AttributeName: registry_sort, KeyType: RANGE}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      Tags: *ProofTags
+
+  AwaitUnitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-await-unit'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: tenant_id, AttributeType: S}
+        - {AttributeName: unit_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: tenant_id, KeyType: HASH}
+        - {AttributeName: unit_id, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: ttl_epoch_s, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      Tags: *ProofTags
+
+  AwaitAdmissionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-await-admission'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: scope_key, AttributeType: S}
+        - {AttributeName: slot, AttributeType: N}
+      KeySchema:
+        - {AttributeName: scope_key, KeyType: HASH}
+        - {AttributeName: slot, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: expires_at, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      Tags: *ProofTags
+
+  AwaitInteractionKeyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-await-interaction-key'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: lookup_key, AttributeType: S}
+      KeySchema:
+        - {AttributeName: lookup_key, KeyType: HASH}
+      TimeToLiveSpecification: {AttributeName: ttl_epoch_s, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      Tags: *ProofTags
+
+  AwaitInteractionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-await-interaction'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: tenant_id, AttributeType: S}
+        - {AttributeName: interaction_id, AttributeType: S}
+        - {AttributeName: query_unit_key, AttributeType: S}
+        - {AttributeName: query_unit_sort, AttributeType: S}
+        - {AttributeName: query_pending_tenant_key, AttributeType: S}
+        - {AttributeName: query_pending_assignee_key, AttributeType: S}
+        - {AttributeName: query_pending_group_key, AttributeType: S}
+        - {AttributeName: query_pending_step_key, AttributeType: S}
+        - {AttributeName: query_pending_deadline_sort, AttributeType: S}
+        - {AttributeName: query_deadline_key, AttributeType: S}
+        - {AttributeName: query_deadline_sort, AttributeType: S}
+      KeySchema:
+        - {AttributeName: tenant_id, KeyType: HASH}
+        - {AttributeName: interaction_id, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: await-interaction-by-unit
+          KeySchema:
+            - {AttributeName: query_unit_key, KeyType: HASH}
+            - {AttributeName: query_unit_sort, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: await-interaction-pending-by-tenant
+          KeySchema:
+            - {AttributeName: query_pending_tenant_key, KeyType: HASH}
+            - {AttributeName: query_pending_deadline_sort, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: await-interaction-pending-by-assignee
+          KeySchema:
+            - {AttributeName: query_pending_assignee_key, KeyType: HASH}
+            - {AttributeName: query_pending_deadline_sort, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: await-interaction-pending-by-group
+          KeySchema:
+            - {AttributeName: query_pending_group_key, KeyType: HASH}
+            - {AttributeName: query_pending_deadline_sort, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: await-interaction-pending-by-step
+          KeySchema:
+            - {AttributeName: query_pending_step_key, KeyType: HASH}
+            - {AttributeName: query_pending_deadline_sort, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: await-interaction-pending-by-deadline
+          KeySchema:
+            - {AttributeName: query_deadline_key, KeyType: HASH}
+            - {AttributeName: query_deadline_sort, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+      TimeToLiveSpecification: {AttributeName: ttl_epoch_s, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      Tags: *ProofTags
+
+  BindingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-binding'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+      TimeToLiveSpecification: {AttributeName: expires_at_epoch_s, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      Tags: *ProofTags
+
+  FaultTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-fault'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      Tags: *ProofTags
+
+  WorkDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties: {QueueName: !Sub '${AWS::StackName}-work-dlq', MessageRetentionPeriod: 1209600, Tags: *ProofTags}
+  WorkQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-work'
+      VisibilityTimeout: 2160
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt WorkDeadLetterQueue.Arn, maxReceiveCount: 5}
+      Tags: *ProofTags
+  AwaitRequestQueue:
+    Type: AWS::SQS::Queue
+    Properties: {QueueName: !Sub '${AWS::StackName}-await-request', MessageRetentionPeriod: 1209600, Tags: *ProofTags}
+  AwaitCompletionDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties: {QueueName: !Sub '${AWS::StackName}-await-completion-dlq', MessageRetentionPeriod: 1209600, Tags: *ProofTags}
+  AwaitCompletionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-await-completion'
+      VisibilityTimeout: 720
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt AwaitCompletionDeadLetterQueue.Arn, maxReceiveCount: 5}
+      Tags: *ProofTags
+  TransitionDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties: {QueueName: !Sub '${AWS::StackName}-transition-dlq', MessageRetentionPeriod: 1209600, Tags: *ProofTags}
+  TransitionRequestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-transition-request'
+      VisibilityTimeout: 720
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt TransitionDeadLetterQueue.Arn, maxReceiveCount: 5}
+      Tags: *ProofTags
+  TransitionResponseQueue:
+    Type: AWS::SQS::Queue
+    Properties: {QueueName: !Sub '${AWS::StackName}-transition-response', VisibilityTimeout: 180, MessageRetentionPeriod: 1209600, Tags: *ProofTags}
+
+  DurableExecutionDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties: {QueueName: !Sub '${AWS::StackName}-durable-dlq', MessageRetentionPeriod: 1209600, Tags: *ProofTags}
+
+  StreamFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties: {QueueName: !Sub '${AWS::StackName}-stream-failure', MessageRetentionPeriod: 1209600, Tags: *ProofTags}
+
+  DurableExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: durable-checkpoints-and-proof-action
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['lambda:CheckpointDurableExecution', 'lambda:GetDurableExecutionState']
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:*'
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-action'
+              - Effect: Allow
+                Action: 'sqs:SendMessage'
+                Resource: !GetAtt DurableExecutionDeadLetterQueue.Arn
+
+  ActionHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: proof-data-and-events
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:ConditionCheckItem
+                  - dynamodb:TransactWriteItems
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DescribeTable
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-*'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-*/index/*'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-*/stream/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:ListDurableExecutionsByFunction
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:*'
+              - Effect: Allow
+                Action:
+                  - lambda:GetDurableExecution
+                  - lambda:GetDurableExecutionHistory
+                  - lambda:SendDurableExecutionCallbackSuccess
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:*'
+
+  DurableCoordinatorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn-lint:
+        config:
+          # cfn-lint's resource schema lags the generally available Lambda Durable property.
+          ignore_checks: [E3002]
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-durable'
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref DurableArtifactKey
+      Handler: org.pipelineframework.awsproof.AwsDurableCoordinatorHandler::handleRequest
+      Runtime: java21
+      Architectures: [arm64]
+      Role: !GetAtt DurableExecutionRole.Arn
+      MemorySize: 1024
+      Timeout: 900
+      TracingConfig: {Mode: Active}
+      DeadLetterConfig: {TargetArn: !GetAtt DurableExecutionDeadLetterQueue.Arn}
+      DurableConfig:
+        ExecutionTimeout: 2592000
+        RetentionPeriodInDays: 30
+      Environment:
+        Variables:
+          TPF_PROOF_ACTION_FUNCTION: !Sub '${AWS::StackName}-action'
+      Tags:
+        - {Key: issue, Value: '976'}
+        - {Key: purpose, Value: aws-durable-proof}
+        - {Key: proof, Value: !Ref ProofName}
+
+  DurableCoordinatorVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref DurableCoordinatorFunction
+      CodeSha256: !Ref DurableCodeSha256
+      Description: !Sub 'TPF durable proof ${ProofName}'
+
+  DurableCoordinatorAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: proof-live
+      FunctionName: !Ref DurableCoordinatorFunction
+      FunctionVersion: !GetAtt DurableCoordinatorVersion.Version
+
+  ActionGatewayFunction: &ActionFunction
+    Type: AWS::Serverless::Function
+    Properties: &ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-action'
+      CodeUri: action-host/target/function.zip
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt ActionHostRole.Arn
+      MemorySize: 1536
+      Timeout: 120
+      ReservedConcurrentExecutions: 8
+      Environment:
+        Variables: &ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: proof-action-gateway
+          PIPELINE_ORCHESTRATOR_QUEUE_URL: !Ref WorkQueue
+          PIPELINE_ORCHESTRATOR_DLQ_URL: !Ref WorkDeadLetterQueue
+          PIPELINE_ORCHESTRATOR_DYNAMO_REGION: !Ref AWS::Region
+          PIPELINE_ORCHESTRATOR_DYNAMO_EXECUTION_TABLE: !Ref ExecutionTable
+          PIPELINE_ORCHESTRATOR_DYNAMO_EXECUTION_KEY_TABLE: !Ref ExecutionKeyTable
+          PIPELINE_ORCHESTRATOR_DYNAMO_EXECUTION_PAYLOAD_TABLE: !Ref ExecutionPayloadTable
+          PIPELINE_ORCHESTRATOR_DYNAMO_RELEASE_TABLE: !Ref ReleaseTable
+          PIPELINE_ORCHESTRATOR_DYNAMO_AWAIT_INTERACTION_TABLE: !Ref AwaitInteractionTable
+          PIPELINE_ORCHESTRATOR_DYNAMO_AWAIT_INTERACTION_KEY_TABLE: !Ref AwaitInteractionKeyTable
+          PIPELINE_ORCHESTRATOR_DYNAMO_AWAIT_UNIT_TABLE: !Ref AwaitUnitTable
+          PIPELINE_ORCHESTRATOR_DYNAMO_AWAIT_ADMISSION_TABLE: !Ref AwaitAdmissionTable
+          PIPELINE_ORCHESTRATOR_SQS_REGION: !Ref AWS::Region
+          PIPELINE_ORCHESTRATOR_RESUME_TOKEN_SECRET: !Ref ResumeTokenSecret
+          PIPELINE_ORCHESTRATOR_WORKER_SQS_REQUEST_QUEUE_URL: !Ref TransitionRequestQueue
+          PIPELINE_ORCHESTRATOR_WORKER_SQS_RESPONSE_QUEUE_URL: !Ref TransitionResponseQueue
+          PIPELINE_ORCHESTRATOR_WORKER_SQS_SHARED_SECRET: !Ref WorkerSharedSecret
+          TPF_PROOF_AWAIT_REQUEST_QUEUE_URL: !Ref AwaitRequestQueue
+          TPF_PROOF_AWAIT_RESPONSE_QUEUE_URL: !Ref AwaitCompletionQueue
+          TPF_PROOF_BINDING_TABLE: !Ref BindingTable
+          TPF_PROOF_FAULT_TABLE: !Ref FaultTable
+          TPF_PROOF_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
+          TPF_PROOF_DURABLE_QUALIFIER: proof-live
+          TPF_PROOF_ACTION_ARTIFACT_DIGEST: !Ref ActionArtifactDigest
+
+  IngressFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-ingress'
+      ReservedConcurrentExecutions: 4
+      Environment:
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: proof-ingress
+
+  WorkItemFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-work'
+      Timeout: 360
+      ReservedConcurrentExecutions: 16
+      Environment:
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: proof-work-item
+      Events:
+        WorkRecords:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WorkQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig: {MaximumConcurrency: 16}
+
+  AwaitCompletionFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-await-completion'
+      Environment:
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: proof-await-completion
+      Events:
+        AwaitCompletions:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AwaitCompletionQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  TransitionWorkerFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-transition-worker'
+      ReservedConcurrentExecutions: 16
+      Environment:
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: proof-transition-worker
+      Events:
+        TransitionRecords:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TransitionRequestQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig: {MaximumConcurrency: 16}
+
+  AwaitWakeupFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-await-wakeup'
+      ReservedConcurrentExecutions: 8
+      Environment:
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: proof-await-wakeup
+      Events:
+        AwaitStateChanges:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt AwaitInteractionTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            BisectBatchOnFunctionError: true
+            MaximumRecordAgeInSeconds: 3600
+            MaximumRetryAttempts: 3
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            DestinationConfig:
+              OnFailure:
+                Destination: !GetAtt StreamFailureQueue.Arn
+        BindingChanges:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt BindingTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            BisectBatchOnFunctionError: true
+            MaximumRecordAgeInSeconds: 3600
+            MaximumRetryAttempts: 3
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            DestinationConfig:
+              OnFailure:
+                Destination: !GetAtt StreamFailureQueue.Arn
+
+  AwaitReconcilerFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-reconciler'
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: proof-await-reconciler
+      Events:
+        ReconcileSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Enabled: true
+
+  DurableTerminalStateRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Reconcile TPF state when a durable driver fails, times out, or is stopped
+      EventPattern:
+        source: [aws.lambda]
+        detail-type: ['Durable Execution Status Change']
+        detail:
+          status: [FAILED, TIMED_OUT, STOPPED]
+          functionArn:
+            - prefix: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AwaitReconcilerFunction.Arn
+          Id: proof-await-reconciler
+
+  DurableTerminalStatePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AwaitReconcilerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DurableTerminalStateRule.Arn
+
+  WorkDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: &DlqAlarm
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt WorkDeadLetterQueue.QueueName}
+  AwaitDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *DlqAlarm
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt AwaitCompletionDeadLetterQueue.QueueName}
+  TransitionDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *DlqAlarm
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt TransitionDeadLetterQueue.QueueName}
+  DurableDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *DlqAlarm
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt DurableExecutionDeadLetterQueue.QueueName}
+  StreamFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *DlqAlarm
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt StreamFailureQueue.QueueName}
+
+Outputs:
+  DurableFunctionName: {Value: !Ref DurableCoordinatorFunction}
+  DurableFunctionAliasArn: {Value: !Ref DurableCoordinatorAlias}
+  IngressFunctionName: {Value: !Ref IngressFunction}
+  ActionFunctionName: {Value: !Ref ActionGatewayFunction}
+  ReconcilerFunctionName: {Value: !Ref AwaitReconcilerFunction}
+  AwaitWakeupFunctionName: {Value: !Ref AwaitWakeupFunction}
+  WorkQueueUrl: {Value: !Ref WorkQueue}
+  WorkDlqUrl: {Value: !Ref WorkDeadLetterQueue}
+  AwaitRequestQueueUrl: {Value: !Ref AwaitRequestQueue}
+  AwaitCompletionQueueUrl: {Value: !Ref AwaitCompletionQueue}
+  AwaitCompletionDlqUrl: {Value: !Ref AwaitCompletionDeadLetterQueue}
+  TransitionRequestQueueUrl: {Value: !Ref TransitionRequestQueue}
+  TransitionDlqUrl: {Value: !Ref TransitionDeadLetterQueue}
+  DurableDlqUrl: {Value: !Ref DurableExecutionDeadLetterQueue}
+  StreamFailureQueueUrl: {Value: !Ref StreamFailureQueue}
+  ExecutionTableName: {Value: !Ref ExecutionTable}
+  ReleaseTableName: {Value: !Ref ReleaseTable}
+  AwaitInteractionTableName: {Value: !Ref AwaitInteractionTable}
+  BindingTableName: {Value: !Ref BindingTable}
+  FaultTableName: {Value: !Ref FaultTable}
+  AwaitStreamMappingId: {Value: !Ref AwaitWakeupFunctionAwaitStateChanges}
+  BindingStreamMappingId: {Value: !Ref AwaitWakeupFunctionBindingChanges}
+  WorkQueueMappingId: {Value: !Ref WorkItemFunctionWorkRecords}
+  AwaitQueueMappingId: {Value: !Ref AwaitCompletionFunctionAwaitCompletions}
+  TransitionQueueMappingId: {Value: !Ref TransitionWorkerFunctionTransitionRecords}
