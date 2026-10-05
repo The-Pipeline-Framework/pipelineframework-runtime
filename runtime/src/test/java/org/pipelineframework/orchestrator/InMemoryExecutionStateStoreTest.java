@@ -112,6 +112,43 @@ class InMemoryExecutionStateStoreTest {
     }
 
     @Test
+    void committedPageCheckpointSurvivesWorkerReplacementAndFencesTheOldClaim() {
+        InMemoryExecutionStateStore store = new InMemoryExecutionStateStore();
+        long now = System.currentTimeMillis();
+        PagedExecutionState firstPage = new PagedExecutionState(
+            0, "source-v1", Optional.empty(), 100);
+        CreateExecutionResult created = store.createOrGetExecution(new ExecutionCreateCommand(
+                "tenant-a", "key-paged", "pipeline-a", "contract-v1", "release-v1", "payload",
+                ExecutionResultShape.SINGLE, Optional.empty(), 0, Optional.of(firstPage),
+                now, now / 1000 + 60))
+            .await().indefinitely();
+        ExecutionRecord<Object, Object> firstClaim = store.claimLease(
+                "tenant-a", created.record().executionId(), "worker-1", now, 1_000L)
+            .await().indefinitely().orElseThrow();
+
+        PagedExecutionState secondPage = firstClaim.pagingState().orElseThrow().successor("cursor-1");
+        ExecutionRecord<Object, Object> committed = store.advancePage(
+                "tenant-a", firstClaim.executionId(), firstClaim.version(), "page-0", secondPage, now + 1)
+            .await().indefinitely().orElseThrow();
+
+        assertEquals(ExecutionStatus.QUEUED, committed.status());
+        assertEquals(1, committed.pagingState().orElseThrow().pageIndex());
+        assertEquals(Optional.of("cursor-1"), committed.pagingState().orElseThrow().startCheckpoint());
+
+        assertTrue(store.advancePage(
+                "tenant-a", firstClaim.executionId(), firstClaim.version(), "stale-page-0",
+                secondPage.successor("cursor-2"), now + 2)
+            .await().indefinitely().isEmpty());
+
+        ExecutionRecord<Object, Object> replacementClaim = store.claimLease(
+                "tenant-a", firstClaim.executionId(), "worker-2", now + 2, 1_000L)
+            .await().indefinitely().orElseThrow();
+        assertEquals(1, replacementClaim.pagingState().orElseThrow().pageIndex());
+        assertEquals(Optional.of("cursor-1"),
+            replacementClaim.pagingState().orElseThrow().startCheckpoint());
+    }
+
+    @Test
     void dueSweepOnlyReturnsNonTerminalDueRecords() {
         InMemoryExecutionStateStore store = new InMemoryExecutionStateStore();
         long now = System.currentTimeMillis();
