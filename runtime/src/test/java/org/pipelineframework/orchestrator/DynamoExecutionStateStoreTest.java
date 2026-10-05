@@ -623,6 +623,7 @@ class DynamoExecutionStateStoreTest {
         assertTrue(request.conditionExpression().contains("#pageIndex = :previousPageIndex"));
         assertTrue(request.updateExpression().contains("#status = :queued"));
         assertTrue(request.updateExpression().contains("#pageCheckpoint = :pageCheckpoint"));
+        assertEquals("page_start_checkpoint", request.expressionAttributeNames().get("#pageCheckpoint"));
         assertEquals("7", request.expressionAttributeValues().get(":expected").n());
         assertEquals("0", request.expressionAttributeValues().get(":previousPageIndex").n());
         assertEquals("1", request.expressionAttributeValues().get(":pageIndex").n());

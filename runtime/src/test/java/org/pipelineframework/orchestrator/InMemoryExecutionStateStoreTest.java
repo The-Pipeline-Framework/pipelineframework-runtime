@@ -135,17 +135,24 @@ class InMemoryExecutionStateStoreTest {
         assertEquals(1, committed.pagingState().orElseThrow().pageIndex());
         assertEquals(Optional.of("cursor-1"), committed.pagingState().orElseThrow().startCheckpoint());
 
-        assertTrue(store.advancePage(
-                "tenant-a", firstClaim.executionId(), firstClaim.version(), "stale-page-0",
-                secondPage.successor("cursor-2"), now + 2)
-            .await().indefinitely().isEmpty());
-
         ExecutionRecord<Object, Object> replacementClaim = store.claimLease(
                 "tenant-a", firstClaim.executionId(), "worker-2", now + 2, 1_000L)
             .await().indefinitely().orElseThrow();
         assertEquals(1, replacementClaim.pagingState().orElseThrow().pageIndex());
         assertEquals(Optional.of("cursor-1"),
             replacementClaim.pagingState().orElseThrow().startCheckpoint());
+
+        assertTrue(store.advancePage(
+                "tenant-a", firstClaim.executionId(), firstClaim.version(), "stale-page-0",
+                secondPage.successor("cursor-2"), now + 3)
+            .await().indefinitely().isEmpty());
+        ExecutionRecord<Object, Object> afterStaleAdvance = store.getExecution(
+                "tenant-a", firstClaim.executionId())
+            .await().indefinitely().orElseThrow();
+        assertEquals(replacementClaim.version(), afterStaleAdvance.version());
+        assertEquals(1, afterStaleAdvance.pagingState().orElseThrow().pageIndex());
+        assertEquals(Optional.of("cursor-1"),
+            afterStaleAdvance.pagingState().orElseThrow().startCheckpoint());
     }
 
     @Test
