@@ -28,6 +28,8 @@ public final class AwsDurableCallbackBindingRepository {
     public static final String BINDING = "BINDING";
     public static final String REGISTRATION = "REGISTRATION";
     public static final String DELIVERY = "DELIVERY";
+    private static final int PROVIDER_LOOKUP_PAGE_SIZE = 25;
+    private static final int PROVIDER_LOOKUP_MAX_PAGES = 8;
 
     private final DynamoDbClient dynamo;
     private final String tableName;
@@ -118,20 +120,34 @@ public final class AwsDurableCallbackBindingRepository {
     public Optional<AwsDurableCallbackRegistration> findRegistrationByProviderExecutionArn(
         String providerExecutionArn
     ) {
-        var response = dynamo.query(QueryRequest.builder()
-            .tableName(tableName())
-            .indexName(PROVIDER_EXECUTION_INDEX)
-            .keyConditionExpression("#providerArn = :providerArn")
-            .expressionAttributeNames(Map.of("#providerArn", "provider_execution_arn"))
-            .expressionAttributeValues(Map.of(
-                ":providerArn", string(required(providerExecutionArn, "providerExecutionArn"))))
-            .scanIndexForward(false)
-            .limit(1)
-            .build());
-        return response.items().stream()
-            .filter(item -> REGISTRATION.equals(text(item, RECORD_TYPE)))
-            .findFirst()
-            .map(this::registrationFromItem);
+        String arn = required(providerExecutionArn, "providerExecutionArn");
+        Map<String, AttributeValue> cursor = Map.of();
+        for (int page = 0; page < PROVIDER_LOOKUP_MAX_PAGES; page++) {
+            var response = dynamo.query(QueryRequest.builder()
+                .tableName(tableName())
+                .indexName(PROVIDER_EXECUTION_INDEX)
+                .keyConditionExpression("#providerArn = :providerArn")
+                .filterExpression("#recordType = :registration")
+                .expressionAttributeNames(Map.of(
+                    "#providerArn", "provider_execution_arn", "#recordType", RECORD_TYPE))
+                .expressionAttributeValues(Map.of(
+                    ":providerArn", string(arn), ":registration", string(REGISTRATION)))
+                .exclusiveStartKey(cursor)
+                .limit(PROVIDER_LOOKUP_PAGE_SIZE)
+                .build());
+            Optional<AwsDurableCallbackRegistration> registration = response.items().stream()
+                .filter(item -> REGISTRATION.equals(text(item, RECORD_TYPE)))
+                .findFirst()
+                .map(this::registrationFromItem);
+            if (registration.isPresent()) {
+                return registration;
+            }
+            cursor = response.lastEvaluatedKey();
+            if (cursor.isEmpty()) {
+                return Optional.empty();
+            }
+        }
+        throw new IllegalStateException("provider registration lookup exceeded its bounded page budget");
     }
 
     public Optional<AwsDurableCallbackBinding> find(String tenantId, String interactionId, long generation) {

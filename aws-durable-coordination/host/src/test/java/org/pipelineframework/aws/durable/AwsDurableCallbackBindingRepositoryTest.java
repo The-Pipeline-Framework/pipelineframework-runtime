@@ -15,6 +15,7 @@ import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
 import software.amazon.awssdk.services.dynamodb.model.QueryResponse;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -69,7 +70,25 @@ class AwsDurableCallbackBindingRepositoryTest {
     @Test
     void providerExecutionLookupUsesTheDedicatedIndex() {
         DynamoDbClient dynamo = mock(DynamoDbClient.class);
-        when(dynamo.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder()
+        when(dynamo.query(any(QueryRequest.class))).thenReturn(registrationResponse());
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, "bindings");
+
+        Optional<AwsDurableCallbackRegistration> result =
+            repository.findRegistrationByProviderExecutionArn("arn:closed");
+
+        assertThat(result).hasValueSatisfying(registration -> {
+            assertThat(registration.providerExecutionArn()).isEqualTo("arn:closed");
+            assertThat(registration.checkpoint().executionId()).isEqualTo("execution-a");
+            assertThat(registration.checkpoint().generation()).isEqualTo(1);
+        });
+        verify(dynamo).query(org.mockito.ArgumentMatchers.<QueryRequest>argThat(request ->
+            AwsDurableCallbackBindingRepository.PROVIDER_EXECUTION_INDEX.equals(request.indexName())
+                && request.limit() == 25
+                && request.filterExpression().equals("#recordType = :registration")));
+    }
+
+    private static QueryResponse registrationResponse() {
+        return QueryResponse.builder()
             .items(Map.ofEntries(
                 Map.entry("pk", AttributeValue.fromS("tenant-a#execution-a")),
                 Map.entry("sk", AttributeValue.fromS("REGISTRATION#00000000000000000001")),
@@ -85,20 +104,35 @@ class AwsDurableCallbackBindingRepositoryTest {
                 Map.entry("provider_callback_id", AttributeValue.fromS("callback-a")),
                 Map.entry("created_at_epoch_ms", AttributeValue.fromN("100")),
                 Map.entry("expires_at_epoch_s", AttributeValue.fromN("1000"))))
-            .build());
-        var repository = new AwsDurableCallbackBindingRepository(dynamo, "bindings");
+            .build();
+    }
 
-        Optional<AwsDurableCallbackRegistration> result =
-            repository.findRegistrationByProviderExecutionArn("arn:closed");
+    @Test
+    void bindingOnlyPageDoesNotHideRegistrationOnNextPage() {
+        DynamoDbClient dynamo = mock(DynamoDbClient.class);
+        Map<String, AttributeValue> cursor = Map.of("pk", AttributeValue.fromS("tenant-a#interaction-a"));
+        // Dynamo filters after evaluating Limit; an empty filtered page can still have a cursor.
+        when(dynamo.query(any(QueryRequest.class))).thenReturn(
+            QueryResponse.builder().lastEvaluatedKey(cursor).build(), registrationResponse());
 
-        assertThat(result).hasValueSatisfying(registration -> {
-            assertThat(registration.providerExecutionArn()).isEqualTo("arn:closed");
-            assertThat(registration.checkpoint().executionId()).isEqualTo("execution-a");
-            assertThat(registration.checkpoint().generation()).isEqualTo(1);
-        });
-        verify(dynamo).query(org.mockito.ArgumentMatchers.<QueryRequest>argThat(request ->
-            AwsDurableCallbackBindingRepository.PROVIDER_EXECUTION_INDEX.equals(request.indexName())
-                && request.limit() == 1));
+        assertThat(new AwsDurableCallbackBindingRepository(dynamo, "bindings")
+            .findRegistrationByProviderExecutionArn("arn:closed")).isPresent();
+
+        var requests = org.mockito.ArgumentCaptor.forClass(QueryRequest.class);
+        verify(dynamo, org.mockito.Mockito.times(2)).query(requests.capture());
+        assertThat(requests.getAllValues().get(1).exclusiveStartKey()).isEqualTo(cursor);
+    }
+
+    @Test
+    void exhaustedPageBudgetFailsRatherThanReportingNoRegistration() {
+        DynamoDbClient dynamo = mock(DynamoDbClient.class);
+        when(dynamo.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder()
+            .lastEvaluatedKey(Map.of("pk", AttributeValue.fromS("next"))).build());
+
+        assertThatThrownBy(() -> new AwsDurableCallbackBindingRepository(dynamo, "bindings")
+            .findRegistrationByProviderExecutionArn("arn:closed"))
+            .isInstanceOf(IllegalStateException.class).hasMessageContaining("page budget");
+        verify(dynamo, org.mockito.Mockito.times(8)).query(any(QueryRequest.class));
     }
 
     private static AwsDurableCallbackBinding binding(String callbackId, long createdAt, long expiresAt) {

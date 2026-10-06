@@ -1,7 +1,6 @@
 package org.pipelineframework.aws.durable;
 
 import java.util.Objects;
-import java.util.Optional;
 
 import org.pipelineframework.aws.durable.model.AwsDurableActionRequest;
 import org.pipelineframework.aws.durable.model.AwsDurableAwaitCheckpoint;
@@ -32,24 +31,25 @@ public final class AwsDurableTerminalReconciler {
             || providerState == AwsDurableProviderExecutionState.SUCCEEDED) {
             return false;
         }
-        return bindings.findRegistrationByProviderExecutionArn(providerExecutionArn)
-            .flatMap(registration -> {
-                String semanticStatus = actions.invoke(AwsDurableActionRequest.status(registration.checkpoint()))
-                    .executionStatus().orElse("");
-                if (!"WAITING_EXTERNAL".equals(semanticStatus)) {
-                    return Optional.empty();
-                }
-                Optional<AwsDurableAwaitCheckpoint> semantic = actions.invoke(
-                    AwsDurableActionRequest.executionAwaits(registration.checkpoint()))
-                    .awaitCheckpoints().stream().findFirst();
-                return semantic.map(checkpoint -> registration.bind(new AwsDurableAwaitIdentity(
-                    checkpoint.tenantId(), checkpoint.executionId(), checkpoint.interactionId(),
-                    checkpoint.correlationId(), registration.checkpoint().generation())));
-            })
-            .map(binding -> {
-                bindings.bind(binding);
-                return replacements.startReplacement(binding);
-            })
-            .orElse(false);
+        var registration = bindings.findRegistrationByProviderExecutionArn(providerExecutionArn)
+            .orElseThrow(() -> new IllegalStateException(
+                "provider registration is not visible; retry targeted reconciliation"));
+        String semanticStatus = actions.invoke(AwsDurableActionRequest.status(registration.checkpoint()))
+            .executionStatus().orElseThrow(() -> new IllegalStateException("TPF execution status is unavailable"));
+        if (!"WAITING_EXTERNAL".equals(semanticStatus)) {
+            return false;
+        }
+        AwsDurableAwaitCheckpoint checkpoint = actions.invoke(
+                AwsDurableActionRequest.executionAwaits(registration.checkpoint()))
+            .awaitCheckpoints().stream().findFirst()
+            .orElseThrow(() -> new IllegalStateException("TPF Await checkpoint is not visible; retry reconciliation"));
+        var binding = registration.bind(new AwsDurableAwaitIdentity(
+            checkpoint.tenantId(), checkpoint.executionId(), checkpoint.interactionId(),
+            checkpoint.correlationId(), registration.checkpoint().generation()));
+        bindings.bind(binding);
+        if (!replacements.startReplacement(binding)) {
+            throw new IllegalStateException("replacement admission is unresolved; retry reconciliation");
+        }
+        return true;
     }
 }
