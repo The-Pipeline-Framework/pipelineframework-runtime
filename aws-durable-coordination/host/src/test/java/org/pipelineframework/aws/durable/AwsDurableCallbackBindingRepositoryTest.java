@@ -120,6 +120,8 @@ class AwsDurableCallbackBindingRepositoryTest {
 
         var requests = org.mockito.ArgumentCaptor.forClass(QueryRequest.class);
         verify(dynamo, org.mockito.Mockito.times(2)).query(requests.capture());
+        assertThat(requests.getAllValues().get(0).hasExclusiveStartKey()).isFalse();
+        assertThat(requests.getAllValues().get(1).hasExclusiveStartKey()).isTrue();
         assertThat(requests.getAllValues().get(1).exclusiveStartKey()).isEqualTo(cursor);
     }
 

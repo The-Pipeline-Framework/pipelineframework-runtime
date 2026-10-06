@@ -123,7 +123,7 @@ public final class AwsDurableCallbackBindingRepository {
         String arn = required(providerExecutionArn, "providerExecutionArn");
         Map<String, AttributeValue> cursor = Map.of();
         for (int page = 0; page < PROVIDER_LOOKUP_MAX_PAGES; page++) {
-            var response = dynamo.query(QueryRequest.builder()
+            var request = QueryRequest.builder()
                 .tableName(tableName())
                 .indexName(PROVIDER_EXECUTION_INDEX)
                 .keyConditionExpression("#providerArn = :providerArn")
@@ -132,9 +132,11 @@ public final class AwsDurableCallbackBindingRepository {
                     "#providerArn", "provider_execution_arn", "#recordType", RECORD_TYPE))
                 .expressionAttributeValues(Map.of(
                     ":providerArn", string(arn), ":registration", string(REGISTRATION)))
-                .exclusiveStartKey(cursor)
-                .limit(PROVIDER_LOOKUP_PAGE_SIZE)
-                .build());
+                .limit(PROVIDER_LOOKUP_PAGE_SIZE);
+            if (!cursor.isEmpty()) {
+                request.exclusiveStartKey(cursor);
+            }
+            var response = dynamo.query(request.build());
             Optional<AwsDurableCallbackRegistration> registration = response.items().stream()
                 .filter(item -> REGISTRATION.equals(text(item, RECORD_TYPE)))
                 .findFirst()

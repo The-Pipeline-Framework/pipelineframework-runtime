@@ -221,6 +221,9 @@ Resources:
 
   DurableFunction:
     Type: AWS::Lambda::Function
+    # After stack deletion, redeploying the same stack name conflicts with this retained,
+    # fixed-name function. Once its executions and recovery windows have expired,
+    # manually delete the retained function before deploying that stack name again.
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Metadata:
