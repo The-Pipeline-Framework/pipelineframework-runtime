@@ -88,14 +88,13 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
 
     private AwsDurableActionResponse pendingAwait(AwsDurableActionRequest request) {
         String executionId = required(request.executionId(), "executionId");
-        Optional<org.pipelineframework.awaitable.AwaitInteractionRecord> pending = controlPlane
-            .queryPendingAwaitInteractions(request.tenantId(), "", "", "", 100)
+        return controlPlane
+            .getAwaitSemanticCheckpoints(request.tenantId(), executionId, 100)
             .await().atMost(actionTimeout).stream()
-            .filter(record -> executionId.equals(record.executionId()))
-            .findFirst();
-        return pending
-            .map(record -> AwsDurableActionResponse.pendingAwait(new AwsDurableAwaitIdentity(
-                record.tenantId(), record.executionId(), record.interactionId(), record.correlationId(),
+            .filter(checkpoint -> !checkpoint.status().terminal())
+            .findFirst()
+            .map(checkpoint -> AwsDurableActionResponse.pendingAwait(new AwsDurableAwaitIdentity(
+                checkpoint.tenantId(), checkpoint.executionId(), checkpoint.interactionId(), checkpoint.correlationId(),
                 request.generation())))
             .orElseGet(AwsDurableControlPlaneActions::emptyResponse);
     }

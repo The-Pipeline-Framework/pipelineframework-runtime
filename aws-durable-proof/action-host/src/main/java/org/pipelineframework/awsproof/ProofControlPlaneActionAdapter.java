@@ -9,7 +9,6 @@ import jakarta.inject.Inject;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.aws.durable.model.AwsDurableActionRequest;
 import org.pipelineframework.aws.durable.model.AwsDurableActionResponse;
 import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
@@ -119,17 +118,15 @@ final class ProofControlPlaneActionAdapter {
 
     private AwsDurableActionResponse pendingAwait(AwsDurableActionRequest request) {
         String executionId = required(request.executionId(), "executionId");
-        Optional<AwaitInteractionRecord> pending = controlPlane.queryPendingAwaitInteractions(
-                request.tenantId(), "", "", "", 100)
+        return controlPlane.getAwaitSemanticCheckpoints(request.tenantId(), executionId, 100)
             .await().atMost(ACTION_TIMEOUT).stream()
-            .filter(record -> executionId.equals(record.executionId()))
-            .findFirst();
-        return pending
-            .map(record -> AwsDurableActionResponse.pendingAwait(new AwsDurableAwaitIdentity(
-                record.tenantId(),
-                record.executionId(),
-                record.interactionId(),
-                record.correlationId(),
+            .filter(checkpoint -> !checkpoint.status().terminal())
+            .findFirst()
+            .map(checkpoint -> AwsDurableActionResponse.pendingAwait(new AwsDurableAwaitIdentity(
+                checkpoint.tenantId(),
+                checkpoint.executionId(),
+                checkpoint.interactionId(),
+                checkpoint.correlationId(),
                 request.generation())))
             .orElseGet(() -> new AwsDurableActionResponse(
                 Optional.empty(), false, Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
@@ -145,9 +142,7 @@ final class ProofControlPlaneActionAdapter {
                 checkpoint.tenantId(), checkpoint.executionId(), checkpoint.interactionId(),
                 checkpoint.correlationId(), checkpoint.unitId(), checkpoint.stepId(), checkpoint.status().name(),
                 checkpoint.pipelineId(), checkpoint.contractVersion(), checkpoint.releaseVersion())))
-            .orElseGet(() -> new AwsDurableActionResponse(
-                Optional.empty(), false, Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
-                java.util.List.of(), false));
+            .orElseThrow(() -> new IllegalStateException("Await semantic checkpoint is not available"));
     }
 
     private AwsDurableActionResponse executionAwaits(AwsDurableActionRequest request) {

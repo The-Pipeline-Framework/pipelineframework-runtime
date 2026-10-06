@@ -197,6 +197,9 @@ Resources:
                   - !GetAtt CallbackBindingTable.Arn
                   - !Sub '${CallbackBindingTable.Arn}/index/provider-execution-index'
               - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query]
+                Resource: !Ref SemanticDynamoResourceArns
+              - Effect: Allow
                 Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
                 Resource: [!Ref AwaitInteractionStreamArn, !GetAtt CallbackBindingTable.StreamArn]
               - Effect: Allow
