@@ -313,7 +313,9 @@ class ItemizedAwaitContinuationFlow {
     return awaitCoordinator.getUnit(command.tenantId(), command.unitId())
         .onItem().transformToUni(unit -> awaitCoordinator.findByUnit(command.tenantId(), command.unitId())
             .onItem().transformToUni(records -> matchingInteraction(command, records)
-                .map(record -> processResolved(command, record, unit, itemContinuationHandler, saturatedDelayMs))
+                .map(record -> awaitCoordinator.recordCompletion(record, command.nowEpochMs())
+                    .chain(completedUnit -> processResolved(
+                        command, record, completedUnit, itemContinuationHandler, saturatedDelayMs)))
                 .orElseGet(() -> Uni.createFrom().item(AwaitItemContinuationResult.notReady(command)))))
         .onItem().transformToUni(result -> recordWorkDisposition(result, saturatedDelayMs));
   }
@@ -364,7 +366,7 @@ class ItemizedAwaitContinuationFlow {
       return Uni.createFrom().item(AwaitItemContinuationResult.alreadyCompleted(command));
     }
     if (unit.hasContinuationCompletionFact(command.itemIndex())) {
-      return Uni.createFrom().item(AwaitItemContinuationResult.alreadyCompleted(command));
+      return reconcileParentRelease(command, record, unit, itemContinuationHandler);
     }
     ItemContinuationKey key = new ItemContinuationKey(
         record.tenantId(), record.executionId(), record.executionId(), record.unitId(), record.itemIndex());
@@ -383,11 +385,19 @@ class ItemizedAwaitContinuationFlow {
           if (!planner.itemContinuationReady(parent, unit)) {
             return Uni.createFrom().item(AwaitItemContinuationResult.notReady(command));
           }
-          Uni<Void> continuation = itemContinuationHandler.continueAwaitItem(
-              record, unit, record.stepIndex() + 1, parent, command.nowEpochMs());
-          return continuation == null
-              ? Uni.createFrom().item(AwaitItemContinuationResult.completed(command))
-              : continuation.replaceWith(AwaitItemContinuationResult.completed(command));
+          return executionStateStore.getExecutionByKey(record.tenantId(),
+                  ItemContinuationKey.from(parent.orElseThrow(), unit, record).childExecutionKey())
+              .chain(child -> {
+                if (child.isPresent() && child.orElseThrow().status() == ExecutionStatus.SUCCEEDED) {
+                  return awaitCoordinator.recordItemContinuationCompleted(
+                          record.tenantId(), unit.unitId(), record.itemIndex(), command.nowEpochMs())
+                      .chain(completedUnit -> reconcileParentRelease(
+                          command, record, completedUnit, itemContinuationHandler));
+                }
+                return itemContinuationHandler.continueAwaitItem(
+                        record, unit, record.stepIndex() + 1, parent, command.nowEpochMs())
+                    .replaceWith(AwaitItemContinuationResult.completed(command));
+              });
         })
         .onFailure().recoverWithUni(failure -> command.attempt() < MAX_ATTEMPTS
             ? Uni.createFrom().item(AwaitItemContinuationResult.retry(
@@ -403,6 +413,19 @@ class ItemizedAwaitContinuationFlow {
         })
         .onFailure().invoke(() -> claims.releaseDispatch(key))
         .onTermination().invoke(permit::close);
+  }
+
+  private Uni<AwaitItemContinuationResult> reconcileParentRelease(
+      AwaitItemContinuationCommand command,
+      AwaitInteractionRecord record,
+      AwaitUnitRecord unit,
+      AwaitItemContinuationHandler itemContinuationHandler) {
+    return executionStateStore.getExecution(record.tenantId(), record.executionId())
+        .chain(parent -> parent
+            .map(current -> itemContinuationHandler.releaseAwaitParentIfReady(
+                current, unit, record.stepIndex() + 1, command.nowEpochMs()))
+            .orElseGet(() -> Uni.createFrom().voidItem()))
+        .replaceWith(AwaitItemContinuationResult.alreadyCompleted(command));
   }
 
   private static AwaitItemContinuationCommand command(

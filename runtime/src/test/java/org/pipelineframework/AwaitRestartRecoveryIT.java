@@ -815,6 +815,8 @@ class AwaitRestartRecoveryIT {
     AwaitCoordinator coordinator = mock(AwaitCoordinator.class);
     when(coordinator.getUnit("tenant-admission", "unit-admission"))
         .thenReturn(Uni.createFrom().item(unit));
+    when(coordinator.recordCompletion(any(), any(Long.class)))
+        .thenReturn(Uni.createFrom().item(unit));
     when(coordinator.findByUnit("tenant-admission", "unit-admission"))
         .thenReturn(Uni.createFrom().item(List.of(interaction)));
     when(coordinator.completeItemContinuation(any()))
@@ -873,7 +875,7 @@ class AwaitRestartRecoveryIT {
       }
     };
     var recoveredResult = flow(
-            DynamoAwaitLifecycleTestStores.executionStoreForExistingState(dynamo, TABLE_PREFIX),
+            DynamoAwaitLifecycleTestStores.executionStoreForCreate(dynamo, TABLE_PREFIX),
             mock(WorkDispatcher.class),
             coordinator)
         .processOne(command.nextAttempt(now + 1L), recoveredHandler, 10L)
