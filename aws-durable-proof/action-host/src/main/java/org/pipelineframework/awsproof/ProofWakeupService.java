@@ -11,9 +11,9 @@ import org.jboss.logging.Logger;
 import org.pipelineframework.awaitable.AwaitCompletionDescriptorRegistry;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.store.DynamoAwaitInteractionStore;
-import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
-import org.pipelineframework.awsproof.model.ProofCallbackBinding;
-import org.pipelineframework.awsproof.model.ProofCallbackSignal;
+import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackSignal;
 import software.amazon.awssdk.services.lambda.model.CallbackTimeoutException;
 import software.amazon.awssdk.services.lambda.model.ResourceNotFoundException;
 
@@ -43,7 +43,7 @@ final class ProofWakeupService {
     @Inject
     ProofAwaitDescriptorFactory descriptorFactory;
 
-    ProofWakeupDisposition wake(ProofAwaitIdentity identity) {
+    ProofWakeupDisposition wake(AwsDurableAwaitIdentity identity) {
         Objects.requireNonNull(identity, "identity");
         descriptorRegistry.register(descriptorFactory.create());
         var interaction = awaitStore.get(identity.tenantId(), identity.interactionId())
@@ -63,8 +63,8 @@ final class ProofWakeupService {
         if (binding.isEmpty()) {
             return ProofWakeupDisposition.RETRY;
         }
-        ProofCallbackBinding current = binding.orElseThrow();
-        Optional<ProofCallbackBinding> latest = bindings.findLatest(identity.tenantId(), identity.interactionId());
+        AwsDurableCallbackBinding current = binding.orElseThrow();
+        Optional<AwsDurableCallbackBinding> latest = bindings.findLatest(identity.tenantId(), identity.interactionId());
         if (latest.isPresent()
             && latest.orElseThrow().awaitIdentity().generation() != identity.generation()) {
             return ProofWakeupDisposition.ACKNOWLEDGE;
@@ -72,7 +72,7 @@ final class ProofWakeupService {
         if (bindings.delivered(current)) {
             return ProofWakeupDisposition.ACKNOWLEDGE;
         }
-        ProofCallbackSignal signal = new ProofCallbackSignal(
+        AwsDurableCallbackSignal signal = new AwsDurableCallbackSignal(
             identity.tenantId(),
             identity.executionId(),
             identity.interactionId(),
@@ -98,7 +98,7 @@ final class ProofWakeupService {
         }
     }
 
-    private ProofWakeupDisposition reconcileUncertain(ProofCallbackBinding binding) {
+    private ProofWakeupDisposition reconcileUncertain(AwsDurableCallbackBinding binding) {
         return switch (callbacks.state(binding)) {
             case SUCCEEDED -> {
                 bindings.recordDelivered(binding, "PROVIDER_STATE_SUCCEEDED");

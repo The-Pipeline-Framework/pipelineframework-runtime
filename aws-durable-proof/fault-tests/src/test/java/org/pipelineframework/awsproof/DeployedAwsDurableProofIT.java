@@ -21,15 +21,15 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
-import org.pipelineframework.awsproof.model.ProofActionRequest;
-import org.pipelineframework.awsproof.model.ProofActionResponse;
-import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
-import org.pipelineframework.awsproof.model.ProofExecutionCheckpoint;
-import org.pipelineframework.awsproof.model.ProofDriverCheckpoint;
-import org.pipelineframework.awsproof.model.ProofExecutionInput;
-import org.pipelineframework.awsproof.model.ProofExecutionNames;
-import org.pipelineframework.awsproof.model.ProofExecutionOutput;
-import org.pipelineframework.awsproof.model.ProofStartResponse;
+import org.pipelineframework.aws.durable.model.AwsDurableActionRequest;
+import org.pipelineframework.aws.durable.model.AwsDurableActionResponse;
+import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionInput;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionNames;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionOutput;
+import org.pipelineframework.aws.durable.model.AwsDurableStartResponse;
 import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
@@ -123,15 +123,15 @@ class DeployedAwsDurableProofIT {
     void repeatedIngressAndSubmitUncertaintyPreserveOneTpfExecution() throws Exception {
         evidence("idempotent-ingress", () -> {
             String suffix = suffix();
-            ProofExecutionInput input = input(suffix, 1);
-            String executionName = ProofExecutionNames.durableExecutionName(
+            AwsDurableExecutionInput input = input(suffix, 1);
+            String executionName = AwsDurableExecutionNames.durableExecutionName(
                 input.tenantId(), input.idempotencyKey(), input.generation());
             arm("ingress-after-provider-start", executionName);
             arm("submit-before-tpf-commit", "*");
             arm("submit-after-tpf-commit", "*");
             var lostResponse = invokeRaw(stack.output("IngressFunctionName"), input);
             assertThat(lostResponse.functionError()).isNotBlank();
-            ProofStartResponse second = start(input);
+            AwsDurableStartResponse second = start(input);
 
             assertThat(second.durableExecutionName()).isEqualTo(executionName);
             AwaitRequest await = awaitRequest(second);
@@ -147,8 +147,8 @@ class DeployedAwsDurableProofIT {
         evidence("worker-redelivery", () -> {
             setQueueMapping(stack.output("WorkQueueMappingId"), false);
             try {
-                ProofExecutionInput input = input(suffix(), 1);
-                ProofStartResponse start = start(input);
+                AwsDurableExecutionInput input = input(suffix(), 1);
+                AwsDurableStartResponse start = start(input);
                 String workBody = receiveBody(stack.output("WorkQueueUrl"), false);
                 sqs.sendMessage(SendMessageRequest.builder().queueUrl(stack.output("WorkQueueUrl"))
                     .messageBody(workBody).build());
@@ -169,7 +169,7 @@ class DeployedAwsDurableProofIT {
         evidence("transition-redelivery", () -> {
             setQueueMapping(stack.output("TransitionQueueMappingId"), false);
             try {
-                ProofStartResponse start = start(input(suffix(), 1));
+                AwsDurableStartResponse start = start(input(suffix(), 1));
                 String transition = receiveBody(stack.output("TransitionRequestQueueUrl"), false);
                 sqs.sendMessage(SendMessageRequest.builder().queueUrl(stack.output("TransitionRequestQueueUrl"))
                     .messageBody(transition).build());
@@ -193,7 +193,7 @@ class DeployedAwsDurableProofIT {
         evidence("binding-races", () -> {
             for (String point : List.of("bind-before-provider-binding", "bind-after-provider-binding")) {
                 arm(point, "*");
-                ProofStartResponse start = start(input(suffix(), 1));
+                AwsDurableStartResponse start = start(input(suffix(), 1));
                 AwaitRequest await = awaitRequest(start);
                 complete(await, point);
                 waitFor(() -> binding(await, 1), FLOW_TIMEOUT);
@@ -205,7 +205,7 @@ class DeployedAwsDurableProofIT {
             setMapping(stack.output("AwaitStreamMappingId"), false);
             setMapping(stack.output("BindingStreamMappingId"), false);
             try {
-                ProofStartResponse start = start(input(suffix(), 1));
+                AwsDurableStartResponse start = start(input(suffix(), 1));
                 AwaitRequest await = awaitRequest(start);
                 complete(await, "completion-with-streams-disabled");
                 invoke(stack.output("ReconcilerFunctionName"), Map.of());
@@ -224,7 +224,7 @@ class DeployedAwsDurableProofIT {
                 "callback-api-throttled",
                 "wakeup-before-provider-callback",
                 "wakeup-after-provider-callback")) {
-                ProofStartResponse start = start(input(suffix(), 1));
+                AwsDurableStartResponse start = start(input(suffix(), 1));
                 AwaitRequest await = awaitRequest(start);
                 arm(point, await.executionId());
                 complete(await, point);
@@ -251,9 +251,9 @@ class DeployedAwsDurableProofIT {
                 "wakeup-after-provider-callback");
             for (int repetition = 0; repetition < repetitions; repetition++) {
                 String suffix = "random-" + repetition + "-" + suffix();
-                ProofExecutionInput input = input(suffix, 1);
+                AwsDurableExecutionInput input = input(suffix, 1);
                 arm(bindingFaults.get(random.nextInt(bindingFaults.size())), "*");
-                ProofStartResponse start = start(input);
+                AwsDurableStartResponse start = start(input);
                 AwaitRequest await = awaitRequest(start);
                 if (random.nextBoolean()) {
                     waitFor(() -> binding(await, 1), FLOW_TIMEOUT);
@@ -279,7 +279,7 @@ class DeployedAwsDurableProofIT {
     void expiredProviderCallbackStartsAReplacementGeneration() throws Exception {
         evidence("callback-expiry-recovery", () -> {
             String suffix = "callback-expiry-" + suffix();
-            ProofExecutionInput input = new ProofExecutionInput(
+            AwsDurableExecutionInput input = new AwsDurableExecutionInput(
                 "tenant-" + suffix,
                 "execution-key-" + suffix,
                 "aws-durable-proof",
@@ -288,7 +288,7 @@ class DeployedAwsDurableProofIT {
                 "{\"request\":\"" + suffix + "\",\"callbackExpiryProbe\":true}",
                 Optional.empty(),
                 1);
-            ProofStartResponse first = start(input);
+            AwsDurableStartResponse first = start(input);
             AwaitRequest await = awaitRequest(first);
             Execution firstExecution = execution(first.durableExecutionName());
             waitFor(() -> lambda.getDurableExecution(GetDurableExecutionRequest.builder()
@@ -302,7 +302,7 @@ class DeployedAwsDurableProofIT {
                     "durableExecutionArn", firstExecution.durableExecutionArn())));
             waitFor(() -> binding(await, 2), FLOW_TIMEOUT);
             complete(await, "callback-expiry-replacement");
-            String replacementName = ProofExecutionNames.durableExecutionName(
+            String replacementName = AwsDurableExecutionNames.durableExecutionName(
                 await.tenantId(), await.executionId(), 2);
             assertSucceeded(execution(replacementName));
         });
@@ -312,11 +312,11 @@ class DeployedAwsDurableProofIT {
     void generationFenceAndHistoryReconstructionRejectStaleBindings() throws Exception {
         evidence("generation-fence", () -> {
             String suffix = suffix();
-            ProofExecutionInput firstInput = input(suffix, 1);
-            ProofStartResponse first = start(firstInput);
+            AwsDurableExecutionInput firstInput = input(suffix, 1);
+            AwsDurableStartResponse first = start(firstInput);
             AwaitRequest await = awaitRequest(first);
             waitFor(() -> binding(await, 1), FLOW_TIMEOUT);
-            ProofStartResponse replacement = start(input(suffix, 2));
+            AwsDurableStartResponse replacement = start(input(suffix, 2));
             waitFor(() -> binding(await, 2), FLOW_TIMEOUT);
             complete(await, "new-generation");
             assertSucceeded(execution(replacement.durableExecutionName()));
@@ -327,7 +327,7 @@ class DeployedAwsDurableProofIT {
         });
 
         evidence("binding-reconstruction", () -> {
-            ProofStartResponse start = start(input(suffix(), 1));
+            AwsDurableStartResponse start = start(input(suffix(), 1));
             AwaitRequest await = awaitRequest(start);
             Map<String, AttributeValue> binding = waitFor(() -> binding(await, 1), FLOW_TIMEOUT);
             dynamo.deleteItem(DeleteItemRequest.builder().tableName(stack.output("BindingTableName"))
@@ -342,7 +342,7 @@ class DeployedAwsDurableProofIT {
     @Test
     void mixedStreamBatchAndClosedCallbacksHaveDeterministicDisposition() throws Exception {
         evidence("partial-stream-batch", () -> {
-            ProofStartResponse start = start(input(suffix(), 1));
+            AwsDurableStartResponse start = start(input(suffix(), 1));
             AwaitRequest await = awaitRequest(start);
             complete(await, "partial-batch");
             assertSucceeded(execution(start.durableExecutionName()));
@@ -365,7 +365,7 @@ class DeployedAwsDurableProofIT {
         });
 
         evidence("closed-callback", () -> {
-            ProofStartResponse start = start(input(suffix(), 1));
+            AwsDurableStartResponse start = start(input(suffix(), 1));
             AwaitRequest await = awaitRequest(start);
             Execution running = execution(start.durableExecutionName());
             lambda.stopDurableExecution(StopDurableExecutionRequest.builder()
@@ -373,7 +373,7 @@ class DeployedAwsDurableProofIT {
             complete(await, "closed-callback");
             invoke(stack.output("ReconcilerFunctionName"), Map.of());
             assertThat(waitFor(() -> deliveryEvidence(await, 1), FLOW_TIMEOUT)).isNotEmpty();
-            String replacementName = ProofExecutionNames.durableExecutionName(
+            String replacementName = AwsDurableExecutionNames.durableExecutionName(
                 await.tenantId(), await.executionId(), 2);
             assertSucceeded(execution(replacementName));
         });
@@ -382,7 +382,7 @@ class DeployedAwsDurableProofIT {
     @Test
     void parkedExecutionSurvivesAliasVersionChange() throws Exception {
         evidence("version-survival", () -> {
-            ProofStartResponse start = start(input(suffix(), 1));
+            AwsDurableStartResponse start = start(input(suffix(), 1));
             AwaitRequest await = awaitRequest(start);
             Execution parked = execution(start.durableExecutionName());
             String originalVersion = functionVersion(parked.functionArn());
@@ -433,9 +433,9 @@ class DeployedAwsDurableProofIT {
     void workerRetryExhaustionKeepsTpfDlqAndRedriveAuthority() throws Exception {
         evidence("tpf-retry-redrive", () -> {
             String suffix = "retry-" + suffix();
-            ProofExecutionInput input = input(suffix, 1);
+            AwsDurableExecutionInput input = input(suffix, 1);
             armPersistent("pipeline-transition", suffix);
-            ProofStartResponse first = start(input);
+            AwsDurableStartResponse first = start(input);
             Map<String, AttributeValue> failed = waitFor(() -> executionForTenant(input.tenantId())
                 .filter(item -> "FAILED".equals(item.get("status").s())), Duration.ofMinutes(8));
             assertThat(queueDepth(stack.output("WorkDlqUrl"))).isGreaterThan(0);
@@ -443,19 +443,19 @@ class DeployedAwsDurableProofIT {
             long version = Long.parseLong(failed.get("version").n());
             clearPersistent("pipeline-transition", suffix);
 
-            ProofDriverCheckpoint checkpoint = new ProofDriverCheckpoint(
-                new ProofExecutionCheckpoint(
+            AwsDurableDriverCheckpoint checkpoint = new AwsDurableDriverCheckpoint(
+                new AwsDurableExecutionCheckpoint(
                     input.tenantId(), executionId, input.pipelineId(), input.contractVersion(),
                     input.releaseVersion()),
                 1);
-            ProofActionResponse redrive = invokeAction(ProofActionRequest.redrive(
+            AwsDurableActionResponse redrive = invokeAction(AwsDurableActionRequest.redrive(
                 checkpoint, version, "deployed proof retry exhaustion"));
             assertThat(redrive.executionStatus()).contains("QUEUED");
 
-            ProofExecutionInput replacementInput = new ProofExecutionInput(
+            AwsDurableExecutionInput replacementInput = new AwsDurableExecutionInput(
                 input.tenantId(), executionId, input.pipelineId(), input.contractVersion(), input.releaseVersion(),
                 "{}", Optional.of(executionId), 2);
-            ProofStartResponse replacement = start(replacementInput);
+            AwsDurableStartResponse replacement = start(replacementInput);
             AwaitRequest await = awaitRequest(replacement);
             complete(await, "redrive-" + suffix);
             assertSucceeded(execution(replacement.durableExecutionName()));
@@ -467,7 +467,7 @@ class DeployedAwsDurableProofIT {
     void awsSchedulesAwaitDeadlineButTpfAdmitsTheSemanticTimeout() throws Exception {
         evidence("await-deadline", () -> {
             String suffix = "deadline-" + suffix();
-            ProofExecutionInput input = new ProofExecutionInput(
+            AwsDurableExecutionInput input = new AwsDurableExecutionInput(
                 "tenant-" + suffix,
                 "execution-key-" + suffix,
                 "aws-durable-proof",
@@ -476,7 +476,7 @@ class DeployedAwsDurableProofIT {
                 "{\"request\":\"" + suffix + "\",\"deadlineProbe\":true}",
                 Optional.empty(),
                 1);
-            ProofStartResponse start = start(input);
+            AwsDurableStartResponse start = start(input);
             AwaitRequest await = awaitRequest(start);
 
             var failed = waitFor(() -> {
@@ -496,8 +496,8 @@ class DeployedAwsDurableProofIT {
     @Test
     void providerHistoryLossRecoversFromTheTpfSemanticCheckpoint() throws Exception {
         evidence("provider-history-loss-recovery", () -> {
-            ProofExecutionInput input = input("history-loss-" + suffix(), 1);
-            ProofStartResponse first = start(input);
+            AwsDurableExecutionInput input = input("history-loss-" + suffix(), 1);
+            AwsDurableStartResponse first = start(input);
             AwaitRequest await = awaitRequest(first);
             waitFor(() -> binding(await, 1), FLOW_TIMEOUT);
             Execution providerExecution = execution(first.durableExecutionName());
@@ -519,7 +519,7 @@ class DeployedAwsDurableProofIT {
             waitFor(() -> binding(await, 2), FLOW_TIMEOUT);
             complete(await, "provider-history-loss");
 
-            String replacementName = ProofExecutionNames.durableExecutionName(
+            String replacementName = AwsDurableExecutionNames.durableExecutionName(
                 await.tenantId(), await.executionId(), 2);
             var terminal = assertSucceeded(execution(replacementName));
             assertTerminalAwaitResult(terminal, await.executionId(), 2);
@@ -538,8 +538,8 @@ class DeployedAwsDurableProofIT {
         }
     }
 
-    private static ProofExecutionInput input(String suffix, long generation) {
-        return new ProofExecutionInput(
+    private static AwsDurableExecutionInput input(String suffix, long generation) {
+        return new AwsDurableExecutionInput(
             "tenant-" + suffix,
             "execution-key-" + suffix,
             "aws-durable-proof",
@@ -550,9 +550,9 @@ class DeployedAwsDurableProofIT {
             generation);
     }
 
-    private static ProofStartResponse start(ProofExecutionInput input) throws Exception {
-        ProofStartResponse response = JSON.treeToValue(
-            invoke(stack.output("IngressFunctionName"), input), ProofStartResponse.class);
+    private static AwsDurableStartResponse start(AwsDurableExecutionInput input) throws Exception {
+        AwsDurableStartResponse response = JSON.treeToValue(
+            invoke(stack.output("IngressFunctionName"), input), AwsDurableStartResponse.class);
         START_TENANTS.put(response.durableExecutionName(), input.tenantId());
         return response;
     }
@@ -575,8 +575,8 @@ class DeployedAwsDurableProofIT {
             .build());
     }
 
-    private static ProofActionResponse invokeAction(ProofActionRequest request) throws Exception {
-        return JSON.treeToValue(invoke(stack.output("ActionFunctionName"), request), ProofActionResponse.class);
+    private static AwsDurableActionResponse invokeAction(AwsDurableActionRequest request) throws Exception {
+        return JSON.treeToValue(invoke(stack.output("ActionFunctionName"), request), AwsDurableActionResponse.class);
     }
 
     private static Execution execution(String executionName) {
@@ -610,13 +610,13 @@ class DeployedAwsDurableProofIT {
         String expectedExecutionId,
         long expectedGeneration
     ) throws Exception {
-        ProofExecutionOutput output = JSON.readValue(execution.result(), ProofExecutionOutput.class);
+        AwsDurableExecutionOutput output = JSON.readValue(execution.result(), AwsDurableExecutionOutput.class);
         assertThat(output.executionId()).isEqualTo(expectedExecutionId);
         assertThat(output.generation()).isEqualTo(expectedGeneration);
         assertThat(JSON.readTree(output.resultJson()).asText()).isEqualTo("approved-result");
     }
 
-    private static AwaitRequest awaitRequest(ProofStartResponse start) {
+    private static AwaitRequest awaitRequest(AwsDurableStartResponse start) {
         String expectedTenant = Optional.ofNullable(START_TENANTS.get(start.durableExecutionName()))
             .orElseThrow(() -> new IllegalStateException(
                 "proof start is missing its test tenant: " + start.durableExecutionName()));

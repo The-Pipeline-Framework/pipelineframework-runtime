@@ -7,9 +7,9 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import org.jboss.logging.Logger;
-import org.pipelineframework.awsproof.model.ProofCallbackBinding;
-import org.pipelineframework.awsproof.model.ProofExecutionInput;
-import org.pipelineframework.awsproof.model.ProofStartResponse;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionInput;
+import org.pipelineframework.aws.durable.model.AwsDurableStartResponse;
 
 @ApplicationScoped
 final class ProofDriverRecoveryService {
@@ -29,7 +29,7 @@ final class ProofDriverRecoveryService {
 
     boolean recoverClosed(String providerExecutionArn) {
         Objects.requireNonNull(providerExecutionArn, "providerExecutionArn");
-        Optional<ProofCallbackBinding> candidate = bindings.scanOpen(100).stream()
+        Optional<AwsDurableCallbackBinding> candidate = bindings.scanOpen(100).stream()
             .filter(binding -> providerExecutionArn.equals(binding.providerExecutionArn()))
             .findFirst();
         return candidate.map(this::recoverClosed).orElse(false);
@@ -37,7 +37,7 @@ final class ProofDriverRecoveryService {
 
     int recoverClosedBindings() {
         int recovered = 0;
-        for (ProofCallbackBinding binding : bindings.scanOpen(100)) {
+        for (AwsDurableCallbackBinding binding : bindings.scanOpen(100)) {
             try {
                 if (callbacks.state(binding) == ProofProviderCallbackState.CLOSED && recover(binding)) {
                     recovered++;
@@ -51,14 +51,14 @@ final class ProofDriverRecoveryService {
         return recovered;
     }
 
-    private boolean recoverClosed(ProofCallbackBinding binding) {
+    private boolean recoverClosed(AwsDurableCallbackBinding binding) {
         return callbacks.state(binding) == ProofProviderCallbackState.CLOSED && recover(binding);
     }
 
-    private boolean recover(ProofCallbackBinding binding) {
-        ProofExecutionInput input = ProofExecutionInput.resume(
+    private boolean recover(AwsDurableCallbackBinding binding) {
+        AwsDurableExecutionInput input = AwsDurableExecutionInput.resume(
             binding.awaitIdentity(), PIPELINE_ID, CONTRACT_VERSION, RELEASE_VERSION);
-        ProofStartResponse response = starter.start(input);
+        AwsDurableStartResponse response = starter.start(input);
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             return false;
         }

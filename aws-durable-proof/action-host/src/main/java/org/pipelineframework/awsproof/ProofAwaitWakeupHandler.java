@@ -15,7 +15,7 @@ import com.amazonaws.services.lambda.runtime.events.DynamodbEvent;
 import com.amazonaws.services.lambda.runtime.events.StreamsEventResponse;
 import com.amazonaws.services.lambda.runtime.events.models.dynamodb.AttributeValue;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
-import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
+import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
 
 @Named("proof-await-wakeup")
 @ApplicationScoped
@@ -37,7 +37,7 @@ public final class ProofAwaitWakeupHandler implements RequestHandler<DynamodbEve
             try {
                 Map<String, AttributeValue> newImage = record.getDynamodb().getNewImage();
                 Map<String, AttributeValue> oldImage = record.getDynamodb().getOldImage();
-                Optional<ProofAwaitIdentity> identity = identity(newImage);
+                Optional<AwsDurableAwaitIdentity> identity = identity(newImage);
                 if (identity.isEmpty() && (newImage == null || newImage.isEmpty())) {
                     identity = bindingIdentity(oldImage);
                     identity.ifPresent(this::reconstruct);
@@ -60,13 +60,13 @@ public final class ProofAwaitWakeupHandler implements RequestHandler<DynamodbEve
             .orElse("");
     }
 
-    private Optional<ProofAwaitIdentity> identity(Map<String, AttributeValue> image) {
+    private Optional<AwsDurableAwaitIdentity> identity(Map<String, AttributeValue> image) {
         if (image == null || image.isEmpty()) {
             return Optional.empty();
         }
         String recordType = text(image, ProofCallbackBindingRepository.RECORD_TYPE).orElse("");
         if (ProofCallbackBindingRepository.BINDING.equals(recordType)) {
-            return Optional.of(new ProofAwaitIdentity(
+            return Optional.of(new AwsDurableAwaitIdentity(
                 text(image, "tenant_id").orElseThrow(),
                 text(image, "execution_id").orElseThrow(),
                 text(image, "interaction_id").orElseThrow(),
@@ -92,7 +92,7 @@ public final class ProofAwaitWakeupHandler implements RequestHandler<DynamodbEve
             }))
             .orElseThrow(() -> new IllegalStateException(
                 "provider callback registration is not available yet"));
-        ProofAwaitIdentity identity = new ProofAwaitIdentity(
+        AwsDurableAwaitIdentity identity = new AwsDurableAwaitIdentity(
             tenantId, executionId, interactionId, correlationId, registration.checkpoint().generation());
         bindings.bind(registration.bind(identity));
         return AwaitInteractionStatus.COMPLETED.name().equals(status)
@@ -100,13 +100,13 @@ public final class ProofAwaitWakeupHandler implements RequestHandler<DynamodbEve
             : Optional.empty();
     }
 
-    private Optional<ProofAwaitIdentity> bindingIdentity(Map<String, AttributeValue> image) {
+    private Optional<AwsDurableAwaitIdentity> bindingIdentity(Map<String, AttributeValue> image) {
         if (image == null || image.isEmpty()
             || !ProofCallbackBindingRepository.BINDING.equals(
                 text(image, ProofCallbackBindingRepository.RECORD_TYPE).orElse(""))) {
             return Optional.empty();
         }
-        return Optional.of(new ProofAwaitIdentity(
+        return Optional.of(new AwsDurableAwaitIdentity(
             text(image, "tenant_id").orElseThrow(),
             text(image, "execution_id").orElseThrow(),
             text(image, "interaction_id").orElseThrow(),
@@ -114,7 +114,7 @@ public final class ProofAwaitWakeupHandler implements RequestHandler<DynamodbEve
             number(image, "generation").orElseThrow()));
     }
 
-    private void reconstruct(ProofAwaitIdentity identity) {
+    private void reconstruct(AwsDurableAwaitIdentity identity) {
         resolver.reconstruct(identity).ifPresent(bindings::bind);
     }
 

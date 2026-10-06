@@ -12,11 +12,11 @@ import com.amazonaws.services.lambda.runtime.Context;
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.awaitable.AwaitCompletionDescriptor;
 import org.pipelineframework.awaitable.AwaitCompletionDescriptorRegistry;
-import org.pipelineframework.awsproof.model.ProofActionRequest;
-import org.pipelineframework.awsproof.model.ProofActionResponse;
-import org.pipelineframework.awsproof.model.ProofDriverCheckpoint;
-import org.pipelineframework.awsproof.model.ProofExecutionCheckpoint;
-import org.pipelineframework.awsproof.model.ProofExecutionInput;
+import org.pipelineframework.aws.durable.model.AwsDurableActionRequest;
+import org.pipelineframework.aws.durable.model.AwsDurableActionResponse;
+import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionInput;
 
 class ProofActionGatewayHandlerTest {
 
@@ -33,9 +33,9 @@ class ProofActionGatewayHandlerTest {
         handler.descriptorRegistry = descriptors;
         handler.descriptorFactory = descriptorFactory;
 
-        ProofActionRequest submit = ProofActionRequest.submit(new ProofExecutionInput(
+        AwsDurableActionRequest submit = AwsDurableActionRequest.submit(new AwsDurableExecutionInput(
             "tenant", "key", "pipeline", "contract", "release", "{}", Optional.empty(), 1));
-        ProofActionResponse submitted = ProofActionResponse.status("QUEUED");
+        AwsDurableActionResponse submitted = AwsDurableActionResponse.status("QUEUED");
         when(controlPlane.handle(submit)).thenReturn(submitted);
 
         assertThat(handler.handleRequest(submit, mock(Context.class)))
@@ -43,15 +43,15 @@ class ProofActionGatewayHandlerTest {
         verify(controlPlane).handle(submit);
         verifyNoInteractions(durableHost);
 
-        ProofActionRequest register = ProofActionRequest.register(
-            new ProofDriverCheckpoint(
-                new ProofExecutionCheckpoint(
+        AwsDurableActionRequest register = AwsDurableActionRequest.register(
+            new AwsDurableDriverCheckpoint(
+                new AwsDurableExecutionCheckpoint(
                     "tenant", "execution", "pipeline", "contract", "release"),
                 1),
             "provider-name",
             "arn:aws:lambda:region:account:function:name:1/durable-execution/id",
             "callback");
-        ProofActionResponse registered = ProofActionResponse.bound(true);
+        AwsDurableActionResponse registered = AwsDurableActionResponse.bound(true);
         when(durableHost.handle(register)).thenReturn(registered);
 
         assertThat(handler.handleRequest(register, mock(Context.class)))

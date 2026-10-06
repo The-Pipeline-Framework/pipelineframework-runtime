@@ -155,6 +155,10 @@ Resources:
         - {AttributeName: query_pending_deadline_sort, AttributeType: S}
         - {AttributeName: query_deadline_key, AttributeType: S}
         - {AttributeName: query_deadline_sort, AttributeType: S}
+        - {AttributeName: query_continuation_key, AttributeType: S}
+        - {AttributeName: query_continuation_due_epoch_ms, AttributeType: N}
+        - {AttributeName: query_execution_key, AttributeType: S}
+        - {AttributeName: query_execution_sort, AttributeType: S}
       KeySchema:
         - {AttributeName: tenant_id, KeyType: HASH}
         - {AttributeName: interaction_id, KeyType: RANGE}
@@ -188,6 +192,16 @@ Resources:
           KeySchema:
             - {AttributeName: query_deadline_key, KeyType: HASH}
             - {AttributeName: query_deadline_sort, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: await-interaction-continuation-work
+          KeySchema:
+            - {AttributeName: query_continuation_key, KeyType: HASH}
+            - {AttributeName: query_continuation_due_epoch_ms, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: await-interaction-by-execution
+          KeySchema:
+            - {AttributeName: query_execution_key, KeyType: HASH}
+            - {AttributeName: query_execution_sort, KeyType: RANGE}
           Projection: {ProjectionType: ALL}
       StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
       TimeToLiveSpecification: {AttributeName: ttl_epoch_s, Enabled: true}
@@ -362,7 +376,7 @@ Resources:
       Code:
         S3Bucket: !Ref ArtifactBucket
         S3Key: !Ref DurableArtifactKey
-      Handler: org.pipelineframework.awsproof.AwsDurableCoordinatorHandler::handleRequest
+      Handler: org.pipelineframework.aws.durable.AwsDurableCoordinatorHandler::handleRequest
       Runtime: java21
       Architectures: [arm64]
       Role: !GetAtt DurableExecutionRole.Arn
@@ -375,7 +389,7 @@ Resources:
         RetentionPeriodInDays: 30
       Environment:
         Variables:
-          TPF_PROOF_ACTION_FUNCTION: !Sub '${AWS::StackName}-action'
+          TPF_AWS_DURABLE_ACTION_FUNCTION: !Sub '${AWS::StackName}-action'
       Tags:
         - {Key: issue, Value: '976'}
         - {Key: purpose, Value: aws-durable-proof}

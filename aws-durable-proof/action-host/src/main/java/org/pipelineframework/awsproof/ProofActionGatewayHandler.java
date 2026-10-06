@@ -9,13 +9,13 @@ import jakarta.inject.Named;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
 import org.pipelineframework.awaitable.AwaitCompletionDescriptorRegistry;
-import org.pipelineframework.awsproof.model.ProofActionRequest;
-import org.pipelineframework.awsproof.model.ProofActionResponse;
+import org.pipelineframework.aws.durable.model.AwsDurableActionRequest;
+import org.pipelineframework.aws.durable.model.AwsDurableActionResponse;
 
 /** One synchronous Lambda invocation maps to one existing bounded TPF or host-mechanical action. */
 @Named("proof-action-gateway")
 @ApplicationScoped
-public final class ProofActionGatewayHandler implements RequestHandler<ProofActionRequest, ProofActionResponse> {
+public final class ProofActionGatewayHandler implements RequestHandler<AwsDurableActionRequest, AwsDurableActionResponse> {
     @Inject
     ProofControlPlaneActionAdapter controlPlaneActions;
 
@@ -29,11 +29,12 @@ public final class ProofActionGatewayHandler implements RequestHandler<ProofActi
     ProofAwaitDescriptorFactory descriptorFactory;
 
     @Override
-    public ProofActionResponse handleRequest(ProofActionRequest request, Context context) {
+    public AwsDurableActionResponse handleRequest(AwsDurableActionRequest request, Context context) {
         Objects.requireNonNull(request, "request");
         descriptorRegistry.register(descriptorFactory.create());
         return switch (request.operation()) {
-            case SUBMIT, STATUS, RESULT, REDRIVE, SWEEP, QUERY_PENDING_AWAIT ->
+            case SUBMIT, STATUS, RESULT, REDRIVE, SWEEP, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT,
+                READ_EXECUTION_AWAITS ->
                 controlPlaneActions.handle(request);
             case REGISTER_CALLBACK, BIND_CALLBACK -> durableHostActions.handle(request);
         };

@@ -1,0 +1,414 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Supported TPF QUEUE_ASYNC coordination host using AWS Lambda Durable Functions
+
+Parameters:
+  DurableArtifactBucket: {Type: String}
+  DurableArtifactKey: {Type: String}
+  DurableCodeSha256: {Type: String}
+  ActionArtifactUri:
+    Type: String
+    Description: S3 URI for the generated Quarkus action and worker Lambda package
+  AwaitInteractionStreamArn: {Type: String}
+  SemanticDynamoResourceArns:
+    Type: CommaDelimitedList
+    Description: Exact TPF semantic table and index ARNs required by the action host
+  ResumeTokenSecret: {Type: String, NoEcho: true, MinLength: 32}
+  WorkerSharedSecret: {Type: String, NoEcho: true, MinLength: 32}
+  DurableExecutionTimeoutSeconds: {Type: Number, Default: 2592000, MinValue: 1, MaxValue: 31536000}
+  DurableRetentionDays: {Type: Number, Default: 30, MinValue: 1, MaxValue: 90}
+  DurableAlias: {Type: String, Default: live, AllowedPattern: '[A-Za-z0-9-_]+'}
+  ActionHandler: {Type: String, Default: aws-durable-action}
+  WorkHandler: {Type: String, Default: aws-durable-work-item}
+  AwaitCompletionHandler: {Type: String, Default: aws-durable-await-completion}
+  TransitionWorkerHandler: {Type: String, Default: aws-durable-transition-worker}
+  AwaitWakeupHandler: {Type: String, Default: aws-durable-await-wakeup}
+  ReconciliationHandler: {Type: String, Default: aws-durable-reconcile}
+
+Globals:
+  Function:
+    Runtime: java21
+    Architectures: [arm64]
+    Tracing: Active
+    Tags: {tpf-coordination-host: aws-durable}
+
+Resources:
+  CallbackBindingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+        - {AttributeName: provider_execution_arn, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: provider-execution-index
+          KeySchema: [{AttributeName: provider_execution_arn, KeyType: HASH}]
+          Projection: {ProjectionType: ALL}
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+      TimeToLiveSpecification: {AttributeName: expires_at_epoch_s, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  WorkDlq:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600}
+  WorkQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 900
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt WorkDlq.Arn, maxReceiveCount: 5}
+  AwaitCompletionDlq:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600}
+  AwaitCompletionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt AwaitCompletionDlq.Arn, maxReceiveCount: 5}
+  TransitionDlq:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600}
+  TransitionRequestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 900
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt TransitionDlq.Arn, maxReceiveCount: 5}
+  TransitionResponseQueue:
+    Type: AWS::SQS::Queue
+    Properties: {VisibilityTimeout: 180, MessageRetentionPeriod: 1209600}
+  DurableDlq:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600}
+  StreamFailureDlq:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600}
+
+  DurableRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: durable-checkpoint-and-action
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['lambda:CheckpointDurableExecution', 'lambda:GetDurableExecutionState']
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:*'
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-action'
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DurableDlq.Arn
+
+  IngressRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: start-durable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Ref DurableAliasResource
+
+  ActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: bounded-tpf-actions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
+                  dynamodb:BatchGetItem, dynamodb:ConditionCheckItem, dynamodb:TransactWriteItems,
+                  dynamodb:Query, dynamodb:DescribeTable]
+                Resource: !Ref SemanticDynamoResourceArns
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+                Resource: !GetAtt CallbackBindingTable.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: [!GetAtt WorkQueue.Arn, !GetAtt TransitionRequestQueue.Arn]
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: sqs-worker-boundary
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: [!GetAtt WorkQueue.Arn, !GetAtt AwaitCompletionQueue.Arn, !GetAtt TransitionRequestQueue.Arn]
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: [!GetAtt TransitionResponseQueue.Arn, !GetAtt WorkDlq.Arn,
+                  !GetAtt AwaitCompletionDlq.Arn, !GetAtt TransitionDlq.Arn]
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource: !Ref SemanticDynamoResourceArns
+
+  WakeupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: callback-binding-and-wakeup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt CallbackBindingTable.Arn
+                  - !Sub '${CallbackBindingTable.Arn}/index/provider-execution-index'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query]
+                Resource: !Ref SemanticDynamoResourceArns
+              - Effect: Allow
+                Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
+                Resource: [!Ref AwaitInteractionStreamArn, !GetAtt CallbackBindingTable.StreamArn]
+              - Effect: Allow
+                Action: [lambda:GetDurableExecution, lambda:GetDurableExecutionHistory,
+                  lambda:SendDurableExecutionCallbackSuccess, lambda:InvokeFunction]
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:*'
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ActionFunction.Arn
+
+  DurableFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn-lint: {config: {ignore_checks: [E3002]}}
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-durable'
+      Code: {S3Bucket: !Ref DurableArtifactBucket, S3Key: !Ref DurableArtifactKey}
+      Handler: org.pipelineframework.aws.durable.AwsDurableCoordinatorHandler::handleRequest
+      Runtime: java21
+      Architectures: [arm64]
+      Role: !GetAtt DurableRole.Arn
+      MemorySize: 1024
+      Timeout: 900
+      DeadLetterConfig: {TargetArn: !GetAtt DurableDlq.Arn}
+      DurableConfig:
+        ExecutionTimeout: !Ref DurableExecutionTimeoutSeconds
+        RetentionPeriodInDays: !Ref DurableRetentionDays
+      Environment:
+        Variables: {TPF_AWS_DURABLE_ACTION_FUNCTION: !Ref ActionFunction}
+
+  DurableVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref DurableFunction
+      CodeSha256: !Ref DurableCodeSha256
+      Description: TPF AWS Durable QUEUE_ASYNC coordination host
+  DurableAliasResource:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: !Ref DurableAlias
+      FunctionName: !Ref DurableFunction
+      FunctionVersion: !GetAtt DurableVersion.Version
+
+  ActionFunction: &ActionFunction
+    Type: AWS::Serverless::Function
+    Properties: &ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-action'
+      CodeUri: !Ref ActionArtifactUri
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt ActionRole.Arn
+      MemorySize: 1536
+      Timeout: 120
+      Environment:
+        Variables: &ActionEnvironment
+          PIPELINE_ORCHESTRATOR_COORDINATION_HOST: AWS_DURABLE
+          PIPELINE_ORCHESTRATOR_PROCESS_LOOPS_DISABLED: 'true'
+          PIPELINE_ORCHESTRATOR_QUEUE_URL: !Ref WorkQueue
+          PIPELINE_ORCHESTRATOR_DLQ_URL: !Ref WorkDlq
+          PIPELINE_ORCHESTRATOR_RESUME_TOKEN_SECRET: !Ref ResumeTokenSecret
+          PIPELINE_ORCHESTRATOR_WORKER_SQS_REQUEST_QUEUE_URL: !Ref TransitionRequestQueue
+          PIPELINE_ORCHESTRATOR_WORKER_SQS_RESPONSE_QUEUE_URL: !Ref TransitionResponseQueue
+          PIPELINE_ORCHESTRATOR_WORKER_SQS_SHARED_SECRET: !Ref WorkerSharedSecret
+          TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
+          TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
+          TPF_AWS_DURABLE_QUALIFIER: !Ref DurableAlias
+          QUARKUS_LAMBDA_HANDLER: !Ref ActionHandler
+
+  IngressFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: {S3Bucket: !Ref DurableArtifactBucket, S3Key: !Ref DurableArtifactKey}
+      Handler: org.pipelineframework.aws.durable.AwsDurableIngressHandler::handleRequest
+      Runtime: java21
+      Architectures: [arm64]
+      Role: !GetAtt IngressRole.Arn
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          TPF_AWS_DURABLE_FUNCTION: !Ref DurableFunction
+          TPF_AWS_DURABLE_QUALIFIER: !Ref DurableAlias
+
+  WorkFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-work'
+      Role: !GetAtt WorkerRole.Arn
+      Timeout: 900
+      Environment:
+        Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref WorkHandler}
+      Events:
+        Work: {Type: SQS, Properties: {Queue: !GetAtt WorkQueue.Arn, BatchSize: 1,
+          FunctionResponseTypes: [ReportBatchItemFailures], ScalingConfig: {MaximumConcurrency: 32}}}
+
+  AwaitCompletionFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-await-completion'
+      Role: !GetAtt WorkerRole.Arn
+      Environment:
+        Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref AwaitCompletionHandler}
+      Events:
+        AwaitCompletion: {Type: SQS, Properties: {Queue: !GetAtt AwaitCompletionQueue.Arn, BatchSize: 1,
+          FunctionResponseTypes: [ReportBatchItemFailures]}}
+
+  TransitionWorkerFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-transition-worker'
+      Role: !GetAtt WorkerRole.Arn
+      Timeout: 900
+      Environment:
+        Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref TransitionWorkerHandler}
+      Events:
+        Transition: {Type: SQS, Properties: {Queue: !GetAtt TransitionRequestQueue.Arn, BatchSize: 1,
+          FunctionResponseTypes: [ReportBatchItemFailures], ScalingConfig: {MaximumConcurrency: 32}}}
+
+  AwaitWakeupFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-await-wakeup'
+      Role: !GetAtt WakeupRole.Arn
+      Environment:
+        Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref AwaitWakeupHandler}
+      Events:
+        AwaitState:
+          Type: DynamoDB
+          Properties: &StreamEvent
+            Stream: !Ref AwaitInteractionStreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            BisectBatchOnFunctionError: true
+            MaximumRecordAgeInSeconds: 3600
+            MaximumRetryAttempts: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            DestinationConfig: {OnFailure: {Destination: !GetAtt StreamFailureDlq.Arn}}
+        CallbackBinding:
+          Type: DynamoDB
+          Properties:
+            <<: *StreamEvent
+            Stream: !GetAtt CallbackBindingTable.StreamArn
+
+  ReconciliationFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-reconcile'
+      Role: !GetAtt WakeupRole.Arn
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref ReconciliationHandler}
+
+  DurableTerminalRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: [aws.lambda]
+        detail-type: ['Durable Execution Status Change']
+        detail:
+          functionArn:
+            - prefix: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:'
+      Targets: [{Arn: !GetAtt ReconciliationFunction.Arn, Id: targeted-durable-reconciliation}]
+  DurableTerminalPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ReconciliationFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DurableTerminalRule.Arn
+
+  WorkDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: &QueueAlarmProperties
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions: [{Name: QueueName, Value: !GetAtt WorkDlq.QueueName}]
+  AwaitDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      Dimensions: [{Name: QueueName, Value: !GetAtt AwaitCompletionDlq.QueueName}]
+  TransitionDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      Dimensions: [{Name: QueueName, Value: !GetAtt TransitionDlq.QueueName}]
+  StreamFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      Dimensions: [{Name: QueueName, Value: !GetAtt StreamFailureDlq.QueueName}]
+
+Outputs:
+  DurableAliasArn: {Value: !Ref DurableAliasResource}
+  IngressFunctionArn: {Value: !GetAtt IngressFunction.Arn}
+  ActionFunctionArn: {Value: !GetAtt ActionFunction.Arn}
+  CallbackBindingTableName: {Value: !Ref CallbackBindingTable}
+  WorkQueueUrl: {Value: !Ref WorkQueue}
+  AwaitCompletionQueueUrl: {Value: !Ref AwaitCompletionQueue}
+  TransitionRequestQueueUrl: {Value: !Ref TransitionRequestQueue}
+  TransitionResponseQueueUrl: {Value: !Ref TransitionResponseQueue}
+  StreamFailureQueueUrl: {Value: !Ref StreamFailureDlq}

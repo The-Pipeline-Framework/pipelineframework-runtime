@@ -14,10 +14,10 @@ import jakarta.inject.Inject;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.jboss.logging.Logger;
-import org.pipelineframework.awsproof.model.ProofAwaitIdentity;
-import org.pipelineframework.awsproof.model.ProofCallbackBinding;
-import org.pipelineframework.awsproof.model.ProofCallbackRegistration;
-import org.pipelineframework.awsproof.model.ProofDriverCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackRegistration;
+import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
 import org.pipelineframework.awaitable.AwaitCompletionDescriptorRegistry;
 import org.pipelineframework.orchestrator.PipelineControlPlane;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -54,13 +54,13 @@ final class ProofDurableBindingResolver {
     @Inject
     DynamoDbClient dynamo;
 
-    Optional<ProofCallbackBinding> reconstruct(ProofAwaitIdentity identity) {
+    Optional<AwsDurableCallbackBinding> reconstruct(AwsDurableAwaitIdentity identity) {
         return reconstructRegistration(identity.tenantId(), identity.executionId())
             .filter(registration -> registration.checkpoint().generation() == identity.generation())
             .map(registration -> registration.bind(identity));
     }
 
-    Optional<ProofCallbackRegistration> reconstructRegistration(String tenantId, String executionId) {
+    Optional<AwsDurableCallbackRegistration> reconstructRegistration(String tenantId, String executionId) {
         return runningExecutions().stream()
             .map(this::registration)
             .flatMap(Optional::stream)
@@ -69,12 +69,12 @@ final class ProofDurableBindingResolver {
             .findFirst();
     }
 
-    List<ProofCallbackBinding> reconstructOpenBindings() {
+    List<AwsDurableCallbackBinding> reconstructOpenBindings() {
         return reconstructOpenBindings(runningExecutions());
     }
 
-    List<ProofCallbackBinding> reconstructOpenBindings(List<Execution> executions) {
-        List<ProofCallbackBinding> recovered = new ArrayList<>();
+    List<AwsDurableCallbackBinding> reconstructOpenBindings(List<Execution> executions) {
+        List<AwsDurableCallbackBinding> recovered = new ArrayList<>();
         for (Execution execution : executions) {
             try {
                 reconstruct(execution).ifPresent(recovered::add);
@@ -87,19 +87,19 @@ final class ProofDurableBindingResolver {
         return List.copyOf(recovered);
     }
 
-    private Optional<ProofCallbackBinding> reconstruct(Execution execution) {
-        Optional<ProofCallbackRegistration> registration = registration(execution);
+    private Optional<AwsDurableCallbackBinding> reconstruct(Execution execution) {
+        Optional<AwsDurableCallbackRegistration> registration = registration(execution);
         if (registration.isEmpty()) {
             return Optional.empty();
         }
         descriptorRegistry.register(descriptorFactory.create());
-        ProofDriverCheckpoint checkpoint = registration.orElseThrow().checkpoint();
-        Optional<ProofAwaitIdentity> identity = controlPlane.queryPendingAwaitInteractions(
+        AwsDurableDriverCheckpoint checkpoint = registration.orElseThrow().checkpoint();
+        Optional<AwsDurableAwaitIdentity> identity = controlPlane.queryPendingAwaitInteractions(
                 checkpoint.tenantId(), "", "", "", 100)
             .await().atMost(ACTION_TIMEOUT).stream()
             .filter(record -> checkpoint.executionId().equals(record.executionId()))
             .findFirst()
-            .map(record -> new ProofAwaitIdentity(
+            .map(record -> new AwsDurableAwaitIdentity(
                 record.tenantId(),
                 record.executionId(),
                 record.interactionId(),
@@ -111,14 +111,14 @@ final class ProofDurableBindingResolver {
         return identity.map(registration.orElseThrow()::bind);
     }
 
-    private Optional<ProofAwaitIdentity> findSemanticAwait(ProofDriverCheckpoint checkpoint) {
+    private Optional<AwsDurableAwaitIdentity> findSemanticAwait(AwsDurableDriverCheckpoint checkpoint) {
         return findSemanticAwait(
             checkpoint,
             requiredEnvironment("PIPELINE_ORCHESTRATOR_DYNAMO_AWAIT_INTERACTION_TABLE"));
     }
 
-    Optional<ProofAwaitIdentity> findSemanticAwait(
-        ProofDriverCheckpoint checkpoint,
+    Optional<AwsDurableAwaitIdentity> findSemanticAwait(
+        AwsDurableDriverCheckpoint checkpoint,
         String tableName
     ) {
         Map<String, AttributeValue> startKey = Map.of();
@@ -135,8 +135,8 @@ final class ProofDurableBindingResolver {
                 request.exclusiveStartKey(startKey);
             }
             var response = dynamo.query(request.build());
-            Optional<ProofAwaitIdentity> identity = response.items().stream().findFirst()
-                .map(item -> new ProofAwaitIdentity(
+            Optional<AwsDurableAwaitIdentity> identity = response.items().stream().findFirst()
+                .map(item -> new AwsDurableAwaitIdentity(
                     attribute(item, "tenant_id"),
                     attribute(item, "execution_id"),
                     attribute(item, "interaction_id"),
@@ -157,9 +157,9 @@ final class ProofDurableBindingResolver {
             .orElseThrow(() -> new IllegalStateException("Await attribute is missing: " + name));
     }
 
-    private Optional<ProofCallbackRegistration> registration(Execution execution) {
+    private Optional<AwsDurableCallbackRegistration> registration(Execution execution) {
         List<Event> events = history(execution.durableExecutionArn());
-        Optional<ProofDriverCheckpoint> checkpoint = ProofDurableHistory
+        Optional<AwsDurableDriverCheckpoint> checkpoint = ProofDurableHistory
             .successfulStepPayload(events, "submit-tpf-execution")
             .or(() -> ProofDurableHistory.successfulStepPayload(events, "resume-tpf-execution"))
             .flatMap(this::parseCheckpoint);
@@ -168,7 +168,7 @@ final class ProofDurableBindingResolver {
             return Optional.empty();
         }
         long now = Instant.now().toEpochMilli();
-        return Optional.of(new ProofCallbackRegistration(
+        return Optional.of(new AwsDurableCallbackRegistration(
             checkpoint.orElseThrow(),
             execution.durableExecutionName(),
             execution.durableExecutionArn(),
@@ -213,12 +213,12 @@ final class ProofDurableBindingResolver {
         return List.copyOf(events);
     }
 
-    private Optional<ProofDriverCheckpoint> parseCheckpoint(String json) {
+    private Optional<AwsDurableDriverCheckpoint> parseCheckpoint(String json) {
         if (json == null || json.isBlank()) {
             return Optional.empty();
         }
         try {
-            return Optional.of(mapper.readValue(json, ProofDriverCheckpoint.class));
+            return Optional.of(mapper.readValue(json, AwsDurableDriverCheckpoint.class));
         } catch (JsonProcessingException malformed) {
             return Optional.empty();
         }

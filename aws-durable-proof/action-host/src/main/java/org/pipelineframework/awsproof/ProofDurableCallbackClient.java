@@ -9,8 +9,8 @@ import jakarta.inject.Inject;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.pipelineframework.awsproof.model.ProofCallbackBinding;
-import org.pipelineframework.awsproof.model.ProofCallbackSignal;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackSignal;
 import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.services.lambda.LambdaClient;
 import software.amazon.awssdk.services.lambda.model.Event;
@@ -29,7 +29,7 @@ class ProofDurableCallbackClient {
     @Inject
     ProofFaultInjector faults;
 
-    void sendSuccess(ProofCallbackBinding binding, ProofCallbackSignal signal) {
+    void sendSuccess(AwsDurableCallbackBinding binding, AwsDurableCallbackSignal signal) {
         try {
             faults.failIfArmed("callback-api-throttled", binding.awaitIdentity().executionId());
             lambda.sendDurableExecutionCallbackSuccess(SendDurableExecutionCallbackSuccessRequest.builder()
@@ -41,7 +41,7 @@ class ProofDurableCallbackClient {
         }
     }
 
-    ProofProviderCallbackState state(ProofCallbackBinding binding) {
+    ProofProviderCallbackState state(AwsDurableCallbackBinding binding) {
         try {
             faults.failIfArmed("provider-history-unavailable", binding.awaitIdentity().executionId());
             List<Event> events = history(binding.providerExecutionArn());

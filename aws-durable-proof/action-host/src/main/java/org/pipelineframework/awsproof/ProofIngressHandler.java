@@ -8,13 +8,13 @@ import jakarta.inject.Named;
 
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
-import org.pipelineframework.awsproof.model.ProofExecutionInput;
-import org.pipelineframework.awsproof.model.ProofExecutionNames;
-import org.pipelineframework.awsproof.model.ProofStartResponse;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionInput;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionNames;
+import org.pipelineframework.aws.durable.model.AwsDurableStartResponse;
 
 @Named("proof-ingress")
 @ApplicationScoped
-public final class ProofIngressHandler implements RequestHandler<ProofExecutionInput, ProofStartResponse> {
+public final class ProofIngressHandler implements RequestHandler<AwsDurableExecutionInput, AwsDurableStartResponse> {
     @Inject
     ProofDurableExecutionStarter starter;
 
@@ -22,12 +22,12 @@ public final class ProofIngressHandler implements RequestHandler<ProofExecutionI
     ProofFaultInjector faults;
 
     @Override
-    public ProofStartResponse handleRequest(ProofExecutionInput input, Context context) {
+    public AwsDurableStartResponse handleRequest(AwsDurableExecutionInput input, Context context) {
         Objects.requireNonNull(input, "input");
-        String executionName = ProofExecutionNames.durableExecutionName(
+        String executionName = AwsDurableExecutionNames.durableExecutionName(
             input.tenantId(), input.idempotencyKey(), input.generation());
         faults.failIfArmed("ingress-before-provider-start", executionName);
-        ProofStartResponse response = starter.start(input);
+        AwsDurableStartResponse response = starter.start(input);
         faults.failIfArmed("ingress-after-provider-start", executionName);
         return response;
     }
