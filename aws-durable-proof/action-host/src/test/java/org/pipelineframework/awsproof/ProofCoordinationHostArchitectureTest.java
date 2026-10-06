@@ -20,8 +20,8 @@ class ProofCoordinationHostArchitectureTest {
         assertThat(fieldTypes(ProofDurableHostActionAdapter.class))
             .doesNotContain(PipelineControlPlane.class);
         assertThat(fieldTypes(ProofControlPlaneActionAdapter.class))
-            .contains(PipelineControlPlane.class)
-            .doesNotContain(ProofCallbackBindingRepository.class, ProofWakeupService.class);
+            .contains(org.pipelineframework.aws.durable.AwsDurableActionInvoker.class)
+            .doesNotContain(PipelineControlPlane.class, ProofCallbackBindingRepository.class, ProofWakeupService.class);
     }
 
     @Test
