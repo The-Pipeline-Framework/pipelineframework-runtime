@@ -35,7 +35,10 @@ Globals:
 Resources:
   CallbackBindingTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
+      SSESpecification: {SSEEnabled: true}
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - {AttributeName: pk, AttributeType: S}
@@ -54,37 +57,40 @@ Resources:
 
   WorkDlq:
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600}
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
   WorkQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 900
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 5400
       RedrivePolicy: {deadLetterTargetArn: !GetAtt WorkDlq.Arn, maxReceiveCount: 5}
   AwaitCompletionDlq:
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600}
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
   AwaitCompletionQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 180
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 720
       RedrivePolicy: {deadLetterTargetArn: !GetAtt AwaitCompletionDlq.Arn, maxReceiveCount: 5}
   TransitionDlq:
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600}
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
   TransitionRequestQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 900
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 5400
       RedrivePolicy: {deadLetterTargetArn: !GetAtt TransitionDlq.Arn, maxReceiveCount: 5}
   TransitionResponseQueue:
     Type: AWS::SQS::Queue
-    Properties: {VisibilityTimeout: 180, MessageRetentionPeriod: 1209600}
+    Properties: {VisibilityTimeout: 720, MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
   DurableDlq:
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600}
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
   StreamFailureDlq:
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600}
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
 
   DurableRole:
     Type: AWS::IAM::Role
@@ -203,6 +209,9 @@ Resources:
                 Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
                 Resource: [!Ref AwaitInteractionStreamArn, !GetAtt CallbackBindingTable.StreamArn]
               - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt StreamFailureDlq.Arn
+              - Effect: Allow
                 Action: [lambda:GetDurableExecution, lambda:GetDurableExecutionHistory,
                   lambda:SendDurableExecutionCallbackSuccess, lambda:InvokeFunction]
                 Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:*'
@@ -212,6 +221,8 @@ Resources:
 
   DurableFunction:
     Type: AWS::Lambda::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Metadata:
       cfn-lint: {config: {ignore_checks: [E3002]}}
     Properties:
@@ -232,6 +243,8 @@ Resources:
 
   DurableVersion:
     Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       FunctionName: !Ref DurableFunction
       CodeSha256: !Ref DurableCodeSha256

@@ -12,4 +12,17 @@
     <artifactId>pipelineframework-aws-durable-coordination-deployment</artifactId>
     <name>TPF AWS Durable Coordination Deployment</name>
     <description>Reference SAM deployment contract for AWS Durable QUEUE_ASYNC coordination</description>
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.dataformat</groupId>
+            <artifactId>jackson-dataformat-yaml</artifactId>
+            <version>2.22.3</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
 </project>
