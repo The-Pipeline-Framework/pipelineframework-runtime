@@ -61,6 +61,35 @@ class AwsDurableDeploymentContractTest {
         assertTrue(destinationAllowed, "Stream failure destination must have a scoped send grant");
     }
 
+    @Test
+    void registrationIndexSelectsRegistrationsBeforeEvaluatingTheLimit() throws Exception {
+        JsonNode resources = resources();
+        JsonNode indexes = resources.path("CallbackBindingTable").path("Properties")
+            .path("GlobalSecondaryIndexes");
+        boolean registrationIndexFound = false;
+        boolean legacyIndexRetained = false;
+        for (JsonNode index : indexes) {
+            if ("provider-registration-index".equals(index.path("IndexName").asText())) {
+                registrationIndexFound = true;
+                assertEquals("provider_execution_arn", index.path("KeySchema").get(0).path("AttributeName").asText());
+                assertEquals("HASH", index.path("KeySchema").get(0).path("KeyType").asText());
+                assertEquals("sk", index.path("KeySchema").get(1).path("AttributeName").asText());
+                assertEquals("RANGE", index.path("KeySchema").get(1).path("KeyType").asText());
+                assertEquals("ALL", index.path("Projection").path("ProjectionType").asText());
+            }
+            legacyIndexRetained |= "provider-execution-index".equals(index.path("IndexName").asText());
+        }
+        assertTrue(registrationIndexFound);
+        assertTrue(legacyIndexRetained, "Retained host versions still need their original index");
+        JsonNode grant = resources.path("WakeupRole").path("Properties").path("Policies").get(0)
+            .path("PolicyDocument").path("Statement").get(0).path("Resource");
+        boolean indexGranted = false;
+        for (JsonNode resource : grant) {
+            indexGranted |= "${CallbackBindingTable.Arn}/index/provider-registration-index".equals(resource.asText());
+        }
+        assertTrue(indexGranted, "Targeted repair must be authorised to query its new index");
+    }
+
     private void assertVisibility(JsonNode resources, String queue, String function) {
         JsonNode properties = resources.path(function).path("Properties");
         int timeout = properties.path("Timeout").asInt(

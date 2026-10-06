@@ -47,9 +47,17 @@ Resources:
       KeySchema:
         - {AttributeName: pk, KeyType: HASH}
         - {AttributeName: sk, KeyType: RANGE}
+      # For existing tables, add provider-registration-index and wait for ACTIVE
+      # before upgrading the repair host. Existing records need no backfill.
+      # Keep provider-execution-index while retained host versions still use it.
       GlobalSecondaryIndexes:
         - IndexName: provider-execution-index
           KeySchema: [{AttributeName: provider_execution_arn, KeyType: HASH}]
+          Projection: {ProjectionType: ALL}
+        - IndexName: provider-registration-index
+          KeySchema:
+            - {AttributeName: provider_execution_arn, KeyType: HASH}
+            - {AttributeName: sk, KeyType: RANGE}
           Projection: {ProjectionType: ALL}
       StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
       TimeToLiveSpecification: {AttributeName: expires_at_epoch_s, Enabled: true}
@@ -202,6 +210,7 @@ Resources:
                 Resource:
                   - !GetAtt CallbackBindingTable.Arn
                   - !Sub '${CallbackBindingTable.Arn}/index/provider-execution-index'
+                  - !Sub '${CallbackBindingTable.Arn}/index/provider-registration-index'
               - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:Query]
                 Resource: !Ref SemanticDynamoResourceArns
