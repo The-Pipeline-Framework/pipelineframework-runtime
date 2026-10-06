@@ -599,6 +599,38 @@ class DynamoExecutionStateStoreTest {
     }
 
     @Test
+    void pageAdvanceAtomicallyPersistsSuccessorCheckpointAndFencingCondition() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        PipelineOrchestratorConfig config = mockConfig("tpf_execution", "tpf_execution_key");
+        DynamoExecutionStateStore store = new DynamoExecutionStateStore(client, config);
+        when(client.updateItem(any(UpdateItemRequest.class)))
+            .thenReturn(UpdateItemResponse.builder().build());
+
+        store.advancePage(
+                "tenant-a",
+                "exec-1",
+                7L,
+                "exec-1:page:0:0:0",
+                new PagedExecutionState(1, "source-v1", Optional.of("cursor-1"), 100),
+                1234L)
+            .await().indefinitely();
+
+        ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        verify(client).updateItem(update.capture());
+        UpdateItemRequest request = update.getValue();
+        assertTrue(request.conditionExpression().contains("#version = :expected"));
+        assertTrue(request.conditionExpression().contains("#status = :running"));
+        assertTrue(request.conditionExpression().contains("#pageIndex = :previousPageIndex"));
+        assertTrue(request.updateExpression().contains("#status = :queued"));
+        assertTrue(request.updateExpression().contains("#pageCheckpoint = :pageCheckpoint"));
+        assertEquals("page_start_checkpoint", request.expressionAttributeNames().get("#pageCheckpoint"));
+        assertEquals("7", request.expressionAttributeValues().get(":expected").n());
+        assertEquals("0", request.expressionAttributeValues().get(":previousPageIndex").n());
+        assertEquals("1", request.expressionAttributeValues().get(":pageIndex").n());
+        assertEquals("cursor-1", request.expressionAttributeValues().get(":pageCheckpoint").s());
+    }
+
+    @Test
     void claimLeaseRejectsNonPositiveLeaseDuration() {
         DynamoDbClient client = mock(DynamoDbClient.class);
         PipelineOrchestratorConfig config = mockConfig("tpf_execution", "tpf_execution_key");
