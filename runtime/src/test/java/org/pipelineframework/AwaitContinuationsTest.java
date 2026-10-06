@@ -138,6 +138,8 @@ class AwaitContinuationsTest {
         record("tenant-1", "exec-1", "key-1", ExecutionStatus.WAITING_EXTERNAL, 7L);
     when(executionStateStore.getExecution("tenant-1", "exec-1"))
         .thenReturn(Uni.createFrom().item(java.util.Optional.of(waitingParent)));
+    when(executionStateStore.getExecutionByKey(eq("tenant-1"), any()))
+        .thenReturn(Uni.createFrom().item(java.util.Optional.empty()));
     when(awaitCoordinator.findByUnit("tenant-1", "unit-1"))
         .thenReturn(Uni.createFrom().item(List.of(held, current)));
     when(handler.continueAwaitItem(any(), any(), any(Integer.class), any(), any(Long.class)))

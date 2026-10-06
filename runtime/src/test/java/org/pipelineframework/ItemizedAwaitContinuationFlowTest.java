@@ -73,6 +73,14 @@ class ItemizedAwaitContinuationFlowTest {
 
   @BeforeEach
   void setUp() {
+    org.mockito.Mockito.lenient().when(executionStateStore.getExecutionByKey(any(), any()))
+        .thenReturn(Uni.createFrom().item(Optional.empty()));
+    org.mockito.Mockito.lenient().when(awaitCoordinator.recordCompletion(
+            any(), org.mockito.ArgumentMatchers.anyLong()))
+        .thenAnswer(invocation -> {
+          AwaitInteractionRecord record = invocation.getArgument(0);
+          return awaitCoordinator.getUnit(record.tenantId(), record.unitId());
+        });
     journal = new InMemoryControlPlaneJournal();
     scheduler = Executors.newSingleThreadScheduledExecutor();
     org.mockito.Mockito.lenient().when(awaitCoordinator.completeItemContinuation(any()))

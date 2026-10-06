@@ -166,6 +166,8 @@ class QueueAsyncCoordinatorTest {
         failureHandler.orchestratorConfig = orchestratorConfig;
         payloadCodec = new JsonTransitionPayloadCodec();
 
+        lenient().when(executionStateStore.getExecutionByKey(any(), any()))
+            .thenReturn(Uni.createFrom().item(Optional.empty()));
         coordinator = new QueueAsyncCoordinator();
         coordinator.orchestratorConfig = orchestratorConfig;
         coordinator.executionStateStore = executionStateStore;
