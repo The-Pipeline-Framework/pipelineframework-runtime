@@ -1,6 +1,7 @@
 package org.pipelineframework;
 
 import java.util.List;
+import java.util.Optional;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -11,6 +12,9 @@ import org.pipelineframework.awaitable.AwaitCompletionCommand;
 import org.pipelineframework.awaitable.AwaitCompletionResult;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.orchestrator.CoordinatorSweepResult;
+import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
+import org.pipelineframework.orchestrator.AwaitItemContinuationResult;
+import org.pipelineframework.orchestrator.AwaitSemanticCheckpoint;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.ExecutionRedriveResult;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
@@ -27,6 +31,9 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
 
     @Inject
     QueueAsyncCoordinator queueAsyncCoordinator;
+
+    @Inject
+    PipelineExecutionService pipelineExecutionService;
 
     @PostConstruct
     void initialize() {
@@ -83,7 +90,9 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
 
     @Override
     public Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs) {
-        return queueAsyncCoordinator.sweepOnce(nowEpochMs);
+        return queueAsyncCoordinator.sweepOnce(
+            nowEpochMs,
+            pipelineExecutionService.awaitItemContinuationHandlerForControlPlane());
     }
 
     @Override
@@ -141,6 +150,29 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
         String stepId,
         int limit) {
         return queueAsyncCoordinator.queryPendingAwaitInteractions(tenantId, assignee, group, stepId, limit);
+    }
+
+    @Override
+    public Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(
+        String tenantId,
+        String interactionId) {
+        return queueAsyncCoordinator.getAwaitSemanticCheckpoint(tenantId, interactionId);
+    }
+
+    @Override
+    public Uni<List<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoints(
+        String tenantId,
+        String executionId,
+        int limit) {
+        return queueAsyncCoordinator.getAwaitSemanticCheckpoints(tenantId, executionId, limit);
+    }
+
+    @Override
+    public Uni<AwaitItemContinuationResult> processAwaitItemContinuation(
+        AwaitItemContinuationCommand command) {
+        return queueAsyncCoordinator.processAwaitItemContinuation(
+            command,
+            pipelineExecutionService.awaitItemContinuationHandlerForControlPlane());
     }
 
     @Override

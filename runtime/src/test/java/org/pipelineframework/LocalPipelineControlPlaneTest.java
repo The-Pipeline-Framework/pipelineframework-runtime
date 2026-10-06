@@ -1,6 +1,7 @@
 package org.pipelineframework;
 
 import java.util.List;
+import java.util.Optional;
 
 import io.smallrye.mutiny.Uni;
 import org.junit.jupiter.api.BeforeEach;
@@ -13,6 +14,9 @@ import org.pipelineframework.awaitable.AwaitCompletionResult;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.orchestrator.CoordinatorSweepResult;
+import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
+import org.pipelineframework.orchestrator.AwaitItemContinuationResult;
+import org.pipelineframework.orchestrator.AwaitSemanticCheckpoint;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
 import org.pipelineframework.orchestrator.ExecutionRedriveResult;
@@ -38,10 +42,17 @@ class LocalPipelineControlPlaneTest {
   @Mock
   private PipelineTransitionWorker transitionWorker;
 
+  @Mock
+  private PipelineExecutionService pipelineExecutionService;
+
+  @Mock
+  private AwaitItemContinuationHandler itemContinuationHandler;
+
   @BeforeEach
   void setUp() {
     controlPlane = new LocalPipelineControlPlane();
     controlPlane.queueAsyncCoordinator = queueAsyncCoordinator;
+    controlPlane.pipelineExecutionService = pipelineExecutionService;
   }
 
   @Test
@@ -82,12 +93,14 @@ class LocalPipelineControlPlaneTest {
   @Test
   void sweepOnceDelegatesToCoordinator() {
     CoordinatorSweepResult expected = new CoordinatorSweepResult(1000L, 50, 2, 3);
-    when(queueAsyncCoordinator.sweepOnce(1000L)).thenReturn(Uni.createFrom().item(expected));
+    AwaitItemContinuationHandler handler = org.mockito.Mockito.mock(AwaitItemContinuationHandler.class);
+    when(pipelineExecutionService.awaitItemContinuationHandlerForControlPlane()).thenReturn(handler);
+    when(queueAsyncCoordinator.sweepOnce(1000L, handler)).thenReturn(Uni.createFrom().item(expected));
 
     CoordinatorSweepResult actual = controlPlane.sweepOnce(1000L).await().indefinitely();
 
     assertEquals(expected, actual);
-    verify(queueAsyncCoordinator).sweepOnce(1000L);
+    verify(queueAsyncCoordinator).sweepOnce(1000L, handler);
   }
 
   @Test
@@ -110,6 +123,36 @@ class LocalPipelineControlPlaneTest {
   }
 
   @Test
+  void awaitSemanticCheckpointDelegatesWithoutExposingStoreSchema() {
+    AwaitSemanticCheckpoint checkpoint = new AwaitSemanticCheckpoint(
+        "tenant-1", "exec-3", "interaction-1", "correlation-1", "unit-1", "await-decision",
+        AwaitInteractionStatus.COMPLETED, "pipeline-a", "contract-a", "release-a");
+    when(queueAsyncCoordinator.getAwaitSemanticCheckpoint("tenant-1", "interaction-1"))
+        .thenReturn(Uni.createFrom().item(Optional.of(checkpoint)));
+
+    assertEquals(Optional.of(checkpoint), controlPlane
+        .getAwaitSemanticCheckpoint("tenant-1", "interaction-1")
+        .await().indefinitely());
+
+    verify(queueAsyncCoordinator).getAwaitSemanticCheckpoint("tenant-1", "interaction-1");
+  }
+
+  @Test
+  void executionAwaitCheckpointsDelegateWithoutExposingStoreSchema() {
+    AwaitSemanticCheckpoint checkpoint = new AwaitSemanticCheckpoint(
+        "tenant-1", "exec-3", "interaction-1", "correlation-1", "unit-1", "await-decision",
+        AwaitInteractionStatus.COMPLETED, "pipeline-a", "contract-a", "release-a");
+    when(queueAsyncCoordinator.getAwaitSemanticCheckpoints("tenant-1", "exec-3", 10))
+        .thenReturn(Uni.createFrom().item(List.of(checkpoint)));
+
+    assertEquals(List.of(checkpoint), controlPlane
+        .getAwaitSemanticCheckpoints("tenant-1", "exec-3", 10)
+        .await().indefinitely());
+
+    verify(queueAsyncCoordinator).getAwaitSemanticCheckpoints("tenant-1", "exec-3", 10);
+  }
+
+  @Test
   void processExecutionWorkItemDelegatesToCoordinatorWithWorker() {
     ExecutionWorkItem workItem = new ExecutionWorkItem("tenant-1", "exec-4");
     when(queueAsyncCoordinator.processExecutionWorkItem(eq(workItem), same(transitionWorker)))
@@ -118,6 +161,21 @@ class LocalPipelineControlPlaneTest {
     controlPlane.processExecutionWorkItem(workItem, transitionWorker).await().indefinitely();
 
     verify(queueAsyncCoordinator).processExecutionWorkItem(eq(workItem), same(transitionWorker));
+  }
+
+  @Test
+  void itemizedAwaitContinuationDelegatesAsOneBoundedAction() {
+    AwaitItemContinuationCommand command = new AwaitItemContinuationCommand(
+        "tenant-1", "exec-4", "unit-1", "interaction-1", 0, 1, 100L);
+    AwaitItemContinuationResult expected = AwaitItemContinuationResult.completed(command);
+    when(pipelineExecutionService.awaitItemContinuationHandlerForControlPlane())
+        .thenReturn(itemContinuationHandler);
+    when(queueAsyncCoordinator.processAwaitItemContinuation(command, itemContinuationHandler))
+        .thenReturn(Uni.createFrom().item(expected));
+
+    assertEquals(expected, controlPlane.processAwaitItemContinuation(command).await().indefinitely());
+
+    verify(queueAsyncCoordinator).processAwaitItemContinuation(command, itemContinuationHandler);
   }
 
   @Test

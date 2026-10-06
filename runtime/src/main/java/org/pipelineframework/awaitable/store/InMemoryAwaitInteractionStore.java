@@ -21,12 +21,16 @@ import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.AwaitInteractionTerminalException;
 import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
+import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 
 /**
  * In-memory await store intended for local development and tests.
  */
 @ApplicationScoped
-public class InMemoryAwaitInteractionStore implements AwaitInteractionStore {
+public class InMemoryAwaitInteractionStore implements
+    AwaitInteractionStore,
+    AwaitItemContinuationWorkStore,
+    AwaitInteractionExecutionLookup {
 
     private static final Comparator<AwaitInteractionRecord> PENDING_ORDER =
         Comparator.comparingLong(AwaitInteractionRecord::deadlineEpochMs)
@@ -37,6 +41,7 @@ public class InMemoryAwaitInteractionStore implements AwaitInteractionStore {
     private final Map<String, AwaitInteractionRecord> interactionsByScopedId = new HashMap<>();
     private final Map<String, String> interactionIdByScopedIdempotencyKey = new HashMap<>();
     private final Map<String, String> interactionIdByScopedCorrelation = new HashMap<>();
+    private final Map<String, AwaitItemContinuationCommand> itemContinuationWorkByInteraction = new HashMap<>();
 
     @Override
     public String providerName() {
@@ -167,6 +172,30 @@ public class InMemoryAwaitInteractionStore implements AwaitInteractionStore {
     }
 
     @Override
+    public Uni<List<AwaitInteractionRecord>> findByExecution(
+        String tenantId,
+        String executionId,
+        int limit
+    ) {
+        if (limit <= 0) {
+            return Uni.createFrom().item(List.of());
+        }
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                purgeExpired(System.currentTimeMillis());
+                return interactionsByScopedId.values().stream()
+                    .filter(record -> Objects.equals(record.tenantId(), tenantId))
+                    .filter(record -> Objects.equals(record.executionId(), executionId))
+                    .sorted(Comparator.comparingLong(AwaitInteractionRecord::createdAtEpochMs)
+                        .thenComparing(AwaitInteractionRecord::interactionId)
+                        .reversed())
+                    .limit(limit)
+                    .toList();
+            }
+        });
+    }
+
+    @Override
     public Uni<Optional<AwaitInteractionRecord>> markDispatching(
         String tenantId,
         String interactionId,
@@ -246,6 +275,7 @@ public class InMemoryAwaitInteractionStore implements AwaitInteractionStore {
         AwaitCompletionCommand command
     ) {
         if (current.status() == AwaitInteractionStatus.COMPLETED || current.status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
+            projectItemContinuation(current, command.nowEpochMs());
             return new AwaitCompletionResult(current, true);
         }
         if (current.status().terminal()) {
@@ -283,7 +313,77 @@ public class InMemoryAwaitInteractionStore implements AwaitInteractionStore {
             current.ttlEpochS(),
             current.transportOutputType());
         interactionsByScopedId.put(scopedInteractionId(completed.tenantId(), completed.interactionId()), completed);
+        projectItemContinuation(completed, command.nowEpochMs());
         return new AwaitCompletionResult(completed, false);
+    }
+
+    @Override
+    public Uni<List<AwaitItemContinuationCommand>> findDueItemContinuations(long nowEpochMs, int limit) {
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                purgeExpired(nowEpochMs);
+                return itemContinuationWorkByInteraction.values().stream()
+                    .filter(command -> command.nowEpochMs() <= nowEpochMs)
+                    .sorted(java.util.Comparator
+                        .comparingLong(AwaitItemContinuationCommand::nowEpochMs)
+                        .thenComparing(AwaitItemContinuationCommand::interactionId))
+                    .limit(Math.max(0, limit))
+                    .toList();
+            }
+        });
+    }
+
+    @Override
+    public Uni<Void> rescheduleItemContinuation(
+        AwaitItemContinuationCommand command,
+        int nextAttempt,
+        long dueEpochMs) {
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                String key = scopedInteractionId(command.tenantId(), command.interactionId());
+                AwaitItemContinuationCommand current = itemContinuationWorkByInteraction.get(key);
+                if (current != null && sameWork(current, command)) {
+                    itemContinuationWorkByInteraction.put(key, new AwaitItemContinuationCommand(
+                        command.tenantId(), command.executionId(), command.unitId(), command.interactionId(),
+                        command.itemIndex(), nextAttempt, dueEpochMs));
+                }
+                return Boolean.TRUE;
+            }
+        }).replaceWithVoid();
+    }
+
+    @Override
+    public Uni<Void> completeItemContinuation(AwaitItemContinuationCommand command) {
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                String key = scopedInteractionId(command.tenantId(), command.interactionId());
+                AwaitItemContinuationCommand current = itemContinuationWorkByInteraction.get(key);
+                if (current != null && sameWork(current, command)) {
+                    itemContinuationWorkByInteraction.remove(key);
+                }
+                return Boolean.TRUE;
+            }
+        }).replaceWithVoid();
+    }
+
+    private void projectItemContinuation(AwaitInteractionRecord record, long dueEpochMs) {
+        if (!record.itemInteraction()) {
+            return;
+        }
+        String key = scopedInteractionId(record.tenantId(), record.interactionId());
+        itemContinuationWorkByInteraction.putIfAbsent(key, new AwaitItemContinuationCommand(
+            record.tenantId(), record.executionId(), record.unitId(), record.interactionId(),
+            record.itemIndex(), 1, dueEpochMs));
+    }
+
+    private static boolean sameWork(
+        AwaitItemContinuationCommand current,
+        AwaitItemContinuationCommand candidate) {
+        return current.tenantId().equals(candidate.tenantId())
+            && current.executionId().equals(candidate.executionId())
+            && current.unitId().equals(candidate.unitId())
+            && current.interactionId().equals(candidate.interactionId())
+            && current.itemIndex() == candidate.itemIndex();
     }
 
     @Override
@@ -468,6 +568,8 @@ public class InMemoryAwaitInteractionStore implements AwaitInteractionStore {
             AwaitInteractionRecord record = iterator.next().getValue();
             if (record.ttlEpochS() > 0 && record.ttlEpochS() <= nowEpochS) {
                 iterator.remove();
+                itemContinuationWorkByInteraction.remove(scopedInteractionId(
+                    record.tenantId(), record.interactionId()));
                 interactionIdByScopedIdempotencyKey.remove(scopedIdempotencyKey(
                     record.tenantId(), record.stepId(), record.idempotencyKey()));
                 interactionIdByScopedCorrelation.remove(scopedCorrelation(record.tenantId(), record.correlationId()));

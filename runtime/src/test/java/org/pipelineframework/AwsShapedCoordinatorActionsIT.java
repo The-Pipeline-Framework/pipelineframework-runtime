@@ -789,20 +789,49 @@ class AwsShapedCoordinatorActionsIT {
                 AttributeDefinition.builder().attributeName("query_deadline_key")
                     .attributeType(ScalarAttributeType.S).build(),
                 AttributeDefinition.builder().attributeName("query_deadline_sort")
+                    .attributeType(ScalarAttributeType.S).build(),
+                AttributeDefinition.builder().attributeName("query_continuation_key")
+                    .attributeType(ScalarAttributeType.S).build(),
+                AttributeDefinition.builder().attributeName("query_continuation_due_epoch_ms")
+                    .attributeType(ScalarAttributeType.N).build(),
+                AttributeDefinition.builder().attributeName("query_execution_key")
+                    .attributeType(ScalarAttributeType.S).build(),
+                AttributeDefinition.builder().attributeName("query_execution_sort")
                     .attributeType(ScalarAttributeType.S).build())
             .keySchema(
                 KeySchemaElement.builder().attributeName("tenant_id").keyType(KeyType.HASH).build(),
                 KeySchemaElement.builder().attributeName("interaction_id").keyType(KeyType.RANGE).build())
-            .globalSecondaryIndexes(GlobalSecondaryIndex.builder()
-                .indexName("await-interaction-pending-by-deadline")
-                .keySchema(
-                    KeySchemaElement.builder().attributeName("query_deadline_key")
-                        .keyType(KeyType.HASH).build(),
-                    KeySchemaElement.builder().attributeName("query_deadline_sort")
-                        .keyType(KeyType.RANGE).build())
-                .projection(Projection.builder().projectionType(ProjectionType.ALL).build())
-                .provisionedThroughput(throughput)
-                .build())
+            .globalSecondaryIndexes(
+                GlobalSecondaryIndex.builder()
+                    .indexName("await-interaction-pending-by-deadline")
+                    .keySchema(
+                        KeySchemaElement.builder().attributeName("query_deadline_key")
+                            .keyType(KeyType.HASH).build(),
+                        KeySchemaElement.builder().attributeName("query_deadline_sort")
+                            .keyType(KeyType.RANGE).build())
+                    .projection(Projection.builder().projectionType(ProjectionType.ALL).build())
+                    .provisionedThroughput(throughput)
+                    .build(),
+                GlobalSecondaryIndex.builder()
+                    .indexName("await-interaction-continuation-work")
+                    .keySchema(
+                        KeySchemaElement.builder().attributeName("query_continuation_key")
+                            .keyType(KeyType.HASH).build(),
+                        KeySchemaElement.builder().attributeName("query_continuation_due_epoch_ms")
+                            .keyType(KeyType.RANGE).build())
+                    .projection(Projection.builder().projectionType(ProjectionType.ALL).build())
+                    .provisionedThroughput(throughput)
+                    .build(),
+                GlobalSecondaryIndex.builder()
+                    .indexName("await-interaction-by-execution")
+                    .keySchema(
+                        KeySchemaElement.builder().attributeName("query_execution_key")
+                            .keyType(KeyType.HASH).build(),
+                        KeySchemaElement.builder().attributeName("query_execution_sort")
+                            .keyType(KeyType.RANGE).build())
+                    .projection(Projection.builder().projectionType(ProjectionType.ALL).build())
+                    .provisionedThroughput(throughput)
+                    .build())
             .streamSpecification(StreamSpecification.builder()
                 .streamEnabled(true)
                 .streamViewType(StreamViewType.NEW_AND_OLD_IMAGES)
@@ -1039,6 +1068,7 @@ class AwsShapedCoordinatorActionsIT {
             PipelineExecutionService coordinatorService = new PipelineExecutionService();
             coordinatorService.controlPlane = controlPlane;
             coordinatorService.transitionWorkerSelector = selector;
+            localControlPlane.pipelineExecutionService = coordinatorService;
             this.workAction = AwsShapedCoordinatorTestComponents.workItemAction(coordinatorService);
             this.awaitAction = AwsShapedAwaitTestComponents.completionAction(coordinatorService);
 
@@ -1344,7 +1374,6 @@ class AwsShapedCoordinatorActionsIT {
 
         @Override
         public void close() {
-            coordinator.shutdownAwaitContinuationRetryExecutor();
             workerHooks.shutdownKillSwitchExecutor();
             dynamo.close();
             sqs.close();
@@ -1523,6 +1552,31 @@ class AwsShapedCoordinatorActionsIT {
         ) {
             return interactions.markTimedOut(
                 record.tenantId(), record.interactionId(), record.version(), nowEpochMs);
+        }
+
+        @Override
+        public Uni<List<org.pipelineframework.orchestrator.AwaitItemContinuationCommand>>
+                findDueItemContinuations(long nowEpochMs, int limit) {
+            return ((org.pipelineframework.awaitable.store.AwaitItemContinuationWorkStore) interactions)
+                .findDueItemContinuations(nowEpochMs, limit);
+        }
+
+        @Override
+        public Uni<Void> rescheduleItemContinuation(
+            org.pipelineframework.orchestrator.AwaitItemContinuationCommand command,
+            int nextAttempt,
+            long dueEpochMs
+        ) {
+            return ((org.pipelineframework.awaitable.store.AwaitItemContinuationWorkStore) interactions)
+                .rescheduleItemContinuation(command, nextAttempt, dueEpochMs);
+        }
+
+        @Override
+        public Uni<Void> completeItemContinuation(
+            org.pipelineframework.orchestrator.AwaitItemContinuationCommand command
+        ) {
+            return ((org.pipelineframework.awaitable.store.AwaitItemContinuationWorkStore) interactions)
+                .completeItemContinuation(command);
         }
     }
 }

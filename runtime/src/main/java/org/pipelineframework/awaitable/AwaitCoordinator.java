@@ -19,6 +19,9 @@ import io.smallrye.mutiny.Uni;
 import io.smallrye.mutiny.infrastructure.Infrastructure;
 import org.jboss.logging.Logger;
 import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
+import org.pipelineframework.awaitable.store.AwaitItemContinuationWorkStore;
+import org.pipelineframework.awaitable.store.AwaitInteractionExecutionLookup;
+import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 import org.pipelineframework.awaitable.spi.AwaitTransportAdapter;
 import org.pipelineframework.awaitable.spi.AwaitUnitStore;
 import org.pipelineframework.awaitable.admission.AwaitAdmissionReservation;
@@ -572,6 +575,54 @@ public class AwaitCoordinator {
 
     public Uni<List<AwaitInteractionRecord>> findByUnit(String tenantId, String unitId) {
         return interactionStore().findByUnit(tenantId, unitId);
+    }
+
+    /** Finds Await interactions by their provider-neutral TPF execution identity. */
+    public Uni<List<AwaitInteractionRecord>> findByExecution(
+        String tenantId,
+        String executionId,
+        int limit
+    ) {
+        AwaitInteractionStore selected = interactionStore();
+        if (selected instanceof AwaitInteractionExecutionLookup lookup) {
+            return lookup.findByExecution(tenantId, executionId, limit);
+        }
+        return Uni.createFrom().failure(new IllegalStateException(
+            "AwaitInteractionStore(" + selected.providerName()
+                + ") does not support execution-scoped Await reconstruction"));
+    }
+
+    /** Finds bounded itemized-Await continuation work from the selected durable interaction provider. */
+    public Uni<List<AwaitItemContinuationCommand>> findDueItemContinuations(long nowEpochMs, int limit) {
+        return itemContinuationWorkStore().findDueItemContinuations(nowEpochMs, limit);
+    }
+
+    /** Advances only the mechanical retry projection; Await records remain semantic authority. */
+    public Uni<Void> rescheduleItemContinuation(
+        AwaitItemContinuationCommand command,
+        int nextAttempt,
+        long dueEpochMs) {
+        return itemContinuationWorkStore().rescheduleItemContinuation(command, nextAttempt, dueEpochMs);
+    }
+
+    /** Removes completed mechanical work after the semantic continuation outcome is durable. */
+    public Uni<Void> completeItemContinuation(AwaitItemContinuationCommand command) {
+        return itemContinuationWorkStore().completeItemContinuation(command);
+    }
+
+    /** Reads one interaction for a provider-neutral control-plane checkpoint projection. */
+    public Uni<Optional<AwaitInteractionRecord>> getInteraction(String tenantId, String interactionId) {
+        return interactionStore().get(tenantId, interactionId);
+    }
+
+    private AwaitItemContinuationWorkStore itemContinuationWorkStore() {
+        AwaitInteractionStore selected = interactionStore();
+        if (selected instanceof AwaitItemContinuationWorkStore workStore) {
+            return workStore;
+        }
+        throw new IllegalStateException(
+            "AwaitInteractionStore(" + selected.providerName()
+                + ") does not support durable itemized-Await continuation work");
     }
 
     /** Preloads release-pinned payload metadata before concurrent item dispatch begins. */

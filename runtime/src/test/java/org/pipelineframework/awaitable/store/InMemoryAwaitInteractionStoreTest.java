@@ -17,8 +17,49 @@ import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.awaitable.AwaitInteractionNotFoundException;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.AwaitInteractionTerminalException;
+import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 
 class InMemoryAwaitInteractionStoreTest {
+
+    @Test
+    void reconstructsCompletedInteractionsByExecutionIdentity() {
+        InMemoryAwaitInteractionStore store = new InMemoryAwaitInteractionStore();
+        var created = store.createOrGet(createCommand("idem-execution", 10_000L, 70_000L))
+            .await().indefinitely();
+        store.complete(new AwaitCompletionCommand(
+            "tenant", created.record().interactionId(), null, "completion", "approved", "provider", 12_000L))
+            .await().indefinitely();
+
+        var records = store.findByExecution("tenant", created.record().executionId(), 10)
+            .await().indefinitely();
+
+        assertEquals(1, records.size());
+        assertEquals(AwaitInteractionStatus.COMPLETED, records.getFirst().status());
+    }
+
+    @Test
+    void itemCompletionAtomicallyProjectsRediscoverableContinuationWork() {
+        InMemoryAwaitInteractionStore store = new InMemoryAwaitInteractionStore();
+        var created = store.createOrGet(itemCommand("item-0", "corr-0", 0)).await().indefinitely();
+
+        store.complete(new AwaitCompletionCommand(
+            "tenant", created.record().interactionId(), null, "completion-0", "approved", "provider", 12_000L))
+            .await().indefinitely();
+
+        AwaitItemContinuationCommand projected = store.findDueItemContinuations(12_000L, 10)
+            .await().indefinitely().getFirst();
+        assertEquals(created.record().interactionId(), projected.interactionId());
+        assertEquals(1, projected.attempt());
+
+        store.rescheduleItemContinuation(projected, 2, 15_000L).await().indefinitely();
+        assertTrue(store.findDueItemContinuations(14_999L, 10).await().indefinitely().isEmpty());
+        AwaitItemContinuationCommand retried = store.findDueItemContinuations(15_000L, 10)
+            .await().indefinitely().getFirst();
+        assertEquals(2, retried.attempt());
+
+        store.completeItemContinuation(retried).await().indefinitely();
+        assertTrue(store.findDueItemContinuations(20_000L, 10).await().indefinitely().isEmpty());
+    }
 
     @Test
     void createOrGetDeduplicatesActiveInteractionByIdempotencyKey() {

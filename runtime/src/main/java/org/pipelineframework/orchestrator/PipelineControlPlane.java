@@ -1,6 +1,7 @@
 package org.pipelineframework.orchestrator;
 
 import java.util.List;
+import java.util.Optional;
 
 import io.smallrye.mutiny.Uni;
 import org.pipelineframework.awaitable.AwaitCompletionCommand;
@@ -98,6 +99,25 @@ public interface PipelineControlPlane {
         String group,
         String stepId,
         int limit);
+
+    /** Reads one provider-neutral Await checkpoint without exposing the backing store schema. */
+    Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(
+        String tenantId,
+        String interactionId);
+
+    /** Reads bounded provider-neutral Await checkpoints for one TPF execution. */
+    Uni<List<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoints(
+        String tenantId,
+        String executionId,
+        int limit);
+
+    /**
+     * Processes one bounded itemized-Await continuation attempt.
+     *
+     * <p>The caller owns retry timing and repeated invocation.</p>
+     */
+    Uni<AwaitItemContinuationResult> processAwaitItemContinuation(
+        AwaitItemContinuationCommand command);
 
     Uni<Void> processExecutionWorkItem(ExecutionWorkItem workItem, PipelineTransitionWorker worker);
 

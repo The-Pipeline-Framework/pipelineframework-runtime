@@ -25,6 +25,25 @@ public interface PipelineOrchestratorConfig {
     OrchestratorMode mode();
 
     /**
+     * Mechanical coordination host. This is orthogonal to worker placement and transport.
+     *
+     * @return configured coordination host
+     */
+    @WithName("coordination-host")
+    @WithDefault("NATIVE")
+    CoordinationHost coordinationHost();
+
+    /**
+     * Disable process-owned sweep and poll loops for an event-source hosted artifact.
+     * Bounded actions remain available. This setting does not select worker placement.
+     *
+     * @return true when provider event sources host every loop for this artifact
+     */
+    @WithName("process-loops-disabled")
+    @WithDefault("false")
+    boolean processLoopsDisabled();
+
+    /**
      * Default tenant when callers do not provide one.
      *
      * @return tenant id

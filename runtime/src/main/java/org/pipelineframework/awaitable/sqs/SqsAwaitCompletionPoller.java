@@ -78,6 +78,9 @@ public class SqsAwaitCompletionPoller {
     }
 
     void onStartup(@Observes StartupEvent event) {
+        if (orchestratorConfig.processLoopsDisabled()) {
+            return;
+        }
         startPolling(SqsAwaitPollerConfig.fromRuntime());
     }
 

@@ -292,6 +292,10 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
     return controlPlane.completeAwait(command, awaitItemContinuationHandler(selectedWorker));
   }
 
+  AwaitItemContinuationHandler awaitItemContinuationHandlerForControlPlane() {
+    return awaitItemContinuationHandler(transitionWorkerSelector.select(this));
+  }
+
   private AwaitItemContinuationHandler awaitItemContinuationHandler(PipelineTransitionWorker selectedWorker) {
     return new AwaitItemContinuationHandler() {
       @Override

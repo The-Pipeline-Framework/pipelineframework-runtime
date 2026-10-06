@@ -201,6 +201,7 @@ public class SqsWorkPoller {
 
     private boolean enabled() {
         return orchestratorConfig != null
+            && !orchestratorConfig.processLoopsDisabled()
             && orchestratorConfig.mode() == OrchestratorMode.QUEUE_ASYNC
             && "sqs".equalsIgnoreCase(orchestratorConfig.dispatcherProvider())
             && !orchestratorConfig.sqs().localLoopback()
