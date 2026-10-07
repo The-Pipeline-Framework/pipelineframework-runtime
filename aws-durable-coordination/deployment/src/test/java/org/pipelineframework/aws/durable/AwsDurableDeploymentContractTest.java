@@ -81,11 +81,13 @@ class AwsDurableDeploymentContractTest {
         }
         assertTrue(registrationIndexFound);
         assertTrue(legacyIndexRetained, "Retained host versions still need their original index");
-        JsonNode grant = resources.path("WakeupRole").path("Properties").path("Policies").get(0)
-            .path("PolicyDocument").path("Statement").get(0).path("Resource");
         boolean indexGranted = false;
-        for (JsonNode resource : grant) {
-            indexGranted |= "${CallbackBindingTable.Arn}/index/provider-registration-index".equals(resource.asText());
+        for (JsonNode statement : resources.path("WakeupRole").path("Properties").path("Policies").get(0)
+                .path("PolicyDocument").path("Statement")) {
+            for (JsonNode resource : statement.path("Resource")) {
+                indexGranted |= "${CallbackBindingTable.Arn}/index/provider-registration-index"
+                    .equals(resource.asText());
+            }
         }
         assertTrue(indexGranted, "Targeted repair must be authorised to query its new index");
     }
