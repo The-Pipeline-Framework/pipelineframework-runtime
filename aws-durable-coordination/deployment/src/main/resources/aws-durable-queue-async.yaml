@@ -35,7 +35,10 @@ Globals:
 Resources:
   CallbackBindingTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
+      SSESpecification: {SSEEnabled: true}
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - {AttributeName: pk, AttributeType: S}
@@ -44,9 +47,17 @@ Resources:
       KeySchema:
         - {AttributeName: pk, KeyType: HASH}
         - {AttributeName: sk, KeyType: RANGE}
+      # For existing tables, add provider-registration-index and wait for ACTIVE
+      # before upgrading the repair host. Existing records need no backfill.
+      # Keep provider-execution-index while retained host versions still use it.
       GlobalSecondaryIndexes:
         - IndexName: provider-execution-index
           KeySchema: [{AttributeName: provider_execution_arn, KeyType: HASH}]
+          Projection: {ProjectionType: ALL}
+        - IndexName: provider-registration-index
+          KeySchema:
+            - {AttributeName: provider_execution_arn, KeyType: HASH}
+            - {AttributeName: sk, KeyType: RANGE}
           Projection: {ProjectionType: ALL}
       StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
       TimeToLiveSpecification: {AttributeName: expires_at_epoch_s, Enabled: true}
@@ -54,37 +65,40 @@ Resources:
 
   WorkDlq:
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600}
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
   WorkQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 900
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 5400
       RedrivePolicy: {deadLetterTargetArn: !GetAtt WorkDlq.Arn, maxReceiveCount: 5}
   AwaitCompletionDlq:
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600}
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
   AwaitCompletionQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 180
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 720
       RedrivePolicy: {deadLetterTargetArn: !GetAtt AwaitCompletionDlq.Arn, maxReceiveCount: 5}
   TransitionDlq:
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600}
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
   TransitionRequestQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 900
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 5400
       RedrivePolicy: {deadLetterTargetArn: !GetAtt TransitionDlq.Arn, maxReceiveCount: 5}
   TransitionResponseQueue:
     Type: AWS::SQS::Queue
-    Properties: {VisibilityTimeout: 180, MessageRetentionPeriod: 1209600}
+    Properties: {VisibilityTimeout: 720, MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
   DurableDlq:
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600}
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
   StreamFailureDlq:
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600}
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
 
   DurableRole:
     Type: AWS::IAM::Role
@@ -196,12 +210,16 @@ Resources:
                 Resource:
                   - !GetAtt CallbackBindingTable.Arn
                   - !Sub '${CallbackBindingTable.Arn}/index/provider-execution-index'
+                  - !Sub '${CallbackBindingTable.Arn}/index/provider-registration-index'
               - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:Query]
                 Resource: !Ref SemanticDynamoResourceArns
               - Effect: Allow
                 Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
                 Resource: [!Ref AwaitInteractionStreamArn, !GetAtt CallbackBindingTable.StreamArn]
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt StreamFailureDlq.Arn
               - Effect: Allow
                 Action: [lambda:GetDurableExecution, lambda:GetDurableExecutionHistory,
                   lambda:SendDurableExecutionCallbackSuccess, lambda:InvokeFunction]
@@ -212,6 +230,11 @@ Resources:
 
   DurableFunction:
     Type: AWS::Lambda::Function
+    # After stack deletion, redeploying the same stack name conflicts with this retained,
+    # fixed-name function. Once its executions and recovery windows have expired,
+    # manually delete the retained function before deploying that stack name again.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Metadata:
       cfn-lint: {config: {ignore_checks: [E3002]}}
     Properties:
@@ -232,6 +255,8 @@ Resources:
 
   DurableVersion:
     Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       FunctionName: !Ref DurableFunction
       CodeSha256: !Ref DurableCodeSha256

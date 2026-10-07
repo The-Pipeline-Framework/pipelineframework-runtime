@@ -69,7 +69,29 @@ class AwsDurableCallbackBindingRepositoryTest {
     @Test
     void providerExecutionLookupUsesTheDedicatedIndex() {
         DynamoDbClient dynamo = mock(DynamoDbClient.class);
-        when(dynamo.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder()
+        when(dynamo.query(any(QueryRequest.class))).thenReturn(registrationResponse());
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, "bindings");
+
+        Optional<AwsDurableCallbackRegistration> result =
+            repository.findRegistrationByProviderExecutionArn("arn:closed");
+
+        assertThat(result).hasValueSatisfying(registration -> {
+            assertThat(registration.providerExecutionArn()).isEqualTo("arn:closed");
+            assertThat(registration.checkpoint().executionId()).isEqualTo("execution-a");
+            assertThat(registration.checkpoint().generation()).isEqualTo(1);
+        });
+        verify(dynamo).query(org.mockito.ArgumentMatchers.<QueryRequest>argThat(request ->
+            AwsDurableCallbackBindingRepository.PROVIDER_REGISTRATION_INDEX.equals(request.indexName())
+                && request.limit() == 1
+                && request.filterExpression() == null
+                && request.keyConditionExpression().equals(
+                    "#providerArn = :providerArn AND begins_with(#sk, :registration)")
+                && request.expressionAttributeNames().get("#sk").equals("sk")
+                && request.expressionAttributeValues().get(":registration").s().equals("REGISTRATION#")));
+    }
+
+    private static QueryResponse registrationResponse() {
+        return QueryResponse.builder()
             .items(Map.ofEntries(
                 Map.entry("pk", AttributeValue.fromS("tenant-a#execution-a")),
                 Map.entry("sk", AttributeValue.fromS("REGISTRATION#00000000000000000001")),
@@ -85,20 +107,17 @@ class AwsDurableCallbackBindingRepositoryTest {
                 Map.entry("provider_callback_id", AttributeValue.fromS("callback-a")),
                 Map.entry("created_at_epoch_ms", AttributeValue.fromN("100")),
                 Map.entry("expires_at_epoch_s", AttributeValue.fromN("1000"))))
-            .build());
-        var repository = new AwsDurableCallbackBindingRepository(dynamo, "bindings");
+            .build();
+    }
 
-        Optional<AwsDurableCallbackRegistration> result =
-            repository.findRegistrationByProviderExecutionArn("arn:closed");
+    @Test
+    void exhaustedRegistrationIndexReturnsEmptyForRetryableRepair() {
+        DynamoDbClient dynamo = mock(DynamoDbClient.class);
+        when(dynamo.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder().build());
 
-        assertThat(result).hasValueSatisfying(registration -> {
-            assertThat(registration.providerExecutionArn()).isEqualTo("arn:closed");
-            assertThat(registration.checkpoint().executionId()).isEqualTo("execution-a");
-            assertThat(registration.checkpoint().generation()).isEqualTo(1);
-        });
-        verify(dynamo).query(org.mockito.ArgumentMatchers.<QueryRequest>argThat(request ->
-            AwsDurableCallbackBindingRepository.PROVIDER_EXECUTION_INDEX.equals(request.indexName())
-                && request.limit() == 1));
+        assertThat(new AwsDurableCallbackBindingRepository(dynamo, "bindings")
+            .findRegistrationByProviderExecutionArn("arn:closed")).isEmpty();
+        verify(dynamo).query(any(QueryRequest.class));
     }
 
     private static AwsDurableCallbackBinding binding(String callbackId, long createdAt, long expiresAt) {

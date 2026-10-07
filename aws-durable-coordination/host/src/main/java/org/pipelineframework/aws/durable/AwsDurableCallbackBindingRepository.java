@@ -22,6 +22,7 @@ import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
 /** Immutable provider callback bindings and append-only delivery evidence. */
 public final class AwsDurableCallbackBindingRepository {
     public static final String PROVIDER_EXECUTION_INDEX = "provider-execution-index";
+    public static final String PROVIDER_REGISTRATION_INDEX = "provider-registration-index";
     public static final String PK = "pk";
     public static final String SK = "sk";
     public static final String RECORD_TYPE = "record_type";
@@ -120,18 +121,15 @@ public final class AwsDurableCallbackBindingRepository {
     ) {
         var response = dynamo.query(QueryRequest.builder()
             .tableName(tableName())
-            .indexName(PROVIDER_EXECUTION_INDEX)
-            .keyConditionExpression("#providerArn = :providerArn")
-            .expressionAttributeNames(Map.of("#providerArn", "provider_execution_arn"))
+            .indexName(PROVIDER_REGISTRATION_INDEX)
+            .keyConditionExpression("#providerArn = :providerArn AND begins_with(#sk, :registration)")
+            .expressionAttributeNames(Map.of("#providerArn", "provider_execution_arn", "#sk", SK))
             .expressionAttributeValues(Map.of(
-                ":providerArn", string(required(providerExecutionArn, "providerExecutionArn"))))
-            .scanIndexForward(false)
+                ":providerArn", string(required(providerExecutionArn, "providerExecutionArn")),
+                ":registration", string("REGISTRATION#")))
             .limit(1)
             .build());
-        return response.items().stream()
-            .filter(item -> REGISTRATION.equals(text(item, RECORD_TYPE)))
-            .findFirst()
-            .map(this::registrationFromItem);
+        return response.items().stream().findFirst().map(this::registrationFromItem);
     }
 
     public Optional<AwsDurableCallbackBinding> find(String tenantId, String interactionId, long generation) {
