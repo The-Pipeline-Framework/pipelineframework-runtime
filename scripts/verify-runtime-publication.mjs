@@ -10,6 +10,10 @@ export const expectedDeployability = new Map([
   ['pipelineframework-runtime-spring', true],
   ['pipelineframework-release-maven-plugin', true],
   ['pipelineframework-release-producer', true],
+  ['pipelineframework-aws-durable-coordination-parent', true],
+  ['pipelineframework-aws-durable-coordination-model', true],
+  ['pipelineframework-aws-durable-coordination-host', true],
+  ['pipelineframework-aws-durable-coordination-deployment', true],
   ['persistence-plugin', true],
   ['cache-plugin', true],
   ['repository-plugin', true],
@@ -17,6 +21,10 @@ export const expectedDeployability = new Map([
   ['framework-foundational-plugins', false],
   ['pipelineframework-spring-smoke-tests', false],
   ['pipelineframework-spring-blocking-smoke-tests', false],
+  ['pipelineframework-aws-durable-proof-parent', false],
+  ['pipelineframework-aws-durable-proof-driver', false],
+  ['pipelineframework-aws-durable-proof-action-host', false],
+  ['pipelineframework-aws-durable-proof-fault-tests', false],
 ]);
 
 function elementValue(xml, element) {
