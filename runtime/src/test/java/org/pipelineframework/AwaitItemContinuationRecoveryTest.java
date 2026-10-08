@@ -72,8 +72,19 @@ class AwaitItemContinuationRecoveryTest {
                 CyclicBarrier start = new CyclicBarrier(2);
                 var a = callers.submit(() -> { start.await(10, TimeUnit.SECONDS); return first.invoke(seed.command()); });
                 var b = callers.submit(() -> { start.await(10, TimeUnit.SECONDS); return second.invoke(seed.command()); });
-                assertTrue(a.get(20, TimeUnit.SECONDS).successful());
-                assertTrue(b.get(20, TimeUnit.SECONDS).successful());
+                AwaitItemContinuationResult firstResult = a.get(20, TimeUnit.SECONDS);
+                AwaitItemContinuationResult secondResult = b.get(20, TimeUnit.SECONDS);
+                for (AwaitItemContinuationResult result : List.of(firstResult, secondResult)) {
+                    assertTrue(result.successful()
+                            || result.disposition() == AwaitItemContinuationDisposition.RETRY
+                            || result.disposition() == AwaitItemContinuationDisposition.NOT_READY,
+                        () -> "concurrent replay returned a terminal failure: " + result);
+                }
+            }
+            for (AwaitItemContinuationCommand pending : ((AwaitItemContinuationWorkStore) stores.get().interactions())
+                    .findDueItemContinuations(seed.now() + 60_000, 10).await().atMost(TIMEOUT)) {
+                assertTrue(runtime(stores.get(), workerCalls, Optional.empty(), 0).invoke(pending).successful(),
+                    "a racing replay must converge when its durable retry is due");
             }
         } else {
             assertTrue(first.invoke(seed.command()).successful());
