@@ -5,6 +5,7 @@ import static org.mockito.Mockito.when;
 
 import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
 import org.pipelineframework.awaitable.spi.AwaitUnitStore;
+import org.pipelineframework.awaitable.AwaitDurablePayloadResolver;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -22,6 +23,17 @@ public final class DynamoAwaitLifecycleTestStores {
   /** A completion/read-only store does not need to resolve idempotency or correlation lookup keys. */
   public static AwaitInteractionStore interactionStoreForCompletion(DynamoDbClient client, String tablePrefix) {
     return interactionStore(client, tablePrefix, false);
+  }
+
+  /** Canonical snapshot/import tests must use the real release-pinned payload resolver. */
+  public static AwaitInteractionStore interactionStore(
+      DynamoDbClient client, String tablePrefix, AwaitDurablePayloadResolver resolver) {
+    PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
+    PipelineOrchestratorConfig.DynamoConfig dynamo = mock(PipelineOrchestratorConfig.DynamoConfig.class);
+    when(config.dynamo()).thenReturn(dynamo);
+    when(dynamo.awaitInteractionTable()).thenReturn(tablePrefix + "_interaction");
+    when(dynamo.awaitInteractionKeyTable()).thenReturn(tablePrefix + "_interaction_key");
+    return new DynamoAwaitInteractionStore(client, config, resolver);
   }
 
   /** A separate store instance models a fresh runtime recovering await-unit state from Dynamo. */
