@@ -73,7 +73,9 @@ public class AwaitLiveCompletionRegistry {
         if (session == null) {
             return Uni.createFrom().item(false);
         }
-        return session.enqueueIfNew(record);
+        // A duplicate already seen by this session is still owned by the live stream.
+        // Only the absence of a session should route admission to durable fallback.
+        return session.enqueueIfNew(record).replaceWith(true);
     }
 
     public void close(String tenantId, String unitId) {

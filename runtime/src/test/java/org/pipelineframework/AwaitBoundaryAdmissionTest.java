@@ -115,6 +115,21 @@ class AwaitBoundaryAdmissionTest {
     verify(continuations, never()).afterRecordedCompletion(any(), any(), any(), any(Long.class));
   }
 
+  @Test
+  void duplicateOwnedByLiveSessionDoesNotEnterDurableFallback() {
+    AwaitInteractionRecord interaction = awaitRecord(0);
+    AwaitCompletionCommand command = command(interaction.interactionId());
+    AwaitCompletionResult duplicate = new AwaitCompletionResult(interaction, true);
+    when(awaitCoordinator.complete(any())).thenReturn(Uni.createFrom().item(duplicate));
+    when(liveCompletionRegistry.signal(interaction)).thenReturn(Uni.createFrom().item(true));
+
+    assertEquals(duplicate, admission.complete(command, AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER)
+        .await().indefinitely());
+
+    verify(awaitCoordinator, never()).recordCompletion(any(), any(Long.class));
+    verify(continuations, never()).afterRecordedCompletion(any(), any(), any(), any(Long.class));
+  }
+
     @Test
     void releasesAdmissionAfterLiveSessionEnqueuesWithoutWaitingForDownstreamDelivery() {
       AwaitInteractionRecord interaction = awaitRecord(null);

@@ -62,11 +62,13 @@ class AwaitLiveCompletionRegistryTest {
     }
 
     @Test
-    void signalReportsOnlyNewlyEnqueuedCompletions() {
+    void signalKeepsDuplicateCompletionsOwnedByTheLiveSession() {
         AwaitLiveCompletionRegistry registry = new AwaitLiveCompletionRegistry();
         registry.open(descriptor(), "tenant", "unit");
 
         assertTrue(registry.signal(completion(0)).await().indefinitely());
+        assertTrue(registry.signal(completion(0)).await().indefinitely());
+        registry.close("tenant", "unit");
         assertFalse(registry.signal(completion(0)).await().indefinitely());
     }
 
