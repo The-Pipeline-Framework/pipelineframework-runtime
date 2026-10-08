@@ -377,6 +377,28 @@ class ItemizedAwaitContinuationFlowTest {
   }
 
   @Test
+  void liveOpenUnitIsNotReconciledByDurableContinuationSweep() {
+    AwaitInteractionRecord completed = itemAwaitRecord(
+        "exec-1", 0, AwaitInteractionStatus.COMPLETED, "approved");
+    AwaitUnitRecord openUnit = awaitUnit(
+        "exec-1", AwaitUnitStatus.WAITING_EXTERNAL, null, 0, false);
+    AwaitItemContinuationCommand command = new AwaitItemContinuationCommand(
+        "tenant-1", "exec-1", "unit-1", completed.interactionId(), 0, 1, 1234L);
+    AwaitItemContinuationHandler handler = org.mockito.Mockito.mock(AwaitItemContinuationHandler.class);
+    when(awaitCoordinator.getUnit("tenant-1", "unit-1"))
+        .thenReturn(Uni.createFrom().item(openUnit));
+
+    AwaitItemContinuationResult result = flow(executionStateStore, workDispatcher, awaitCoordinator)
+        .processOne(command, handler, 10L)
+        .await().indefinitely();
+
+    assertEquals(AwaitItemContinuationDisposition.NOT_READY, result.disposition());
+    verify(awaitCoordinator, never()).recordCompletion(any(), any(Long.class));
+    verify(awaitCoordinator, never()).findByUnit(any(), any());
+    org.mockito.Mockito.verifyNoInteractions(handler);
+  }
+
+  @Test
   void boundedSweepRediscoversAdmittedContinuationAfterOriginalCallerIsGone() {
     AwaitInteractionRecord completed = itemAwaitRecord(
         "exec-1", 0, AwaitInteractionStatus.COMPLETED, "approved");
