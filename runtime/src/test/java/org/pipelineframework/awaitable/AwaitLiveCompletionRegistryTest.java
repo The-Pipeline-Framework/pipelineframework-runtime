@@ -64,10 +64,14 @@ class AwaitLiveCompletionRegistryTest {
     @Test
     void signalKeepsDuplicateCompletionsOwnedByTheLiveSession() {
         AwaitLiveCompletionRegistry registry = new AwaitLiveCompletionRegistry();
-        registry.open(descriptor(), "tenant", "unit");
+        AwaitLiveCompletionRegistry.LiveAwaitSession<String> session = registry.open(descriptor(), "tenant", "unit");
+        AssertSubscriber<String> subscriber = AssertSubscriber.create(2);
+        Multi.createFrom().publisher(session).subscribe().withSubscriber(subscriber);
 
         assertTrue(registry.signal(completion(0)).await().indefinitely());
         assertTrue(registry.signal(completion(0)).await().indefinitely());
+        subscriber.awaitItems(1, Duration.ofSeconds(5));
+        subscriber.assertItems("response-0");
         registry.close("tenant", "unit");
         assertFalse(registry.signal(completion(0)).await().indefinitely());
     }
