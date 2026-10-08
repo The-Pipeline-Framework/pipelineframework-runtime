@@ -401,6 +401,11 @@
                 </executions>
                 <configuration>
                     <deployment>org.pipelineframework:pipelineframework-deployment:${project.version}</deployment>
+                    <!-- Quarkus already loads Resolver API/impl in the parent. Its service-role
+                         SPI must share that loader for native Maven release admission. -->
+                    <parentFirstArtifacts>
+                        <parentFirstArtifact>org.apache.maven.resolver:maven-resolver-spi</parentFirstArtifact>
+                    </parentFirstArtifacts>
                 </configuration>
             </plugin>
             <!-- Versions Maven Plugin for consistent version management across modules -->
