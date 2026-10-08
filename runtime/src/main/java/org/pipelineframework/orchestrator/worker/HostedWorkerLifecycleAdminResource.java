@@ -23,6 +23,7 @@ import org.pipelineframework.orchestrator.ControlPlaneSecretResolver;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.PipelineReleaseRuntimeBeans;
 import org.pipelineframework.orchestrator.WorkerSecretSupport;
+import org.pipelineframework.orchestrator.RegisteredRestWorkerTargets;
 import org.pipelineframework.orchestrator.worker.dto.HostedWorkerRegisterRequest;
 
 /**
@@ -44,6 +45,9 @@ public class HostedWorkerLifecycleAdminResource {
 
     @Inject
     ControlPlaneSecretResolver secretResolver;
+
+    @Inject
+    RegisteredRestWorkerTargets registeredTargets;
 
     private volatile PipelineWorkerRegistry fallbackRegistry;
 
@@ -90,6 +94,14 @@ public class HostedWorkerLifecycleAdminResource {
             request.endpoint(),
             request.artifactId(),
             request.artifactDigest());
+        if (RegisteredRestWorkerTargets.enabled(orchestratorConfig)) {
+            try {
+                registeredTargets.validateRegistration(registration);
+            } catch (IllegalArgumentException failure) {
+                return Uni.createFrom().item(Response.status(Response.Status.CONFLICT)
+                    .entity("Worker registration conflicts with server-owned target binding").build());
+            }
+        }
         return registry().register(registration, System.currentTimeMillis())
             .onItem().transform(record -> Response.ok(record).build())
             .onFailure(IllegalArgumentException.class).recoverWithItem(failure ->

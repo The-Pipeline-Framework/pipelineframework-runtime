@@ -2,6 +2,7 @@ package org.pipelineframework.orchestrator;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import io.quarkus.arc.Unremovable;
@@ -701,6 +702,17 @@ public interface PipelineOrchestratorConfig {
      */
     interface WorkerConfig {
 
+        /** Legacy fixed target selection or explicitly bound whole-bundle REST targets. */
+        @WithDefault("legacy")
+        String targetingMode();
+
+        /** Named environment-owned worker bindings. */
+        Map<String, RegisteredRestTargetConfig> targets();
+
+        /** Permit cleartext only for literal loopback development endpoints. */
+        @WithDefault("false")
+        boolean allowLoopbackHttp();
+
         /**
          * Execution mode for admitted transitions.
          *
@@ -784,6 +796,30 @@ public interface PipelineOrchestratorConfig {
          */
         @WithName("lifecycle")
         WorkerLifecycleConfig lifecycle();
+    }
+
+    interface RegisteredRestTargetConfig {
+        /** Bound tenant identifier. */
+        String tenantId();
+        /** Bound pipeline identifier. */
+        String pipelineId();
+        /** Bound semantic contract version. */
+        String contractVersion();
+        /** Bound immutable Release version. */
+        String releaseVersion();
+        /** Bound lifecycle worker identifier. */
+        String workerId();
+        /** Supported transition transport. */
+        @WithDefault("rest")
+        String protocol();
+        /** Trusted worker origin, never supplied by an execution caller. */
+        String endpoint();
+        /** Environment-owned request signing secret reference. */
+        String sharedSecretRef();
+        /** Deployable whole-bundle artifact identifier. */
+        String artifactId();
+        /** Exact deployable artifact digest. */
+        String artifactDigest();
     }
 
     /**

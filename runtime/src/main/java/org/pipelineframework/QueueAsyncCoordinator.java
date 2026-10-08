@@ -107,6 +107,9 @@ class QueueAsyncCoordinator {
   TransitionPayloadCodec transitionPayloadCodec;
 
   @Inject
+  org.pipelineframework.orchestrator.RegisteredRestWorkerTargets registeredTargets;
+
+  @Inject
   PipelineReleaseIdentityResolver releaseIdentityResolver;
 
   @Inject
@@ -256,6 +259,12 @@ class QueueAsyncCoordinator {
       ensureQueueModeReady();
       if (worker == null) {
         return Uni.createFrom().failure(new IllegalArgumentException("PipelineTransitionWorker must not be null"));
+      }
+      if (org.pipelineframework.orchestrator.RegisteredRestWorkerTargets.enabled(orchestratorConfig)) {
+        return executionStateStore.getExecution(workItem.tenantId(), workItem.executionId())
+            .chain(execution -> execution.map(registeredTargets::validateExecutionPin)
+                .orElseGet(() -> Uni.createFrom().voidItem()))
+            .chain(() -> segmentPipeline().process(workItem, worker, itemContinuationHandler));
       }
       return segmentPipeline().process(workItem, worker, itemContinuationHandler);
     });

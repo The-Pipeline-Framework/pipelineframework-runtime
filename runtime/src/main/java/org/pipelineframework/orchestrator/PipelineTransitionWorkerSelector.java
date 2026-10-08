@@ -3,6 +3,7 @@ package org.pipelineframework.orchestrator;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import java.util.Optional;
 
 /**
  * Selects the transition worker from configured remote targets.
@@ -22,8 +23,13 @@ public class PipelineTransitionWorkerSelector {
     @Inject
     SqsPipelineTransitionWorker sqsWorker;
 
+    @Inject
+    RegisteredRestWorkerTargets registeredTargets;
+
     @PostConstruct
     void validateConfiguredTargets() {
+        Optional.ofNullable(registeredTargets).ifPresent(RegisteredRestWorkerTargets::validateConfiguration);
+        if (RegisteredRestWorkerTargets.enabled(orchestratorConfig)) return;
         boolean restEnabled = orchestratorConfig.workerRest().isEnabled();
         boolean grpcEnabled = orchestratorConfig.workerGrpc().isEnabled();
         boolean sqsEnabled = orchestratorConfig.workerSqs().isEnabled();
@@ -39,6 +45,7 @@ public class PipelineTransitionWorkerSelector {
      * @return selected worker
      */
     public PipelineTransitionWorker select(PipelineTransitionWorker localWorker) {
+        if (RegisteredRestWorkerTargets.enabled(orchestratorConfig)) return registeredTargets;
         boolean restEnabled = orchestratorConfig.workerRest().isEnabled();
         boolean grpcEnabled = orchestratorConfig.workerGrpc().isEnabled();
         boolean sqsEnabled = orchestratorConfig.workerSqs().isEnabled();

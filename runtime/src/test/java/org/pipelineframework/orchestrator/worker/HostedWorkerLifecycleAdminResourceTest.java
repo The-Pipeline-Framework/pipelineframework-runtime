@@ -13,6 +13,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.orchestrator.LocalControlPlaneSecretResolver;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
+import org.pipelineframework.orchestrator.RegisteredRestWorkerTargetsTest;
 import org.pipelineframework.orchestrator.worker.dto.HostedWorkerRegisterRequest;
 
 class HostedWorkerLifecycleAdminResourceTest {
@@ -95,6 +96,31 @@ class HostedWorkerLifecycleAdminResourceTest {
             .await().indefinitely();
 
         assertEquals(400, response.getStatus());
+    }
+
+    @Test
+    void registeredModeAdminRejectsEndpointSubstitutionAndKeepsDrainOnDuplicates() throws Exception {
+        var fixture = new RegisteredRestWorkerTargetsTest();
+        try {
+            fixture.setup();
+            when(resource.orchestratorConfig.worker()).thenReturn(fixture.configForTest().worker());
+            resource.registeredTargets = fixture.targetsForTest();
+            var binding = fixture.configForTest().worker().targets().get("A");
+            var request = new HostedWorkerRegisterRequest("A", "contract", "A", "rest", binding.endpoint(), "app", "sha256:A");
+            assertEquals(200, resource.register("tenant", "pipeline", AUTH, request).await().indefinitely().getStatus());
+            assertEquals(409, resource.register("tenant", "pipeline", AUTH, new HostedWorkerRegisterRequest(
+                "A", "contract", "A", "rest", "https://unbound.example", "app", "sha256:A"))
+                .await().indefinitely().getStatus());
+            assertEquals(409, resource.register("other-tenant", "pipeline", AUTH, request).await().indefinitely().getStatus());
+            resource.markDraining("tenant", "pipeline", "A", AUTH).await().indefinitely();
+            var repeated = resource.register("tenant", "pipeline", AUTH, request).await().indefinitely();
+            assertEquals(200, repeated.getStatus());
+            assertEquals(PipelineWorkerState.DRAINING, assertInstanceOf(PipelineWorkerRecord.class, repeated.getEntity()).state());
+            assertEquals(binding.endpoint(), resource.workerRegistry.list("tenant", "pipeline", System.currentTimeMillis(),
+                java.time.Duration.ofMinutes(2)).await().indefinitely().getFirst().endpoint());
+        } finally {
+            fixture.close();
+        }
     }
 
     private static HostedWorkerRegisterRequest request() {

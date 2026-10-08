@@ -138,6 +138,22 @@ class PipelineWorkerRegistryTest {
         assertFalse(content.contains("return null"));
     }
 
+    @Test
+    void dynamoReregistrationAndHeartbeatRetainDrainLikeMemory() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        when(client.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder().items(List.of(
+            eventItem("worker-1", "rest", "REGISTER", 1_000L),
+            eventItem("worker-1", "rest", "DRAIN", 2_000L),
+            eventItem("worker-1", "rest", "REGISTER", 3_000L),
+            eventItem("worker-1", "rest", "HEARTBEAT", 4_000L))).build());
+        var record = new DynamoPipelineWorkerRegistry(client, dynamoConfig())
+            .list("tenant-1", "org.example.restaurant", 5_000L, Duration.ofSeconds(10))
+            .await().indefinitely().getFirst();
+        assertEquals(PipelineWorkerState.DRAINING, record.state());
+        assertEquals(2_000L, record.drainingSinceEpochMs());
+        assertEquals(4_000L, record.lastHeartbeatAtEpochMs());
+    }
+
     private static PipelineWorkerRegistration registration(
         String workerId,
         String protocol,

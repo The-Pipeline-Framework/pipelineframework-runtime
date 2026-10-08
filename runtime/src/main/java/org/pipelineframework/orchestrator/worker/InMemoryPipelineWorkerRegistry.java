@@ -20,6 +20,9 @@ public class InMemoryPipelineWorkerRegistry implements PipelineWorkerRegistry {
     public Uni<PipelineWorkerRecord> register(PipelineWorkerRegistration registration, long nowEpochMs) {
         return Uni.createFrom().item(() -> {
             synchronized (lock) {
+                long drainingSince = Optional.ofNullable(workers.get(
+                    key(registration.tenantId(), registration.pipelineId(), registration.workerId())))
+                    .map(PipelineWorkerRecord::drainingSinceEpochMs).orElse(0L);
                 PipelineWorkerRecord record = new PipelineWorkerRecord(
                     registration.tenantId(),
                     registration.pipelineId(),
@@ -30,10 +33,10 @@ public class InMemoryPipelineWorkerRegistry implements PipelineWorkerRegistry {
                     registration.endpoint(),
                     registration.artifactId(),
                     registration.artifactDigest(),
-                    PipelineWorkerState.HEALTHY,
+                    drainingSince > 0L ? PipelineWorkerState.DRAINING : PipelineWorkerState.HEALTHY,
                     nowEpochMs,
                     nowEpochMs,
-                    0L);
+                    drainingSince);
                 workers.put(key(registration.tenantId(), registration.pipelineId(), registration.workerId()), record);
                 return record;
             }
