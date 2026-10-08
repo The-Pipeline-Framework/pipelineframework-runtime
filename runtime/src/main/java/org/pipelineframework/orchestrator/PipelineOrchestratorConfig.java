@@ -568,6 +568,9 @@ public interface PipelineOrchestratorConfig {
      */
     interface ReleasesConfig {
 
+        /** Environment-owned artifact resolution settings, separate from release identity. */
+        ReleaseResolverConfig resolver();
+
         /**
          * Release registry metadata provider settings.
          *
@@ -583,6 +586,19 @@ public interface PipelineOrchestratorConfig {
          */
         @WithName("storage")
         ReleaseStorageConfig storage();
+    }
+
+    /** Maven admission uses the shared public Release resolver and its settings contract. */
+    interface ReleaseResolverConfig {
+        /** Explicit settings file for private repository IDs and server credentials. */
+        Optional<String> mavenSettings();
+
+        /** Optional cache override; defaults to the release storage root's maven subdirectory. */
+        Optional<String> mavenLocalRepository();
+
+        /** Public repositories. Private authenticated repositories belong in the settings file. */
+        @WithDefault("https://repo.maven.apache.org/maven2")
+        List<String> mavenRepositories();
     }
 
     /**
