@@ -311,7 +311,9 @@ class ItemizedAwaitContinuationFlow {
       return Uni.createFrom().item(AwaitItemContinuationResult.notReady(command));
     }
     return awaitCoordinator.getUnit(command.tenantId(), command.unitId())
-        .onItem().transformToUni(unit -> awaitCoordinator.findByUnit(command.tenantId(), command.unitId())
+        .onItem().transformToUni(unit -> !unit.dispatchComplete()
+            ? Uni.createFrom().item(AwaitItemContinuationResult.notReady(command))
+            : awaitCoordinator.findByUnit(command.tenantId(), command.unitId())
             .onItem().transformToUni(records -> matchingInteraction(command, records)
                 .map(record -> awaitCoordinator.recordCompletion(record, command.nowEpochMs())
                     .chain(completedUnit -> processResolved(
