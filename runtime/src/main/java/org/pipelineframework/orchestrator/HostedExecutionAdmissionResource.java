@@ -87,8 +87,15 @@ public class HostedExecutionAdmissionResource {
                         return Uni.createFrom().item(Response.status(409).build());
                     }
                     hosted.registrar().verify(release);
-                    Object input = hosted.executionInput(new HostedExecutionSubmitRequest(pipeline, request.inputShape(),
-                        request.inputPayload(), request.clientKey(), request.outputStreaming()), release);
+                    Object input;
+                    try {
+                        input = hosted.executionInput(new HostedExecutionSubmitRequest(pipeline, request.inputShape(),
+                            request.inputPayload(), request.clientKey(), request.outputStreaming()), release);
+                    } catch (HostedPipelineControlPlaneResource.IngressPayloadTypeResolutionException unavailable) {
+                        return Uni.createFrom().item(Response.status(503).build());
+                    } catch (RuntimeException invalid) {
+                        return Uni.createFrom().item(Response.status(400).build());
+                    }
                     var evidence = ExecutionAdmissionReleaseEvidence.snapshot(release);
                     return hosted.availability().check(new PipelineWorkerAvailabilityRequest(tenant, pipeline,
                         release.contractVersion(), release.releaseVersion(), release.primaryArtifactId(), release.primaryArtifactDigest()))

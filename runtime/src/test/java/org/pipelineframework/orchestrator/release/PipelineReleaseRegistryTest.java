@@ -9,6 +9,7 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.when;
 
 import java.nio.file.Files;
@@ -264,6 +265,48 @@ class PipelineReleaseRegistryTest {
                 && request.transactItems().get(2).put().item().get("registry_sort").s().equals("activation-head:v1")
                 && request.transactItems().get(2).put().conditionExpression().contains("attribute_not_exists")
                 && request.transactItems().get(2).put().item().get("activation_sequence").n().equals("1")));
+    }
+
+    @Test
+    void dynamoActivationRetriesProviderContentionButNeverFailedReleaseCondition() {
+        for (String reason : List.of("TransactionConflict", "ThrottlingError", "ReleaseCondition", "Mixed", "Persistent")) {
+            DynamoDbClient client = mock(DynamoDbClient.class);
+            PipelineReleaseRecord record = releaseRecord();
+            var registry = new DynamoPipelineReleaseRegistry(client, dynamoConfig());
+            when(client.getItem(any(GetItemRequest.class))).thenAnswer(invocation -> {
+                GetItemRequest request = invocation.getArgument(0);
+                return GetItemResponse.builder().item(request.key().get("registry_sort").s().startsWith("release:")
+                    ? dynamoReleaseItem(record) : Map.of()).build();
+            });
+            when(client.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder().items(List.of()).build());
+            var failure = software.amazon.awssdk.services.dynamodb.model.TransactionCanceledException.builder()
+                .cancellationReasons(
+                    software.amazon.awssdk.services.dynamodb.model.CancellationReason.builder()
+                        .code(reason.equals("ReleaseCondition") || reason.equals("Mixed") ? "ConditionalCheckFailed" : "None").build(),
+                    software.amazon.awssdk.services.dynamodb.model.CancellationReason.builder()
+                        .code(reason.equals("ReleaseCondition") ? "None"
+                            : reason.equals("Mixed") || reason.equals("Persistent") ? "TransactionConflict" : reason).build())
+                .build();
+            if (reason.equals("Persistent")) {
+                when(client.transactWriteItems(any(TransactWriteItemsRequest.class))).thenThrow(failure);
+                var exhausted = assertThrows(IllegalStateException.class,
+                    () -> registry.activate(record.tenantId(), record.pipelineId(), record.releaseVersion(), 3000L).await().indefinitely());
+                assertEquals("Activation head remained contended; no effect inferred", exhausted.getMessage());
+                verify(client, times(32)).transactWriteItems(any(TransactWriteItemsRequest.class));
+            } else {
+                when(client.transactWriteItems(any(TransactWriteItemsRequest.class))).thenThrow(failure)
+                    .thenReturn(TransactWriteItemsResponse.builder().build());
+            }
+            if (reason.equals("ReleaseCondition") || reason.equals("Mixed")) {
+                assertThrows(software.amazon.awssdk.services.dynamodb.model.TransactionCanceledException.class,
+                    () -> registry.activate(record.tenantId(), record.pipelineId(), record.releaseVersion(), 3000L).await().indefinitely());
+                verify(client, times(1)).transactWriteItems(any(TransactWriteItemsRequest.class));
+            } else if (!reason.equals("Persistent")) {
+                assertEquals(PipelineReleaseStatus.ACTIVE, registry.activate(record.tenantId(), record.pipelineId(), record.releaseVersion(), 3000L)
+                    .await().indefinitely().orElseThrow().status());
+                verify(client, times(2)).transactWriteItems(any(TransactWriteItemsRequest.class));
+            }
+        }
     }
 
     @Test

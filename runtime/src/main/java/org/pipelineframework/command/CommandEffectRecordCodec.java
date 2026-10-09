@@ -86,8 +86,9 @@ final class CommandEffectRecordCodec {
                 "Unsupported durable Command effect schema version " + schemaVersion);
         }
         if (schemaVersion < SCHEMA_VERSION
-            && (root.findValues("recoveryBinding").stream().anyMatch(value -> !value.isNull())
-                || root.findValues("reconciliationReceipt").stream().anyMatch(value -> !value.isNull()))) {
+            && java.util.stream.StreamSupport.stream(root.path("attempts").spliterator(), false)
+                .anyMatch(attempt -> !attempt.path("recoveryBinding").isMissingNode() && !attempt.path("recoveryBinding").isNull()
+                    || !attempt.path("reconciliationReceipt").isMissingNode() && !attempt.path("reconciliationReceipt").isNull())) {
             throw new CommandEffectStoreException("Older Command schema cannot acquire recovery metadata");
         }
         try {

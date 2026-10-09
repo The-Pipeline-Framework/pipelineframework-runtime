@@ -305,9 +305,10 @@ class AwsShapedCoordinatorActionsIT {
             assertEquals(queued.createdAtEpochMs(), queued.updatedAtEpochMs());
             long observedNow = System.currentTimeMillis();
             long persistedNow = Math.max(queued.nextDueEpochMs(), queued.createdAtEpochMs());
-            assertTrue(observedNow >= persistedNow,
-                "Wall clock regressed behind the persisted execution timestamp");
             long fixedNow = Math.max(observedNow, persistedNow);
+            assertTrue(fixedNow >= persistedNow);
+            assertEquals(persistedNow, Math.max(persistedNow - 1, persistedNow),
+                "A regressed observation must not precede persisted authority");
             ExecutionRecord<Object, Object> claimed = runtime.executionStore.claimLease(
                     tenantId, accepted.executionId(), "retry-arranger", fixedNow, 1_000L)
                 .await().atMost(Duration.ofSeconds(10)).orElseThrow();

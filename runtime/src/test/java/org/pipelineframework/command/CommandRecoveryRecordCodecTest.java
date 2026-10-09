@@ -11,6 +11,23 @@ class CommandRecoveryRecordCodecTest {
     private final CommandEffectRecordCodec codec = new CommandEffectRecordCodec();
 
     @Test
+    void legacyUserPayloadRecoveryNamesAreNotAttemptMetadata() throws Exception {
+        var payload = Map.of("recoveryBinding", "business-value", "reconciliationReceipt", "business-receipt");
+        var record = new CommandEffectRecord("tenant", "execution", "step", "command", "id", CommandEffectStatus.SUCCEEDED,
+            payload, payload, null, null, Optional.empty(), List.of(), 1L, 1L);
+        for (int version : List.of(1, 2)) {
+            var root = (ObjectNode) PipelineJson.mapper().readTree(codec.encode(record, Map.class.getName(), Map.class.getName()));
+            root.put("schemaVersion", version);
+            for (var attempt : root.withArray("attempts")) {
+                ((ObjectNode) attempt).remove(List.of("recoveryBinding", "reconciliationReceipt"));
+                if (version == 1) ((ObjectNode) attempt).remove(List.of("occurrenceId", "purpose", "output", "reason"));
+            }
+            assertEquals(payload, codec.decode(root.toString()).record().input());
+            assertEquals(payload, codec.decode(root.toString()).record().output());
+        }
+    }
+
+    @Test
     void roundTripsOriginalTypedBindingAndReconciledReceipt() {
         CommandEffectRecord settled = settled();
         String encoded = codec.encode(settled, String.class.getName(), Result.class.getName());

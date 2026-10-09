@@ -9,6 +9,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.LocalPipelineControlPlane;
+import org.pipelineframework.orchestrator.dto.HostedExecutionSubmitRequest;
 
 class HostedExecutionAdmissionBoundaryTest {
     @Test
@@ -60,6 +61,54 @@ class HostedExecutionAdmissionBoundaryTest {
             verify(dispatcher, never()).enqueueNow(any());
             verify(local, never()).admitExecution(any(), any(), any());
         }
+    }
+
+    @Test
+    void payloadResolutionAndMalformedPayloadHaveDistinctPreEffectStatuses() {
+        for (boolean unavailable : new boolean[] {true, false}) {
+            var hosted = spy(hosted(true));
+            hosted.releaseRegistry = mock(org.pipelineframework.orchestrator.release.PipelineReleaseRegistry.class);
+            hosted.releaseRegistrar = mock(org.pipelineframework.orchestrator.release.PipelineReleaseRegistrar.class);
+            hosted.workerAvailability = mock(org.pipelineframework.orchestrator.worker.PipelineWorkerAvailability.class);
+            var release = mock(org.pipelineframework.orchestrator.release.PipelineReleaseRecord.class);
+            when(release.contractVersion()).thenReturn("contract");
+            when(hosted.releaseRegistry.get("tenant", "pipeline", "release"))
+                .thenReturn(Uni.createFrom().item(Optional.of(release)));
+            RuntimeException failure = unavailable
+                ? new HostedPipelineControlPlaneResource.IngressPayloadTypeResolutionException(new ClassNotFoundException())
+                : new IllegalArgumentException("malformed payload");
+            doThrow(failure).when(hosted).executionInput(any(HostedExecutionSubmitRequest.class), eq(release));
+            var store = mock(NativeExecutionAdmissionStore.class);
+            when(store.inspectExistingAdmission(any())).thenReturn(Uni.createFrom().item(Optional.empty()));
+            var local = mock(LocalPipelineControlPlane.class);
+            when(local.nativeAdmissionStore()).thenReturn(store);
+            assertEquals(unavailable ? 503 : 400, resource(hosted, local)
+                .admit("tenant", "pipeline", "Bearer token", request()).await().indefinitely().getStatus());
+            verifyNoInteractions(hosted.workerAvailability);
+            verify(local, never()).admitExecution(any(), any(), any());
+        }
+    }
+
+    @Test
+    void genericDecodeFailureReturns400BeforeAvailabilityOrAdmission() {
+        var hosted = spy(hosted(true));
+        hosted.releaseRegistry = mock(org.pipelineframework.orchestrator.release.PipelineReleaseRegistry.class);
+        hosted.releaseRegistrar = mock(org.pipelineframework.orchestrator.release.PipelineReleaseRegistrar.class);
+        hosted.workerAvailability = mock(org.pipelineframework.orchestrator.worker.PipelineWorkerAvailability.class);
+        var release = mock(org.pipelineframework.orchestrator.release.PipelineReleaseRecord.class);
+        when(release.contractVersion()).thenReturn("contract");
+        when(hosted.releaseRegistry.get("tenant", "pipeline", "release"))
+            .thenReturn(Uni.createFrom().item(Optional.of(release)));
+        doThrow(new RuntimeException("decoder failure")).when(hosted)
+            .executionInput(any(HostedExecutionSubmitRequest.class), eq(release));
+        var store = mock(NativeExecutionAdmissionStore.class);
+        when(store.inspectExistingAdmission(any())).thenReturn(Uni.createFrom().item(Optional.empty()));
+        var local = mock(LocalPipelineControlPlane.class);
+        when(local.nativeAdmissionStore()).thenReturn(store);
+        assertEquals(400, resource(hosted, local).admit("tenant", "pipeline", "Bearer token", request())
+            .await().indefinitely().getStatus());
+        verifyNoInteractions(hosted.workerAvailability);
+        verify(local, never()).admitExecution(any(), any(), any());
     }
 
     @Test

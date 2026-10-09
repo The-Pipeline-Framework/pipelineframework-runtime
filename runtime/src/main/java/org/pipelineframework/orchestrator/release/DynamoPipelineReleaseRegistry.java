@@ -348,12 +348,24 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
                 dynamoClient().transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writes).build());
                 return receipt;
             } catch (TransactionCanceledException conflict) {
+                var reasons = conflict.cancellationReasons();
+                // The first transaction member verifies the immutable registered Release.
+                if (!reasons.isEmpty() && "ConditionalCheckFailed".equals(reasons.getFirst().code())) throw conflict;
                 if (receipt.isPresent()) {
                     Optional<ActivationOperationReceipt> winner = operationBlocking(tenant, pipeline, receipt.get().operationKey());
                     if (winner.isPresent()) {
                         winner.get().requireIntent(new ActivationOperationCommand(receipt.get().operationKey(), release, now));
                         return winner;
                     }
+                }
+                if (reasons.stream().anyMatch(reason -> "TransactionConflict".equals(reason.code())
+                    || "ThrottlingError".equals(reason.code()))) {
+                    try { Thread.sleep(Math.min(50L, 2L * (attempt + 1))); }
+                    catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("Activation contention retry interrupted", interrupted);
+                    }
+                    continue;
                 }
                 Map<String, AttributeValue> current = readItem(tenant, pipeline, HEAD_SORT);
                 if (current.equals(previous)) {

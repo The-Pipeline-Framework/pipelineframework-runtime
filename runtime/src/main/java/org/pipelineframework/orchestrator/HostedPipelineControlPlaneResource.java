@@ -483,8 +483,8 @@ public class HostedPipelineControlPlaneResource {
             && orchestratorConfig.controlPlane().enabled();
     }
 
-    private static final class IngressPayloadTypeResolutionException extends RuntimeException {
-        private IngressPayloadTypeResolutionException(Throwable cause) {
+    static final class IngressPayloadTypeResolutionException extends RuntimeException {
+        IngressPayloadTypeResolutionException(Throwable cause) {
             super(cause);
         }
     }

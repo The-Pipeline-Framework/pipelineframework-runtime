@@ -20,6 +20,7 @@ import org.pipelineframework.orchestrator.worker.*;
 /** Environment-owned REST bindings shared by admission checks and command-time routing. */
 @ApplicationScoped
 public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
+    private static final org.jboss.logging.Logger LOG = org.jboss.logging.Logger.getLogger(RegisteredRestWorkerTargets.class);
     @Inject PipelineOrchestratorConfig config;
     @Inject PipelineReleaseRegistry releases;
     @Inject PipelineWorkerRegistry workers;
@@ -197,7 +198,9 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
                     if (records.stream().noneMatch(record -> eligibleRecord(record, target))) throw new IllegalStateException("Registered worker became unavailable");
                     return new Selection(target, capability);
                 });
-        }).onFailure().recoverWithUni(failure -> probe(targets, index + 1));
+        }).onFailure().invoke(failure -> LOG.warnf("Registered REST capability probe failed for tenant=%s worker=%s (%s)",
+            target.tenantId(), target.workerId(), failure.getClass().getName()))
+            .onFailure().recoverWithUni(failure -> probe(targets, index + 1));
     }
 
     private record Selection(PipelineOrchestratorConfig.RegisteredRestTargetConfig target, PipelineWorkerCapability capability) {}

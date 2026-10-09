@@ -647,7 +647,8 @@ public class CommandStepSupport {
                 confirmed.outcome().code(), confirmed.outcome().flags(), confirmed.outcome().confirmation(), confirmed.outcome().references());
             return Uni.createFrom().deferred(() -> store.reconcileSucceeded(expected, record.status(), output, outcome, receipt, now))
                 .replaceWith((O) output)
-                .onFailure().recoverWithUni(failure -> matchingSuccessOrConflict(store, request, output, outcome));
+                .onFailure(CommandStepSupport::isTransitionConflict)
+                .recoverWithUni(failure -> matchingSuccessOrConflict(store, request, output, outcome));
         });
     }
 
@@ -661,6 +662,10 @@ public class CommandStepSupport {
             }
             return Uni.createFrom().failure(new CommandRecoveryConflictException("Concurrent or late Command outcome conflicts with retained authority"));
         });
+    }
+
+    private static boolean isTransitionConflict(Throwable failure) {
+        return failure instanceof CommandEffectConflictException || failure instanceof IllegalStateException;
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
@@ -759,7 +764,8 @@ public class CommandStepSupport {
                 .invoke(ignored -> CommandEffectMetrics.recordTerminalTransition(
                     request.descriptor(), CommandEffectStatus.SUCCEEDED, effectStartNanos))
                 .replaceWith(output)
-                .onFailure().recoverWithUni(failure -> store.find(request.executionContext().tenantId(), request.commandId())
+                .onFailure(CommandStepSupport::isTransitionConflict)
+                .recoverWithUni(failure -> store.find(request.executionContext().tenantId(), request.commandId())
                     .onItem().transformToUni(current -> current.isPresent() && current.orElseThrow().currentAttempt().recoveryBinding().isPresent()
                         ? matchingSuccessOrConflict(store, request, output, snapshot)
                         : Uni.createFrom().failure(failure)));

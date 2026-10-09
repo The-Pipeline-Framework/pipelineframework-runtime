@@ -55,6 +55,37 @@ class NativeCommandRecoveryIT {
     }
 
     @Test
+    void transientSuccessWriteFailureRemainsAStoreFailure() {
+        var faulty = spy(store());
+        var failure = new CommandEffectStoreException("store unavailable");
+        doReturn(io.smallrye.mutiny.Uni.createFrom().failure(failure)).when(faulty)
+            .markSucceeded(anyString(), anyString(), anyString(), any(), any(), anyLong());
+        assertSame(failure, assertThrows(CommandEffectStoreException.class,
+            () -> execute(support(faulty, true), "store-failure", descriptor("archive"))));
+        assertEquals(1, fixture.entries("store-failure").get());
+    }
+
+    @Test
+    void transientReconciliationWriteFailureDoesNotBecomeAReceiptConflict() throws Exception {
+        String id = "reconciliation-store-failure";
+        var original = start(support(store(), false), id, descriptor("archive"));
+        fixture.applied(id).get(15, TimeUnit.SECONDS);
+        fixture.ack(id).complete(new CommandOutcome.Ambiguous<>("uncertain", List.of()));
+        assertThrows(ExecutionException.class, () -> original.get(15, TimeUnit.SECONDS));
+        var before = effect(id);
+        var rows = history(id);
+        var faulty = spy(store());
+        var failure = new CommandEffectStoreException("store unavailable");
+        doReturn(io.smallrye.mutiny.Uni.createFrom().failure(failure)).when(faulty)
+            .reconcileSucceeded(any(), any(), any(), any(), any(), anyLong());
+        assertSame(failure, assertThrows(CommandEffectStoreException.class,
+            () -> execute(support(faulty, false), id, descriptor("archive"))));
+        assertEquals(before, effect(id));
+        assertEquals(rows, history(id));
+        assertEquals(1, fixture.entries(id).get());
+    }
+
+    @Test
     void authoritativeSuccessRecoversTypedOutputWithoutRepeatingEffectAndLateAckConverges() throws Exception {
         String id = "lost-ack";
         CompletableFuture<Result> original = start(support(store(), false), id, descriptor("archive"));
