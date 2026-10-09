@@ -1220,7 +1220,8 @@ public class AwaitCoordinator {
         Object canonicalPayload;
         if (descriptor.requestAwareCompletion()) {
             Object canonicalRequest = restoreCanonicalRequestPayload(descriptor, record.requestPayload());
-            canonicalPayload = descriptor.completionProjector().project(canonicalRequest, transportPayload, metadata);
+            Object canonicalCompletion = descriptor.outputFromTransport().apply(transportPayload);
+            canonicalPayload = descriptor.completionProjector().project(canonicalRequest, canonicalCompletion, metadata);
         } else {
             canonicalPayload = descriptor.outputFromTransport().apply(transportPayload);
         }

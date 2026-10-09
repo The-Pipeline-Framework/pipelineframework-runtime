@@ -67,10 +67,13 @@ class DynamoTypedAwaitImportIT {
         var contract = new PipelineContractDescriptor(2, "org.example.await", "contract", "contract-hash",
             null, null, null, false, null,
             List.of(new PipelineBundleStepDescriptor(2, "await", "internal", "ONE_TO_ONE",
-                "Request", "Decision", null, null, Map.of("transportType", "kafka"))),
+                "Request", "Decision", null, null, Map.of("transportType", "kafka")),
+                new PipelineBundleStepDescriptor(3, "projected-await", "internal", "ONE_TO_ONE",
+                    "Request", "ProjectedDecision", null, null, Map.of("transportType", "kafka"))),
             PipelineBundleCapabilities.defaults(),
             Map.of("Request", binding(Request.class, "request-fingerprint"),
-                "Decision", binding(Decision.class, "decision-fingerprint")), "catalog-fingerprint");
+                "Decision", binding(Decision.class, "decision-fingerprint"),
+                "ProjectedDecision", binding(ProjectedDecision.class, "projected-fingerprint")), "catalog-fingerprint");
         releases = new InMemoryPipelineReleaseRegistry();
         var descriptor = new PipelineReleaseDescriptor(1, "org.example.await", "contract", "release-1", "application",
             List.of(new PipelineReleaseArtifactDescriptor("application", "application-archive", "file:/fixture",
@@ -81,6 +84,69 @@ class DynamoTypedAwaitImportIT {
         descriptors = new AwaitCompletionDescriptorRegistry();
         descriptors.register(new AwaitCompletionDescriptor("await", Request.class.getName(), Decision.class.getName(),
             "ONE_TO_ONE", Duration.ofMinutes(10), "correlation", "kafka", Map.of(), List.of()));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void requestAwareWireCompletionPersistsCanonicalFinalValueAndFreshRuntimeReplaysIt() throws Exception {
+        var conversions = new java.util.concurrent.atomic.AtomicInteger();
+        var projections = new java.util.concurrent.atomic.AtomicInteger();
+        AwaitCompletionProjector<Request, CanonicalChoice, ProjectedDecision> typed =
+            new DecisionProjector(projections);
+        var descriptor = new AwaitCompletionDescriptor("projected-await", Request.class.getName(),
+            ProjectedDecision.class.getName(), "ONE_TO_ONE", Duration.ofMinutes(10), "interactionId", "kafka",
+            Map.of(), List.of(), Map.class.getName(), com.google.protobuf.DescriptorProtos.FileDescriptorProto.class.getName(),
+            value -> Map.of("id", ((Request) value).id()),
+            value -> {
+                conversions.incrementAndGet();
+                return new CanonicalChoice(((com.google.protobuf.DescriptorProtos.FileDescriptorProto) value).getName());
+            }, DecisionProjector.class.getName(),
+            (AwaitCompletionProjector<Object, Object, Object>) (AwaitCompletionProjector<?, ?, ?>) typed, true);
+        descriptors.register(descriptor);
+        var first = completionCoordinator();
+        var created = first.createOrGet(descriptor, "tenant", executionId, 3, "cause", new Request("r-1"),
+            "reviewer", "review").await().indefinitely().record();
+
+        first.complete(new AwaitCompletionCommand("tenant", created.interactionId(), created.correlationId(),
+            "completion-1", Map.of("name", "approved"), "reviewer", System.currentTimeMillis())).await().indefinitely();
+
+        var expected = new ProjectedDecision("r-1", "approved");
+        var persisted = store().get("tenant", created.interactionId()).await().indefinitely().orElseThrow();
+        assertEquals(AwaitInteractionStatus.COMPLETED, persisted.status());
+        assertEquals(expected, assertInstanceOf(ProjectedDecision.class, persisted.responsePayload()));
+        var encoded = PipelineJson.mapper().readTree(row(created.interactionId()).get("response_payload_json").s());
+        assertEquals("ProjectedDecision", encoded.path("canonicalTypeId").asText());
+        assertEquals("projected-fingerprint", encoded.path("typeExpressionFingerprint").asText());
+        assertEquals(PipelineJson.mapper().valueToTree(Map.of("requestId", "r-1", "decision", "approved")),
+            PipelineJson.mapper().readTree(java.util.Base64.getDecoder().decode(encoded.path("payload").asText())));
+        assertEquals(1, conversions.get());
+        assertEquals(1, projections.get());
+
+        var restarted = completionCoordinator();
+        var fresh = store().get("tenant", created.interactionId()).await().indefinitely().orElseThrow();
+        assertEquals(expected, restarted.resumePayload(fresh));
+        assertEquals(expected, restarted.resumePayload(fresh));
+        assertEquals(1, conversions.get(), "durable canonical replay must not decode the transport twice");
+        assertEquals(1, projections.get(), "durable canonical replay must not project twice");
+    }
+
+    private AwaitCoordinator completionCoordinator() {
+        var coordinator = new AwaitCoordinator();
+        coordinator.interactionStores = instances(store());
+        coordinator.unitStores = instances(new InMemoryAwaitUnitStore());
+        coordinator.descriptorFactory = descriptors;
+        coordinator.durablePayloadResolver = resolver();
+        coordinator.resumeTokenService = new AwaitResumeTokenService("test-only-resume-token-secret");
+        return coordinator;
+    }
+
+    private record DecisionProjector(java.util.concurrent.atomic.AtomicInteger projections)
+        implements AwaitCompletionProjector<Request, CanonicalChoice, ProjectedDecision> {
+        @Override public ProjectedDecision project(Request request, CanonicalChoice completion,
+                                                   AwaitCompletionMetadata metadata) {
+            projections.incrementAndGet();
+            return new ProjectedDecision(request.id(), completion.status());
+        }
     }
 
     @Test
@@ -249,4 +315,6 @@ class DynamoTypedAwaitImportIT {
 
     public record Request(String id) {}
     public record Decision(String status) {}
+    public record CanonicalChoice(String status) {}
+    public record ProjectedDecision(String requestId, String decision) {}
 }
