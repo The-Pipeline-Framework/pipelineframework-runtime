@@ -10,6 +10,7 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.pipelineframework.connector.CommandRecoveryBinding;
 
 import io.quarkus.arc.properties.IfBuildProperty;
 import io.smallrye.mutiny.Uni;
@@ -70,9 +71,26 @@ public class DynamoCommandEffectStore implements CommandEffectStore {
 
     @Override
     public Uni<CommandEffectRecord> createPending(CommandRequest<?> request, long nowEpochMs) {
+        return createPendingBound(request, Optional.empty(), nowEpochMs);
+    }
+
+    @Override
+    public boolean supportsRecovery() {
+        return true;
+    }
+
+    @Override
+    public Uni<CommandEffectRecord> createPending(CommandRequest<?> request, CommandRecoveryBinding binding, long nowEpochMs) {
+        return createPendingBound(request, Optional.of(Objects.requireNonNull(binding)), nowEpochMs);
+    }
+
+    private Uni<CommandEffectRecord> createPendingBound(
+        CommandRequest<?> request, Optional<CommandRecoveryBinding> binding, long nowEpochMs
+    ) {
         Objects.requireNonNull(request, "command request must not be null");
         return blocking("create pending Command effect", () -> {
-            CommandEffectRecord pending = pending(request, nowEpochMs);
+            CommandEffectRecord unbound = pending(request, nowEpochMs);
+            CommandEffectRecord pending = binding.map(unbound::bindRecovery).orElse(unbound);
             StoredRevision initial = new StoredRevision(
                 0L,
                 pending,
@@ -81,6 +99,34 @@ public class DynamoCommandEffectStore implements CommandEffectStore {
             append(initial, "Command effect already exists for commandId " + request.commandId());
             return pending;
         });
+    }
+
+    @Override
+    public Uni<CommandEffectRecord> createAttempt(
+        CommandRequest<?> request, CommandAttemptAdmission admission, CommandRecoveryBinding binding, long nowEpochMs
+    ) {
+        Objects.requireNonNull(binding, "recovery binding must not be null");
+        return transition(request.executionContext().tenantId(), request.commandId(), current -> {
+            if (!current.inputDeclaredType().equals(request.descriptor().inputType())
+                || !current.outputDeclaredType().equals(request.descriptor().outputType())) {
+                throw new IllegalArgumentException("Attempt request types do not match the recorded Command effect");
+            }
+            return current.record().appendAttempt(request, admission, nowEpochMs).bindRecovery(binding);
+        });
+    }
+
+    @Override
+    public Uni<CommandEffectRecord> claimPendingDispatch(CommandRecoveryBinding expected, long nowEpochMs) {
+        return transition(expected.tenantId(), expected.commandId(), current -> current.record().claimPendingDispatch(expected, nowEpochMs));
+    }
+
+    @Override
+    public Uni<CommandEffectRecord> reconcileSucceeded(
+        CommandRecoveryBinding expected, CommandEffectStatus expectedStatus, Object output,
+        CommandOutcomeSnapshot outcome, CommandReconciliationReceipt receipt, long nowEpochMs
+    ) {
+        return transition(expected.tenantId(), expected.commandId(), current ->
+            current.record().reconcileSucceeded(expected, expectedStatus, output, outcome, receipt, nowEpochMs));
     }
 
     @Override

@@ -5,6 +5,9 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import org.pipelineframework.connector.CommandRecoveryBinding;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -15,7 +18,8 @@ import org.pipelineframework.config.pipeline.PipelineJson;
 
 /** Versioned, type-preserving durable representation of a Command effect record. */
 final class CommandEffectRecordCodec {
-    static final int SCHEMA_VERSION = 2;
+    static final int SCHEMA_VERSION = 3;
+    private static final int OCCURRENCE_SCHEMA_VERSION = 2;
     private static final int LEGACY_SCHEMA_VERSION = 1;
 
     private static final String JSON_ENCODING = "json";
@@ -39,7 +43,8 @@ final class CommandEffectRecordCodec {
         Objects.requireNonNull(record, "command effect record must not be null");
         requireText(inputDeclaredType, "input declared type");
         requireText(outputDeclaredType, "output declared type");
-        PersistedSnapshotV2 snapshot = new PersistedSnapshotV2(
+        validateRecovery(record, inputDeclaredType, outputDeclaredType);
+        PersistedSnapshotV3 snapshot = new PersistedSnapshotV3(
             SCHEMA_VERSION,
             record.tenantId(),
             record.executionId(),
@@ -80,10 +85,15 @@ final class CommandEffectRecordCodec {
             throw new CommandEffectStoreException(
                 "Unsupported durable Command effect schema version " + schemaVersion);
         }
+        if (schemaVersion < SCHEMA_VERSION
+            && (root.findValues("recoveryBinding").stream().anyMatch(value -> !value.isNull())
+                || root.findValues("reconciliationReceipt").stream().anyMatch(value -> !value.isNull()))) {
+            throw new CommandEffectStoreException("Older Command schema cannot acquire recovery metadata");
+        }
         try {
             return schemaVersion == LEGACY_SCHEMA_VERSION
                 ? decodeLegacy(json.treeToValue(root, PersistedSnapshotV1.class))
-                : decodeCurrent(json.treeToValue(root, PersistedSnapshotV2.class));
+                : decodeCurrent(json.treeToValue(root, PersistedSnapshotV3.class));
         } catch (CommandEffectStoreException failure) {
             throw failure;
         } catch (IOException | RuntimeException failure) {
@@ -92,10 +102,11 @@ final class CommandEffectRecordCodec {
     }
 
     static boolean supportsSchemaVersion(int schemaVersion) {
-        return schemaVersion == LEGACY_SCHEMA_VERSION || schemaVersion == SCHEMA_VERSION;
+        return schemaVersion == LEGACY_SCHEMA_VERSION || schemaVersion == OCCURRENCE_SCHEMA_VERSION
+            || schemaVersion == SCHEMA_VERSION;
     }
 
-    private DecodedSnapshot decodeCurrent(PersistedSnapshotV2 snapshot) {
+    private DecodedSnapshot decodeCurrent(PersistedSnapshotV3 snapshot) {
         requireText(snapshot.inputDeclaredType(), "input declared type");
         requireText(snapshot.outputDeclaredType(), "output declared type");
         try {
@@ -118,6 +129,7 @@ final class CommandEffectRecordCodec {
                     .toList(),
                 snapshot.createdAtEpochMs(),
                 snapshot.updatedAtEpochMs());
+            validateRecovery(record, snapshot.inputDeclaredType(), snapshot.outputDeclaredType());
             return new DecodedSnapshot(record, snapshot.inputDeclaredType(), snapshot.outputDeclaredType());
         } catch (CommandEffectStoreException failure) {
             throw failure;
@@ -165,11 +177,11 @@ final class CommandEffectRecordCodec {
         return new DecodedSnapshot(record, snapshot.inputDeclaredType(), snapshot.outputDeclaredType());
     }
 
-    private PersistedAttemptSnapshotV2 encodeAttempt(
+    private PersistedAttemptSnapshotV3 encodeAttempt(
         CommandEffectAttemptRecord attempt,
         String outputDeclaredType
     ) {
-        return new PersistedAttemptSnapshotV2(
+        return new PersistedAttemptSnapshotV3(
             attempt.attemptId(),
             attempt.occurrenceId(),
             attempt.attemptNumber(),
@@ -182,11 +194,13 @@ final class CommandEffectRecordCodec {
             attempt.outcome(),
             attempt.reason(),
             attempt.createdAtEpochMs(),
-            attempt.updatedAtEpochMs());
+            attempt.updatedAtEpochMs(),
+            attempt.recoveryBinding(),
+            attempt.reconciliationReceipt());
     }
 
     private CommandEffectAttemptRecord decodeAttempt(
-        PersistedAttemptSnapshotV2 attempt,
+        PersistedAttemptSnapshotV3 attempt,
         String outputDeclaredType
     ) {
         return new CommandEffectAttemptRecord(
@@ -202,7 +216,75 @@ final class CommandEffectRecordCodec {
             requireOptional(attempt.outcome(), "attempt outcome snapshot"),
             requireOptional(attempt.reason(), "attempt reason"),
             attempt.createdAtEpochMs(),
-            attempt.updatedAtEpochMs());
+            attempt.updatedAtEpochMs(),
+            attempt.recoveryBinding() == null ? Optional.empty() : attempt.recoveryBinding(),
+            attempt.reconciliationReceipt() == null ? Optional.empty() : attempt.reconciliationReceipt());
+    }
+
+    /** Stable digest of the exact typed durable value, with recursively sorted object members. */
+    String digest(Object value, String declaredType) {
+        resolve(declaredType); // Recovery never accepts an unresolved declared type.
+        try {
+            var envelope = json.createObjectNode();
+            envelope.put("declaredType", declaredType);
+            envelope.set("typedValue", json.valueToTree(encodeValue(value, declaredType)));
+            byte[] encoded = json.writeValueAsString(canonical(envelope)).getBytes(StandardCharsets.UTF_8);
+            return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(encoded));
+        } catch (CommandEffectStoreException failure) {
+            throw failure;
+        } catch (Exception failure) {
+            throw new CommandEffectStoreException("Failed computing typed Command value digest", failure);
+        }
+    }
+
+    private JsonNode canonical(JsonNode value) {
+        if (value.isObject()) {
+            var result = json.createObjectNode();
+            java.util.TreeSet<String> names = new java.util.TreeSet<>();
+            value.fieldNames().forEachRemaining(names::add);
+            names.forEach(name -> result.set(name, canonical(value.get(name))));
+            return result;
+        }
+        if (value.isArray()) {
+            var result = json.createArrayNode();
+            value.forEach(item -> result.add(canonical(item)));
+            return result;
+        }
+        return value;
+    }
+
+    void validateRecovery(CommandEffectRecord record, String inputType, String outputType) {
+        for (CommandEffectAttemptRecord attempt : record.attempts()) {
+            if (attempt.recoveryBinding().isEmpty()) {
+                continue;
+            }
+            CommandRecoveryBinding binding = attempt.recoveryBinding().orElseThrow();
+            String namedCommand = "native-binding:" + binding.binding().value() + "/" + binding.operationIdentity().operationId();
+            String providerCommand = "native:" + binding.operationIdentity().providerId().value() + "/" + binding.operationIdentity().operationId();
+            if (!binding.inputType().equals(inputType) || !binding.outputType().equals(outputType)
+                || (!record.command().equals(namedCommand) && !record.command().equals(providerCommand))
+                || !binding.inputDigest().equals(digest(record.input(), inputType))) {
+                throw new CommandEffectStoreException("Durable Command recovery binding does not match original typed input");
+            }
+            if (attempt.reconciliationReceipt().isPresent()
+                && !attempt.reconciliationReceipt().orElseThrow().outputDigest()
+                    .equals(digest(attempt.output().orElseThrow(), outputType))) {
+                throw new CommandEffectStoreException("Durable Command receipt does not match typed output");
+            }
+            if (attempt.outcome().isPresent()) {
+                CommandOutcomeSnapshot outcome = attempt.outcome().orElseThrow();
+                if (!outcome.operationIdentity().equals(binding.operationIdentity())
+                    || outcome.providerMajorVersion() != binding.providerMajorVersion()
+                    || !outcome.configuration().equals(binding.operationConfiguration())) {
+                    throw new CommandEffectStoreException("Durable Command outcome does not match original provider/configuration");
+                }
+            }
+        }
+        if (record.currentAttempt().recoveryBinding().isPresent() && record.status() == CommandEffectStatus.SUCCEEDED
+            && (!record.outcome().equals(record.currentAttempt().outcome())
+                || !digest(record.output(), outputType).equals(digest(record.currentAttempt().output().orElseThrow(), outputType)))) {
+            throw new CommandEffectStoreException("Durable Command success conflicts with current attempt output/outcome");
+        }
     }
 
     private Optional<TypedValueSnapshot> encodeValue(Object value, String declaredType) {
@@ -335,7 +417,7 @@ final class CommandEffectRecordCodec {
     ) {
     }
 
-    private record PersistedAttemptSnapshotV2(
+    private record PersistedAttemptSnapshotV3(
         String attemptId,
         String occurrenceId,
         int attemptNumber,
@@ -348,11 +430,13 @@ final class CommandEffectRecordCodec {
         Optional<CommandOutcomeSnapshot> outcome,
         Optional<String> reason,
         long createdAtEpochMs,
-        long updatedAtEpochMs
+        long updatedAtEpochMs,
+        Optional<CommandRecoveryBinding> recoveryBinding,
+        Optional<CommandReconciliationReceipt> reconciliationReceipt
     ) {
     }
 
-    private record PersistedSnapshotV2(
+    private record PersistedSnapshotV3(
         int schemaVersion,
         String tenantId,
         String executionId,
@@ -365,7 +449,7 @@ final class CommandEffectRecordCodec {
         Optional<String> errorClass,
         Optional<String> errorMessage,
         Optional<CommandOutcomeSnapshot> outcome,
-        List<PersistedAttemptSnapshotV2> attempts,
+        List<PersistedAttemptSnapshotV3> attempts,
         long createdAtEpochMs,
         long updatedAtEpochMs,
         String inputDeclaredType,

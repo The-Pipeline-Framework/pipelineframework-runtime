@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -284,21 +285,67 @@ class AwsShapedCoordinatorActionsIT {
             Message initial = runtime.take(queues.workQueueUrl());
             runtime.delete(queues.workQueueUrl(), initial);
 
-            long fixedNow = System.currentTimeMillis();
-            ExecutionRecord<Object, Object> claimed = runtime.executionStore.claimLease(
-                    tenantId, accepted.executionId(), "retry-arranger", fixedNow - 20L, 1_000L)
+            ExecutionRecord<Object, Object> queued = runtime.executionStore.getExecution(
+                    tenantId, accepted.executionId())
                 .await().atMost(Duration.ofSeconds(10)).orElseThrow();
-            runtime.executionStore.scheduleRetry(
+            assertEquals(tenantId, queued.tenantId());
+            assertEquals(accepted.executionId(), queued.executionId());
+            String persistedExecutionKey = queued.executionKey();
+            assertNotNull(persistedExecutionKey);
+            assertFalse(persistedExecutionKey.isBlank());
+            assertEquals(PIPELINE_ID, queued.pipelineId());
+            assertEquals(CONTRACT_VERSION, queued.contractVersion());
+            assertEquals(RELEASE_VERSION, queued.releaseVersion());
+            assertEquals(ExecutionStatus.QUEUED, queued.status());
+            assertEquals(0L, queued.version());
+            assertEquals(0, queued.attempt());
+            assertNull(queued.leaseOwner());
+            assertEquals(0L, queued.leaseExpiresEpochMs());
+            assertEquals(queued.createdAtEpochMs(), queued.nextDueEpochMs());
+            assertEquals(queued.createdAtEpochMs(), queued.updatedAtEpochMs());
+            long observedNow = System.currentTimeMillis();
+            long persistedNow = Math.max(queued.nextDueEpochMs(), queued.createdAtEpochMs());
+            assertTrue(observedNow >= persistedNow,
+                "Wall clock regressed behind the persisted execution timestamp");
+            long fixedNow = Math.max(observedNow, persistedNow);
+            ExecutionRecord<Object, Object> claimed = runtime.executionStore.claimLease(
+                    tenantId, accepted.executionId(), "retry-arranger", fixedNow, 1_000L)
+                .await().atMost(Duration.ofSeconds(10)).orElseThrow();
+            assertEquals(ExecutionStatus.RUNNING, claimed.status());
+            assertEquals(tenantId, claimed.tenantId());
+            assertEquals(accepted.executionId(), claimed.executionId());
+            assertEquals(persistedExecutionKey, claimed.executionKey());
+            assertEquals(PIPELINE_ID, claimed.pipelineId());
+            assertEquals(CONTRACT_VERSION, claimed.contractVersion());
+            assertEquals(RELEASE_VERSION, claimed.releaseVersion());
+            assertEquals(queued.version() + 1L, claimed.version());
+            assertEquals("retry-arranger", claimed.leaseOwner());
+            assertEquals(fixedNow + 1_000L, claimed.leaseExpiresEpochMs());
+            ExecutionRecord<Object, Object> retry = runtime.executionStore.scheduleRetry(
                     tenantId,
                     accepted.executionId(),
                     claimed.version(),
                     1,
-                    fixedNow - 1L,
+                    fixedNow,
                     accepted.executionId() + ":0:0",
                     "RetryableFailure",
                     "retry scheduled for synthetic wake-up",
-                    fixedNow - 10L)
+                    fixedNow)
                 .await().atMost(Duration.ofSeconds(10)).orElseThrow();
+            assertEquals(tenantId, retry.tenantId());
+            assertEquals(accepted.executionId(), retry.executionId());
+            assertEquals(persistedExecutionKey, retry.executionKey());
+            assertEquals(queued.pipelineId(), retry.pipelineId());
+            assertEquals(queued.contractVersion(), retry.contractVersion());
+            assertEquals(queued.releaseVersion(), retry.releaseVersion());
+            assertEquals(ExecutionStatus.WAIT_RETRY, retry.status());
+            assertEquals(claimed.version() + 1L, retry.version());
+            assertEquals(1, retry.attempt());
+            assertEquals(fixedNow, retry.nextDueEpochMs());
+            assertEquals(fixedNow, retry.updatedAtEpochMs());
+            assertEquals(accepted.executionId() + ":0:0", retry.lastTransitionKey());
+            assertNull(retry.leaseOwner());
+            assertEquals(0L, retry.leaseExpiresEpochMs());
 
             CoordinatorSweepResult result = runtime.controlPlane.sweepOnce(fixedNow)
                 .await().atMost(Duration.ofSeconds(10));
