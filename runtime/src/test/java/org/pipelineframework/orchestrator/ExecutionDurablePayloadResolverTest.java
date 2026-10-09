@@ -24,6 +24,56 @@ import io.smallrye.mutiny.Uni;
 class ExecutionDurablePayloadResolverTest {
 
     @Test
+    void terminalSingleResultsUsePinnedOutputForScalarAndListAtEveryCursor() {
+        ExecutionDurablePayloadResolver resolver = resolver();
+        PaymentOutput output = new PaymentOutput("payment-1", "approved");
+        for (int cursor : List.of(0, 1, 2, 4, 5, 8)) {
+            ExecutionRecord<Object, Object> execution = execution(cursor);
+            String scalar = resolver.encode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, output);
+            String collection = resolver.encode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, List.of(output));
+            assertTrue(scalar.contains("\"canonicalTypeId\":\"PaymentOutput\""));
+            assertTrue(collection.contains("\"canonicalTypeId\":\"List<PaymentOutput>\""));
+            assertEquals(output, resolver.decode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, scalar));
+            assertEquals(List.of(output), resolver.decode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, collection));
+            String materialized = resolver.encode(execution(cursor, ExecutionResultShape.MATERIALIZED_MULTI),
+                ExecutionDurablePayloadResolver.Slot.RESULT, List.of(output));
+            assertEquals(List.of(output), resolver.decode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, materialized));
+        }
+    }
+
+    @Test
+    void legacySucceededResultsUsePinnedTerminalOutputAtInRangeCursors() {
+        for (int cursor : List.of(0, 2, 4)) {
+            ExecutionRecord<Object, Object> execution = execution(cursor);
+            when(execution.status()).thenReturn(ExecutionStatus.SUCCEEDED);
+            assertEquals(new PaymentOutput("payment-1", "approved"), resolver().decodeLegacy(execution,
+                ExecutionDurablePayloadResolver.Slot.RESULT, "{\"id\":\"payment-1\",\"status\":\"approved\"}"));
+        }
+    }
+
+    @Test
+    void historicalTypedResultsKeepTheirStoredIdentityAndTerminalEncodingRejectsIntermediateValues() {
+        ResolverFixture fixture = resolverFixture();
+        ExecutionDurablePayloadResolver resolver = fixture.resolver();
+        PaymentStatus historical = new PaymentStatus("payment-1", "approved");
+        String stored = resolver.encode(execution(2), "PaymentStatus", historical);
+        assertEquals(historical, resolver.decode(execution(0), ExecutionDurablePayloadResolver.Slot.RESULT, stored));
+        assertThrows(IllegalStateException.class, () -> resolver.encode(execution(1),
+            ExecutionDurablePayloadResolver.Slot.RESULT, new PaymentRecord("payment-1")));
+        assertThrows(IllegalStateException.class, () -> resolver.encode(execution(4),
+            ExecutionDurablePayloadResolver.Slot.RESULT, List.of(historical)));
+        assertTrue(stored.contains("\"catalogFingerprint\":\"catalog\""));
+        assertThrows(IllegalStateException.class, () -> resolver.decode(execution(0), ExecutionDurablePayloadResolver.Slot.RESULT,
+            stored.replace("\"catalogFingerprint\":\"catalog\"", "\"catalogFingerprint\":\"wrong-catalog\"")));
+        ExecutionRecord<Object, Object> unavailable = execution(4);
+        when(unavailable.releaseVersion()).thenReturn("unavailable-release");
+        when(fixture.registry().get("tenant", "payments", "unavailable-release"))
+            .thenReturn(Uni.createFrom().item(Optional.empty()));
+        assertThrows(IllegalStateException.class, () -> resolver.encode(unavailable,
+            ExecutionDurablePayloadResolver.Slot.RESULT, new PaymentOutput("payment-1", "approved")));
+    }
+
+    @Test
     void restoresCanonicalInputAndItemizedChildResultsFromAPinnedRelease() {
         ExecutionDurablePayloadResolver resolver = resolver();
         ExecutionRecord<Object, Object> inputExecution = execution(0);
