@@ -53,7 +53,7 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
  * DynamoDB-backed async execution state store.
  */
 @ApplicationScoped
-public class DynamoExecutionStateStore implements ExecutionStateStore {
+public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExecutionAdmissionStore {
     private static final Logger LOG = Logger.getLogger(DynamoExecutionStateStore.class);
 
     private static final String TENANT_ID = "tenant_id";
@@ -195,6 +195,105 @@ public class DynamoExecutionStateStore implements ExecutionStateStore {
     @Override
     public Uni<CreateExecutionResult> createOrGetExecution(ExecutionCreateCommand command) {
         return blocking(() -> createOrGetExecutionBlocking(command));
+    }
+
+    @Override
+    public Uni<Optional<ExecutionAdmissionResult>> inspectExistingAdmission(ExecutionAdmissionIntent intent) {
+        return blocking(() -> readAdmission(intent.tenantId(), intent.pipelineId(), intent.clientKey())
+            .map(value -> value.replay(intent)));
+    }
+
+    @Override
+    public Uni<Optional<ExecutionAdmissionReceipt>> lookupAdmission(String tenant, String pipeline, String key) {
+        return blocking(() -> readAdmission(tenant, pipeline, key).map(NativeExecutionAdmission::receipt));
+    }
+
+    private Optional<NativeExecutionAdmission> readAdmission(String tenant, String pipeline, String key) {
+        var item = dynamoClient().getItem(GetItemRequest.builder().tableName(executionKeyTable())
+            .key(Map.of(TENANT_EXECUTION_KEY, avS(NativeExecutionAdmission.key(tenant, pipeline, key))))
+            .consistentRead(true).build()).item();
+        return item == null || item.isEmpty() ? Optional.empty()
+            : Optional.of(NativeAdmissionDynamoCodec.decode(item, tenant, pipeline, key));
+    }
+
+    @Override
+    public Uni<ExecutionAdmissionResult> createOrGetNativeAdmittedExecution(ExecutionAdmissionCreateCommand command,
+        org.pipelineframework.orchestrator.release.PipelineReleaseEvidence evidence) {
+        return blocking(() -> {
+            NativeExecutionAdmission.validate(command, evidence);
+            var intent = command.intent();
+            var existing = readAdmission(intent.tenantId(), intent.pipelineId(), intent.clientKey());
+            if (existing.isPresent()) {
+                existing.get().requireEvidence(evidence);
+                return existing.get().replay(intent);
+            }
+            var execution = command.execution();
+            String scopedKey = scopedExecutionKey(execution.tenantId(), execution.executionKey());
+            requireAdmissionKeyBytes(scopedKey, 2048, "ordinary execution-key partition key");
+            requireAdmissionKeyBytes(execution.tenantId(), 2048, "execution tenant partition key");
+            // Do not adopt, expire, or clean a legacy execution-key row during strict admission.
+            var legacy = dynamoClient().getItem(GetItemRequest.builder().tableName(executionKeyTable())
+                .key(Map.of(TENANT_EXECUTION_KEY, avS(scopedKey))).consistentRead(true).build()).item();
+            if (legacy != null && !legacy.isEmpty()) {
+                // A native winner may have committed between the preceding admission read and this key read.
+                var winner = readAdmission(intent.tenantId(), intent.pipelineId(), intent.clientKey());
+                if (winner.isPresent()) {
+                    winner.get().requireEvidence(evidence);
+                    return winner.get().replay(intent);
+                }
+                throw new IllegalStateException("Legacy execution key has no strict admission authority");
+            }
+            var created = newQueuedExecution(execution);
+            requireAdmissionKeyBytes(created.executionId(), 1024, "execution sort key");
+            var admission = NativeExecutionAdmission.create(command, evidence, created.executionId());
+            // The complete inline admission is validated before toItem can persist an execution payload.
+            var admissionItem = NativeAdmissionDynamoCodec.encode(admission);
+            var executionItem = toItem(created, execution.inputCanonicalTypeId());
+            var keyItem = new HashMap<String, AttributeValue>();
+            keyItem.put(TENANT_EXECUTION_KEY, avS(scopedKey));
+            keyItem.put(TENANT_ID, avS(created.tenantId()));
+            keyItem.put(EXECUTION_ID, avS(created.executionId()));
+            keyItem.put(CREATED_AT_EPOCH_MS, avN(execution.nowEpochMs()));
+            keyItem.put(UPDATED_AT_EPOCH_MS, avN(execution.nowEpochMs()));
+            keyItem.put(TTL_EPOCH_S, avN(execution.ttlEpochS()));
+            var putExecution = Put.builder().tableName(executionTable()).item(executionItem)
+                .conditionExpression("attribute_not_exists(#tenant) AND attribute_not_exists(#execution)")
+                .expressionAttributeNames(Map.of("#tenant", TENANT_ID, "#execution", EXECUTION_ID)).build();
+            var putKey = Put.builder().tableName(executionKeyTable()).item(keyItem)
+                .conditionExpression("attribute_not_exists(#key)")
+                .expressionAttributeNames(Map.of("#key", TENANT_EXECUTION_KEY)).build();
+            var putAdmission = Put.builder().tableName(executionKeyTable()).item(admissionItem)
+                .conditionExpression("attribute_not_exists(#key)")
+                .expressionAttributeNames(Map.of("#key", TENANT_EXECUTION_KEY)).build();
+            try {
+                dynamoClient().transactWriteItems(TransactWriteItemsRequest.builder().transactItems(
+                    TransactWriteItem.builder().put(putExecution).build(),
+                    TransactWriteItem.builder().put(putKey).build(),
+                    TransactWriteItem.builder().put(putAdmission).build()).build());
+                return new ExecutionAdmissionResult(Optional.of(new CreateExecutionResult(created, false)), admission.receipt());
+            } catch (TransactionCanceledException | ConditionalCheckFailedException failure) {
+                var raced = readAdmission(intent.tenantId(), intent.pipelineId(), intent.clientKey());
+                if (raced.isPresent()) {
+                    raced.get().requireEvidence(evidence);
+                    return raced.get().replay(intent);
+                }
+                throw failure;
+            }
+        });
+    }
+
+    private static ExecutionRecord<Object, Object> newQueuedExecution(ExecutionCreateCommand command) {
+        return new ExecutionRecord<>(command.tenantId(), UUID.randomUUID().toString(), command.executionKey(),
+            command.pipelineId(), command.contractVersion(), command.releaseVersion(), command.resultShape(),
+            ExecutionStatus.QUEUED, 0L, command.initialStepIndex(), 0, null, 0L, command.nowEpochMs(), null,
+            command.inputPayload(), null, null, null, null, command.nowEpochMs(), command.nowEpochMs(),
+            command.ttlEpochS(), command.pagingState());
+    }
+
+    private static void requireAdmissionKeyBytes(String value, int limit, String role) {
+        if (NativeExecutionAdmission.utf8(value).length > limit) {
+            throw new ExecutionAdmissionTooLargeException("Native admission " + role + " exceeds DynamoDB UTF-8 byte limit " + limit);
+        }
     }
 
     @Override

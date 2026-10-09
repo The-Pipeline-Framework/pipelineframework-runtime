@@ -297,7 +297,7 @@ public class HostedPipelineControlPlaneResource {
             .onItem().transform(result -> Response.ok(AwaitDtoMapper.toCompletionResponse(result)).build());
     }
 
-    private Object executionInput(HostedExecutionSubmitRequest request, PipelineReleaseRecord release) {
+    Object executionInput(HostedExecutionSubmitRequest request, PipelineReleaseRecord release) {
         if (request == null) {
             throw new IllegalArgumentException("Execution submit request is required");
         }
@@ -383,7 +383,7 @@ public class HostedPipelineControlPlaneResource {
         return Class.forName(className, false, HostedPipelineControlPlaneResource.class.getClassLoader());
     }
 
-    private Response guard(String tenantId, String authorization) {
+    Response guard(String tenantId, String authorization) {
         if (!enabled()) {
             return Response.status(Response.Status.NOT_FOUND).build();
         }
@@ -393,7 +393,7 @@ public class HostedPipelineControlPlaneResource {
         return authenticate(authorization);
     }
 
-    private PipelineReleaseRegistry registry() {
+    PipelineReleaseRegistry registry() {
         if (releaseRegistry != null) {
             return releaseRegistry;
         }
@@ -410,7 +410,7 @@ public class HostedPipelineControlPlaneResource {
         return fallback;
     }
 
-    private PipelineReleaseRegistrar registrar() {
+    PipelineReleaseRegistrar registrar() {
         if (releaseRegistrar != null) {
             return releaseRegistrar;
         }
@@ -427,7 +427,7 @@ public class HostedPipelineControlPlaneResource {
         return fallback;
     }
 
-    private PipelineWorkerAvailability availability() {
+    PipelineWorkerAvailability availability() {
         if (workerAvailability != null) {
             return workerAvailability;
         }

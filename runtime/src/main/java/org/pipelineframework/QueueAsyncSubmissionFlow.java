@@ -183,6 +183,45 @@ class QueueAsyncSubmissionFlow {
     return Optional.empty();
   }
 
+  Uni<org.pipelineframework.orchestrator.ExecutionAdmissionResult> admit(
+      Object input, org.pipelineframework.orchestrator.ExecutionAdmissionIntent intent,
+      org.pipelineframework.orchestrator.release.PipelineReleaseEvidence evidence,
+      org.pipelineframework.orchestrator.NativeExecutionAdmissionStore nativeStore) {
+    PipelineContext context = PipelineContextHolder.get();
+    return Uni.createFrom().deferred(() -> {
+      var guard = guardSubmission(intent.outputStreaming());
+      if (guard.isPresent()) {
+        return Uni.createFrom().failure(guard.get());
+      }
+      Object executionInput = executionInputPolicy.normalizeExecutionInput(input);
+      RuntimeException inputFailure = executionInputPolicy.validateInputShape(executionInput);
+      if (inputFailure != null) {
+        return Uni.createFrom().failure(inputFailure);
+      }
+      var submission = new PipelineRunSubmission(intent.tenantId(), true, intent.pipelineId(),
+          intent.contractVersion(), intent.releaseVersion(), intent.clientKey(), intent.outputStreaming());
+      var rejected = admissionFailure(submission);
+      if (rejected.isPresent()) {
+        return Uni.createFrom().failure(rejected.get());
+      }
+      long now = System.currentTimeMillis();
+      // Expected Release admission is not activation and must not execute the local activation hook.
+      return executionInputPolicy.resolveExecutionInputPayload(executionInput, context)
+          .flatMap(snapshot -> createPlan(submission, snapshot, now, ttlEpochS(now)))
+          .flatMap(plan -> {
+            var command = plan.createCommand();
+            var wrapper = new org.pipelineframework.orchestrator.ExecutionAdmissionCreateCommand(command, intent,
+                evidence.metadataFingerprint(), evidence.primaryArtifactId(), evidence.primaryArtifactDigest());
+            return nativeStore.createOrGetNativeAdmittedExecution(wrapper, evidence).flatMap(result -> {
+              if (!result.newlyCreated()) {
+                return Uni.createFrom().item(result);
+              }
+              return accept(result.creation().orElseThrow(), command, now).replaceWith(result);
+            });
+          });
+    });
+  }
+
   private Uni<PipelineRunSubmissionPlan> createPlan(
       PipelineRunSubmission submission,
       ExecutionInputSnapshot snapshot,
