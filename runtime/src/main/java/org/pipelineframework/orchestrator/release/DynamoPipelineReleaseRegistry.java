@@ -309,6 +309,7 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
         ActivationEvent event = new ActivationEvent(release.releaseVersion(), now);
         String activationId = receipt.map(ActivationOperationReceipt::activationId).orElseGet(() -> UUID.randomUUID().toString());
         for (int attempt = 0; attempt < 32; attempt++) {
+            Map<String, AttributeValue> registeredSnapshot = activationReleaseSnapshot(release);
             Map<String, AttributeValue> previous = readActivationHead(tenant, pipeline);
             long sequence = 1;
             if (!previous.isEmpty()) {
@@ -328,19 +329,7 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
             orderedEvent.put(SEQUENCE, avN(sequence));
             orderedEvent.put(ACTIVATION_ID, avS(activationId));
             List<TransactWriteItem> writes = new ArrayList<>();
-            writes.add(TransactWriteItem.builder().conditionCheck(ConditionCheck.builder().tableName(releaseTable())
-                .key(key(tenant, pipeline, releaseSort(release.releaseVersion())))
-                .conditionExpression("attribute_exists(#pk) AND attribute_exists(#sk) AND #descriptor = :descriptor AND #contract = :contract AND #digest = :digest AND (#uri = :uri OR primary_artifact_path = :uri) AND #size = :size AND #checksum = :checksum AND #artifact = :artifact AND #contractVersion = :contractVersion")
-                .expressionAttributeNames(Map.of("#pk", REGISTRY_KEY, "#sk", REGISTRY_SORT,
-                    "#descriptor", DESCRIPTOR_JSON, "#contract", CONTRACT_JSON, "#digest", PRIMARY_ARTIFACT_DIGEST,
-                    "#uri", PRIMARY_ARTIFACT_URI, "#size", PRIMARY_ARTIFACT_SIZE_BYTES, "#checksum", PRIMARY_ARTIFACT_CHECKSUM,
-                    "#artifact", PRIMARY_ARTIFACT_ID, "#contractVersion", CONTRACT_VERSION))
-                .expressionAttributeValues(Map.of(":descriptor", avS(toJson(release.descriptor())),
-                    ":contract", avS(toJson(release.contract())), ":digest", avS(release.primaryArtifactDigest()),
-                    ":uri", avS(release.primaryArtifactUri()), ":size", avN(release.primaryArtifactSizeBytes()),
-                    ":checksum", avS(release.primaryArtifactChecksum()), ":artifact", avS(release.primaryArtifactId()),
-                    ":contractVersion", avS(release.contractVersion())))
-                .build()).build());
+            writes.add(TransactWriteItem.builder().conditionCheck(activationReleaseCondition(release, registeredSnapshot)).build());
             writes.add(absentPut(orderedEvent));
             Put.Builder headPut = Put.builder().tableName(releaseTable()).item(nextHead);
             if (previous.isEmpty()) {
@@ -373,6 +362,52 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
             }
         }
         throw new IllegalStateException("Activation head remained contended; no effect inferred");
+    }
+
+    private Map<String, AttributeValue> activationReleaseSnapshot(PipelineReleaseRecord selected) {
+        Map<String, AttributeValue> item = readItem(selected.tenantId(), selected.pipelineId(), releaseSort(selected.releaseVersion()));
+        if (item == null || item.isEmpty()) {
+            throw new IllegalStateException("Activation requires a registered Release");
+        }
+        if (!partitionKey(selected.tenantId(), selected.pipelineId()).equals(stringValue(item, REGISTRY_KEY))
+            || !releaseSort(selected.releaseVersion()).equals(stringValue(item, REGISTRY_SORT))
+            || !RECORD_TYPE_RELEASE.equals(stringValue(item, RECORD_TYPE))
+            || !selected.tenantId().equals(stringValue(item, TENANT_ID))
+            || !selected.pipelineId().equals(stringValue(item, PIPELINE_ID))
+            || !selected.releaseVersion().equals(stringValue(item, RELEASE_VERSION))) {
+            throw new IllegalStateException("Registered Release scope mismatch");
+        }
+        if (!PipelineReleaseRecordMetadata.sameImmutableMetadata(selected, toReleaseRecord(item, Optional.empty()))) {
+            throw new IllegalStateException("Activation requires matching immutable registered metadata");
+        }
+        return Map.copyOf(item);
+    }
+
+    private ConditionCheck activationReleaseCondition(PipelineReleaseRecord release, Map<String, AttributeValue> snapshot) {
+        // CAS the observed representation after semantic validation. Re-serializing a decoded map is not byte identity.
+        List<String> attributes = List.of(REGISTRY_KEY, REGISTRY_SORT, RECORD_TYPE, TENANT_ID, PIPELINE_ID,
+            RELEASE_VERSION, CONTRACT_VERSION, DESCRIPTOR_JSON, CONTRACT_JSON, PRIMARY_ARTIFACT_ID,
+            PRIMARY_ARTIFACT_DIGEST, PRIMARY_ARTIFACT_SIZE_BYTES, PRIMARY_ARTIFACT_CHECKSUM,
+            PRIMARY_ARTIFACT_URI, LEGACY_PRIMARY_ARTIFACT_PATH);
+        Map<String, String> names = new HashMap<>();
+        Map<String, AttributeValue> values = new HashMap<>();
+        List<String> predicates = new ArrayList<>();
+        for (int index = 0; index < attributes.size(); index++) {
+            String attribute = attributes.get(index);
+            String name = "#release" + index;
+            names.put(name, attribute);
+            if (snapshot.containsKey(attribute)) {
+                String value = ":release" + index;
+                values.put(value, snapshot.get(attribute));
+                predicates.add(name + " = " + value);
+            } else {
+                predicates.add("attribute_not_exists(" + name + ")");
+            }
+        }
+        return ConditionCheck.builder().tableName(releaseTable())
+            .key(key(release.tenantId(), release.pipelineId(), releaseSort(release.releaseVersion())))
+            .conditionExpression(String.join(" AND ", predicates)).expressionAttributeNames(names)
+            .expressionAttributeValues(values).build();
     }
 
     private TransactWriteItem absentPut(Map<String, AttributeValue> item) {
