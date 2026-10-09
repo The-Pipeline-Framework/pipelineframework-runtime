@@ -13,6 +13,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledFuture;
@@ -87,21 +88,30 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
 
     @Override
     public Uni<TransitionResultEnvelope> executeTransition(TransitionCommandEnvelope command) {
-        return invocationRuntime().invokeTransportUni(this, () ->
-            Uni.createFrom().deferred(() -> executeRequest(command)));
+        var runtime = invocationRuntime();
+        return Uni.createFrom().deferred(() -> {
+            Executor signalContext = subscriberSignalContext();
+            return runtime.invokeTransportUni(this, () ->
+                Uni.createFrom().deferred(() -> executeRequest(command, signalContext)));
+        });
     }
 
     /** Execute against an environment-owned target without changing the legacy global endpoint. */
     public Uni<TransitionResultEnvelope> executeTransition(TransitionCommandEnvelope command, URI endpoint, String secretRef) {
-        return invocationRuntime().invokeTransportUni(this, () -> Uni.createFrom().deferred(() ->
-            executeRequest(command, endpoint, targetSecret(secretRef))));
+        var runtime = invocationRuntime();
+        return Uni.createFrom().deferred(() -> {
+            Executor signalContext = subscriberSignalContext();
+            return runtime.invokeTransportUni(this, () -> Uni.createFrom().deferred(() ->
+                executeRequest(command, endpoint, targetSecret(secretRef), signalContext)));
+        });
     }
 
-    private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command) {
-        return executeRequest(command, configuredEndpoint(), sharedSecret());
+    private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command, Executor signalContext) {
+        return executeRequest(command, configuredEndpoint(), sharedSecret(), signalContext);
     }
 
-    private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command, URI endpoint, String secret) {
+    private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command, URI endpoint, String secret,
+                                                       Executor signalContext) {
         Duration deadline = orchestratorConfig.workerRest().requestTimeout();
         long deadlineMillis = Math.max(1L, deadline.toMillis());
         long startedAtNanos = System.nanoTime();
@@ -112,6 +122,7 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
                 .thenCompose(response -> CompletableFuture.supplyAsync(
                     () -> decodeResponse(response, command),
                     blockingExecutor)))
+            .emitOn(signalContext)
             .onItemOrFailure().invoke((ignored, failure) -> warning.cancel(false))
             .onFailure().transform(failure -> classifyFailure(failure, target, startedAtNanos, deadlineMillis));
     }
@@ -158,20 +169,42 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
      * @return remote worker capabilities
      */
     public Uni<PipelineWorkerCapability> capabilities() {
-        return Uni.createFrom().deferred(() -> capabilitiesAt(configuredEndpoint(), sharedSecret()));
+        return Uni.createFrom().deferred(() -> {
+            Executor signalContext = subscriberSignalContext();
+            return capabilitiesAt(configuredEndpoint(), sharedSecret(), signalContext);
+        });
     }
 
     public Uni<PipelineWorkerCapability> capabilities(URI endpoint, String secretRef) {
-        return Uni.createFrom().deferred(() -> capabilitiesAt(endpoint, targetSecret(secretRef)));
+        return Uni.createFrom().deferred(() -> {
+            Executor signalContext = subscriberSignalContext();
+            return capabilitiesAt(endpoint, targetSecret(secretRef), signalContext);
+        });
     }
 
-    private Uni<PipelineWorkerCapability> capabilitiesAt(URI endpoint, String secret) {
+    private Uni<PipelineWorkerCapability> capabilitiesAt(URI endpoint, String secret, Executor signalContext) {
         return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(() -> capabilitiesRequest(endpoint, secret), blockingExecutor)
             .thenCompose(request -> httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString()))
             .thenCompose(response -> CompletableFuture.supplyAsync(
                 () -> decodeCapabilitiesResponse(response),
                 blockingExecutor)))
+            .emitOn(signalContext)
             .onFailure().transform(this::unwrapFailure);
+    }
+
+    /** Preserve the server-side subscription loader only while delivering either transport signal. */
+    private static Executor subscriberSignalContext() {
+        ClassLoader subscriberLoader = Thread.currentThread().getContextClassLoader();
+        return signal -> {
+            Thread thread = Thread.currentThread();
+            ClassLoader previous = thread.getContextClassLoader();
+            try {
+                thread.setContextClassLoader(subscriberLoader);
+                signal.run();
+            } finally {
+                thread.setContextClassLoader(previous);
+            }
+        };
     }
 
     @Override
