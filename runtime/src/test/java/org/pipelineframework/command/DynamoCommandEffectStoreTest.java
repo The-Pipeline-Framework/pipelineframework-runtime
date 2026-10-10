@@ -86,7 +86,7 @@ class DynamoCommandEffectStoreTest {
         when(client.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder().items(Map.of(
             DynamoCommandEffectStore.COMMAND_KEY, AttributeValue.builder().s("key").build(),
             DynamoCommandEffectStore.REVISION, AttributeValue.builder().n("4").build(),
-            DynamoCommandEffectStore.SCHEMA_VERSION, AttributeValue.builder().n("2").build(),
+            DynamoCommandEffectStore.SCHEMA_VERSION, AttributeValue.builder().n(Integer.toString(CommandEffectRecordCodec.SCHEMA_VERSION)).build(),
             DynamoCommandEffectStore.RECORD_JSON, AttributeValue.builder().s(encoded).build())).build());
         when(client.putItem(any(PutItemRequest.class))).thenReturn(PutItemResponse.builder().build());
         CommandRequest<TestInput> reissue = new CommandRequest<>(
@@ -102,7 +102,7 @@ class DynamoCommandEffectStoreTest {
         verify(client).putItem(argThat((PutItemRequest put) ->
             "5".equals(put.item().get(DynamoCommandEffectStore.REVISION).n())
                 && put.conditionExpression().contains("attribute_not_exists")
-                && "2".equals(put.item().get(DynamoCommandEffectStore.SCHEMA_VERSION).n())));
+                && Integer.toString(CommandEffectRecordCodec.SCHEMA_VERSION).equals(put.item().get(DynamoCommandEffectStore.SCHEMA_VERSION).n())));
     }
 
     static CommandRequest<TestInput> request(

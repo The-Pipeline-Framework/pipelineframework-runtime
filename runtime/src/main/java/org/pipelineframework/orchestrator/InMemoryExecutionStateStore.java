@@ -19,12 +19,66 @@ import io.smallrye.mutiny.Uni;
  * In-memory execution state store intended for development and tests.
  */
 @ApplicationScoped
-public class InMemoryExecutionStateStore implements ExecutionStateStore {
+public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeExecutionAdmissionStore {
 
     private final Object lock = new Object();
     private final Map<String, ExecutionRecord<Object, Object>> executionsByScopedId = new HashMap<>();
     private final Map<String, String> executionIdByScopedKey = new HashMap<>();
     private final Map<String, Object> initialInputByScopedId = new HashMap<>();
+    private final Map<String, NativeExecutionAdmission> admissions = new HashMap<>();
+
+    @Override
+    public Uni<Optional<ExecutionAdmissionResult>> inspectExistingAdmission(ExecutionAdmissionIntent intent) {
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                return Optional.ofNullable(admissions.get(NativeExecutionAdmission.key(
+                    intent.tenantId(), intent.pipelineId(), intent.clientKey()))).map(value -> value.replay(intent));
+            }
+        });
+    }
+
+    @Override
+    public Uni<Optional<ExecutionAdmissionReceipt>> lookupAdmission(String tenant, String pipeline, String key) {
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                var admission = admissions.get(NativeExecutionAdmission.key(tenant, pipeline, key));
+                if (admission == null) {
+                    return Optional.empty();
+                }
+                if (!admission.intent().tenantId().equals(tenant) || !admission.intent().pipelineId().equals(pipeline)
+                    || !admission.intent().clientKey().equals(key)) {
+                    throw new IllegalStateException("Corrupt admission index scope");
+                }
+                return Optional.of(admission.receipt());
+            }
+        });
+    }
+
+    @Override
+    public Uni<ExecutionAdmissionResult> createOrGetNativeAdmittedExecution(ExecutionAdmissionCreateCommand command,
+        org.pipelineframework.orchestrator.release.PipelineReleaseEvidence evidence) {
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                NativeExecutionAdmission.validate(command, evidence);
+                var intent = command.intent();
+                String key = NativeExecutionAdmission.key(intent.tenantId(), intent.pipelineId(), intent.clientKey());
+                var existing = admissions.get(key);
+                if (existing != null) {
+                    existing.requireEvidence(evidence);
+                    return existing.replay(intent);
+                }
+                // Never adopt or delete legacy key authority, including expired execution keys.
+                if (executionIdByScopedKey.containsKey(scopedExecutionKey(
+                    command.execution().tenantId(), command.execution().executionKey()))) {
+                    throw new IllegalStateException("Legacy execution key has no strict admission authority");
+                }
+                var created = createOrGetExecution(command.execution()).await().indefinitely();
+                var admission = NativeExecutionAdmission.create(command, evidence, created.record().executionId());
+                admissions.put(key, admission);
+                return new ExecutionAdmissionResult(Optional.of(created), admission.receipt());
+            }
+        });
+    }
 
     @Override
     public String providerName() {

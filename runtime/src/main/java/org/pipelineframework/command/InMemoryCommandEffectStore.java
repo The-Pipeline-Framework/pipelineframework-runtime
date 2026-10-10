@@ -5,6 +5,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import jakarta.enterprise.context.ApplicationScoped;
+import org.pipelineframework.connector.CommandRecoveryBinding;
 
 import io.quarkus.arc.properties.IfBuildProperty;
 import io.smallrye.mutiny.Uni;
@@ -27,6 +28,22 @@ public class InMemoryCommandEffectStore implements CommandEffectStore {
 
     @Override
     public Uni<CommandEffectRecord> createPending(CommandRequest<?> request, long nowEpochMs) {
+        return createPendingBound(request, Optional.empty(), nowEpochMs);
+    }
+
+    @Override
+    public boolean supportsRecovery() {
+        return true;
+    }
+
+    @Override
+    public Uni<CommandEffectRecord> createPending(CommandRequest<?> request, CommandRecoveryBinding binding, long nowEpochMs) {
+        return createPendingBound(request, Optional.of(java.util.Objects.requireNonNull(binding)), nowEpochMs);
+    }
+
+    private Uni<CommandEffectRecord> createPendingBound(
+        CommandRequest<?> request, Optional<CommandRecoveryBinding> binding, long nowEpochMs
+    ) {
         CommandEffectRecord pending = new CommandEffectRecord(
             request.executionContext().tenantId(),
             request.executionContext().executionId(),
@@ -55,11 +72,48 @@ public class InMemoryCommandEffectStore implements CommandEffectStore {
                 nowEpochMs)),
             nowEpochMs,
             nowEpochMs);
+        pending = binding.map(pending::bindRecovery).orElse(pending);
+        if (binding.isPresent()) {
+            new CommandEffectRecordCodec().validateRecovery(pending, request.descriptor().inputType(), request.descriptor().outputType());
+        }
         CommandEffectRecord existing = records.putIfAbsent(key(pending.tenantId(), pending.commandId()), pending);
         if (existing != null) {
             throw new IllegalStateException("Command effect record already exists for commandId " + pending.commandId());
         }
         return Uni.createFrom().item(pending);
+    }
+
+    @Override
+    public Uni<CommandEffectRecord> createAttempt(
+        CommandRequest<?> request, CommandAttemptAdmission admission, CommandRecoveryBinding binding, long nowEpochMs
+    ) {
+        return update(request.executionContext().tenantId(), request.commandId(),
+            current -> {
+                CommandEffectRecord next = current.appendAttempt(request, admission, nowEpochMs).bindRecovery(binding);
+                new CommandEffectRecordCodec().validateRecovery(next, request.descriptor().inputType(), request.descriptor().outputType());
+                return next;
+            });
+    }
+
+    @Override
+    public Uni<CommandEffectRecord> claimPendingDispatch(CommandRecoveryBinding expected, long nowEpochMs) {
+        return update(expected.tenantId(), expected.commandId(), current -> {
+            new CommandEffectRecordCodec().validateRecovery(current, expected.inputType(), expected.outputType());
+            return current.claimPendingDispatch(expected, nowEpochMs);
+        });
+    }
+
+    @Override
+    public Uni<CommandEffectRecord> reconcileSucceeded(
+        CommandRecoveryBinding expected, CommandEffectStatus expectedStatus, Object output,
+        CommandOutcomeSnapshot outcome, CommandReconciliationReceipt receipt, long nowEpochMs
+    ) {
+        return update(expected.tenantId(), expected.commandId(),
+            current -> {
+                CommandEffectRecord next = current.reconcileSucceeded(expected, expectedStatus, output, outcome, receipt, nowEpochMs);
+                new CommandEffectRecordCodec().validateRecovery(next, expected.inputType(), expected.outputType());
+                return next;
+            });
     }
 
     @Override

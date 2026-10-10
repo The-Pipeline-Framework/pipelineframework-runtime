@@ -673,6 +673,101 @@ class AwaitCoordinatorCompletionTest {
     }
 
     @Test
+    void requestAwareCompletionConvertsWireValueBeforeTypedProjectionAndReplaysCanonicalOutput() throws Exception {
+        InMemoryAwaitInteractionStore store = new InMemoryAwaitInteractionStore();
+        AwaitCoordinator coordinator = coordinator(store);
+        var conversions = new java.util.concurrent.atomic.AtomicInteger();
+        var projections = new java.util.concurrent.atomic.AtomicInteger();
+        AwaitCompletionDescriptor descriptor = distinctCompletionDescriptor(conversions, projections, false, false);
+        var created = coordinator.createOrGet(descriptor, "tenant-1", "exec-1", 1, "cause-1",
+            new PendingSelection("invoice-1", "property-a"), "alice", "review").await().indefinitely();
+
+        var completed = coordinator.complete(new AwaitCompletionCommand("tenant-1", created.record().interactionId(),
+            created.record().correlationId(), "completion-1", Map.of("name", "property-b"), "alice", 11_000L))
+            .await().indefinitely();
+        var expected = new ConfirmedSelection("invoice-1", "property-a", "property-b",
+            java.time.Instant.ofEpochMilli(11_000L));
+        var persisted = store.get("tenant-1", created.record().interactionId()).await().indefinitely().orElseThrow();
+        assertEquals(AwaitInteractionStatus.COMPLETED, persisted.status());
+        assertEquals(expected, persisted.responsePayload());
+        assertEquals(expected, completed.record().responsePayload());
+        assertEquals(1, conversions.get());
+        assertEquals(1, projections.get());
+
+        var snapshot = coordinator.suspensionSnapshot(new AwaitSuspendedException(
+            "tenant-1", "exec-1", created.record().unitId(), 1)).await().indefinitely();
+        var serialized = PipelineJson.mapper().readValue(PipelineJson.mapper().writeValueAsBytes(snapshot),
+            TransitionAwaitSuspension.class);
+        var restartedStore = new InMemoryAwaitInteractionStore();
+        var restarted = coordinator(restartedStore);
+        restarted.descriptorFactory.register(descriptor);
+        restarted.importSuspension(serialized).await().indefinitely();
+        var restored = restartedStore.get("tenant-1", created.record().interactionId()).await().indefinitely().orElseThrow();
+        assertEquals(expected, restarted.resumePayload(restored));
+        assertEquals(expected, restarted.resumePayload(restored));
+        assertEquals(1, conversions.get(), "canonical replay must not apply the wire adapter again");
+        assertEquals(1, projections.get(), "canonical replay must not project the final output again");
+    }
+
+    @Test
+    void requestAwareMappingOrProjectionRejectionDoesNotPersistACompletion() {
+        for (boolean rejectMapping : List.of(true, false)) {
+            var store = new InMemoryAwaitInteractionStore();
+            var coordinator = coordinator(store);
+            var conversions = new java.util.concurrent.atomic.AtomicInteger();
+            var projections = new java.util.concurrent.atomic.AtomicInteger();
+            var descriptor = distinctCompletionDescriptor(conversions, projections, rejectMapping, !rejectMapping);
+            var created = coordinator.createOrGet(descriptor, "tenant-1", "exec-1", 1, "cause-1",
+                new PendingSelection("invoice-1", "property-a"), "alice", "review").await().indefinitely();
+
+            var failure = assertThrows(IllegalArgumentException.class, () -> coordinator.complete(
+                new AwaitCompletionCommand("tenant-1", created.record().interactionId(), created.record().correlationId(),
+                    "completion-1", Map.of("name", "property-b"), "alice", 11_000L)).await().indefinitely());
+            assertEquals(rejectMapping ? "invalid wire choice" : "invalid canonical choice", failure.getMessage());
+            var persisted = store.get("tenant-1", created.record().interactionId()).await().indefinitely().orElseThrow();
+            assertEquals(created.record(), persisted, "rejected mapping/projector must leave the entire waiting record unchanged");
+            assertEquals(AwaitInteractionStatus.WAITING, persisted.status());
+            assertNull(persisted.responsePayload());
+            assertEquals(1, conversions.get());
+            assertEquals(rejectMapping ? 0 : 1, projections.get());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static AwaitCompletionDescriptor distinctCompletionDescriptor(
+        java.util.concurrent.atomic.AtomicInteger conversions,
+        java.util.concurrent.atomic.AtomicInteger projections,
+        boolean rejectMapping,
+        boolean rejectProjection
+    ) {
+        AwaitCompletionProjector<PendingSelection, SelectionChoice, ConfirmedSelection> typed =
+            new DistinctSelectionProjector(projections, rejectProjection);
+        return new AwaitCompletionDescriptor("DistinctSelection", PendingSelection.class.getName(),
+            ConfirmedSelection.class.getName(), "ONE_TO_ONE", java.time.Duration.ofMinutes(10),
+            "interactionId", "interaction-api", Map.of(), List.of("documentId"), Map.class.getName(),
+            DescriptorProtos.FileDescriptorProto.class.getName(),
+            value -> Map.of("documentId", ((PendingSelection) value).documentId()),
+            value -> {
+                conversions.incrementAndGet();
+                var wire = (DescriptorProtos.FileDescriptorProto) value;
+                if (rejectMapping) throw new IllegalArgumentException("invalid wire choice");
+                return new SelectionChoice(wire.getName());
+            }, DistinctSelectionProjector.class.getName(),
+            (AwaitCompletionProjector<Object, Object, Object>) (AwaitCompletionProjector<?, ?, ?>) typed, true);
+    }
+
+    private record DistinctSelectionProjector(java.util.concurrent.atomic.AtomicInteger projections, boolean reject)
+        implements AwaitCompletionProjector<PendingSelection, SelectionChoice, ConfirmedSelection> {
+        @Override public ConfirmedSelection project(PendingSelection request, SelectionChoice completion,
+                                                   AwaitCompletionMetadata metadata) {
+            projections.incrementAndGet();
+            if (reject) throw new IllegalArgumentException("invalid canonical choice");
+            return new ConfirmedSelection(request.documentId(), request.recommendedPropertyId(),
+                completion.propertyId(), metadata.completedAt());
+        }
+    }
+
+    @Test
     void requestAwareCompletionProjectsCanonicalRequestAndActorPayloadBeforePersistence() {
         InMemoryAwaitInteractionStore store = new InMemoryAwaitInteractionStore();
         AwaitCoordinator coordinator = coordinator(store);

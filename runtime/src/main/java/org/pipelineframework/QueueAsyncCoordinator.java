@@ -107,6 +107,9 @@ class QueueAsyncCoordinator {
   TransitionPayloadCodec transitionPayloadCodec;
 
   @Inject
+  org.pipelineframework.orchestrator.RegisteredRestWorkerTargets registeredTargets;
+
+  @Inject
   PipelineReleaseIdentityResolver releaseIdentityResolver;
 
   @Inject
@@ -135,6 +138,25 @@ class QueueAsyncCoordinator {
   PipelineReplayTelemetry telemetry;
 
   volatile ExecutionStateStore executionStateStore;
+
+  org.pipelineframework.orchestrator.NativeExecutionAdmissionStore nativeAdmissionStore() {
+    if (!ensureQueueModeReady()) {
+      throw queueModeDisabledException();
+    }
+    if (!(executionStateStore instanceof org.pipelineframework.orchestrator.InMemoryExecutionStateStore)
+        && !(executionStateStore instanceof org.pipelineframework.orchestrator.DynamoExecutionStateStore)) {
+      throw new UnsupportedOperationException("Strict native execution admission is unsupported by this state provider");
+    }
+    return (org.pipelineframework.orchestrator.NativeExecutionAdmissionStore) executionStateStore;
+  }
+
+  Uni<org.pipelineframework.orchestrator.ExecutionAdmissionResult> admitExecution(
+      Object input, org.pipelineframework.orchestrator.ExecutionAdmissionIntent intent,
+      org.pipelineframework.orchestrator.release.PipelineReleaseEvidence evidence) {
+    var store = nativeAdmissionStore();
+    return store.inspectExistingAdmission(intent).flatMap(existing -> existing.isPresent()
+        ? Uni.createFrom().item(existing.get()) : submissionFlow().admit(input, intent, evidence, store));
+  }
   volatile WorkDispatcher workDispatcher;
   volatile DeadLetterPublisher deadLetterPublisher;
   private final String queueWorkerId = "worker-" + UUID.randomUUID();
@@ -256,6 +278,12 @@ class QueueAsyncCoordinator {
       ensureQueueModeReady();
       if (worker == null) {
         return Uni.createFrom().failure(new IllegalArgumentException("PipelineTransitionWorker must not be null"));
+      }
+      if (org.pipelineframework.orchestrator.RegisteredRestWorkerTargets.enabled(orchestratorConfig)) {
+        return executionStateStore.getExecution(workItem.tenantId(), workItem.executionId())
+            .chain(execution -> execution.map(registeredTargets::validateExecutionPin)
+                .orElseGet(() -> Uni.createFrom().voidItem()))
+            .chain(() -> segmentPipeline().process(workItem, worker, itemContinuationHandler));
       }
       return segmentPipeline().process(workItem, worker, itemContinuationHandler);
     });

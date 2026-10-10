@@ -6,6 +6,9 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.UUID;
 import jakarta.annotation.PreDestroy;
 
 import io.smallrye.mutiny.Uni;
@@ -31,8 +34,37 @@ import software.amazon.awssdk.services.dynamodb.model.TransactionCanceledExcepti
 
 /**
  * DynamoDB-backed release registry that stores immutable release and activation records.
+ *
+ * <p>Activation head v1 requires a coordinated, quiesced reader/writer rollout: older binaries neither
+ * fence their writes nor read this head. Before the first head write, reads retain the legacy
+ * timestamp/Release ordering of unchanged legacy history. The first new write starts a separate
+ * ordered-event sequence; it does not rewrite history or manufacture receipts for previous activations.
+ * All activation writers in this binary, including the legacy API, then use the common CAS head.
+ * Rolling back to an older reader/writer after new writes is unsafe without a separately planned
+ * migration. Actual activation time is retained independently of sequence and never synthesized.
+ * Operation receipts have no automatic expiry or key reuse; inquiry never mutates any registry row.</p>
  */
 public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
+
+    @Override
+    public boolean supportsCurrentActivationObservation() { return true; }
+
+    @Override
+    public Uni<CurrentActivationObservation> currentActivationObservation(String tenant, String pipeline) {
+        return blocking(() -> {
+            var head = readActivationHead(tenant, pipeline);
+            if (head.isEmpty()) {
+                return new CurrentActivationObservation(1, tenant, pipeline, legacyLatestActivation(tenant, pipeline).isPresent()
+                    ? CurrentActivationObservation.State.LEGACY_UNKNOWN : CurrentActivationObservation.State.NONE, Optional.empty());
+            }
+            validateHead(head, tenant, pipeline);
+            var release = getReleaseRecord(tenant, pipeline, stringValue(head, RELEASE_VERSION), Optional.empty())
+                .orElseThrow(() -> new IllegalStateException("Current activation lacks immutable registered Release"));
+            return new CurrentActivationObservation(1, tenant, pipeline, CurrentActivationObservation.State.IDENTIFIED,
+                Optional.of(new CurrentActivationEvent(stringValue(head, ACTIVATION_ID), release.contractVersion(), release.releaseVersion(),
+                    PipelineReleaseEvidence.from(release), longValue(head, ACTIVATED_AT_EPOCH_MS))));
+        });
+    }
     private static final Logger LOG = Logger.getLogger(DynamoPipelineReleaseRegistry.class);
 
     private static final String REGISTRY_KEY = "registry_key";
@@ -42,6 +74,12 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
     private static final String RECORD_TYPE_ACTIVATION = "ACTIVATION";
     private static final String RELEASE_PREFIX = "release:";
     private static final String ACTIVATION_PREFIX = "activation:";
+    private static final String HEAD_SORT = "activation-head:v1";
+    private static final String HEAD_TYPE = "ACTIVATION_HEAD_V1";
+    private static final String OPERATION_TYPE = "ACTIVATION_OPERATION_V1";
+    private static final String SEQUENCE = "activation_sequence";
+    private static final String RECEIPT_JSON = "receipt_json";
+    private static final String ACTIVATION_ID = "activation_id";
     private static final String TENANT_ID = "tenant_id";
     private static final String PIPELINE_ID = "pipeline_id";
     private static final String CONTRACT_VERSION = "contract_version";
@@ -104,6 +142,40 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
         String releaseVersion,
         long nowEpochMs) {
         return blocking(() -> activateBlocking(tenantId, pipelineId, releaseVersion, nowEpochMs));
+    }
+
+    @Override
+    public boolean supportsActivationOperations() {
+        return true;
+    }
+
+    @Override
+    public Uni<ActivationOperationReceipt> activateOnce(ActivationOperationCommand command) {
+        return blocking(() -> {
+            PipelineReleaseRecord release = command.release();
+            Optional<ActivationOperationReceipt> existing = operationBlocking(
+                release.tenantId(), release.pipelineId(), command.operationKey());
+            if (existing.isPresent()) {
+                existing.get().requireIntent(command);
+                return existing.get();
+            }
+            PipelineReleaseRecord registered = getReleaseRecord(release.tenantId(), release.pipelineId(),
+                release.releaseVersion(), Optional.empty()).orElseThrow(() ->
+                    new IllegalStateException("Activation requires a registered Release"));
+            if (!PipelineReleaseRecordMetadata.sameImmutableMetadata(registered, release)) {
+                throw new IllegalStateException("Activation requires matching immutable registered metadata");
+            }
+            ActivationOperationReceipt receipt = new ActivationOperationReceipt(1, command.operationKey(),
+                UUID.randomUUID().toString(), release.tenantId(), release.pipelineId(), release.contractVersion(),
+                release.releaseVersion(), PipelineReleaseEvidence.from(registered), command.activatedAtEpochMs());
+            return writeActivation(registered, command.activatedAtEpochMs(), Optional.of(receipt)).orElseThrow();
+        });
+    }
+
+    @Override
+    public Uni<Optional<ActivationOperationReceipt>> getActivationOperation(
+        String tenantId, String pipelineId, String operationKey) {
+        return blocking(() -> operationBlocking(tenantId, pipelineId, operationKey));
     }
 
     @PreDestroy
@@ -178,9 +250,14 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
         Map<String, AttributeValue> item = dynamoClient().getItem(GetItemRequest.builder()
             .tableName(releaseTable())
             .key(key(tenantId, pipelineId, releaseSort(releaseVersion)))
+            .consistentRead(true)
             .build()).item();
         if (item == null || item.isEmpty()) {
             return Optional.empty();
+        }
+        if (!tenantId.equals(stringValue(item, TENANT_ID)) || !pipelineId.equals(stringValue(item, PIPELINE_ID))
+            || !releaseVersion.equals(stringValue(item, RELEASE_VERSION))) {
+            throw new IllegalStateException("Registered Release scope mismatch");
         }
         return Optional.of(toReleaseRecord(item, active));
     }
@@ -203,37 +280,223 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
         if (existing.isEmpty()) {
             return Optional.empty();
         }
-        ActivationEvent event = new ActivationEvent(releaseVersion, nowEpochMs);
-        try {
-            dynamoClient().transactWriteItems(TransactWriteItemsRequest.builder()
-                .transactItems(
-                    TransactWriteItem.builder().conditionCheck(ConditionCheck.builder()
-                        .tableName(releaseTable())
-                        .key(key(tenantId, pipelineId, releaseSort(releaseVersion)))
-                        .conditionExpression("attribute_exists(#pk) AND attribute_exists(#sk)")
-                        .expressionAttributeNames(Map.of("#pk", REGISTRY_KEY, "#sk", REGISTRY_SORT))
-                        .build()).build(),
-                    TransactWriteItem.builder().put(Put.builder()
-                        .tableName(releaseTable())
-                        .item(toActivationItem(tenantId, pipelineId, event))
-                        .conditionExpression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
-                        .expressionAttributeNames(Map.of("#pk", REGISTRY_KEY, "#sk", REGISTRY_SORT))
-                        .build()).build())
-                .build());
-        } catch (TransactionCanceledException | ConditionalCheckFailedException ignored) {
-            return activeBlocking(tenantId, pipelineId)
-                .filter(record -> record.releaseVersion().equals(releaseVersion));
-        }
+        writeActivation(existing.get(), nowEpochMs, Optional.empty());
         return Optional.of(existing.get().withStatus(PipelineReleaseStatus.ACTIVE, nowEpochMs));
     }
 
     private Optional<ActivationEvent> latestActivation(String tenantId, String pipelineId) {
+        Map<String, AttributeValue> head = readActivationHead(tenantId, pipelineId);
+        if (!head.isEmpty()) {
+            validateHead(head, tenantId, pipelineId);
+            return Optional.of(new ActivationEvent(stringValue(head, RELEASE_VERSION), longValue(head, ACTIVATED_AT_EPOCH_MS)));
+        }
+        return legacyLatestActivation(tenantId, pipelineId);
+    }
+
+    private Optional<ActivationEvent> legacyLatestActivation(String tenantId, String pipelineId) {
         return queryRecords(tenantId, pipelineId, ACTIVATION_PREFIX, false).items().stream()
             .filter(item -> RECORD_TYPE_ACTIVATION.equals(stringValue(item, RECORD_TYPE)))
             .findFirst()
             .map(item -> new ActivationEvent(
                 stringValue(item, RELEASE_VERSION),
                 longValue(item, ACTIVATED_AT_EPOCH_MS)));
+    }
+
+    private Optional<ActivationOperationReceipt> writeActivation(PipelineReleaseRecord release, long now,
+        Optional<ActivationOperationReceipt> receipt) {
+        String tenant = release.tenantId();
+        String pipeline = release.pipelineId();
+        ActivationEvent event = new ActivationEvent(release.releaseVersion(), now);
+        String activationId = receipt.map(ActivationOperationReceipt::activationId).orElseGet(() -> UUID.randomUUID().toString());
+        for (int attempt = 0; attempt < 32; attempt++) {
+            Map<String, AttributeValue> registeredSnapshot = activationReleaseSnapshot(release);
+            Map<String, AttributeValue> previous = readActivationHead(tenant, pipeline);
+            long sequence = 1;
+            if (!previous.isEmpty()) {
+                validateHead(previous, tenant, pipeline);
+                sequence = Math.addExact(longValue(previous, SEQUENCE), 1);
+            } else {
+                // Retained legacy history is read-only. Older writers must be quiesced before first new write.
+                legacyLatestActivation(tenant, pipeline);
+            }
+            Map<String, AttributeValue> nextHead = new HashMap<>(toActivationItem(tenant, pipeline, event));
+            nextHead.put(REGISTRY_SORT, avS(HEAD_SORT));
+            nextHead.put(RECORD_TYPE, avS(HEAD_TYPE));
+            nextHead.put(SEQUENCE, avN(sequence));
+            nextHead.put(ACTIVATION_ID, avS(activationId));
+            Map<String, AttributeValue> orderedEvent = new HashMap<>(toActivationItem(tenant, pipeline, event));
+            orderedEvent.put(REGISTRY_SORT, avS("activation-v2:" + String.format("%019d", sequence)));
+            orderedEvent.put(SEQUENCE, avN(sequence));
+            orderedEvent.put(ACTIVATION_ID, avS(activationId));
+            List<TransactWriteItem> writes = new ArrayList<>();
+            writes.add(TransactWriteItem.builder().conditionCheck(activationReleaseCondition(release, registeredSnapshot)).build());
+            writes.add(absentPut(orderedEvent));
+            Put.Builder headPut = Put.builder().tableName(releaseTable()).item(nextHead);
+            if (previous.isEmpty()) {
+                headPut.conditionExpression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
+                    .expressionAttributeNames(Map.of("#pk", REGISTRY_KEY, "#sk", REGISTRY_SORT));
+            } else {
+                headPut.conditionExpression("#sequence = :previous AND #type = :type")
+                    .expressionAttributeNames(Map.of("#sequence", SEQUENCE, "#type", RECORD_TYPE))
+                    .expressionAttributeValues(Map.of(":previous", avN(sequence - 1), ":type", avS(HEAD_TYPE)));
+            }
+            writes.add(TransactWriteItem.builder().put(headPut.build()).build());
+            receipt.ifPresent(value -> writes.add(absentPut(Map.of(
+                REGISTRY_KEY, avS(partitionKey(tenant, pipeline)), REGISTRY_SORT, avS(operationSort(tenant, pipeline, value.operationKey())),
+                RECORD_TYPE, avS(OPERATION_TYPE), RECEIPT_JSON, avS(toJson(value))))));
+            try {
+                dynamoClient().transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writes).build());
+                return receipt;
+            } catch (TransactionCanceledException conflict) {
+                var reasons = conflict.cancellationReasons();
+                // The first transaction member verifies the immutable registered Release.
+                if (!reasons.isEmpty() && "ConditionalCheckFailed".equals(reasons.getFirst().code())) throw conflict;
+                if (receipt.isPresent()) {
+                    Optional<ActivationOperationReceipt> winner = operationBlocking(tenant, pipeline, receipt.get().operationKey());
+                    if (winner.isPresent()) {
+                        winner.get().requireIntent(new ActivationOperationCommand(receipt.get().operationKey(), release, now));
+                        return winner;
+                    }
+                }
+                if (reasons.stream().anyMatch(reason -> "TransactionConflict".equals(reason.code())
+                    || "ThrottlingError".equals(reason.code()))) {
+                    try { Thread.sleep(Math.min(50L, 2L * (attempt + 1))); }
+                    catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("Activation contention retry interrupted", interrupted);
+                    }
+                    continue;
+                }
+                Map<String, AttributeValue> current = readItem(tenant, pipeline, HEAD_SORT);
+                if (current.equals(previous)) {
+                    throw conflict;
+                }
+            }
+        }
+        throw new IllegalStateException("Activation head remained contended; no effect inferred");
+    }
+
+    private Map<String, AttributeValue> activationReleaseSnapshot(PipelineReleaseRecord selected) {
+        Map<String, AttributeValue> item = readItem(selected.tenantId(), selected.pipelineId(), releaseSort(selected.releaseVersion()));
+        if (item == null || item.isEmpty()) {
+            throw new IllegalStateException("Activation requires a registered Release");
+        }
+        if (!partitionKey(selected.tenantId(), selected.pipelineId()).equals(stringValue(item, REGISTRY_KEY))
+            || !releaseSort(selected.releaseVersion()).equals(stringValue(item, REGISTRY_SORT))
+            || !RECORD_TYPE_RELEASE.equals(stringValue(item, RECORD_TYPE))
+            || !selected.tenantId().equals(stringValue(item, TENANT_ID))
+            || !selected.pipelineId().equals(stringValue(item, PIPELINE_ID))
+            || !selected.releaseVersion().equals(stringValue(item, RELEASE_VERSION))) {
+            throw new IllegalStateException("Registered Release scope mismatch");
+        }
+        if (!PipelineReleaseRecordMetadata.sameImmutableMetadata(selected, toReleaseRecord(item, Optional.empty()))) {
+            throw new IllegalStateException("Activation requires matching immutable registered metadata");
+        }
+        return Map.copyOf(item);
+    }
+
+    private ConditionCheck activationReleaseCondition(PipelineReleaseRecord release, Map<String, AttributeValue> snapshot) {
+        // CAS the observed representation after semantic validation. Re-serializing a decoded map is not byte identity.
+        List<String> attributes = List.of(REGISTRY_KEY, REGISTRY_SORT, RECORD_TYPE, TENANT_ID, PIPELINE_ID,
+            RELEASE_VERSION, CONTRACT_VERSION, DESCRIPTOR_JSON, CONTRACT_JSON, PRIMARY_ARTIFACT_ID,
+            PRIMARY_ARTIFACT_DIGEST, PRIMARY_ARTIFACT_SIZE_BYTES, PRIMARY_ARTIFACT_CHECKSUM,
+            PRIMARY_ARTIFACT_URI, LEGACY_PRIMARY_ARTIFACT_PATH);
+        Map<String, String> names = new HashMap<>();
+        Map<String, AttributeValue> values = new HashMap<>();
+        List<String> predicates = new ArrayList<>();
+        for (int index = 0; index < attributes.size(); index++) {
+            String attribute = attributes.get(index);
+            String name = "#release" + index;
+            names.put(name, attribute);
+            if (snapshot.containsKey(attribute)) {
+                String value = ":release" + index;
+                values.put(value, snapshot.get(attribute));
+                predicates.add(name + " = " + value);
+            } else {
+                predicates.add("attribute_not_exists(" + name + ")");
+            }
+        }
+        return ConditionCheck.builder().tableName(releaseTable())
+            .key(key(release.tenantId(), release.pipelineId(), releaseSort(release.releaseVersion())))
+            .conditionExpression(String.join(" AND ", predicates)).expressionAttributeNames(names)
+            .expressionAttributeValues(values).build();
+    }
+
+    private TransactWriteItem absentPut(Map<String, AttributeValue> item) {
+        return TransactWriteItem.builder().put(Put.builder().tableName(releaseTable()).item(item)
+            .conditionExpression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
+            .expressionAttributeNames(Map.of("#pk", REGISTRY_KEY, "#sk", REGISTRY_SORT)).build()).build();
+    }
+
+    private Map<String, AttributeValue> readItem(String tenant, String pipeline, String sort) {
+        return dynamoClient().getItem(GetItemRequest.builder().tableName(releaseTable())
+            .key(key(tenant, pipeline, sort)).consistentRead(true).build()).item();
+    }
+
+    private Map<String, AttributeValue> readActivationHead(String tenant, String pipeline) {
+        Map<String, AttributeValue> head = readItem(tenant, pipeline, HEAD_SORT);
+        if (head.isEmpty() && (hasNamespaceEvidence(tenant, pipeline, "activation-v2:")
+            || hasNamespaceEvidence(tenant, pipeline, "activation-operation:v1:"))) {
+            // A legitimate concurrent first commit may have appeared after the initial absent read.
+            head = readItem(tenant, pipeline, HEAD_SORT);
+            if (head.isEmpty()) {
+                throw new IllegalStateException("Retained activation evidence exists without its ordered head");
+            }
+        }
+        return head;
+    }
+
+    private boolean hasNamespaceEvidence(String tenant, String pipeline, String prefix) {
+        return !dynamoClient().query(QueryRequest.builder().tableName(releaseTable())
+            .keyConditionExpression("#pk = :pk AND begins_with(#sk, :prefix)")
+            .expressionAttributeNames(Map.of("#pk", REGISTRY_KEY, "#sk", REGISTRY_SORT))
+            .expressionAttributeValues(Map.of(":pk", avS(partitionKey(tenant, pipeline)), ":prefix", avS(prefix)))
+            .consistentRead(true).limit(1).build()).items().isEmpty();
+    }
+
+    private Optional<ActivationOperationReceipt> operationBlocking(String tenant, String pipeline, String operationKey) {
+        Map<String, AttributeValue> item = readItem(tenant, pipeline, operationSort(tenant, pipeline, operationKey));
+        if (item.isEmpty()) {
+            return Optional.empty();
+        }
+        if (!OPERATION_TYPE.equals(stringValue(item, RECORD_TYPE))) {
+            throw new IllegalStateException("Unknown activation operation record type");
+        }
+        ActivationOperationReceipt receipt = fromJson(stringValue(item, RECEIPT_JSON), ActivationOperationReceipt.class);
+        if (!receipt.tenantId().equals(tenant) || !receipt.pipelineId().equals(pipeline) || !receipt.operationKey().equals(operationKey)) {
+            throw new IllegalStateException("Activation operation scope mismatch");
+        }
+        return Optional.of(receipt);
+    }
+
+    private static String operationSort(String tenant, String pipeline, String operationKey) {
+        if (operationKey == null || operationKey.isBlank()) {
+            throw new IllegalArgumentException("operationKey must not be blank");
+        }
+        try {
+            byte[] bytes = PipelineJson.mapper().writeValueAsBytes(List.of(tenant, pipeline, operationKey));
+            return "activation-operation:v1:" + java.util.HexFormat.of().formatHex(
+                java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
+        } catch (Exception failure) {
+            throw new IllegalArgumentException("Invalid activation operation scope", failure);
+        }
+    }
+
+    private void validateHead(Map<String, AttributeValue> head, String tenant, String pipeline) {
+        if (!HEAD_TYPE.equals(stringValue(head, RECORD_TYPE)) || !tenant.equals(stringValue(head, TENANT_ID))
+            || !pipeline.equals(stringValue(head, PIPELINE_ID)) || longValue(head, SEQUENCE) <= 0) {
+            throw new IllegalStateException("Unknown or corrupt activation head");
+        }
+        Map<String, AttributeValue> event = readItem(tenant, pipeline,
+            "activation-v2:" + String.format("%019d", longValue(head, SEQUENCE)));
+        if (event.isEmpty() || !RECORD_TYPE_ACTIVATION.equals(stringValue(event, RECORD_TYPE))
+            || !tenant.equals(stringValue(event, TENANT_ID)) || !pipeline.equals(stringValue(event, PIPELINE_ID))
+            || !stringValue(head, RELEASE_VERSION).equals(stringValue(event, RELEASE_VERSION))
+            || !stringValue(head, ACTIVATION_ID).equals(stringValue(event, ACTIVATION_ID))
+            || longValue(head, ACTIVATED_AT_EPOCH_MS) != longValue(event, ACTIVATED_AT_EPOCH_MS)
+            || longValue(head, SEQUENCE) != longValue(event, SEQUENCE)) {
+            throw new IllegalStateException("Activation head lacks matching immutable event");
+        }
     }
 
     private QueryResponse queryRecords(
@@ -249,6 +512,7 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
                 ":pk", avS(partitionKey(tenantId, pipelineId)),
                 ":prefix", avS(sortPrefix)))
             .scanIndexForward(ascending)
+            .consistentRead(true)
             .build());
     }
 

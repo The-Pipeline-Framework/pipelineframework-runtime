@@ -245,16 +245,10 @@ public class ExecutionDurablePayloadResolver {
                 // the contract's terminal canonical output rather than the entry input.
                 : steps.getLast().outputTypeId();
         }
-        if (execution.resultShape() == ExecutionResultShape.MATERIALIZED_MULTI) {
-            // Itemized child records persist the materialized output of their segment. Branch
-            // ordering does not identify that result contract; the pinned pipeline contract's
-            // terminal output does.
-            return steps.getLast().outputTypeId();
-        }
-        int index = execution.currentStepIndex();
-        return index >= 0 && index < steps.size()
-            ? steps.get(index).inputTypeId()
-            : steps.getLast().outputTypeId();
+        // RESULT stores completed execution/segment output, even while markSucceeded still
+        // holds the pre-terminal cursor. Shape controls collection materialization, not the
+        // canonical element identity; only the pinned terminal output selects that binding.
+        return steps.getLast().outputTypeId();
     }
 
     private static String required(Map<String, Object> definition, String field, String id) {

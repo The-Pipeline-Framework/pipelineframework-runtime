@@ -2,6 +2,7 @@ package org.pipelineframework.orchestrator;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import io.quarkus.arc.Unremovable;
@@ -568,6 +569,9 @@ public interface PipelineOrchestratorConfig {
      */
     interface ReleasesConfig {
 
+        /** Environment-owned artifact resolution settings, separate from release identity. */
+        ReleaseResolverConfig resolver();
+
         /**
          * Release registry metadata provider settings.
          *
@@ -583,6 +587,19 @@ public interface PipelineOrchestratorConfig {
          */
         @WithName("storage")
         ReleaseStorageConfig storage();
+    }
+
+    /** Maven admission uses the shared public Release resolver and its settings contract. */
+    interface ReleaseResolverConfig {
+        /** Explicit settings file for private repository IDs and server credentials. */
+        Optional<String> mavenSettings();
+
+        /** Optional cache override; defaults to the release storage root's maven subdirectory. */
+        Optional<String> mavenLocalRepository();
+
+        /** Public repositories. Private authenticated repositories belong in the settings file. */
+        @WithDefault("https://repo.maven.apache.org/maven2")
+        List<String> mavenRepositories();
     }
 
     /**
@@ -685,6 +702,17 @@ public interface PipelineOrchestratorConfig {
      */
     interface WorkerConfig {
 
+        /** Legacy fixed target selection or explicitly bound whole-bundle REST targets. */
+        @WithDefault("legacy")
+        String targetingMode();
+
+        /** Named environment-owned worker bindings. */
+        Map<String, RegisteredRestTargetConfig> targets();
+
+        /** Permit cleartext only for literal loopback development endpoints. */
+        @WithDefault("false")
+        boolean allowLoopbackHttp();
+
         /**
          * Execution mode for admitted transitions.
          *
@@ -768,6 +796,30 @@ public interface PipelineOrchestratorConfig {
          */
         @WithName("lifecycle")
         WorkerLifecycleConfig lifecycle();
+    }
+
+    interface RegisteredRestTargetConfig {
+        /** Bound tenant identifier. */
+        String tenantId();
+        /** Bound pipeline identifier. */
+        String pipelineId();
+        /** Bound semantic contract version. */
+        String contractVersion();
+        /** Bound immutable Release version. */
+        String releaseVersion();
+        /** Bound lifecycle worker identifier. */
+        String workerId();
+        /** Supported transition transport. */
+        @WithDefault("rest")
+        String protocol();
+        /** Trusted worker origin, never supplied by an execution caller. */
+        String endpoint();
+        /** Environment-owned request signing secret reference. */
+        String sharedSecretRef();
+        /** Deployable whole-bundle artifact identifier. */
+        String artifactId();
+        /** Exact deployable artifact digest. */
+        String artifactDigest();
     }
 
     /**

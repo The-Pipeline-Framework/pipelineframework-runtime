@@ -46,6 +46,62 @@ import static org.mockito.Mockito.*;
 class DynamoExecutionStateStoreTest {
 
     @Test
+    void terminalSingleCommitUsesRealPinnedCodecAtUnchangedCursorAndRestoresRemoteResults() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoExecutionStateStore store = new DynamoExecutionStateStore(client, mockConfig("tpf_execution", "tpf_execution_key"));
+        var registry = new org.pipelineframework.orchestrator.release.InMemoryPipelineReleaseRegistry();
+        var contract = new org.pipelineframework.orchestrator.release.PipelineContractDescriptor(2, "org.example.pipeline", "3",
+            "sha256:contract", null, null, null, false, null, List.of(
+                new PipelineBundleStepDescriptor(0, "input", "object", "ONE_TO_ONE", PaymentRecord.class.getName(), PaymentStatus.class.getName(), null, null, null),
+                new PipelineBundleStepDescriptor(1, "terminal", "object", "ONE_TO_ONE", PaymentStatus.class.getName(), PaymentOutput.class.getName(), null, null, null)),
+            PipelineBundleCapabilities.defaults(), Map.of(
+                "PaymentRecord", Map.of("runtimeClass", PaymentRecord.class.getName(), "definitionFingerprint", "record-fingerprint"),
+                "PaymentStatus", Map.of("runtimeClass", PaymentStatus.class.getName(), "definitionFingerprint", "status-fingerprint"),
+                "PaymentOutput", Map.of("runtimeClass", PaymentOutput.class.getName(), "definitionFingerprint", "output-fingerprint")), "catalog");
+        var artifact = new org.pipelineframework.orchestrator.release.PipelineReleaseArtifactDescriptor("archive", "application-archive",
+            "file:///external-fixture/application.jar", "sha256:" + "a".repeat(64), List.of("input", "terminal"), List.of("local"));
+        var descriptor = new org.pipelineframework.orchestrator.release.PipelineReleaseDescriptor(1, "org.example.pipeline", "sha256:contract",
+            "sha256:release", "archive", List.of(artifact));
+        registry.register(new org.pipelineframework.orchestrator.release.PipelineReleaseRecord("tenant-a", "org.example.pipeline", "sha256:contract",
+            "sha256:release", org.pipelineframework.orchestrator.release.PipelineReleaseStatus.REGISTERED, descriptor, "archive", artifact.digest(),
+            artifact.uri(), 1, artifact.digest(), contract, 1, 1, 0)).await().indefinitely();
+        ExecutionDurablePayloadResolver payloads = new ExecutionDurablePayloadResolver();
+        payloads.releaseRegistry = registry;
+        payloads.codec = new JsonDurablePayloadCodec();
+        store.durablePayloadResolver = payloads;
+        long now = 10_000;
+        long ttl = System.currentTimeMillis() / 1000 + 3600;
+        var persisted = new java.util.concurrent.atomic.AtomicReference<Map<String, AttributeValue>>(new HashMap<>(
+            executionItem("tenant-a", "exec-terminal", "key-terminal", ttl, ExecutionStatus.RUNNING)));
+        persisted.get().put("current_step_index", AttributeValue.builder().n("1").build());
+        when(client.getItem(any(GetItemRequest.class))).thenAnswer(ignored -> GetItemResponse.builder().item(persisted.get()).build());
+        when(client.updateItem(any(UpdateItemRequest.class))).thenAnswer(invocation -> {
+            UpdateItemRequest request = invocation.getArgument(0);
+            Map<String, AttributeValue> completed = new HashMap<>(persisted.get());
+            completed.put("status", request.expressionAttributeValues().get(":succeeded"));
+            completed.put("version", AttributeValue.builder().n("1").build());
+            completed.put("result_payload_json", request.expressionAttributeValues().get(":result"));
+            persisted.set(completed);
+            return UpdateItemResponse.builder().attributes(completed).build();
+        });
+        PaymentOutput output = new PaymentOutput("payment-1", "approved");
+        SerializedTransitionPayload remote = store.transitionPayloadCodec.encode(output);
+        ExecutionRecord<Object, Object> completed = store.markSucceeded("tenant-a", "exec-terminal", 0, "terminal-key", List.of(remote), now)
+            .await().indefinitely().orElseThrow();
+        assertEquals(ExecutionStatus.SUCCEEDED, completed.status());
+        assertEquals(1, completed.currentStepIndex());
+        assertEquals(1, completed.version());
+        assertEquals(List.of(output), completed.resultPayload());
+        assertEquals(List.of(output), store.getExecution("tenant-a", "exec-terminal").await().indefinitely().orElseThrow().resultPayload());
+        ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        verify(client, times(1)).updateItem(update.capture());
+        assertTrue(update.getValue().conditionExpression().contains("#version = :expected"));
+        assertEquals("0", update.getValue().expressionAttributeValues().get(":expected").n());
+        assertFalse(update.getValue().updateExpression().contains("#currentStep"));
+        assertTrue(update.getValue().expressionAttributeValues().get(":result").s().contains("\"canonicalTypeId\":\"List<PaymentOutput>\""));
+    }
+
+    @Test
     void writesAndRestoresAsyncPipelineContextWithTheExecutionInput() {
         DynamoDbClient client = mock(DynamoDbClient.class);
         DynamoExecutionStateStore store = new DynamoExecutionStateStore(

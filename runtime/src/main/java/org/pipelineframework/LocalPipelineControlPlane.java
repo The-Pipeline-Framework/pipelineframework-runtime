@@ -35,6 +35,17 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     @Inject
     PipelineExecutionService pipelineExecutionService;
 
+    /** Strict native admission capability; file and custom state providers are unsupported before effects. */
+    public org.pipelineframework.orchestrator.NativeExecutionAdmissionStore nativeAdmissionStore() {
+        return queueAsyncCoordinator.nativeAdmissionStore();
+    }
+
+    public Uni<org.pipelineframework.orchestrator.ExecutionAdmissionResult> admitExecution(Object input,
+        org.pipelineframework.orchestrator.ExecutionAdmissionIntent intent,
+        org.pipelineframework.orchestrator.release.PipelineReleaseEvidence evidence) {
+        return queueAsyncCoordinator.admitExecution(input, intent, evidence);
+    }
+
     @PostConstruct
     void initialize() {
         initializeQueueMode();

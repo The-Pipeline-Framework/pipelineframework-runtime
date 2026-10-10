@@ -63,6 +63,11 @@
     <dependencies>
         <dependency>
             <groupId>org.pipelineframework</groupId>
+            <artifactId>tpf-release-resolver</artifactId>
+            <version>${tpf.release-resolver.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.pipelineframework</groupId>
             <artifactId>pipelineframework-runtime-api</artifactId>
             <version>${tpf.contracts.version}</version>
         </dependency>
@@ -321,6 +326,7 @@
                                     <include>org.pipelineframework:pipelineframework-runtime-protocol</include>
                                     <include>org.pipelineframework:pipelineframework-api</include>
                                     <include>org.pipelineframework:pipelineframework-runtime-core</include>
+                                    <include>org.pipelineframework:tpf-release-resolver</include>
                                     <include>org.pipelineframework:pipelineframework-runtime-spi</include>
                                     <include>org.pipelineframework:pipelineframework-dsl</include>
                                     <include>org.pipelineframework:pipelineframework-semantic-model</include>
@@ -395,6 +401,11 @@
                 </executions>
                 <configuration>
                     <deployment>org.pipelineframework:pipelineframework-deployment:${project.version}</deployment>
+                    <!-- Quarkus already loads Resolver API/impl in the parent. Its service-role
+                         SPI must share that loader for native Maven release admission. -->
+                    <parentFirstArtifacts>
+                        <parentFirstArtifact>org.apache.maven.resolver:maven-resolver-spi</parentFirstArtifact>
+                    </parentFirstArtifacts>
                 </configuration>
             </plugin>
             <!-- Versions Maven Plugin for consistent version management across modules -->

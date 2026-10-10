@@ -179,7 +179,7 @@ public class HostedReleaseAdminResource {
         return Uni.createFrom().failure(new InvalidReleaseRegistrationException(failure.getMessage(), failure));
     }
 
-    private Optional<Response> guard(String tenantId, String pipelineId, String authorization) {
+    Optional<Response> guard(String tenantId, String pipelineId, String authorization) {
         if (!enabled()) {
             return Optional.of(Response.status(Response.Status.NOT_FOUND).build());
         }
@@ -226,7 +226,7 @@ public class HostedReleaseAdminResource {
             && orchestratorConfig.admin().enabled();
     }
 
-    private PipelineReleaseRegistry registry() {
+    PipelineReleaseRegistry registry() {
         if (releaseRegistry != null) {
             return releaseRegistry;
         }
@@ -243,7 +243,7 @@ public class HostedReleaseAdminResource {
         return fallback;
     }
 
-    private PipelineReleaseRegistrar registrar() {
+    PipelineReleaseRegistrar registrar() {
         if (releaseRegistrar != null) {
             return releaseRegistrar;
         }

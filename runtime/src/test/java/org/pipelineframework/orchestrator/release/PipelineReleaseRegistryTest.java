@@ -9,6 +9,7 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.when;
 
 import java.nio.file.Files;
@@ -164,7 +165,11 @@ class PipelineReleaseRegistryTest {
         PipelineReleaseRecord record = releaseRecord();
         PipelineReleaseRegistry registry = new DynamoPipelineReleaseRegistry(client, dynamoConfig());
         when(client.getItem(any(GetItemRequest.class)))
-            .thenReturn(GetItemResponse.builder().item(dynamoReleaseItem(record)).build());
+            .thenAnswer(invocation -> {
+                GetItemRequest request = invocation.getArgument(0);
+                return GetItemResponse.builder().item(request.key().get("registry_sort").s().startsWith("release:")
+                    ? dynamoReleaseItem(record) : Map.of()).build();
+            });
         when(client.query(any(QueryRequest.class)))
             .thenReturn(QueryResponse.builder().items(List.of()).build());
 
@@ -182,7 +187,11 @@ class PipelineReleaseRegistryTest {
         when(client.query(any(QueryRequest.class)))
             .thenReturn(QueryResponse.builder().items(List.of()).build());
         when(client.getItem(any(GetItemRequest.class)))
-            .thenReturn(GetItemResponse.builder().item(legacyDynamoReleaseItem(record)).build());
+            .thenAnswer(invocation -> {
+                GetItemRequest request = invocation.getArgument(0);
+                return GetItemResponse.builder().item(request.key().get("registry_sort").s().startsWith("release:")
+                    ? legacyDynamoReleaseItem(record) : Map.of()).build();
+            });
 
         PipelineReleaseRecord read = registry.get(record.tenantId(), record.pipelineId(), record.releaseVersion())
             .await().indefinitely()
@@ -213,11 +222,17 @@ class PipelineReleaseRegistryTest {
             existing.activatedAtEpochMs());
         PipelineReleaseRegistry registry = new DynamoPipelineReleaseRegistry(client, dynamoConfig());
         when(client.getItem(any(GetItemRequest.class)))
-            .thenReturn(GetItemResponse.builder().item(dynamoReleaseItem(existing)).build());
+            .thenAnswer(invocation -> {
+                GetItemRequest request = invocation.getArgument(0);
+                return GetItemResponse.builder().item(request.key().get("registry_sort").s().startsWith("release:")
+                    ? dynamoReleaseItem(existing) : Map.of()).build();
+            });
         when(client.query(any(QueryRequest.class)))
             .thenReturn(QueryResponse.builder().items(List.of()).build());
 
-        assertThrows(IllegalStateException.class, () -> registry.register(conflicting).await().indefinitely());
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+            () -> registry.register(conflicting).await().indefinitely());
+        assertEquals("Release version is already registered with different metadata", failure.getMessage());
         verify(client, never()).putItem(any(PutItemRequest.class));
     }
 
@@ -227,7 +242,11 @@ class PipelineReleaseRegistryTest {
         PipelineReleaseRecord record = releaseRecord();
         PipelineReleaseRegistry registry = new DynamoPipelineReleaseRegistry(client, dynamoConfig());
         when(client.getItem(any(GetItemRequest.class)))
-            .thenReturn(GetItemResponse.builder().item(dynamoReleaseItem(record)).build());
+            .thenAnswer(invocation -> {
+                GetItemRequest request = invocation.getArgument(0);
+                return GetItemResponse.builder().item(request.key().get("registry_sort").s().startsWith("release:")
+                    ? dynamoReleaseItem(record) : Map.of()).build();
+            });
         when(client.query(any(QueryRequest.class)))
             .thenReturn(QueryResponse.builder().items(List.of()).build());
         when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
@@ -244,10 +263,56 @@ class PipelineReleaseRegistryTest {
         assertEquals(PipelineReleaseStatus.ACTIVE, active.status());
         assertEquals(3000L, active.activatedAtEpochMs());
         verify(client).transactWriteItems(argThat((TransactWriteItemsRequest request) ->
-            request.transactItems().size() == 2
+            request.transactItems().size() == 3
                 && request.transactItems().get(0).conditionCheck() != null
                 && request.transactItems().get(1).put() != null
-                && request.transactItems().get(1).put().conditionExpression().contains("attribute_not_exists")));
+                && request.transactItems().get(1).put().conditionExpression().contains("attribute_not_exists")
+                && request.transactItems().get(2).put() != null
+                && request.transactItems().get(2).put().item().get("registry_sort").s().equals("activation-head:v1")
+                && request.transactItems().get(2).put().conditionExpression().contains("attribute_not_exists")
+                && request.transactItems().get(2).put().item().get("activation_sequence").n().equals("1")));
+    }
+
+    @Test
+    void dynamoActivationRetriesProviderContentionButNeverFailedReleaseCondition() {
+        for (String reason : List.of("TransactionConflict", "ThrottlingError", "ReleaseCondition", "Mixed", "Persistent")) {
+            DynamoDbClient client = mock(DynamoDbClient.class);
+            PipelineReleaseRecord record = releaseRecord();
+            var registry = new DynamoPipelineReleaseRegistry(client, dynamoConfig());
+            when(client.getItem(any(GetItemRequest.class))).thenAnswer(invocation -> {
+                GetItemRequest request = invocation.getArgument(0);
+                return GetItemResponse.builder().item(request.key().get("registry_sort").s().startsWith("release:")
+                    ? dynamoReleaseItem(record) : Map.of()).build();
+            });
+            when(client.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder().items(List.of()).build());
+            var failure = software.amazon.awssdk.services.dynamodb.model.TransactionCanceledException.builder()
+                .cancellationReasons(
+                    software.amazon.awssdk.services.dynamodb.model.CancellationReason.builder()
+                        .code(reason.equals("ReleaseCondition") || reason.equals("Mixed") ? "ConditionalCheckFailed" : "None").build(),
+                    software.amazon.awssdk.services.dynamodb.model.CancellationReason.builder()
+                        .code(reason.equals("ReleaseCondition") ? "None"
+                            : reason.equals("Mixed") || reason.equals("Persistent") ? "TransactionConflict" : reason).build())
+                .build();
+            if (reason.equals("Persistent")) {
+                when(client.transactWriteItems(any(TransactWriteItemsRequest.class))).thenThrow(failure);
+                var exhausted = assertThrows(IllegalStateException.class,
+                    () -> registry.activate(record.tenantId(), record.pipelineId(), record.releaseVersion(), 3000L).await().indefinitely());
+                assertEquals("Activation head remained contended; no effect inferred", exhausted.getMessage());
+                verify(client, times(32)).transactWriteItems(any(TransactWriteItemsRequest.class));
+            } else {
+                when(client.transactWriteItems(any(TransactWriteItemsRequest.class))).thenThrow(failure)
+                    .thenReturn(TransactWriteItemsResponse.builder().build());
+            }
+            if (reason.equals("ReleaseCondition") || reason.equals("Mixed")) {
+                assertThrows(software.amazon.awssdk.services.dynamodb.model.TransactionCanceledException.class,
+                    () -> registry.activate(record.tenantId(), record.pipelineId(), record.releaseVersion(), 3000L).await().indefinitely());
+                verify(client, times(1)).transactWriteItems(any(TransactWriteItemsRequest.class));
+            } else if (!reason.equals("Persistent")) {
+                assertEquals(PipelineReleaseStatus.ACTIVE, registry.activate(record.tenantId(), record.pipelineId(), record.releaseVersion(), 3000L)
+                    .await().indefinitely().orElseThrow().status());
+                verify(client, times(2)).transactWriteItems(any(TransactWriteItemsRequest.class));
+            }
+        }
     }
 
     @Test
@@ -256,9 +321,17 @@ class PipelineReleaseRegistryTest {
         PipelineReleaseRecord record = releaseRecord();
         PipelineReleaseRegistry registry = new DynamoPipelineReleaseRegistry(client, dynamoConfig());
         when(client.query(any(QueryRequest.class)))
-            .thenReturn(QueryResponse.builder().items(List.of(dynamoActivationItem(record, 4000L))).build());
+            .thenAnswer(invocation -> {
+                QueryRequest request = invocation.getArgument(0);
+                return QueryResponse.builder().items("activation:".equals(request.expressionAttributeValues().get(":prefix").s())
+                    ? List.of(dynamoActivationItem(record, 4000L)) : List.of()).build();
+            });
         when(client.getItem(any(GetItemRequest.class)))
-            .thenReturn(GetItemResponse.builder().item(dynamoReleaseItem(record)).build());
+            .thenAnswer(invocation -> {
+                GetItemRequest request = invocation.getArgument(0);
+                return GetItemResponse.builder().item(request.key().get("registry_sort").s().startsWith("release:")
+                    ? dynamoReleaseItem(record) : Map.of()).build();
+            });
 
         PipelineReleaseRecord active = registry.active(record.tenantId(), record.pipelineId())
             .await().indefinitely()
@@ -268,7 +341,8 @@ class PipelineReleaseRegistryTest {
         assertEquals(PipelineReleaseStatus.ACTIVE, active.status());
         assertEquals(4000L, active.activatedAtEpochMs());
         verify(client).query(argThat((QueryRequest request) ->
-            Boolean.FALSE.equals(request.scanIndexForward())));
+            "activation:".equals(request.expressionAttributeValues().get(":prefix").s())
+                && Boolean.FALSE.equals(request.scanIndexForward())));
     }
 
     @Test

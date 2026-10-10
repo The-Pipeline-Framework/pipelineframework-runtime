@@ -93,7 +93,7 @@ class CommandEffectRecordCodecTest {
     void rejectsUnknownSchemaVersion() {
         CommandEffectRecord record = pending(new TestInput("invoice-42", 7));
         String encoded = codec.encode(record, TestInput.class.getName(), TestOutput.class.getName())
-            .replace("\"schemaVersion\":2", "\"schemaVersion\":99");
+            .replace("\"schemaVersion\":" + CommandEffectRecordCodec.SCHEMA_VERSION, "\"schemaVersion\":99");
 
         CommandEffectStoreException failure = assertThrows(
             CommandEffectStoreException.class, () -> codec.decode(encoded));
@@ -123,7 +123,7 @@ class CommandEffectRecordCodecTest {
         root.put("schemaVersion", 1);
         for (JsonNode attempt : root.withArray("attempts")) {
             ObjectNode object = (ObjectNode) attempt;
-            object.remove(List.of("occurrenceId", "purpose", "output", "reason"));
+            object.remove(List.of("occurrenceId", "purpose", "output", "reason", "recoveryBinding", "reconciliationReceipt"));
         }
 
         CommandEffectRecord decoded = codec.decode(PipelineJson.mapper().writeValueAsString(root)).record();

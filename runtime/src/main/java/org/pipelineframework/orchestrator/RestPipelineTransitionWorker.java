@@ -13,6 +13,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledFuture;
@@ -87,21 +88,41 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
 
     @Override
     public Uni<TransitionResultEnvelope> executeTransition(TransitionCommandEnvelope command) {
-        return invocationRuntime().invokeTransportUni(this, () ->
-            Uni.createFrom().deferred(() -> executeRequest(command)));
+        var runtime = invocationRuntime();
+        return Uni.createFrom().deferred(() -> {
+            Executor signalContext = subscriberSignalContext();
+            return runtime.invokeTransportUni(this, () ->
+                Uni.createFrom().deferred(() -> executeRequest(command, signalContext)));
+        });
     }
 
-    private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command) {
+    /** Execute against an environment-owned target without changing the legacy global endpoint. */
+    public Uni<TransitionResultEnvelope> executeTransition(TransitionCommandEnvelope command, URI endpoint, String secretRef) {
+        var runtime = invocationRuntime();
+        return Uni.createFrom().deferred(() -> {
+            Executor signalContext = subscriberSignalContext();
+            return runtime.invokeTransportUni(this, () -> Uni.createFrom().deferred(() ->
+                executeRequest(command, endpoint, targetSecret(secretRef), signalContext)));
+        });
+    }
+
+    private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command, Executor signalContext) {
+        return executeRequest(command, configuredEndpoint(), sharedSecret(), signalContext);
+    }
+
+    private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command, URI endpoint, String secret,
+                                                       Executor signalContext) {
         Duration deadline = orchestratorConfig.workerRest().requestTimeout();
         long deadlineMillis = Math.max(1L, deadline.toMillis());
         long startedAtNanos = System.nanoTime();
-        String target = workerTarget();
+        String target = workerTarget(endpoint);
         ScheduledFuture<?> warning = scheduleDeadlineWarning(command, target, deadlineMillis);
-        return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(() -> request(command), blockingExecutor)
+        return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(() -> request(command, endpoint, secret), blockingExecutor)
                 .thenCompose(request -> httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString()))
                 .thenCompose(response -> CompletableFuture.supplyAsync(
                     () -> decodeResponse(response, command),
                     blockingExecutor)))
+            .emitOn(signalContext)
             .onItemOrFailure().invoke((ignored, failure) -> warning.cancel(false))
             .onFailure().transform(failure -> classifyFailure(failure, target, startedAtNanos, deadlineMillis));
     }
@@ -148,12 +169,42 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
      * @return remote worker capabilities
      */
     public Uni<PipelineWorkerCapability> capabilities() {
-        return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(this::capabilitiesRequest, blockingExecutor)
+        return Uni.createFrom().deferred(() -> {
+            Executor signalContext = subscriberSignalContext();
+            return capabilitiesAt(configuredEndpoint(), sharedSecret(), signalContext);
+        });
+    }
+
+    public Uni<PipelineWorkerCapability> capabilities(URI endpoint, String secretRef) {
+        return Uni.createFrom().deferred(() -> {
+            Executor signalContext = subscriberSignalContext();
+            return capabilitiesAt(endpoint, targetSecret(secretRef), signalContext);
+        });
+    }
+
+    private Uni<PipelineWorkerCapability> capabilitiesAt(URI endpoint, String secret, Executor signalContext) {
+        return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(() -> capabilitiesRequest(endpoint, secret), blockingExecutor)
             .thenCompose(request -> httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString()))
             .thenCompose(response -> CompletableFuture.supplyAsync(
                 () -> decodeCapabilitiesResponse(response),
                 blockingExecutor)))
+            .emitOn(signalContext)
             .onFailure().transform(this::unwrapFailure);
+    }
+
+    /** Preserve the server-side subscription loader only while delivering either transport signal. */
+    private static Executor subscriberSignalContext() {
+        ClassLoader subscriberLoader = Thread.currentThread().getContextClassLoader();
+        return signal -> {
+            Thread thread = Thread.currentThread();
+            ClassLoader previous = thread.getContextClassLoader();
+            try {
+                thread.setContextClassLoader(subscriberLoader);
+                signal.run();
+            } finally {
+                thread.setContextClassLoader(previous);
+            }
+        };
     }
 
     @Override
@@ -221,14 +272,14 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
         }
     }
 
-    private HttpRequest request(TransitionCommandEnvelope command) {
+    private HttpRequest request(TransitionCommandEnvelope command, URI endpoint, String secret) {
         try {
             byte[] body = JSON.writeValueAsBytes(command);
-            URI uri = workerUri(orchestratorConfig.workerRest().path());
+            URI uri = workerUri(endpoint, orchestratorConfig.workerRest().path());
             String timestamp = Instant.now().toString();
             String nonce = UUID.randomUUID().toString();
             String signature = TransitionWorkerSignature.sign(
-                sharedSecret(),
+                secret,
                 RestTransitionWorkerProtocol.EXECUTE_METHOD,
                 orchestratorConfig.workerRest().path(),
                 timestamp,
@@ -248,13 +299,13 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
         }
     }
 
-    private HttpRequest capabilitiesRequest() {
-        URI uri = workerUri(orchestratorConfig.workerRest().capabilitiesPath());
+    private HttpRequest capabilitiesRequest(URI endpoint, String secret) {
+        URI uri = workerUri(endpoint, orchestratorConfig.workerRest().capabilitiesPath());
         byte[] body = new byte[0];
         String timestamp = Instant.now().toString();
         String nonce = UUID.randomUUID().toString();
         String signature = TransitionWorkerSignature.sign(
-            sharedSecret(),
+            secret,
             RestTransitionWorkerProtocol.CAPABILITIES_METHOD,
             orchestratorConfig.workerRest().capabilitiesPath(),
             timestamp,
@@ -290,17 +341,27 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
         }
     }
 
-    private URI workerUri(String path) {
+    private URI configuredEndpoint() {
         String baseUrl = orchestratorConfig.workerRest().baseUrl()
             .orElseThrow(() -> new IllegalStateException(
                 "pipeline.orchestrator.worker.rest.base-url is required for REST transition worker"));
+        return URI.create(baseUrl);
+    }
+
+    private URI workerUri(URI endpoint, String path) {
+        String baseUrl = endpoint.toString();
         String normalizedBase = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
         String normalizedPath = path.startsWith("/") ? path : "/" + path;
         return URI.create(normalizedBase + normalizedPath);
     }
 
-    private String workerTarget() {
-        URI uri = workerUri(orchestratorConfig.workerRest().path());
+    private String targetSecret(String reference) {
+        return WorkerSecretSupport.resolve(Optional.empty(), Optional.of(reference), secretResolver,
+            "registered REST target shared-secret", "registered REST target shared-secret-ref");
+    }
+
+    private String workerTarget(URI endpoint) {
+        URI uri = workerUri(endpoint, orchestratorConfig.workerRest().path());
         String host = uri.getHost() == null ? "<unknown>" : uri.getHost();
         return uri.getScheme() + "://" + host + (uri.getPort() < 0 ? "" : ":" + uri.getPort()) + uri.getPath();
     }

@@ -133,7 +133,7 @@ public class DynamoPipelineWorkerRegistry implements PipelineWorkerRegistry {
         Optional<String> workerId,
         long nowEpochMs,
         Duration staleAfter) {
-        QueryResponse response = dynamoClient().query(QueryRequest.builder()
+        QueryRequest request = QueryRequest.builder()
             .tableName(workerTable())
             .keyConditionExpression("#pk = :pk AND begins_with(#sk, :prefix)")
             .expressionAttributeNames(Map.of("#pk", REGISTRY_KEY, "#sk", REGISTRY_SORT))
@@ -141,12 +141,18 @@ public class DynamoPipelineWorkerRegistry implements PipelineWorkerRegistry {
                 ":pk", avS(partitionKey(tenantId, pipelineId)),
                 ":prefix", avS(workerId.map(DynamoPipelineWorkerRegistry::workerSortPrefix).orElse("worker:"))))
             .scanIndexForward(true)
-            .build());
+            .build();
         Map<String, WorkerAccumulator> workers = new HashMap<>();
-        for (Map<String, AttributeValue> item : response.items()) {
-            WorkerAccumulator accumulator = workers.computeIfAbsent(stringValue(item, WORKER_ID), WorkerAccumulator::new);
-            accumulator.apply(item);
-        }
+        Map<String, AttributeValue> continuation = Map.of();
+        do {
+            QueryResponse response = dynamoClient().query(continuation.isEmpty()
+                ? request : request.toBuilder().exclusiveStartKey(continuation).build());
+            for (Map<String, AttributeValue> item : response.items()) {
+                WorkerAccumulator accumulator = workers.computeIfAbsent(stringValue(item, WORKER_ID), WorkerAccumulator::new);
+                accumulator.apply(item);
+            }
+            continuation = response.lastEvaluatedKey();
+        } while (!continuation.isEmpty());
         return workers.values().stream()
             .map(accumulator -> accumulator.toRecord(nowEpochMs, staleAfter))
             .flatMap(Optional::stream)

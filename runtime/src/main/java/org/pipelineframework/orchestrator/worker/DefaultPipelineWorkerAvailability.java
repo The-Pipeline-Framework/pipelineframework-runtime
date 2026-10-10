@@ -14,6 +14,7 @@ import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.PipelineReleaseRuntimeBeans;
 import org.pipelineframework.orchestrator.PipelineReleaseIdentityResolver;
 import org.pipelineframework.orchestrator.RestPipelineTransitionWorker;
+import org.pipelineframework.orchestrator.RegisteredRestWorkerTargets;
 import org.pipelineframework.orchestrator.TransitionPayloadEncoding;
 
 /**
@@ -39,10 +40,14 @@ public class DefaultPipelineWorkerAvailability implements PipelineWorkerAvailabi
     @Inject
     PipelineWorkerRegistry workerRegistry;
 
+    @Inject
+    RegisteredRestWorkerTargets registeredTargets;
+
     private volatile PipelineWorkerRegistry fallbackWorkerRegistry;
 
     @Override
     public Uni<PipelineWorkerAvailabilityResult> check(PipelineWorkerAvailabilityRequest request) {
+        if (RegisteredRestWorkerTargets.enabled(orchestratorConfig)) return registeredTargets.check(request);
         if (orchestratorConfig.workerRest().isEnabled()) {
             return restWorker.capabilities()
                 .onItem().transformToUni(capability -> matchWithLifecycle("rest", capability, request))

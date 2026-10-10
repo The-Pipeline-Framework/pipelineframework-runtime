@@ -1190,11 +1190,13 @@ public class DynamoAwaitInteractionStore implements
         AwaitDurablePayloadResolver.Slot slot,
         Object payload
     ) {
-        if (!(payload instanceof Map<?, ?> map)) {
+        if (!(payload instanceof TypedDurablePayload) && !(payload instanceof Map<?, ?>)) {
             return payload;
         }
         try {
-            var envelope = TypedDurablePayload.fromDurableValue(map);
+            // In-process suspension snapshots retain the envelope object; JSON transitions
+            // materialize it as a map. Both must pass the same pinned-binding checks.
+            var envelope = TypedDurablePayload.fromDurableValue(payload);
             if (envelope.isPresent()) {
                 return durablePayloadResolver.decodeEnvelope(interaction, slot, envelope.get());
             }
@@ -1202,7 +1204,7 @@ public class DynamoAwaitInteractionStore implements
             // still materialize as a JSON object. Bind that known legacy shape to the descriptor,
             // never pass the map through to another durable write.
             return durablePayloadResolver.decodeLegacy(interaction, slot,
-                PipelineJson.mapper().writeValueAsString(map));
+                PipelineJson.mapper().writeValueAsString(payload));
         } catch (Exception e) {
             throw new IllegalStateException("Await transition carried an invalid typed durable payload: interactionId="
                 + interaction.interactionId() + ", slot=" + slot, e);

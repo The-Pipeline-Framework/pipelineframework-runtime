@@ -34,6 +34,18 @@ executing project or fork code.
 
 Fork pull requests require `safe-to-system-test`. Candidate publication uses the coordination GitHub App and the
 workflow package token; it uses no Maven Central credentials or GPG key.
+## Coordinator Maven Release admission
+
+The existing private, default-disabled release admin registration endpoint accepts canonical `maven:`
+application-archive Releases through the public `tpf-release-resolver`. Admission verifies the closure
+before storage, preserves the descriptor and retains native immutable registration and primary-artifact
+activation verification. Legacy local file/JAR registration remains supported; admission does not deploy
+or execute customer code.
+
+See [Coordinator admission configuration](https://pipelineframework.org/deploy/release-descriptors#register-with-a-self-hosted-coordinator)
+for environment-owned Maven access and current OCI/settings/native-image limits. Secondary-artifact
+activation verification and garbage collection are unchanged.
+
 ## Unit coverage
 
 The normal Maven verify lifecycle writes a JaCoCo HTML and XML report for each

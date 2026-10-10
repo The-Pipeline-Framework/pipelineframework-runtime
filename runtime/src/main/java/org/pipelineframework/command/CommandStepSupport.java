@@ -21,6 +21,11 @@ import org.pipelineframework.connector.CommandOperation;
 import org.pipelineframework.connector.CommandOutcome;
 import org.pipelineframework.connector.CommandPolicy;
 import org.pipelineframework.connector.CommandReference;
+import org.pipelineframework.connector.CommandRecoveryBinding;
+import org.pipelineframework.connector.CommandRecoveryTarget;
+import org.pipelineframework.connector.CommandReconciliationInvocation;
+import org.pipelineframework.connector.CommandReconciliationResult;
+import org.pipelineframework.connector.CommandInvocation;
 import org.pipelineframework.connector.ConnectorBindingRegistry;
 import org.pipelineframework.connector.ConnectorConfigurationDocument;
 import org.pipelineframework.connector.ConnectorConfigurationBinder;
@@ -319,6 +324,9 @@ public class CommandStepSupport {
                 CommandReexecutionScope.claimRecorded(
                     request.commandId(), record.currentAttempt().attemptId());
                 CommandEffectMetrics.recordDuplicate(request.descriptor(), "in_progress");
+                if (recoveryEligible(store, request, record)) {
+                    return recoverNative(store, request, record);
+                }
                 return Uni.createFrom().failure(new CommandInProgressException(
                     "Command already in progress for commandId " + request.commandId()));
             }
@@ -376,6 +384,9 @@ public class CommandStepSupport {
                 || record.status() == CommandEffectStatus.USER_ACTION_REQUIRED) {
                 CommandReexecutionScope.claimAttempt(
                     request.commandId(), record.currentAttempt().occurrenceId());
+                if (record.status() == CommandEffectStatus.AMBIGUOUS && recoveryEligible(store, request, record)) {
+                    return recoverNative(store, request, record);
+                }
                 return Uni.createFrom().failure(new CommandOutcomeException(record.status(), recordedOutcomeCode(record)));
             }
             return Uni.createFrom().failure(new IllegalStateException(
@@ -470,20 +481,11 @@ public class CommandStepSupport {
             return Uni.createFrom().failure(failure);
         }
         return activateProviderFirst(selector)
-            .onItem().transformToUni(ignored -> beginDispatch(store, request, attemptAdmission)
-                .onItem().transformToUni(dispatched -> dispatchNative(operation, request, selector, boundConfiguration)
-                    .onFailure(CommandStepSupport::isCancellation)
-                    .recoverWithItem(new CommandOutcome.Ambiguous<>("provider-dispatch-cancelled", List.of()))
-                    .onFailure(failure -> !isNonRetryable(failure))
-                    .transform(failure -> CommandRetryableEffectException.mark(request.commandId(), failure))
-                    .onItem().transformToUni(outcome -> applyNativeOutcome(
-                        store, request, selector, snapshot, operation.capabilities(), selector.policy(), outcome, effectStartNanos))
-                    .onFailure(CommandRetryableOutcomeException.class)
-                    .transform(failure -> CommandRetryableEffectException.mark(request.commandId(), failure))
-                    .onFailure().call(failure -> isTypedOutcomeFailure(failure)
-                        ? Uni.createFrom().voidItem()
-                        : recordFailure(
-                            store, request, failure, System.currentTimeMillis(), effectStartNanos).replaceWithVoid())))
+            .onItem().transformToUni(ignored -> recoveryBinding(operation, store, request, selector, boundConfiguration, snapshot)
+                .onItem().transformToUni(binding -> bindingForAttempt(store, request, attemptAdmission, binding)
+                    .onItem().transformToUni(retainedBinding -> beginDispatch(store, request, attemptAdmission, retainedBinding)))
+                .onItem().<O>transformToUni(dispatched -> dispatchNativeWithOutcome(
+                    store, request, selector, operation, boundConfiguration, snapshot, effectStartNanos)))
             .map(value -> (O) value);
     }
 
@@ -492,10 +494,21 @@ public class CommandStepSupport {
         CommandRequest<I> request,
         Optional<CommandAttemptAdmission> attemptAdmission
     ) {
+        return beginDispatch(store, request, attemptAdmission, Optional.empty());
+    }
+
+    private <I> Uni<Void> beginDispatch(
+        CommandEffectStore store, CommandRequest<I> request,
+        Optional<CommandAttemptAdmission> attemptAdmission, Optional<CommandRecoveryBinding> binding
+    ) {
         // Each effect transition records its own wall-clock time so the store can show dispatch/write duration.
         Uni<CommandEffectRecord> admitted = attemptAdmission
-            .map(admission -> store.createAttempt(request, admission, System.currentTimeMillis()))
-            .orElseGet(() -> store.createPending(request, System.currentTimeMillis()));
+            .map(admission -> binding
+                .map(value -> store.createAttempt(request, admission, value, System.currentTimeMillis()))
+                .orElseGet(() -> store.createAttempt(request, admission, System.currentTimeMillis())))
+            .orElseGet(() -> binding
+                .map(value -> store.createPending(request, value, System.currentTimeMillis()))
+                .orElseGet(() -> store.createPending(request, System.currentTimeMillis())));
         return admitted
             .invoke(ignored -> CommandEffectMetrics.recordAdmission(
                 request.descriptor(),
@@ -504,15 +517,175 @@ public class CommandStepSupport {
             .invoke(ignored -> CommandEffectMetrics.recordTransition(
                 request.descriptor(),
                 CommandEffectStatus.PENDING))
-            .onItem().transformToUni(ignored -> store.markDispatching(
+            .onItem().transformToUni(ignored -> binding
+                .map(value -> store.claimPendingDispatch(value, System.currentTimeMillis()))
+                .orElseGet(() -> store.markDispatching(
                 request.executionContext().tenantId(),
                 request.commandId(),
                 request.attemptId(),
-                System.currentTimeMillis()))
+                System.currentTimeMillis())))
             .invoke(ignored -> CommandEffectMetrics.recordTransition(
                 request.descriptor(),
                 CommandEffectStatus.DISPATCHING))
             .replaceWithVoid();
+    }
+
+    private static boolean recoveryEligible(CommandEffectStore store, CommandRequest<?> request, CommandEffectRecord record) {
+        return store.supportsRecovery() && request.descriptor().nativeSelector().isPresent()
+            && request.callbackContext().isEmpty() && record.currentAttempt().recoveryBinding().isPresent();
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private Uni<Optional<CommandRecoveryBinding>> recoveryBinding(
+        CommandOperation operation, CommandEffectStore store, CommandRequest<?> request,
+        NativeCommandSelector selector, Object configuration, ConnectorConfigurationSnapshot snapshot
+    ) {
+        // Callback destinations are not captured by this recovery contract. Never guess a binding.
+        if (!store.supportsRecovery() || !operation.capabilities().reconciliationSupported()
+            || request.callbackContext().isPresent()) {
+            return Uni.createFrom().item(Optional.empty());
+        }
+        var binding = selector.binding().orElseGet(() ->
+            org.pipelineframework.connector.ConnectorBindingName.of(selector.operationIdentity().providerId().value()));
+        CommandInvocation invocation = nativeInvocation(request, selector, configuration);
+        CompletionStage<Optional<CommandRecoveryTarget>> target = invocationCoordinator.invoke(binding, operation,
+            () -> java.util.concurrent.CompletableFuture.completedFuture(operation.recoveryTarget(invocation)));
+        return Uni.createFrom().completionStage(target).map(value -> value.map(destination ->
+            CommandRecoverySupport.binding(request, selector, snapshot, destination)));
+    }
+
+    private Uni<Optional<CommandRecoveryBinding>> bindingForAttempt(
+        CommandEffectStore store, CommandRequest<?> request, Optional<CommandAttemptAdmission> admission,
+        Optional<CommandRecoveryBinding> binding
+    ) {
+        if (admission.isEmpty() || binding.isEmpty()) {
+            return Uni.createFrom().item(binding);
+        }
+        // Existing effect history retains the original typed input, not a second per-attempt payload.
+        // A deliberate effect with changed input remains legal but cannot gain recovery by inference.
+        return store.find(request.executionContext().tenantId(), request.commandId()).map(record ->
+            record.filter(value -> new CommandEffectRecordCodec().digest(value.input(), request.descriptor().inputType())
+                .equals(binding.orElseThrow().inputDigest())).isPresent() ? binding : Optional.empty());
+    }
+
+    private <I, O> Uni<O> recoverNative(CommandEffectStore store, CommandRequest<I> fresh, CommandEffectRecord record) {
+        CommandRecoveryBinding retained = record.currentAttempt().recoveryBinding().orElseThrow();
+        CommandRequest<I> request = new CommandRequest<>(fresh.descriptor(), fresh.commandId(),
+            retained.occurrenceId(), retained.attemptId(), fresh.input(), fresh.executionContext(), fresh.config(), fresh.callbackContext());
+        NativeCommandSelector selector = request.descriptor().nativeSelector().orElseThrow();
+        return activateBinding(selector).onItem().transformToUni(ignored -> {
+            CommandOperation<?, ?, ?> operation = selector.binding().isPresent() ? requireBoundCommandOperation(selector)
+                : requireRegistry().requireCommandOperation(selector.operationIdentity(), selector.providerMajorVersion(), selector.policy());
+            if (!operation.capabilities().reconciliationSupported()) {
+                return Uni.createFrom().failure(new CommandInProgressException("Command provider does not support recovery"));
+            }
+            ConnectorConfigSchema<?> schema = operation.configurationSchema().orElseThrow();
+            ConnectorConfigurationDocument document = new ConnectorConfigurationDocument(request.config());
+            Object configuration = ConnectorConfigurationBinder.bind(schema, document, "native Command recovery");
+            ConnectorConfigurationSnapshot snapshot = ConnectorConfigurationSnapshot.from(schema, document, false);
+            return activateProviderFirst(selector).onItem().transformToUni(active ->
+                recoveryBinding(operation, store, request, selector, configuration, snapshot)
+                    .onItem().transformToUni(proposed -> {
+                        if (proposed.isEmpty()) {
+                            return Uni.createFrom().failure(new CommandInProgressException("Command target recovery binding is unavailable"));
+                        }
+                        CommandRecoverySupport.verify(record, request, proposed.orElseThrow());
+                        if (record.status() == CommandEffectStatus.PENDING) {
+                            return store.claimPendingDispatch(retained, System.currentTimeMillis())
+                                .onItem().<O>transformToUni(claimed -> dispatchNativeWithOutcome(
+                                    store, request, selector, operation, configuration, snapshot, CommandEffectMetrics.startNanos()));
+                        }
+                        return this.<I, O>inquireNative(store, request, record, selector, operation, configuration, snapshot);
+                    }));
+        });
+    }
+
+    private <I, O> Uni<O> dispatchNativeWithOutcome(
+        CommandEffectStore store, CommandRequest<I> request, NativeCommandSelector selector,
+        CommandOperation<?, ?, ?> operation, Object configuration, ConnectorConfigurationSnapshot snapshot,
+        long effectStartNanos
+    ) {
+        return dispatchNative(operation, request, selector, configuration)
+            .onFailure(CommandStepSupport::isCancellation)
+            .recoverWithItem(new CommandOutcome.Ambiguous<>("provider-dispatch-cancelled", List.of()))
+            .onFailure(failure -> !isNonRetryable(failure))
+            .transform(failure -> CommandRetryableEffectException.mark(request.commandId(), failure))
+            .onItem().<O>transformToUni(outcome -> applyNativeOutcome(store, request, selector, snapshot,
+                operation.capabilities(), selector.policy(), outcome, effectStartNanos))
+            .onFailure(CommandRetryableOutcomeException.class)
+            .transform(failure -> CommandRetryableEffectException.mark(request.commandId(), failure))
+            .onFailure().call(failure -> isTypedOutcomeFailure(failure) || isStoreFailure(failure)
+                ? Uni.createFrom().voidItem() : recordFailure(store, request, failure, System.currentTimeMillis(), effectStartNanos).replaceWithVoid());
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private <I, O> Uni<O> inquireNative(
+        CommandEffectStore store, CommandRequest<I> request, CommandEffectRecord record, NativeCommandSelector selector,
+        CommandOperation operation, Object configuration, ConnectorConfigurationSnapshot snapshot
+    ) {
+        CommandRecoveryBinding expected = record.currentAttempt().recoveryBinding().orElseThrow();
+        var invocation = new CommandReconciliationInvocation(nativeInvocation(request, selector, configuration), expected);
+        CompletionStage<CommandReconciliationResult<Object>> stage = invocationCoordinator.invoke(expected.binding(), operation,
+            () -> operation.reconcile(invocation));
+        return Uni.createFrom().completionStage(stage).onItem().transformToUni(result -> {
+            if (!(result instanceof CommandReconciliationResult.ConfirmedSucceeded<Object> confirmed)) {
+                String code = result instanceof CommandReconciliationResult.Unresolved<?> unresolved
+                    ? unresolved.code() : "invalid-provider-response";
+                return Uni.createFrom().failure(new CommandInProgressException("Command reconciliation unresolved: " + code));
+            }
+            if (!expected.equals(confirmed.binding())
+                || !operation.capabilities().durableReferenceKinds().contains(confirmed.receipt().kind())
+                || !confirmed.outcome().references().contains(confirmed.receipt())
+                || confirmationBarrier(selector.policy(), confirmed.outcome().confirmation()).isPresent()) {
+                return Uni.createFrom().failure(new CommandRecoveryConflictException("Provider receipt binding/confirmation is insufficient or conflicting"));
+            }
+            Object output = confirmed.outcome().output();
+            long now = System.currentTimeMillis();
+            CommandReconciliationReceipt receipt = new CommandReconciliationReceipt(confirmed.receipt(),
+                new CommandEffectRecordCodec().digest(output, request.descriptor().outputType()), now);
+            CommandOutcomeSnapshot outcome = snapshot(selector, snapshot, operation.capabilities(), CommandEffectStatus.SUCCEEDED,
+                confirmed.outcome().code(), confirmed.outcome().flags(), confirmed.outcome().confirmation(), confirmed.outcome().references());
+            return Uni.createFrom().deferred(() -> store.reconcileSucceeded(expected, record.status(), output, outcome, receipt, now))
+                .replaceWith((O) output)
+                .onFailure(CommandStepSupport::isTransitionConflict)
+                .recoverWithUni(failure -> matchingSuccessOrConflict(store, request, output, outcome));
+        });
+    }
+
+    private <O> Uni<O> matchingSuccessOrConflict(
+        CommandEffectStore store, CommandRequest<?> request, Object output, CommandOutcomeSnapshot snapshot
+    ) {
+        return store.find(request.executionContext().tenantId(), request.commandId()).onItem().transformToUni(current -> {
+            if (current.isPresent() && CommandRecoverySupport.sameSuccess(current.orElseThrow(), request, output, snapshot)) {
+                @SuppressWarnings("unchecked") O recorded = (O) current.orElseThrow().output();
+                return Uni.createFrom().item(recorded);
+            }
+            return Uni.createFrom().failure(new CommandRecoveryConflictException("Concurrent or late Command outcome conflicts with retained authority"));
+        });
+    }
+
+    private static boolean isTransitionConflict(Throwable failure) {
+        return failure instanceof CommandEffectConflictException || failure instanceof IllegalStateException;
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static CommandInvocation nativeInvocation(CommandRequest<?> request, NativeCommandSelector selector, Object configuration) {
+        var binding = selector.binding().orElseGet(() ->
+            org.pipelineframework.connector.ConnectorBindingName.of(selector.operationIdentity().providerId().value()));
+        return new CommandInvocation(request.input(), configuration, commandOutputType(request.descriptor()),
+            connectorExecutionContext(request, selector, binding), Optional.of(new org.pipelineframework.connector.CommandDispatchIdentity(
+                request.commandId(), request.occurrenceId(), request.attemptId())), request.callbackContext());
+    }
+
+    private static boolean isStoreFailure(Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof CommandEffectStoreException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     @SuppressWarnings({ "rawtypes", "unchecked" })
@@ -571,12 +744,13 @@ public class CommandStepSupport {
                     selector, configuration, capabilities, resolved.status(), resolved.code(), succeeded.flags(),
                     succeeded.confirmation(), succeeded.references());
                 CommandOutcomeException failure = new CommandOutcomeException(resolved.status(), resolved.code());
-                return store.markOutcome(
+                return Uni.createFrom().deferred(() -> store.markOutcome(
                         request.executionContext().tenantId(), request.commandId(), request.attemptId(),
                         resolved.status(), failure, snapshot,
-                        System.currentTimeMillis())
+                        System.currentTimeMillis()))
                     .invoke(ignored -> CommandEffectMetrics.recordTerminalTransition(
                         request.descriptor(), resolved.status(), effectStartNanos))
+                    .onFailure().recoverWithUni(conflict -> guardLateFailure(store, request, conflict))
                     .onItem().transformToUni(ignored -> Uni.createFrom().failure(failure));
             }
             CommandOutcomeSnapshot snapshot = snapshot(
@@ -584,12 +758,17 @@ public class CommandStepSupport {
                 succeeded.confirmation(), succeeded.references());
             @SuppressWarnings("unchecked")
             O output = (O) succeeded.output();
-            return store.markSucceeded(
+            return Uni.createFrom().deferred(() -> store.markSucceeded(
                     request.executionContext().tenantId(), request.commandId(), request.attemptId(),
-                    output, snapshot, System.currentTimeMillis())
+                    output, snapshot, System.currentTimeMillis()))
                 .invoke(ignored -> CommandEffectMetrics.recordTerminalTransition(
                     request.descriptor(), CommandEffectStatus.SUCCEEDED, effectStartNanos))
-                .replaceWith(output);
+                .replaceWith(output)
+                .onFailure(CommandStepSupport::isTransitionConflict)
+                .recoverWithUni(failure -> store.find(request.executionContext().tenantId(), request.commandId())
+                    .onItem().transformToUni(current -> current.isPresent() && current.orElseThrow().currentAttempt().recoveryBinding().isPresent()
+                        ? matchingSuccessOrConflict(store, request, output, snapshot)
+                        : Uni.createFrom().failure(failure)));
         }
         CommandEffectStatus status = outcomeStatus(outcome);
         CommandOutcomeSnapshot snapshot = snapshot(
@@ -597,10 +776,11 @@ public class CommandStepSupport {
         Throwable failure = status == CommandEffectStatus.FAILED_RETRYABLE
             ? new CommandRetryableOutcomeException(outcome.code())
             : new CommandOutcomeException(status, outcome.code());
-        return store.markOutcome(
+        return Uni.createFrom().deferred(() -> store.markOutcome(
                 request.executionContext().tenantId(), request.commandId(), request.attemptId(),
-                status, failure, snapshot, System.currentTimeMillis())
+                status, failure, snapshot, System.currentTimeMillis()))
             .invoke(ignored -> CommandEffectMetrics.recordTerminalTransition(request.descriptor(), status, effectStartNanos))
+            .onFailure().recoverWithUni(conflict -> guardLateFailure(store, request, conflict))
             .onItem().transformToUni(ignored -> Uni.createFrom().failure(failure));
     }
 
@@ -665,27 +845,35 @@ public class CommandStepSupport {
         long effectStartNanos
     ) {
         if (isNonRetryable(failure)) {
-            return store.markDlq(
+            return Uni.createFrom().deferred(() -> store.markDlq(
                 request.executionContext().tenantId(),
                 request.commandId(),
                 request.attemptId(),
                 failure,
-                nowEpochMs)
+                nowEpochMs))
                 .invoke(ignored -> CommandEffectMetrics.recordTerminalTransition(
                     request.descriptor(),
                     CommandEffectStatus.DLQ,
-                    effectStartNanos));
+                    effectStartNanos))
+                .onFailure().recoverWithUni(conflict -> guardLateFailure(store, request, conflict));
         }
-        return store.markFailed(
+        return Uni.createFrom().deferred(() -> store.markFailed(
             request.executionContext().tenantId(),
             request.commandId(),
             request.attemptId(),
             failure,
-            nowEpochMs)
+            nowEpochMs))
             .invoke(ignored -> CommandEffectMetrics.recordTerminalTransition(
                 request.descriptor(),
                 CommandEffectStatus.FAILED_RETRYABLE,
-                effectStartNanos));
+                effectStartNanos))
+            .onFailure().recoverWithUni(conflict -> guardLateFailure(store, request, conflict));
+    }
+
+    private Uni<CommandEffectRecord> guardLateFailure(CommandEffectStore store, CommandRequest<?> request, Throwable failure) {
+        return store.find(request.executionContext().tenantId(), request.commandId()).onItem().transformToUni(current ->
+            Uni.createFrom().failure(current.isPresent() && current.orElseThrow().currentAttempt().recoveryBinding().isPresent()
+                ? new CommandRecoveryConflictException("Late Command failure cannot overwrite retained recovery authority") : failure));
     }
 
     private boolean isNonRetryable(Throwable failure) {

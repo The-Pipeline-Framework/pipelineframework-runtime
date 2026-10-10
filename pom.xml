@@ -78,6 +78,7 @@
         <mockito.version>5.21.0</mockito.version>
         <tpf.contracts.version>26.10.1-SNAPSHOT</tpf.contracts.version>
         <tpf.compiler.version>26.10.1-SNAPSHOT</tpf.compiler.version>
+        <tpf.release-resolver.version>26.10.1-SNAPSHOT</tpf.release-resolver.version>
         <maven.deploy.skip>false</maven.deploy.skip>
         <gpg.skip>true</gpg.skip>
         <skipTests>false</skipTests>

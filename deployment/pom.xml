@@ -87,6 +87,18 @@
         </dependency>
         <dependency>
             <groupId>org.pipelineframework</groupId>
+            <artifactId>pipelineframework-runtime-protocol</artifactId>
+            <version>${tpf.contracts.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.pipelineframework</groupId>
+            <artifactId>representation-provider-api</artifactId>
+            <version>${tpf.contracts.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.pipelineframework</groupId>
             <artifactId>pipelineframework-dsl</artifactId>
             <version>${tpf.contracts.version}</version>
         </dependency>
