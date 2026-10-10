@@ -18,6 +18,7 @@ package org.pipelineframework.rest;
 
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.NotFoundException;
+import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.Response;
 
@@ -85,6 +86,11 @@ public class RestExceptionMapper {
                 LOG.debug("Request did not match a REST endpoint", ex);
                 return Response.status(Response.Status.NOT_FOUND)
                     .entity("Not Found")
+                    .build();
+            }
+            if (ex instanceof WebApplicationException httpFailure && httpFailure.getResponse() != null) {
+                return Response.fromResponse(httpFailure.getResponse())
+                    .entity("Request rejected")
                     .build();
             }
             Throwable rootCause = rootCause(ex);
