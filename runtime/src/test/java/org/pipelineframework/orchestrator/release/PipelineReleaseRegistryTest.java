@@ -222,11 +222,17 @@ class PipelineReleaseRegistryTest {
             existing.activatedAtEpochMs());
         PipelineReleaseRegistry registry = new DynamoPipelineReleaseRegistry(client, dynamoConfig());
         when(client.getItem(any(GetItemRequest.class)))
-            .thenReturn(GetItemResponse.builder().item(dynamoReleaseItem(existing)).build());
+            .thenAnswer(invocation -> {
+                GetItemRequest request = invocation.getArgument(0);
+                return GetItemResponse.builder().item(request.key().get("registry_sort").s().startsWith("release:")
+                    ? dynamoReleaseItem(existing) : Map.of()).build();
+            });
         when(client.query(any(QueryRequest.class)))
             .thenReturn(QueryResponse.builder().items(List.of()).build());
 
-        assertThrows(IllegalStateException.class, () -> registry.register(conflicting).await().indefinitely());
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+            () -> registry.register(conflicting).await().indefinitely());
+        assertEquals("Release version is already registered with different metadata", failure.getMessage());
         verify(client, never()).putItem(any(PutItemRequest.class));
     }
 

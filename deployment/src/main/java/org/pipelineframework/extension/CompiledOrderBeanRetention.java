@@ -15,7 +15,7 @@ public class CompiledOrderBeanRetention {
     @BuildStep
     UnremovableBeanBuildItem retainCompiledSteps(ApplicationArchivesBuildItem archives) {
         Set<String> classes = new HashSet<>();
-        for (var archive : archives.getAllApplicationArchives()) {
+        for (var archive : archives.getAllArchives()) {
             var resource = Optional.ofNullable(archive.getChildPath("META-INF/pipeline/order.json"))
                 .filter(Files::isRegularFile);
             if (resource.isEmpty()) continue;
