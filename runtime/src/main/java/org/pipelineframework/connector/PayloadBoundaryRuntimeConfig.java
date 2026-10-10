@@ -15,15 +15,17 @@ public final class PayloadBoundaryRuntimeConfig {
 
     public static PipelineYamlConfig load() {
         PipelineYamlConfigLoader loader = new PipelineYamlConfigLoader();
-        String explicit = System.getProperty("pipeline.config", System.getenv("PIPELINE_CONFIG"));
+        String explicit = System.getProperty("pipeline.config");
+        if (explicit == null || explicit.isBlank()) {
+            explicit = System.getenv("PIPELINE_CONFIG");
+        }
         if (explicit != null && !explicit.isBlank()) {
             return loader.load(Path.of(explicit));
         }
         ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
-        if (classLoader == null) {
-            classLoader = PayloadBoundaryRuntimeConfig.class.getClassLoader();
-        }
-        URL resource = new PipelineYamlConfigLocator().locateResource(classLoader)
+        PipelineYamlConfigLocator locator = new PipelineYamlConfigLocator();
+        URL resource = (classLoader == null ? java.util.Optional.<URL>empty() : locator.locateResource(classLoader))
+            .or(() -> locator.locateResource(PayloadBoundaryRuntimeConfig.class.getClassLoader()))
             .orElseThrow(() -> new IllegalStateException("packaged pipeline.yaml is required for payload boundaries"));
         try (InputStream input = resource.openStream()) {
             return loader.load(input);
