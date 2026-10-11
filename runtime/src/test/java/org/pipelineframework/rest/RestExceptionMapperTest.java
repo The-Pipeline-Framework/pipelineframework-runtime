@@ -80,6 +80,16 @@ class RestExceptionMapperTest {
     }
 
     @Test
+    void preservesExplicitHttpStatusWithoutExposingExceptionDetails() {
+        RestExceptionMapper mapper = new RestExceptionMapper();
+        Response response = mapper.handleException(new jakarta.ws.rs.ForbiddenException("private locator"),
+            createNonProtobufHeaders());
+
+        assertEquals(403, response.getStatus());
+        assertEquals("Request rejected", response.getEntity());
+    }
+
+    @Test
     void mapsIllegalArgumentExceptionTo400() {
         RestExceptionMapper mapper = new RestExceptionMapper();
         HttpHeaders headers = createNonProtobufHeaders();
