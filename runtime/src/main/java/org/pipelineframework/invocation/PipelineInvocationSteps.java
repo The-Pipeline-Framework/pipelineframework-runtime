@@ -189,7 +189,8 @@ public final class PipelineInvocationSteps {
         }
 
         private Uni<O> invokeWithParentContext(I input, RecursiveCall call) {
-            requireMatchingParentWhenActive(call);
+            // Ownership was checked at application time. The executor's ambient context may
+            // belong to another invocation; restore the captured parent before entering the child.
             return call.context().call(
                 () -> invokeOneToOne(input, Optional.of(call.parentContext())));
         }

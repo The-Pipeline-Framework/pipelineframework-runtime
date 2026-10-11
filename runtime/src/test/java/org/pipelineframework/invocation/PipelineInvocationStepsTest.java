@@ -1,10 +1,14 @@
 package org.pipelineframework.invocation;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 
 import io.smallrye.mutiny.Uni;
+import io.smallrye.mutiny.infrastructure.Infrastructure;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -118,5 +122,43 @@ class PipelineInvocationStepsTest {
         assertTrue(executionAfterCall.get().isEmpty());
         assertTrue(PipelineInvocationContextHolder.get().isEmpty());
         assertTrue(PipelineExecutionContextHolder.get().isEmpty());
+    }
+
+    @Test
+    void recursiveAdapterRestoresItsParentBeforeUsingExecutorAmbientContext() {
+        PipelineRunner runner = mock(PipelineRunner.class);
+        PipelineInvocationContext parent = PipelineInvocationContext.root(8);
+        PipelineInvocationContext unrelated = PipelineInvocationContext.root(9);
+        AtomicReference<PipelineInvocationContext> observedParent = new AtomicReference<>();
+        AtomicReference<PipelineInvocationContext> observedChild = new AtomicReference<>();
+        when(runner.runNestedWithContext(
+                any(), anyList(), anyString(), anyInt(), any(PipelineInvocationContext.class)))
+            .thenAnswer(invocation -> {
+                observedParent.set(PipelineInvocationContextHolder.get().orElseThrow());
+                observedChild.set(invocation.getArgument(4));
+                Uni<?> input = invocation.getArgument(0);
+                return new PipelineRunner.ExecutionResult(input.replaceWith("done"), null);
+            });
+
+        Executor previousExecutor = Infrastructure.getDefaultExecutor();
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            Infrastructure.setDefaultExecutor(command -> executor.execute(() ->
+                PipelineInvocationContextHolder.call(unrelated, () -> {
+                    command.run();
+                    return null;
+                })), false);
+            PipelineInvocationContextHolder.set(parent);
+            StepOneToOne<String, String> adapter = PipelineInvocationSteps.recursiveOneToOne(
+                runner, "agent", "continue", 2, List.of());
+            Uni<String> result = adapter.applyOneToOne("value");
+            PipelineInvocationContextHolder.clear();
+
+            assertEquals("done", result.await().atMost(Duration.ofSeconds(5)));
+            assertEquals(parent, observedParent.get());
+            assertEquals(parent.enterRecursive("agent", "continue"), observedChild.get());
+            assertTrue(PipelineInvocationContextHolder.get().isEmpty());
+        } finally {
+            Infrastructure.setDefaultExecutor(previousExecutor, false);
+        }
     }
 }
