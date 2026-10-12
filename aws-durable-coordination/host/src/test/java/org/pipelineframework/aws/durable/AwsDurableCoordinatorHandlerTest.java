@@ -60,7 +60,7 @@ class AwsDurableCoordinatorHandlerTest {
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case REGISTER_CALLBACK -> {
                 callbackId.set(request.providerCallbackId().orElseThrow());
-                assertThat(request.awaitIdentity()).isPresent();
+                assertThat(request.awaitIdentity()).contains(await);
                 yield AwsDurableActionResponse.bound(true);
             }
             case STATUS -> resumed.get() ? AwsDurableActionResponse.status("SUCCEEDED") : waiting(checkpoint, "interaction-a", "correlation-a");
