@@ -9,6 +9,14 @@ Parameters:
   ActionArtifactUri:
     Type: String
     Description: S3 URI for the generated Quarkus action and worker Lambda package
+  CallbackGenerationMigrationValidation:
+    Type: String
+    AllowedValues: [validated]
+    ConstraintDescription: Must be validated before enabling callback writers
+    Description: >-
+      Set validated only after confirming a fresh table has no retained executions,
+      or completing and validating the retained table's generation-claim migration
+      with unfenced writers quiesced. This is an operator attestation, not an automatic data check.
   AwaitInteractionStreamArn: {Type: String}
   SemanticDynamoResourceArns:
     Type: CommaDelimitedList
@@ -24,6 +32,12 @@ Parameters:
   TransitionWorkerHandler: {Type: String, Default: aws-durable-transition-worker}
   AwaitWakeupHandler: {Type: String, Default: aws-durable-await-wakeup}
   ReconciliationHandler: {Type: String, Default: aws-durable-reconcile}
+
+Rules:
+  CallbackGenerationMigrationValidated:
+    Assertions:
+      - Assert: !Equals [!Ref CallbackGenerationMigrationValidation, validated]
+        AssertDescription: Callback writers require a validated generation-claim migration or a fresh table
 
 Globals:
   Function:

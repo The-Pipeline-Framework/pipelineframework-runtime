@@ -6,13 +6,34 @@ import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AwsDurableDeploymentContractTest {
-    private JsonNode resources() throws Exception {
+    private JsonNode template() throws Exception {
         try (var template = getClass().getResourceAsStream("/aws-durable-queue-async.yaml")) {
-            return new ObjectMapper(new YAMLFactory()).readTree(template).path("Resources");
+            return new ObjectMapper(new YAMLFactory()).readTree(template);
         }
+    }
+
+    private JsonNode resources() throws Exception {
+        return template().path("Resources");
+    }
+
+    @Test
+    void deploymentRequiresExplicitGenerationMigrationValidation() throws Exception {
+        JsonNode template = template();
+        JsonNode validation = template.path("Parameters").path("CallbackGenerationMigrationValidation");
+        assertEquals("String", validation.path("Type").asText());
+        assertFalse(validation.has("Default"), "Migration validation must never be assumed");
+        assertEquals(1, validation.path("AllowedValues").size());
+        assertEquals("validated", validation.path("AllowedValues").get(0).asText());
+        JsonNode assertions = template.path("Rules").path("CallbackGenerationMigrationValidated").path("Assertions");
+        assertEquals(1, assertions.size());
+        JsonNode comparison = assertions.get(0).path("Assert");
+        assertEquals(2, comparison.size());
+        assertEquals("CallbackGenerationMigrationValidation", comparison.get(0).asText());
+        assertEquals("validated", comparison.get(1).asText());
     }
 
     @Test
