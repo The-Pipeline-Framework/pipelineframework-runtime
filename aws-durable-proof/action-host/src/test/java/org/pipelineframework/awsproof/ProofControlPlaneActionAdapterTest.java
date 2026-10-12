@@ -21,10 +21,10 @@ import org.pipelineframework.orchestrator.PipelineControlPlane;
 class ProofControlPlaneActionAdapterTest {
 
     @Test
-    void pendingAwaitUsesExecutionScopedSemanticCheckpoints() {
+    void pendingAwaitUsesCurrentUnitSemanticCheckpoint() {
         PipelineControlPlane controlPlane = mock(PipelineControlPlane.class);
-        when(controlPlane.getAwaitSemanticCheckpoints("tenant-1", "execution-1", 100))
-            .thenReturn(Uni.createFrom().item(List.of(new AwaitSemanticCheckpoint(
+        when(controlPlane.getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1"))
+            .thenReturn(Uni.createFrom().item(Optional.of(new AwaitSemanticCheckpoint(
                 "tenant-1", "execution-1", "interaction-1", "correlation-1", "unit-1", "step-1",
                 AwaitInteractionStatus.WAITING, "pipeline-1", "contract-1", "release-1"))));
         ProofControlPlaneActionAdapter adapter = adapter(controlPlane);

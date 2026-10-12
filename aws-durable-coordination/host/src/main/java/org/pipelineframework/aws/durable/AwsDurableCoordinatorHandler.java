@@ -7,6 +7,7 @@ import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import java.time.Duration;
 import java.util.Objects;
+import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
 
 import org.pipelineframework.aws.durable.model.AwsDurableActionRequest;
 import org.pipelineframework.aws.durable.model.AwsDurableActionResponse;
@@ -92,7 +93,10 @@ public final class AwsDurableCoordinatorHandler
             if (!"WAITING_EXTERNAL".equals(terminal.status())) {
                 throw new IllegalStateException("TPF execution cannot be resumed from status " + terminal.status());
             }
-            waitForAwaitWakeup(input, checkpoint, context, awaitIndex);
+            AwsDurableAwaitIdentity observed = terminal.awaitIdentity().orElseThrow();
+            AwsDurableAwaitIdentity identity = new AwsDurableAwaitIdentity(observed.tenantId(), observed.executionId(),
+                observed.interactionId(), observed.correlationId(), checkpoint.generation(), (long) awaitIndex + 1);
+            waitForAwaitWakeup(input, checkpoint, identity, context, awaitIndex);
             awaitIndex++;
             terminal = waitForBlockedOrTerminal(checkpoint, context, awaitIndex);
         }
@@ -119,6 +123,7 @@ public final class AwsDurableCoordinatorHandler
     private void waitForAwaitWakeup(
         AwsDurableExecutionInput input,
         AwsDurableDriverCheckpoint checkpoint,
+        AwsDurableAwaitIdentity identity,
         DurableContext context,
         int awaitIndex
     ) {
@@ -128,8 +133,8 @@ public final class AwsDurableCoordinatorHandler
             "await-completion-" + awaitIndex,
             AwsDurableCallbackSignal.class,
             (callbackId, ignored) -> actions.invoke(AwsDurableActionRequest.register(
-                checkpoint, providerExecutionName, context.getExecutionArn(), callbackId)));
-        verifySignal(checkpoint, signal);
+                checkpoint, identity, providerExecutionName, context.getExecutionArn(), callbackId)));
+        verifySignal(identity, signal);
     }
 
     private AwsDurableExecutionStatusPoll waitForBlockedOrTerminal(
@@ -145,8 +150,10 @@ public final class AwsDurableCoordinatorHandler
                 AwsDurableActionResponse current = actions.invoke(AwsDurableActionRequest.status(checkpoint));
                 AwsDurableExecutionStatusPoll poll = new AwsDurableExecutionStatusPoll(
                     current.executionStatus().orElseThrow(() ->
-                        new IllegalStateException("TPF status action returned no status")));
-                return poll.terminal() || "WAITING_EXTERNAL".equals(poll.status())
+                        new IllegalStateException("TPF status action returned no status")),
+                    current.awaitCheckpoint().map(semantic -> new AwsDurableAwaitIdentity(semantic.tenantId(),
+                        semantic.executionId(), semantic.interactionId(), semantic.correlationId(), checkpoint.generation())));
+                return poll.terminal() || ("WAITING_EXTERNAL".equals(poll.status()) && poll.awaitIdentity().isPresent())
                     ? WaitForConditionResult.stopPolling(poll)
                     : WaitForConditionResult.continuePolling(poll);
             });
@@ -157,10 +164,14 @@ public final class AwsDurableCoordinatorHandler
             .orElseThrow(() -> new IllegalStateException("TPF submit action returned no checkpoint"));
     }
 
-    private static void verifySignal(AwsDurableDriverCheckpoint expected, AwsDurableCallbackSignal actual) {
+    private static void verifySignal(AwsDurableAwaitIdentity expected, AwsDurableCallbackSignal actual) {
         if (!expected.tenantId().equals(actual.tenantId())
             || !expected.executionId().equals(actual.executionId())
-            || expected.generation() != actual.generation()) {
+            || expected.generation() != actual.generation()
+            || expected.occurrence() != actual.occurrence()
+            || !expected.interactionId().equals(actual.interactionId())
+            || !expected.correlationId().equals(actual.correlationId())
+            || !"COMPLETED".equals(actual.admittedStatus())) {
             throw new IllegalStateException("provider callback identity does not match the TPF execution checkpoint");
         }
     }

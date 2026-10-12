@@ -6,13 +6,46 @@ import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AwsDurableDeploymentContractTest {
-    private JsonNode resources() throws Exception {
+    private JsonNode template() throws Exception {
         try (var template = getClass().getResourceAsStream("/aws-durable-queue-async.yaml")) {
-            return new ObjectMapper(new YAMLFactory()).readTree(template).path("Resources");
+            return new ObjectMapper(new YAMLFactory()).readTree(template);
         }
+    }
+
+    private JsonNode resources() throws Exception {
+        return template().path("Resources");
+    }
+
+    @Test
+    void deploymentRequiresExplicitGenerationMigrationValidation() throws Exception {
+        JsonNode template = template();
+        JsonNode validation = template.path("Parameters").path("CallbackGenerationMigrationValidation");
+        assertEquals("String", validation.path("Type").asText());
+        assertFalse(validation.has("Default"), "Migration validation must never be assumed");
+        assertEquals(1, validation.path("AllowedValues").size());
+        assertEquals("validated", validation.path("AllowedValues").get(0).asText());
+        JsonNode assertions = template.path("Rules").path("CallbackGenerationMigrationValidated").path("Assertions");
+        assertEquals(1, assertions.size());
+        JsonNode comparison = assertions.get(0).path("Assert");
+        assertEquals(2, comparison.size());
+        assertEquals("CallbackGenerationMigrationValidation", comparison.get(0).asText());
+        assertEquals("validated", comparison.get(1).asText());
+    }
+
+    @Test
+    void occurrenceWritersRequireExplicitProtocolUpgradeValidation() throws Exception {
+        JsonNode template = template();
+        JsonNode parameter = template.path("Parameters").path("CallbackOccurrenceMigrationValidation");
+        assertFalse(parameter.has("Default"));
+        assertEquals("validated", parameter.path("AllowedValues").get(0).asText());
+        JsonNode comparison = template.path("Rules").path("CallbackOccurrenceMigrationValidated")
+            .path("Assertions").get(0).path("Assert");
+        assertEquals("CallbackOccurrenceMigrationValidation", comparison.get(0).asText());
+        assertEquals("validated", comparison.get(1).asText());
     }
 
     @Test
@@ -90,6 +123,40 @@ class AwsDurableDeploymentContractTest {
             }
         }
         assertTrue(indexGranted, "Targeted repair must be authorised to query its new index");
+    }
+
+    @Test
+    void callbackWritersCanConditionTransactionsOnGenerationAuthority() throws Exception {
+        JsonNode resources = resources();
+        for (String role : new String[]{"ActionRole", "WakeupRole"}) {
+            boolean granted = false;
+            for (JsonNode statement : resources.path(role).path("Properties").path("Policies").get(0)
+                    .path("PolicyDocument").path("Statement")) {
+                boolean checksGeneration = false;
+                for (JsonNode action : statement.path("Action")) {
+                    checksGeneration |= "dynamodb:ConditionCheckItem".equals(action.asText());
+                }
+                if (checksGeneration) {
+                    granted |= "CallbackBindingTable.Arn".equals(statement.path("Resource").asText());
+                    for (JsonNode resource : statement.path("Resource")) {
+                        granted |= "CallbackBindingTable.Arn".equals(resource.asText());
+                    }
+                }
+            }
+            assertTrue(granted, role + " must condition writes on the callback table generation fence");
+        }
+    }
+
+    @Test
+    void wakeupRoutesExactSemanticAndMechanicalStreamSources() throws Exception {
+        JsonNode function = resources().path("AwaitWakeupFunction").path("Properties");
+        JsonNode variables = function.path("Environment").path("Variables");
+        assertEquals("AwaitInteractionStreamArn", variables.path("TPF_AWS_DURABLE_AWAIT_STREAM_ARN").asText());
+        assertEquals("CallbackBindingTable.StreamArn", variables.path("TPF_AWS_DURABLE_BINDING_STREAM_ARN").asText());
+        assertEquals(variables.path("TPF_AWS_DURABLE_AWAIT_STREAM_ARN"),
+            function.path("Events").path("AwaitState").path("Properties").path("Stream"));
+        assertEquals(variables.path("TPF_AWS_DURABLE_BINDING_STREAM_ARN"),
+            function.path("Events").path("CallbackBinding").path("Properties").path("Stream"));
     }
 
     private void assertVisibility(JsonNode resources, String queue, String function) {

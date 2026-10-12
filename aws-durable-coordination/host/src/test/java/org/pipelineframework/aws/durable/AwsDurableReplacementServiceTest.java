@@ -28,7 +28,7 @@ class AwsDurableReplacementServiceTest {
             binding.awaitIdentity(), "pipeline-a", "contract-a", "release-a");
         when(starter.start(expected)).thenReturn(new AwsDurableStartResponse("replacement", 202));
 
-        assertThat(new AwsDurableReplacementService(checkpoints, starter).startReplacement(binding)).isTrue();
+        assertThat(new AwsDurableReplacementService(checkpoints, starter, mock(AwsDurableCallbackBindingRepository.class)).startReplacement(binding)).isTrue();
 
         verify(starter).start(expected);
     }
@@ -37,8 +37,47 @@ class AwsDurableReplacementServiceTest {
     void missingSemanticCheckpointDoesNotStartReplacement() {
         AwsDurableExecutionStarter starter = mock(AwsDurableExecutionStarter.class);
 
-        assertThat(new AwsDurableReplacementService((tenant, interaction) -> Optional.empty(), starter)
+        assertThat(new AwsDurableReplacementService((tenant, interaction) -> Optional.empty(), starter, mock(AwsDurableCallbackBindingRepository.class))
             .startReplacement(binding())).isFalse();
+    }
+
+    @Test
+    void retriesProviderStartAfterTheGenerationClaimSurvivesALostAcknowledgement() {
+        var repository = mock(AwsDurableCallbackBindingRepository.class);
+        var starter = mock(AwsDurableExecutionStarter.class);
+        AwsDurableAwaitCheckpointReader checkpoints = (tenant, interaction) -> Optional.of(
+            new AwsDurableAwaitCheckpoint(tenant, "execution-a", interaction, "correlation-a", "unit-a", "await-a",
+                "COMPLETED", "pipeline-a", "contract-a", "release-a"));
+        when(repository.claimGeneration(org.mockito.ArgumentMatchers.any()))
+            .thenReturn(AwsDurableGenerationAdmission.CREATED, AwsDurableGenerationAdmission.REPLAYED);
+        when(starter.start(org.mockito.ArgumentMatchers.any()))
+            .thenThrow(new IllegalStateException("lost start acknowledgement"))
+            .thenReturn(new AwsDurableStartResponse("replacement", 202));
+        var service = new AwsDurableReplacementService(checkpoints, starter, repository);
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> service.startReplacement(binding()))
+            .hasMessageContaining("lost start acknowledgement");
+        assertThat(service.startReplacement(binding())).isTrue();
+
+        var order = org.mockito.Mockito.inOrder(repository, starter);
+        var expected = AwsDurableExecutionInput.resume(binding().awaitIdentity(), "pipeline-a", "contract-a", "release-a");
+        order.verify(repository).claimGeneration(org.mockito.ArgumentMatchers.any());
+        order.verify(starter).start(expected);
+        order.verify(repository).claimGeneration(org.mockito.ArgumentMatchers.any());
+        order.verify(starter).start(expected);
+    }
+
+    @Test
+    void laterGenerationDoesNotStartAnObsoleteReplacement() {
+        var repository = mock(AwsDurableCallbackBindingRepository.class);
+        var starter = mock(AwsDurableExecutionStarter.class);
+        when(repository.claimGeneration(org.mockito.ArgumentMatchers.any())).thenReturn(AwsDurableGenerationAdmission.STALE);
+        AwsDurableAwaitCheckpointReader checkpoints = (tenant, interaction) -> Optional.of(
+            new AwsDurableAwaitCheckpoint(tenant, "execution-a", interaction, "correlation-a", "unit-a", "await-a",
+                "COMPLETED", "pipeline-a", "contract-a", "release-a"));
+
+        assertThat(new AwsDurableReplacementService(checkpoints, starter, repository).startReplacement(binding())).isTrue();
+        org.mockito.Mockito.verifyNoInteractions(starter);
     }
 
     private static AwsDurableCallbackBinding binding() {

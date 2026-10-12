@@ -1,7 +1,15 @@
 package org.pipelineframework.aws.durable.model;
 
-public record AwsDurableExecutionStatusPoll(String status) {
+import java.util.Optional;
+import java.util.Objects;
+
+public record AwsDurableExecutionStatusPoll(String status, Optional<AwsDurableAwaitIdentity> awaitIdentity) {
+    public AwsDurableExecutionStatusPoll(String status) {
+        this(status, Optional.empty());
+    }
+
     public AwsDurableExecutionStatusPoll {
+        awaitIdentity = Objects.requireNonNull(awaitIdentity, "awaitIdentity");
         status = AwsDurableValidation.required(status, "status");
     }
 

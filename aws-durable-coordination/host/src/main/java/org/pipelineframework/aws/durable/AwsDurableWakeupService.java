@@ -41,24 +41,37 @@ public final class AwsDurableWakeupService {
             return AwsDurableWakeupDisposition.ACKNOWLEDGE;
         }
         Optional<AwsDurableCallbackBinding> binding = bindings.find(
-            identity.tenantId(), identity.interactionId(), identity.generation());
+            identity.tenantId(), identity.interactionId(), identity.generation(), identity.occurrence());
+        if (bindings.isSuperseded(identity.tenantId(), identity.executionId(), identity.generation())) {
+            Optional<AwsDurableCallbackBinding> obsolete = binding.or(() -> bindings.findRegistration(
+                identity.tenantId(), identity.executionId(), identity.generation(), identity.occurrence()).map(value -> value.bind(identity)));
+            return obsolete.isPresent() && replacements.startReplacement(obsolete.orElseThrow())
+                ? AwsDurableWakeupDisposition.ACKNOWLEDGE : AwsDurableWakeupDisposition.RETRY;
+        }
         if (binding.isEmpty()) {
             return AwsDurableWakeupDisposition.RETRY;
         }
         AwsDurableCallbackBinding current = binding.orElseThrow();
+        if (!bindings.isCurrentGeneration(identity.tenantId(), identity.executionId(), identity.generation())) {
+            return AwsDurableWakeupDisposition.RETRY;
+        }
         Optional<AwsDurableCallbackBinding> latest = bindings.findLatest(
             identity.tenantId(), identity.interactionId());
         if (latest.isPresent()
-            && latest.orElseThrow().awaitIdentity().generation() != identity.generation()) {
+            && !latest.orElseThrow().awaitIdentity().equals(identity)) {
             return AwsDurableWakeupDisposition.ACKNOWLEDGE;
         }
         if (bindings.delivered(current)) {
             return AwsDurableWakeupDisposition.ACKNOWLEDGE;
         }
         try {
+            if (bindings.isSuperseded(identity.tenantId(), identity.executionId(), identity.generation())) {
+                return replacements.startReplacement(current)
+                    ? AwsDurableWakeupDisposition.ACKNOWLEDGE : AwsDurableWakeupDisposition.RETRY;
+            }
             callbacks.sendSuccess(current, new AwsDurableCallbackSignal(
                 identity.tenantId(), identity.executionId(), identity.interactionId(),
-                identity.correlationId(), identity.generation(), semantic.status()));
+                identity.correlationId(), identity.generation(), semantic.status(), identity.occurrence()));
             bindings.recordDelivered(current, "CALLBACK_ACCEPTED");
             return AwsDurableWakeupDisposition.ACKNOWLEDGE;
         } catch (ResourceNotFoundException | CallbackTimeoutException uncertain) {

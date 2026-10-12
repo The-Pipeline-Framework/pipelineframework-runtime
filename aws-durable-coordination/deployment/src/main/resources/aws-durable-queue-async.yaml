@@ -9,6 +9,23 @@ Parameters:
   ActionArtifactUri:
     Type: String
     Description: S3 URI for the generated Quarkus action and worker Lambda package
+  CallbackGenerationMigrationValidation:
+    Type: String
+    AllowedValues: [validated]
+    ConstraintDescription: Must be validated before enabling callback writers
+    Description: >-
+      Set validated only after confirming a fresh table has no retained executions,
+      or completing and validating the retained table's generation-claim migration
+      with unfenced writers quiesced. This is an operator attestation, not an automatic data check.
+  CallbackOccurrenceMigrationValidation:
+    Type: String
+    AllowedValues: [validated]
+    ConstraintDescription: Must be validated before enabling occurrence-aware callback writers
+    Description: >-
+      Set validated only for a fresh table, or after legacy callback executions have
+      drained and their writers are quiesced or isolated on their original table.
+      Retained coordinator, action, wake-up and repair versions must remain protocol-compatible.
+      This attestation does not migrate callback rows or inspect retained executions.
   AwaitInteractionStreamArn: {Type: String}
   SemanticDynamoResourceArns:
     Type: CommaDelimitedList
@@ -24,6 +41,17 @@ Parameters:
   TransitionWorkerHandler: {Type: String, Default: aws-durable-transition-worker}
   AwaitWakeupHandler: {Type: String, Default: aws-durable-await-wakeup}
   ReconciliationHandler: {Type: String, Default: aws-durable-reconcile}
+
+Rules:
+  CallbackGenerationMigrationValidated:
+    Assertions:
+      - Assert: !Equals [!Ref CallbackGenerationMigrationValidation, validated]
+        AssertDescription: Callback writers require a validated generation-claim migration or a fresh table
+
+  CallbackOccurrenceMigrationValidated:
+    Assertions:
+      - Assert: !Equals [!Ref CallbackOccurrenceMigrationValidation, validated]
+        AssertDescription: Callback writers require validated occurrence protocol isolation or a fresh table
 
 Globals:
   Function:
@@ -160,7 +188,7 @@ Resources:
                   dynamodb:Query, dynamodb:DescribeTable]
                 Resource: !Ref SemanticDynamoResourceArns
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:ConditionCheckItem, dynamodb:Query]
                 Resource: !GetAtt CallbackBindingTable.Arn
               - Effect: Allow
                 Action: sqs:SendMessage
@@ -206,7 +234,7 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:ConditionCheckItem, dynamodb:Query]
                 Resource:
                   - !GetAtt CallbackBindingTable.Arn
                   - !Sub '${CallbackBindingTable.Arn}/index/provider-execution-index'
@@ -352,7 +380,11 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-await-wakeup'
       Role: !GetAtt WakeupRole.Arn
       Environment:
-        Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref AwaitWakeupHandler}
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: !Ref AwaitWakeupHandler
+          TPF_AWS_DURABLE_AWAIT_STREAM_ARN: !Ref AwaitInteractionStreamArn
+          TPF_AWS_DURABLE_BINDING_STREAM_ARN: !GetAtt CallbackBindingTable.StreamArn
       Events:
         AwaitState:
           Type: DynamoDB

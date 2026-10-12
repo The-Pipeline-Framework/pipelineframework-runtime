@@ -39,14 +39,31 @@ public final class AwsDurableTerminalReconciler {
         if (!"WAITING_EXTERNAL".equals(semanticStatus)) {
             return false;
         }
-        AwsDurableAwaitCheckpoint checkpoint = actions.invoke(
-                AwsDurableActionRequest.executionAwaits(registration.checkpoint()))
-            .awaitCheckpoints().stream().findFirst()
-            .orElseThrow(() -> new IllegalStateException("TPF Await checkpoint is not visible; retry reconciliation"));
-        var binding = registration.bind(new AwsDurableAwaitIdentity(
-            checkpoint.tenantId(), checkpoint.executionId(), checkpoint.interactionId(),
-            checkpoint.correlationId(), registration.checkpoint().generation()));
-        bindings.bind(binding);
+        registration.awaitIdentity()
+            .orElseThrow(() -> new IllegalStateException("legacy registration requires a validated protocol upgrade"));
+        var current = actions.invoke(AwsDurableActionRequest.pendingAwait(registration.checkpoint()))
+            .awaitIdentity().orElseThrow(() -> new IllegalStateException("current Await checkpoint is unavailable; retry reconciliation"));
+        AwsDurableAwaitCheckpoint checkpoint = actions.invoke(AwsDurableActionRequest.awaitCheckpoint(current)).awaitCheckpoint()
+            .orElseThrow(() -> new IllegalStateException("current Await checkpoint is unavailable; retry reconciliation"));
+        boolean sameInteraction = registration.awaitIdentity().map(identity ->
+            identity.interactionId().equals(checkpoint.interactionId())
+                && identity.correlationId().equals(checkpoint.correlationId())).orElse(true);
+        var identity = new AwsDurableAwaitIdentity(checkpoint.tenantId(), checkpoint.executionId(),
+            checkpoint.interactionId(), checkpoint.correlationId(), registration.checkpoint().generation(),
+            sameInteraction ? registration.occurrence() : Math.addExact(registration.occurrence(), 1));
+        var binding = sameInteraction ? registration.bind(identity)
+            : new org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding(identity,
+                registration.providerExecutionName(), registration.providerExecutionArn(), registration.providerCallbackId(),
+                org.pipelineframework.aws.durable.model.AwsDurableBindingStatus.OPEN,
+                registration.createdAtEpochMs(), registration.expiresAtEpochS());
+        if (sameInteraction) {
+            try {
+                bindings.bind(binding);
+            } catch (AwsDurableStaleGenerationException stale) {
+                // The successor claim fences this binding, but its provider start may still need replay.
+            }
+        }
+        // A later semantic Await is a reconstruction locator, never authority to bind the old callback to it.
         if (!replacements.startReplacement(binding)) {
             throw new IllegalStateException("replacement admission is unresolved; retry reconciliation");
         }

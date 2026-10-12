@@ -1,6 +1,7 @@
 package org.pipelineframework.aws.durable;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -18,6 +19,11 @@ import software.amazon.awssdk.services.dynamodb.model.ConditionalCheckFailedExce
 import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
+import software.amazon.awssdk.services.dynamodb.model.ConditionCheck;
+import software.amazon.awssdk.services.dynamodb.model.Put;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItem;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItemsRequest;
+import software.amazon.awssdk.services.dynamodb.model.TransactionCanceledException;
 
 /** Immutable provider callback bindings and append-only delivery evidence. */
 public final class AwsDurableCallbackBindingRepository {
@@ -38,21 +44,84 @@ public final class AwsDurableCallbackBindingRepository {
         this.tableName = required(tableName, "tableName");
     }
 
+    /** Generation claims and successor fences never expire with disposable callback rows. */
+    public AwsDurableGenerationAdmission claimGeneration(AwsDurableDriverCheckpoint checkpoint) {
+        Objects.requireNonNull(checkpoint, "checkpoint");
+        String partition = checkpoint.tenantId() + "#" + checkpoint.executionId();
+        Map<String, AttributeValue> claim = Map.ofEntries(
+            Map.entry(PK, string(partition)), Map.entry(SK, string(claimKey(checkpoint.generation()))),
+            Map.entry(RECORD_TYPE, string("GENERATION_CLAIM")),
+            Map.entry("schema_version", number(2)),
+            Map.entry("pipeline_id", string(checkpoint.pipelineId())),
+            Map.entry("contract_version", string(checkpoint.contractVersion())),
+            Map.entry("release_version", string(checkpoint.releaseVersion())));
+        var operations = new java.util.ArrayList<TransactWriteItem>();
+        operations.add(TransactWriteItem.builder().put(immutablePut(claim)).build());
+        if (checkpoint.generation() > 1) {
+            long predecessor = checkpoint.generation() - 1;
+            operations.add(TransactWriteItem.builder().conditionCheck(ConditionCheck.builder()
+                .tableName(tableName).key(key(partition, claimKey(predecessor)))
+                .conditionExpression("pipeline_id = :pipeline AND contract_version = :contract AND release_version = :release")
+                .expressionAttributeValues(Map.of(":pipeline", string(checkpoint.pipelineId()),
+                    ":contract", string(checkpoint.contractVersion()), ":release", string(checkpoint.releaseVersion())))
+                .build()).build());
+            operations.add(TransactWriteItem.builder().put(immutablePut(Map.of(
+                PK, string(partition), SK, string(successorKey(predecessor)),
+                RECORD_TYPE, string("GENERATION_SUCCESSOR"), "schema_version", number(2),
+                "generation", number(checkpoint.generation())))).build());
+        }
+        try {
+            dynamo.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(operations).build());
+            return AwsDurableGenerationAdmission.CREATED;
+        } catch (TransactionCanceledException conflict) {
+            Map<String, AttributeValue> existing = read(partition, claimKey(checkpoint.generation()));
+            if (existing.isEmpty()) {
+                throw conflict; // Missing predecessor, contention or infrastructure failure remains retryable.
+            }
+            if (!existing.equals(claim)) {
+                throw new IllegalStateException("generation is already owned by another semantic checkpoint", conflict);
+            }
+            if (!read(partition, successorKey(checkpoint.generation())).isEmpty()) {
+                return AwsDurableGenerationAdmission.STALE;
+            }
+            return AwsDurableGenerationAdmission.REPLAYED;
+        }
+    }
+
+    public boolean isCurrentGeneration(String tenantId, String executionId, long generation) {
+        String partition = required(tenantId, "tenantId") + "#" + required(executionId, "executionId");
+        return !read(partition, claimKey(generation)).isEmpty()
+            && !isSuperseded(tenantId, executionId, generation);
+    }
+
+    public boolean isSuperseded(String tenantId, String executionId, long generation) {
+        return !read(required(tenantId, "tenantId") + "#" + required(executionId, "executionId"),
+            successorKey(generation)).isEmpty();
+    }
+
     public boolean bind(AwsDurableCallbackBinding binding) {
         Objects.requireNonNull(binding, "binding");
+        AwsDurableAwaitIdentity identity = binding.awaitIdentity();
+        String partition = identity.tenantId() + "#" + identity.executionId();
+        var operations = generationConditions(partition, identity.generation());
+        operations.add(TransactWriteItem.builder().conditionCheck(ConditionCheck.builder()
+            .tableName(tableName).key(key(partition,
+                AwsDurableCallbackRegistration.registrationSortKey(identity.generation(), identity.occurrence())))
+            .conditionExpression("provider_callback_id = :callback AND provider_execution_arn = :arn AND provider_execution_name = :name"
+                + " AND (attribute_not_exists(interaction_id) OR (interaction_id = :interaction AND correlation_id = :correlation AND occurrence = :occurrence))")
+            .expressionAttributeValues(Map.of(":callback", string(binding.providerCallbackId()),
+                ":arn", string(binding.providerExecutionArn()), ":name", string(binding.providerExecutionName()),
+                ":interaction", string(identity.interactionId()), ":correlation", string(identity.correlationId()),
+                ":occurrence", number(identity.occurrence())))
+            .build()).build());
+        operations.add(TransactWriteItem.builder().put(immutablePut(toItem(binding))).build());
         try {
-            dynamo.putItem(PutItemRequest.builder()
-                .tableName(tableName())
-                .item(toItem(binding))
-                .conditionExpression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
-                .expressionAttributeNames(Map.of("#pk", PK, "#sk", SK))
-                .build());
+            dynamo.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(operations).build());
             return true;
-        } catch (ConditionalCheckFailedException conflict) {
-            AwsDurableCallbackBinding existing = find(
-                binding.awaitIdentity().tenantId(),
-                binding.awaitIdentity().interactionId(),
-                binding.awaitIdentity().generation()).orElseThrow(() -> conflict);
+        } catch (TransactionCanceledException conflict) {
+            requireCurrentGeneration(identity.tenantId(), identity.executionId(), identity.generation());
+            AwsDurableCallbackBinding existing = find(identity.tenantId(), identity.interactionId(),
+                identity.generation(), identity.occurrence()).orElseThrow(() -> conflict);
             if (!sameBindingAuthority(existing, binding)) {
                 throw new IllegalStateException("callback binding generation is already owned by another callback", conflict);
             }
@@ -62,25 +131,68 @@ public final class AwsDurableCallbackBindingRepository {
 
     public boolean register(AwsDurableCallbackRegistration registration) {
         Objects.requireNonNull(registration, "registration");
+        AwsDurableDriverCheckpoint checkpoint = registration.checkpoint();
+        if (claimGeneration(checkpoint) == AwsDurableGenerationAdmission.STALE) {
+            throw new AwsDurableStaleGenerationException();
+        }
+        var operations = generationConditions(registration.partitionKey(), checkpoint.generation());
+        operations.add(TransactWriteItem.builder().put(immutablePut(toItem(registration))).build());
         try {
-            dynamo.putItem(PutItemRequest.builder()
-                .tableName(tableName())
-                .item(toItem(registration))
-                .conditionExpression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
-                .expressionAttributeNames(Map.of("#pk", PK, "#sk", SK))
-                .build());
+            dynamo.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(operations).build());
             return true;
-        } catch (ConditionalCheckFailedException conflict) {
-            AwsDurableDriverCheckpoint checkpoint = registration.checkpoint();
+        } catch (TransactionCanceledException conflict) {
+            requireCurrentGeneration(checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
             AwsDurableCallbackRegistration existing = findRegistration(
-                checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation())
-                .orElseThrow(() -> conflict);
+                checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation(), registration.occurrence()).orElseThrow(() -> conflict);
             if (!sameRegistrationAuthority(existing, registration)) {
-                throw new IllegalStateException(
-                    "callback registration generation is already owned by another callback", conflict);
+                throw new IllegalStateException("callback registration generation is already owned by another callback", conflict);
             }
             return false;
         }
+    }
+
+    private java.util.ArrayList<TransactWriteItem> generationConditions(String partition, long generation) {
+        return new java.util.ArrayList<>(List.of(
+            TransactWriteItem.builder().conditionCheck(ConditionCheck.builder().tableName(tableName)
+                .key(key(partition, claimKey(generation))).conditionExpression("attribute_exists(#pk)")
+                .expressionAttributeNames(Map.of("#pk", PK)).build()).build(),
+            TransactWriteItem.builder().conditionCheck(ConditionCheck.builder().tableName(tableName)
+                .key(key(partition, successorKey(generation))).conditionExpression("attribute_not_exists(#pk)")
+                .expressionAttributeNames(Map.of("#pk", PK)).build()).build()));
+    }
+
+    private Put immutablePut(Map<String, AttributeValue> item) {
+        return Put.builder().tableName(tableName).item(item)
+            .conditionExpression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
+            .expressionAttributeNames(Map.of("#pk", PK, "#sk", SK)).build();
+    }
+
+    private void requireCurrentGeneration(String tenantId, String executionId, long generation) {
+        if (isSuperseded(tenantId, executionId, generation)) {
+            throw new AwsDurableStaleGenerationException();
+        }
+        if (!isCurrentGeneration(tenantId, executionId, generation)) {
+            throw new IllegalStateException("provider generation claim is unavailable");
+        }
+    }
+
+    private Map<String, AttributeValue> read(String partition, String sort) {
+        return dynamo.getItem(GetItemRequest.builder().tableName(tableName).consistentRead(true)
+            .key(key(partition, sort)).build()).item();
+    }
+
+    private static Map<String, AttributeValue> key(String partition, String sort) {
+        return Map.of(PK, string(partition), SK, string(sort));
+    }
+
+    private static String claimKey(long generation) {
+        if (generation < 1) throw new IllegalArgumentException("generation must be positive");
+        return "CLAIM#" + generation;
+    }
+
+    private static String successorKey(long generation) {
+        if (generation < 1) throw new IllegalArgumentException("generation must be positive");
+        return "SUCCESSOR#" + generation;
     }
 
     public Optional<AwsDurableCallbackRegistration> findRegistration(
@@ -88,12 +200,18 @@ public final class AwsDurableCallbackBindingRepository {
         String executionId,
         long generation
     ) {
+        return findRegistration(tenantId, executionId, generation, 1);
+    }
+
+    public Optional<AwsDurableCallbackRegistration> findRegistration(
+        String tenantId, String executionId, long generation, long occurrence
+    ) {
         Map<String, AttributeValue> item = dynamo.getItem(GetItemRequest.builder()
             .tableName(tableName())
             .consistentRead(true)
             .key(Map.of(
                 PK, string(tenantId + "#" + executionId),
-                SK, string(AwsDurableCallbackRegistration.registrationSortKey(generation))))
+                SK, string(AwsDurableCallbackRegistration.registrationSortKey(generation, occurrence))))
             .build()).item();
         return item == null || item.isEmpty()
             ? Optional.empty()
@@ -121,6 +239,7 @@ public final class AwsDurableCallbackBindingRepository {
     ) {
         var response = dynamo.query(QueryRequest.builder()
             .tableName(tableName())
+            .scanIndexForward(false)
             .indexName(PROVIDER_REGISTRATION_INDEX)
             .keyConditionExpression("#providerArn = :providerArn AND begins_with(#sk, :registration)")
             .expressionAttributeNames(Map.of("#providerArn", "provider_execution_arn", "#sk", SK))
@@ -133,12 +252,16 @@ public final class AwsDurableCallbackBindingRepository {
     }
 
     public Optional<AwsDurableCallbackBinding> find(String tenantId, String interactionId, long generation) {
+        return find(tenantId, interactionId, generation, 1);
+    }
+
+    public Optional<AwsDurableCallbackBinding> find(String tenantId, String interactionId, long generation, long occurrence) {
         Map<String, AttributeValue> item = dynamo.getItem(GetItemRequest.builder()
             .tableName(tableName())
             .consistentRead(true)
             .key(Map.of(
                 PK, string(tenantId + "#" + interactionId),
-                SK, string(AwsDurableCallbackBinding.generationSortKey(generation))))
+                SK, string(AwsDurableCallbackBinding.generationSortKey(generation, occurrence))))
             .build()).item();
         return item == null || item.isEmpty() ? Optional.empty() : Optional.of(fromItem(item));
     }
@@ -164,7 +287,7 @@ public final class AwsDurableCallbackBindingRepository {
             .consistentRead(true)
             .key(Map.of(
                 PK, string(binding.partitionKey()),
-                SK, string(deliveredKey(binding.awaitIdentity().generation()))))
+                SK, string(deliveredKey(binding.awaitIdentity().generation(), binding.awaitIdentity().occurrence()))))
             .build()).item();
         return item != null && !item.isEmpty();
     }
@@ -172,7 +295,7 @@ public final class AwsDurableCallbackBindingRepository {
     public void recordDelivered(AwsDurableCallbackBinding binding, String providerOutcome) {
         Map<String, AttributeValue> item = Map.of(
             PK, string(binding.partitionKey()),
-            SK, string(deliveredKey(binding.awaitIdentity().generation())),
+            SK, string(deliveredKey(binding.awaitIdentity().generation(), binding.awaitIdentity().occurrence())),
             RECORD_TYPE, string(DELIVERY),
             "provider_callback_id", string(binding.providerCallbackId()),
             "provider_outcome", string(required(providerOutcome, "providerOutcome")),
@@ -201,6 +324,7 @@ public final class AwsDurableCallbackBindingRepository {
             Map.entry("interaction_id", string(identity.interactionId())),
             Map.entry("correlation_id", string(identity.correlationId())),
             Map.entry("generation", number(identity.generation())),
+            Map.entry("occurrence", number(identity.occurrence())),
             Map.entry("provider_execution_name", string(binding.providerExecutionName())),
             Map.entry("provider_execution_arn", string(binding.providerExecutionArn())),
             Map.entry("provider_callback_id", string(binding.providerCallbackId())),
@@ -211,7 +335,7 @@ public final class AwsDurableCallbackBindingRepository {
 
     private Map<String, AttributeValue> toItem(AwsDurableCallbackRegistration registration) {
         AwsDurableDriverCheckpoint checkpoint = registration.checkpoint();
-        return Map.ofEntries(
+        var item = new java.util.HashMap<>(Map.ofEntries(
             Map.entry(PK, string(registration.partitionKey())),
             Map.entry(SK, string(registration.sortKey())),
             Map.entry(RECORD_TYPE, string(REGISTRATION)),
@@ -225,7 +349,14 @@ public final class AwsDurableCallbackBindingRepository {
             Map.entry("provider_execution_arn", string(registration.providerExecutionArn())),
             Map.entry("provider_callback_id", string(registration.providerCallbackId())),
             Map.entry("created_at_epoch_ms", number(registration.createdAtEpochMs())),
-            Map.entry("expires_at_epoch_s", number(registration.expiresAtEpochS())));
+            Map.entry("expires_at_epoch_s", number(registration.expiresAtEpochS()))));
+        registration.awaitIdentity().ifPresent(identity -> {
+            item.put("interaction_id", string(identity.interactionId()));
+            item.put("correlation_id", string(identity.correlationId()));
+            item.put("occurrence", number(identity.occurrence()));
+            item.put("schema_version", number(3));
+        });
+        return Map.copyOf(item);
     }
 
     public static Optional<AwsDurableCallbackBinding> decodeBinding(Map<String, AttributeValue> item) {
@@ -242,7 +373,7 @@ public final class AwsDurableCallbackBindingRepository {
             text(item, "execution_id"),
             text(item, "interaction_id"),
             text(item, "correlation_id"),
-            longValue(item, "generation"));
+            longValue(item, "generation"), occurrenceFromItem(item));
         return new AwsDurableCallbackBinding(
             identity,
             text(item, "provider_execution_name"),
@@ -268,7 +399,15 @@ public final class AwsDurableCallbackBindingRepository {
             text(item, "provider_execution_arn"),
             text(item, "provider_callback_id"),
             longValue(item, "created_at_epoch_ms"),
-            longValue(item, "expires_at_epoch_s"));
+            longValue(item, "expires_at_epoch_s"),
+            item.containsKey("interaction_id") ? Optional.of(new AwsDurableAwaitIdentity(checkpoint.tenantId(),
+                checkpoint.executionId(), text(item, "interaction_id"), text(item, "correlation_id"),
+                checkpoint.generation(), occurrenceFromItem(item))) : Optional.empty());
+    }
+
+    private static long occurrenceFromItem(Map<String, AttributeValue> item) {
+        return item.containsKey("occurrence") || (item.containsKey("schema_version") && longValue(item, "schema_version") >= 3)
+            ? longValue(item, "occurrence") : 1;
     }
 
     private String tableName() {
@@ -291,13 +430,14 @@ public final class AwsDurableCallbackBindingRepository {
         AwsDurableCallbackRegistration candidate
     ) {
         return existing.checkpoint().equals(candidate.checkpoint())
+            && existing.awaitIdentity().equals(candidate.awaitIdentity())
             && existing.providerExecutionName().equals(candidate.providerExecutionName())
             && existing.providerExecutionArn().equals(candidate.providerExecutionArn())
             && existing.providerCallbackId().equals(candidate.providerCallbackId());
     }
 
-    private static String deliveredKey(long generation) {
-        return "DELIVERED#" + generation;
+    private static String deliveredKey(long generation, long occurrence) {
+        return "DELIVERED#" + generation + (occurrence == 1 ? "" : "#OCCURRENCE#" + occurrence);
     }
 
     private static AttributeValue string(String value) {

@@ -34,7 +34,7 @@ class AwsDurableWakeupServiceTest {
         AwsDurableCallbackBindingRepository bindings = mock(AwsDurableCallbackBindingRepository.class);
         AwsDurableCallbackClient callbacks = mock(AwsDurableCallbackClient.class);
         AwsDurableCallbackBinding current = binding(2);
-        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2)).thenReturn(Optional.of(current));
+        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2, 1)).thenReturn(Optional.of(current));
         when(bindings.findLatest(IDENTITY.tenantId(), IDENTITY.interactionId()))
             .thenReturn(Optional.of(binding(3)));
         AwsDurableWakeupService service = service(bindings, callbacks, "COMPLETED", current);
@@ -49,7 +49,7 @@ class AwsDurableWakeupServiceTest {
         AwsDurableCallbackBindingRepository bindings = mock(AwsDurableCallbackBindingRepository.class);
         AwsDurableCallbackClient callbacks = mock(AwsDurableCallbackClient.class);
         AwsDurableCallbackBinding current = binding(2);
-        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2)).thenReturn(Optional.of(current));
+        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2, 1)).thenReturn(Optional.of(current));
         when(bindings.findLatest(IDENTITY.tenantId(), IDENTITY.interactionId()))
             .thenReturn(Optional.of(current));
         when(bindings.delivered(current)).thenReturn(false);
@@ -59,6 +59,34 @@ class AwsDurableWakeupServiceTest {
 
         verify(callbacks).sendSuccess(org.mockito.ArgumentMatchers.eq(current), org.mockito.ArgumentMatchers.any());
         verify(bindings).recordDelivered(current, "CALLBACK_ACCEPTED");
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void fencedWakeRetriesReplacementStartWithoutCallingTheOldCallback(boolean bindingMissing) {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var callbacks = mock(AwsDurableCallbackClient.class);
+        var replacements = mock(AwsDurableReplacementStarter.class);
+        var current = binding(2);
+        when(bindings.isSuperseded("tenant-a", "execution-a", 2)).thenReturn(true);
+        when(bindings.find("tenant-a", "interaction-a", 2, 1))
+            .thenReturn(bindingMissing ? Optional.empty() : Optional.of(current));
+        when(bindings.findRegistration("tenant-a", "execution-a", 2, 1)).thenReturn(Optional.of(
+            new org.pipelineframework.aws.durable.model.AwsDurableCallbackRegistration(
+                new org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint(
+                    new org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint(
+                        "tenant-a", "execution-a", "pipeline-a", "contract-a", "release-a"), 2),
+                current.providerExecutionName(), current.providerExecutionArn(), current.providerCallbackId(),
+                current.createdAtEpochMs(), current.expiresAtEpochS())));
+        when(replacements.startReplacement(current)).thenReturn(false, true);
+        AwsDurableAwaitCheckpointReader checkpoints = (tenant, interaction) -> Optional.of(
+            new AwsDurableAwaitCheckpoint(tenant, "execution-a", interaction, "correlation-a", "unit-a", "await-a",
+                "COMPLETED", "pipeline-a", "contract-a", "release-a"));
+        var service = new AwsDurableWakeupService(checkpoints, bindings, callbacks, replacements);
+
+        assertThat(service.wake(IDENTITY)).isEqualTo(AwsDurableWakeupDisposition.RETRY);
+        assertThat(service.wake(IDENTITY)).isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        org.mockito.Mockito.verifyNoInteractions(callbacks);
     }
 
     private static AwsDurableWakeupService service(
@@ -71,7 +99,8 @@ class AwsDurableWakeupServiceTest {
             new AwsDurableAwaitCheckpoint(
                 tenantId, "execution-a", interactionId, "correlation-a", "unit-a", "await-a", status,
                 "pipeline-a", "contract-a", "release-a"));
-        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2))
+        when(bindings.isCurrentGeneration(IDENTITY.tenantId(), IDENTITY.executionId(), 2)).thenReturn(true);
+        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2, 1))
             .thenReturn(Optional.of(current));
         return new AwsDurableWakeupService(reader, bindings, callbacks, ignored -> true);
     }
