@@ -22,6 +22,13 @@ import software.amazon.lambda.durable.testing.LocalDurableTestRunner;
 class AwsDurableCoordinatorHandlerTest {
     private static final ObjectMapper JSON = new ObjectMapper().registerModule(new Jdk8Module());
 
+    private static AwsDurableActionResponse waiting(AwsDurableExecutionCheckpoint execution, String interaction, String correlation) {
+        return AwsDurableActionResponse.observation("WAITING_EXTERNAL", Optional.of(
+            new org.pipelineframework.aws.durable.model.AwsDurableAwaitCheckpoint(execution.tenantId(), execution.executionId(),
+                interaction, correlation, "unit-" + interaction, "step", "WAITING", execution.pipelineId(),
+                execution.contractVersion(), execution.releaseVersion())));
+    }
+
     @Test
     void durableConfigurationRoundTripsResumeIdentityForReplay() {
         AwsDurableExecutionInput input = AwsDurableExecutionInput.resume(
@@ -53,9 +60,10 @@ class AwsDurableCoordinatorHandlerTest {
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case REGISTER_CALLBACK -> {
                 callbackId.set(request.providerCallbackId().orElseThrow());
+                assertThat(request.awaitIdentity()).isPresent();
                 yield AwsDurableActionResponse.bound(true);
             }
-            case STATUS -> AwsDurableActionResponse.status(resumed.get() ? "SUCCEEDED" : "WAITING_EXTERNAL");
+            case STATUS -> resumed.get() ? AwsDurableActionResponse.status("SUCCEEDED") : waiting(checkpoint, "interaction-a", "correlation-a");
             case RESULT -> AwsDurableActionResponse.result("{\"approved\":true}");
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REDRIVE -> throw new AssertionError("driver must not re-drive implicitly");
@@ -86,6 +94,49 @@ class AwsDurableCoordinatorHandlerTest {
         assertThat(completed.getResult()).isEqualTo(new AwsDurableExecutionOutput(
             "tenant-a", "execution-a", "pipeline-a", "contract-a", "release-a", 1,
             "{\"approved\":true}"));
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void rejectsCallbackForWrongInteractionOrOccurrence(boolean wrongOccurrence) throws Exception {
+        var checkpoint = new AwsDurableExecutionCheckpoint("tenant-a", "execution-a", "pipeline-a", "contract-a", "release-a");
+        var callback = new AtomicReference<String>();
+        AwsDurableActionInvoker actions = request -> switch (request.operation()) {
+            case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
+            case STATUS -> waiting(checkpoint, "interaction-a", "correlation-a");
+            case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
+            case REGISTER_CALLBACK -> {
+                callback.set(request.providerCallbackId().orElseThrow());
+                yield AwsDurableActionResponse.bound(true);
+            }
+            default -> throw new AssertionError("invalid callback must not advance execution");
+        };
+        var runner = LocalDurableTestRunner.create(AwsDurableExecutionInput.class, new AwsDurableCoordinatorHandler(actions))
+            .withOutputType(AwsDurableExecutionOutput.class);
+        var input = new AwsDurableExecutionInput("tenant-a", "key", "pipeline-a", "contract-a", "release-a", "{}", Optional.empty(), 1);
+        assertThat(runner.run(input).getStatus()).isEqualTo(ExecutionStatus.PENDING);
+        runner.completeCallback(callback.get(), JSON.writeValueAsString(new AwsDurableCallbackSignal(
+            "tenant-a", "execution-a", wrongOccurrence ? "interaction-a" : "old-interaction", "correlation-a", 1,
+            "COMPLETED", wrongOccurrence ? 2 : 1)));
+        assertThat(runner.runUntilComplete(input).getStatus()).isEqualTo(ExecutionStatus.FAILED);
+    }
+
+    @Test
+    void completionBetweenStatusAndCurrentAwaitReadDoesNotParkWithoutAnIdentity() {
+        var checkpoint = new AwsDurableExecutionCheckpoint("tenant-a", "execution-a", "pipeline-a", "contract-a", "release-a");
+        var polls = new java.util.concurrent.atomic.AtomicInteger();
+        AwsDurableActionInvoker actions = request -> switch (request.operation()) {
+            case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
+            case STATUS -> AwsDurableActionResponse.status(polls.getAndIncrement() == 0 ? "WAITING_EXTERNAL" : "SUCCEEDED");
+            case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
+            case RESULT -> AwsDurableActionResponse.result("{}");
+            default -> throw new AssertionError("missing current Await must not register a callback");
+        };
+        var runner = LocalDurableTestRunner.create(AwsDurableExecutionInput.class, new AwsDurableCoordinatorHandler(actions))
+            .withOutputType(AwsDurableExecutionOutput.class);
+        var input = new AwsDurableExecutionInput("tenant-a", "key", "pipeline-a", "contract-a", "release-a", "{}", Optional.empty(), 1);
+        assertThat(runner.runUntilComplete(input).isSucceeded()).isTrue();
+        assertThat(polls).hasValue(2);
     }
 
     @Test
@@ -124,15 +175,18 @@ class AwsDurableCoordinatorHandlerTest {
         AwsDurableExecutionCheckpoint checkpoint = new AwsDurableExecutionCheckpoint(
             "tenant-a", "execution-many", "pipeline-a", "contract-a", "release-a");
         AtomicReference<String> callbackId = new AtomicReference<>();
+        var registrations = new java.util.ArrayList<AwsDurableAwaitIdentity>();
         java.util.concurrent.atomic.AtomicInteger completedAwaits = new java.util.concurrent.atomic.AtomicInteger();
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case REGISTER_CALLBACK -> {
                 callbackId.set(request.providerCallbackId().orElseThrow());
+                registrations.add(request.awaitIdentity().orElseThrow());
                 yield AwsDurableActionResponse.bound(true);
             }
-            case STATUS -> AwsDurableActionResponse.status(
-                completedAwaits.get() < 2 ? "WAITING_EXTERNAL" : "SUCCEEDED");
+            case STATUS -> completedAwaits.get() < 2
+                ? waiting(checkpoint, "interaction-" + (completedAwaits.get() + 1), "correlation-" + (completedAwaits.get() + 1))
+                : AwsDurableActionResponse.status("SUCCEEDED");
             case RESULT -> AwsDurableActionResponse.result("{\"awaits\":2}");
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REDRIVE, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, BIND_CALLBACK ->
@@ -154,13 +208,15 @@ class AwsDurableCoordinatorHandlerTest {
         assertThat(secondCallback).isNotEqualTo(firstCallback);
         completedAwaits.incrementAndGet();
         runner.completeCallback(secondCallback, JSON.writeValueAsString(new AwsDurableCallbackSignal(
-            "tenant-a", "execution-many", "interaction-2", "correlation-2", 1, "COMPLETED")));
+            "tenant-a", "execution-many", "interaction-2", "correlation-2", 1, "COMPLETED", 2)));
 
         var completed = runner.runUntilComplete(input);
 
         assertThat(completed.isSucceeded()).isTrue();
         assertThat(completed.getResult().executionId()).isEqualTo("execution-many");
         assertThat(completed.getResult().resultJson()).isEqualTo("{\"awaits\":2}");
+        assertThat(registrations).extracting(AwsDurableAwaitIdentity::occurrence).containsExactly(1L, 2L);
+        assertThat(registrations).extracting(AwsDurableAwaitIdentity::interactionId).containsExactly("interaction-1", "interaction-2");
     }
 
     @Test

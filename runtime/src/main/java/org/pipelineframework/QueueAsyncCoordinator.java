@@ -389,6 +389,45 @@ class QueueAsyncCoordinator {
     });
   }
 
+  Uni<Optional<AwaitSemanticCheckpoint>> getCurrentAwaitSemanticCheckpoint(
+      String tenantId, String executionId) {
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) {
+        return Uni.createFrom().failure(queueModeDisabledException());
+      }
+      if (executionId == null || executionId.isBlank()) {
+        return Uni.createFrom().failure(new IllegalArgumentException("executionId must not be blank"));
+      }
+      String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
+      RuntimeException denied = admissionFailure(admissionRequest(resolvedTenant,
+          ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT, executionId, "api", explicitTenant(tenantId)));
+      if (denied != null) {
+        return Uni.createFrom().failure(denied);
+      }
+      return executionStateStore.getExecution(resolvedTenant, executionId)
+          .onItem().transformToUni(parent -> parent
+              .filter(record -> record.status() == org.pipelineframework.orchestrator.ExecutionStatus.WAITING_EXTERNAL)
+              .filter(record -> record.awaitUnitId() != null && !record.awaitUnitId().isBlank())
+              .map(record -> awaitCoordinator.getUnit(resolvedTenant, record.awaitUnitId())
+                  .onItem().transformToUni(unit -> {
+                    if (!record.executionId().equals(unit.executionId()) || !resolvedTenant.equals(unit.tenantId())) {
+                      return Uni.createFrom().failure(new IllegalStateException("Await unit does not belong to execution"));
+                    }
+                    return Optional.ofNullable(unit.primaryInteractionId()).filter(id -> !id.isBlank())
+                        .map(id -> getAwaitSemanticCheckpoint(resolvedTenant, id)
+                            .onItem().transform(checkpoint -> checkpoint.map(value -> {
+                              if (!record.executionId().equals(value.executionId())
+                                  || !unit.unitId().equals(value.unitId())) {
+                                throw new IllegalStateException("primary Await interaction does not belong to unit");
+                              }
+                              return value;
+                            })))
+                        .orElseGet(() -> Uni.createFrom().item(Optional.<AwaitSemanticCheckpoint>empty()));
+                  }))
+              .orElseGet(() -> Uni.createFrom().item(Optional.<AwaitSemanticCheckpoint>empty())));
+    });
+  }
+
   Uni<List<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoints(
       String tenantId,
       String executionId,

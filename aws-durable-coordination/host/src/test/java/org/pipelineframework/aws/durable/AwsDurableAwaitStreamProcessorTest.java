@@ -35,7 +35,7 @@ class AwsDurableAwaitStreamProcessorTest {
             "tenant", "execution", "interaction", "correlation", "unit", "step", "COMPLETED",
             "pipeline", "contract", "release");
         when(actions.invoke(org.mockito.ArgumentMatchers.any()))
-            .thenReturn(AwsDurableActionResponse.awaitCheckpoints(List.of(semantic)));
+            .thenReturn(AwsDurableActionResponse.awaitCheckpoint(semantic));
         if (superseded) {
             org.mockito.Mockito.doThrow(new AwsDurableStaleGenerationException())
                 .when(bindings).bind(org.mockito.ArgumentMatchers.any());
@@ -52,6 +52,47 @@ class AwsDurableAwaitStreamProcessorTest {
             "tenant", "execution", "interaction", "correlation", 2)));
         verify(wakeups).wake(new org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity(
             "tenant", "execution", "interaction", "correlation", 2));
+    }
+
+    @Test
+    void secondRegistrationReadsItsPinnedCompletedInteractionWithoutListingHistory() {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var wakeups = mock(AwsDurableWakeupService.class);
+        var second = new org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity(
+            "tenant", "execution", "interaction-2", "correlation-2", 2, 2);
+        var original = registration();
+        var registration = new AwsDurableCallbackRegistration(original.checkpoint(), original.providerExecutionName(),
+            original.providerExecutionArn(), "second-callback", 100, 1000, Optional.of(second));
+        var semantic = new AwsDurableAwaitCheckpoint("tenant", "execution", "interaction-2", "correlation-2", "unit-2", "step-2",
+            "COMPLETED", "pipeline", "contract", "release");
+        AwsDurableActionInvoker actions = request -> {
+            assertThat(request).isEqualTo(org.pipelineframework.aws.durable.model.AwsDurableActionRequest.awaitCheckpoint(second));
+            return AwsDurableActionResponse.awaitCheckpoint(semantic);
+        };
+        when(wakeups.wake(second)).thenReturn(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, AWAIT_STREAM, BINDING_STREAM,
+            ignored -> { throw new AssertionError("mechanical registration is not a semantic row"); });
+        assertThat(processor.process(record(BINDING_STREAM, registrationImage(registration))))
+            .isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        verify(bindings).bind(registration.bind(second));
+        verify(wakeups).wake(second);
+    }
+
+    @Test
+    void lateFirstCompletionCannotBindOrWakeTheSecondCallback() {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var wakeups = mock(AwsDurableWakeupService.class);
+        var original = registration();
+        var second = new org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity(
+            "tenant", "execution", "interaction-2", "correlation-2", 2, 2);
+        when(bindings.findLatestRegistration("tenant", "execution")).thenReturn(Optional.of(new AwsDurableCallbackRegistration(
+            original.checkpoint(), original.providerExecutionName(), original.providerExecutionArn(), "second-callback", 100, 1000,
+            Optional.of(second))));
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, mock(AwsDurableActionInvoker.class), wakeups,
+            AWAIT_STREAM, BINDING_STREAM, ignored -> Optional.of(semantic("COMPLETED")));
+        assertThat(processor.process(record(AWAIT_STREAM, Map.of()))).isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        verify(bindings, org.mockito.Mockito.never()).bind(org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.verifyNoInteractions(wakeups);
     }
 
     @Test
@@ -141,7 +182,8 @@ class AwsDurableAwaitStreamProcessorTest {
         return new AwsDurableCallbackRegistration(
             new AwsDurableDriverCheckpoint(
                 new AwsDurableExecutionCheckpoint("tenant", "execution", "pipeline", "contract", "release"), 2),
-            "durable-name", "durable-arn", "callback", 1_000L, 9_999L);
+            "durable-name", "durable-arn", "callback", 1_000L, 9_999L, Optional.of(new org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity(
+                "tenant", "execution", "interaction", "correlation", 2)));
     }
 
     private static Map<String, AttributeValue> registrationImage(AwsDurableCallbackRegistration registration) {
@@ -158,6 +200,11 @@ class AwsDurableAwaitStreamProcessorTest {
         image.put("provider_callback_id", string(registration.providerCallbackId()));
         image.put("created_at_epoch_ms", number(registration.createdAtEpochMs()));
         image.put("expires_at_epoch_s", number(registration.expiresAtEpochS()));
+        registration.awaitIdentity().ifPresent(identity -> {
+            image.put("interaction_id", string(identity.interactionId()));
+            image.put("correlation_id", string(identity.correlationId()));
+            image.put("occurrence", number(identity.occurrence()));
+        });
         return image;
     }
 

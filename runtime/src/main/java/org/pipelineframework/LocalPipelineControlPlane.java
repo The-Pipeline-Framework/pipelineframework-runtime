@@ -171,6 +171,12 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     }
 
     @Override
+    public Uni<Optional<AwaitSemanticCheckpoint>> getCurrentAwaitSemanticCheckpoint(
+        String tenantId, String executionId) {
+        return queueAsyncCoordinator.getCurrentAwaitSemanticCheckpoint(tenantId, executionId);
+    }
+
+    @Override
     public Uni<List<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoints(
         String tenantId,
         String executionId,

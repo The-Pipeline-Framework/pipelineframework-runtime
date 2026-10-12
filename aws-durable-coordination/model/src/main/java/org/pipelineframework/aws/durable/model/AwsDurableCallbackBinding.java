@@ -27,7 +27,13 @@ public record AwsDurableCallbackBinding(
     }
 
     public String sortKey() {
-        return generationSortKey(awaitIdentity.generation());
+        return generationSortKey(awaitIdentity.generation(), awaitIdentity.occurrence());
+    }
+
+    public static String generationSortKey(long generation, long occurrence) {
+        if (occurrence < 1) throw new IllegalArgumentException("occurrence must be positive");
+        return generationSortKey(generation) + (occurrence == 1 ? "" :
+            String.format(java.util.Locale.ROOT, "#OCCURRENCE#%020d", occurrence));
     }
 
     public static String generationSortKey(long generation) {

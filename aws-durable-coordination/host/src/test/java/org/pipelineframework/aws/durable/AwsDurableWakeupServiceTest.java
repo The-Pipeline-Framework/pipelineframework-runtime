@@ -34,7 +34,7 @@ class AwsDurableWakeupServiceTest {
         AwsDurableCallbackBindingRepository bindings = mock(AwsDurableCallbackBindingRepository.class);
         AwsDurableCallbackClient callbacks = mock(AwsDurableCallbackClient.class);
         AwsDurableCallbackBinding current = binding(2);
-        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2)).thenReturn(Optional.of(current));
+        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2, 1)).thenReturn(Optional.of(current));
         when(bindings.findLatest(IDENTITY.tenantId(), IDENTITY.interactionId()))
             .thenReturn(Optional.of(binding(3)));
         AwsDurableWakeupService service = service(bindings, callbacks, "COMPLETED", current);
@@ -49,7 +49,7 @@ class AwsDurableWakeupServiceTest {
         AwsDurableCallbackBindingRepository bindings = mock(AwsDurableCallbackBindingRepository.class);
         AwsDurableCallbackClient callbacks = mock(AwsDurableCallbackClient.class);
         AwsDurableCallbackBinding current = binding(2);
-        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2)).thenReturn(Optional.of(current));
+        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2, 1)).thenReturn(Optional.of(current));
         when(bindings.findLatest(IDENTITY.tenantId(), IDENTITY.interactionId()))
             .thenReturn(Optional.of(current));
         when(bindings.delivered(current)).thenReturn(false);
@@ -69,9 +69,9 @@ class AwsDurableWakeupServiceTest {
         var replacements = mock(AwsDurableReplacementStarter.class);
         var current = binding(2);
         when(bindings.isSuperseded("tenant-a", "execution-a", 2)).thenReturn(true);
-        when(bindings.find("tenant-a", "interaction-a", 2))
+        when(bindings.find("tenant-a", "interaction-a", 2, 1))
             .thenReturn(bindingMissing ? Optional.empty() : Optional.of(current));
-        when(bindings.findRegistration("tenant-a", "execution-a", 2)).thenReturn(Optional.of(
+        when(bindings.findRegistration("tenant-a", "execution-a", 2, 1)).thenReturn(Optional.of(
             new org.pipelineframework.aws.durable.model.AwsDurableCallbackRegistration(
                 new org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint(
                     new org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint(
@@ -100,7 +100,7 @@ class AwsDurableWakeupServiceTest {
                 tenantId, "execution-a", interactionId, "correlation-a", "unit-a", "await-a", status,
                 "pipeline-a", "contract-a", "release-a"));
         when(bindings.isCurrentGeneration(IDENTITY.tenantId(), IDENTITY.executionId(), 2)).thenReturn(true);
-        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2))
+        when(bindings.find(IDENTITY.tenantId(), IDENTITY.interactionId(), 2, 1))
             .thenReturn(Optional.of(current));
         return new AwsDurableWakeupService(reader, bindings, callbacks, ignored -> true);
     }

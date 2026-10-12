@@ -59,6 +59,58 @@ class AwsDurableGenerationFencingIT {
     }
 
     @Test
+    void repeatedCallbacksPinSeparateInteractionsAndRejectCrossBinding() {
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, TABLE);
+        String execution = UUID.randomUUID().toString();
+        var checkpoint = registration(execution, 1).checkpoint();
+        var first = new AwsDurableAwaitIdentity("tenant", execution, "first-" + execution, "correlation-first", 1, 1);
+        var second = new AwsDurableAwaitIdentity("tenant", execution, "second-" + execution, "correlation-second", 1, 2);
+        var r1 = new AwsDurableCallbackRegistration(checkpoint, "provider", "arn:" + execution, "callback-1", 100, 1000,
+            java.util.Optional.of(first));
+        var r2 = new AwsDurableCallbackRegistration(checkpoint, "provider", "arn:" + execution, "callback-2", 100, 1000,
+            java.util.Optional.of(second));
+        assertThat(repository.register(r1)).isTrue();
+        assertThat(repository.register(r2)).isTrue();
+        assertThat(repository.register(new AwsDurableCallbackRegistration(checkpoint, "provider", "arn:" + execution,
+            "callback-2", 200, 2000, java.util.Optional.of(second)))).isFalse();
+        assertThat(repository.findLatestRegistration("tenant", execution)).contains(r2);
+        assertThat(repository.bind(r1.bind(first))).isTrue();
+        assertThat(repository.bind(r2.bind(second))).isTrue();
+        assertThat(repository.find("tenant", second.interactionId(), 1, 2)).contains(r2.bind(second));
+        assertThatThrownBy(() -> r2.bind(first)).isInstanceOf(IllegalArgumentException.class);
+        var forged = new org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding(
+            new AwsDurableAwaitIdentity("tenant", execution, "forged", "forged", 1, 2), "provider", "arn:" + execution,
+            "callback-2", org.pipelineframework.aws.durable.model.AwsDurableBindingStatus.OPEN, 100, 1000);
+        assertThatThrownBy(() -> repository.bind(forged)).isInstanceOf(TransactionCanceledException.class);
+        repository.recordDelivered(r1.bind(first), "accepted");
+        assertThat(repository.delivered(r2.bind(second))).isFalse();
+        repository.claimGeneration(new AwsDurableDriverCheckpoint(checkpoint.execution(), 2));
+        assertThatThrownBy(() -> repository.register(r2)).isInstanceOf(AwsDurableStaleGenerationException.class);
+        assertThatThrownBy(() -> repository.bind(r2.bind(second))).isInstanceOf(AwsDurableStaleGenerationException.class);
+    }
+
+    @Test
+    void deliveryOfAnEarlierOccurrenceDoesNotRetireASecondWaitOnTheSameInteraction() {
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, TABLE);
+        String execution = UUID.randomUUID().toString();
+        var checkpoint = registration(execution, 1).checkpoint();
+        var first = new AwsDurableAwaitIdentity("tenant", execution, "same-" + execution, "correlation", 1, 1);
+        var second = new AwsDurableAwaitIdentity("tenant", execution, first.interactionId(), first.correlationId(), 1, 2);
+        var r1 = new AwsDurableCallbackRegistration(checkpoint, "provider", "arn:" + execution, "first", 100, 1000,
+            java.util.Optional.of(first));
+        var r2 = new AwsDurableCallbackRegistration(checkpoint, "provider", "arn:" + execution, "second", 100, 1000,
+            java.util.Optional.of(second));
+        repository.register(r1);
+        repository.register(r2);
+        repository.bind(r1.bind(first));
+        repository.bind(r2.bind(second));
+        repository.recordDelivered(r1.bind(first), "accepted");
+        assertThat(repository.delivered(r1.bind(first))).isTrue();
+        assertThat(repository.delivered(r2.bind(second))).isFalse();
+        assertThat(repository.findLatest("tenant", first.interactionId())).contains(r2.bind(second));
+    }
+
+    @Test
     void replayAndConflictAreClassifiedFromStoredAuthority() {
         var repository = new AwsDurableCallbackBindingRepository(dynamo, TABLE);
         String execution = UUID.randomUUID().toString();

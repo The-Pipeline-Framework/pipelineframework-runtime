@@ -37,6 +37,18 @@ class AwsDurableDeploymentContractTest {
     }
 
     @Test
+    void occurrenceWritersRequireExplicitProtocolUpgradeValidation() throws Exception {
+        JsonNode template = template();
+        JsonNode parameter = template.path("Parameters").path("CallbackOccurrenceMigrationValidation");
+        assertFalse(parameter.has("Default"));
+        assertEquals("validated", parameter.path("AllowedValues").get(0).asText());
+        JsonNode comparison = template.path("Rules").path("CallbackOccurrenceMigrationValidated")
+            .path("Assertions").get(0).path("Assert");
+        assertEquals("CallbackOccurrenceMigrationValidation", comparison.get(0).asText());
+        assertEquals("validated", comparison.get(1).asText());
+    }
+
+    @Test
     void stackReplacementCannotDeleteParkedCodeOrMechanicalRecoveryEvidence() throws Exception {
         JsonNode resources = resources();
         for (String name : new String[]{"DurableFunction", "DurableVersion", "CallbackBindingTable"}) {

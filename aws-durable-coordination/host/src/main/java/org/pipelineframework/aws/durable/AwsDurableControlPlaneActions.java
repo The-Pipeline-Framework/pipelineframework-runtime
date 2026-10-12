@@ -48,9 +48,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         Objects.requireNonNull(request, "request");
         return switch (request.operation()) {
             case SUBMIT -> submit(request);
-            case STATUS -> AwsDurableActionResponse.status(controlPlane
-                .getExecutionStatus(request.tenantId(), required(request.executionId(), "executionId"))
-                .await().atMost(actionTimeout).status().name());
+            case STATUS -> status(request);
             case RESULT -> AwsDurableActionResponse.result(json(controlPlane
                 .getExecutionResultPayload(request.tenantId(), required(request.executionId(), "executionId"))
                 .await().atMost(actionTimeout)));
@@ -88,15 +86,28 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
 
     private AwsDurableActionResponse pendingAwait(AwsDurableActionRequest request) {
         String executionId = required(request.executionId(), "executionId");
-        return controlPlane
-            .getAwaitSemanticCheckpoints(request.tenantId(), executionId, 100)
-            .await().atMost(actionTimeout).stream()
-            .filter(checkpoint -> !checkpoint.status().terminal())
-            .findFirst()
+        return controlPlane.getCurrentAwaitSemanticCheckpoint(request.tenantId(), executionId)
+            .await().atMost(actionTimeout)
             .map(checkpoint -> AwsDurableActionResponse.pendingAwait(new AwsDurableAwaitIdentity(
                 checkpoint.tenantId(), checkpoint.executionId(), checkpoint.interactionId(), checkpoint.correlationId(),
                 request.generation())))
             .orElseGet(AwsDurableControlPlaneActions::emptyResponse);
+    }
+
+    private AwsDurableActionResponse status(AwsDurableActionRequest request) {
+        String executionId = required(request.executionId(), "executionId");
+        String status = controlPlane.getExecutionStatus(request.tenantId(), executionId)
+            .await().atMost(actionTimeout).status().name();
+        return AwsDurableActionResponse.observation(status, "WAITING_EXTERNAL".equals(status)
+            ? controlPlane.getCurrentAwaitSemanticCheckpoint(request.tenantId(), executionId)
+                .await().atMost(actionTimeout).map(this::providerCheckpoint)
+            : java.util.Optional.empty());
+    }
+
+    private AwsDurableAwaitCheckpoint providerCheckpoint(AwaitSemanticCheckpoint checkpoint) {
+        return new AwsDurableAwaitCheckpoint(checkpoint.tenantId(), checkpoint.executionId(), checkpoint.interactionId(),
+            checkpoint.correlationId(), checkpoint.unitId(), checkpoint.stepId(), checkpoint.status().name(),
+            checkpoint.pipelineId(), checkpoint.contractVersion(), checkpoint.releaseVersion());
     }
 
     private AwsDurableActionResponse sweep() {
@@ -131,6 +142,21 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
 
     private AwsDurableActionResponse register(AwsDurableActionRequest request) {
         AwsDurableDriverCheckpoint checkpoint = driverCheckpoint(request);
+        var identity = request.awaitIdentity()
+            .orElseThrow(() -> new IllegalArgumentException("callback registration requires a pinned Await identity"));
+        var semantic = controlPlane.getAwaitSemanticCheckpoint(identity.tenantId(), identity.interactionId())
+            .await().atMost(actionTimeout).orElseThrow(() -> new IllegalStateException("pinned Await is unavailable"));
+        if (!checkpoint.tenantId().equals(identity.tenantId())
+            || !checkpoint.executionId().equals(identity.executionId()) || checkpoint.generation() != identity.generation()
+            || !identity.tenantId().equals(semantic.tenantId())
+            || !identity.interactionId().equals(semantic.interactionId())
+            || !identity.executionId().equals(semantic.executionId())
+            || !identity.correlationId().equals(semantic.correlationId())
+            || !checkpoint.pipelineId().equals(semantic.pipelineId())
+            || !checkpoint.contractVersion().equals(semantic.contractVersion())
+            || !checkpoint.releaseVersion().equals(semantic.releaseVersion())) {
+            throw new IllegalArgumentException("callback registration does not match the semantic Await checkpoint");
+        }
         long now = System.currentTimeMillis();
         boolean created = bindings.register(new AwsDurableCallbackRegistration(
             checkpoint,
@@ -138,7 +164,8 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             required(request.providerExecutionArn(), "providerExecutionArn"),
             required(request.providerCallbackId(), "providerCallbackId"),
             now,
-            Instant.ofEpochMilli(now).plus(callbackRetention.toSeconds(), ChronoUnit.SECONDS).getEpochSecond()));
+            Instant.ofEpochMilli(now).plus(callbackRetention.toSeconds(), ChronoUnit.SECONDS).getEpochSecond(),
+            request.awaitIdentity()));
         return AwsDurableActionResponse.bound(created);
     }
 
@@ -146,7 +173,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         AwsDurableAwaitIdentity identity = request.awaitIdentity()
             .orElseThrow(() -> new IllegalArgumentException("awaitIdentity is required"));
         AwsDurableCallbackRegistration registration = bindings.findRegistration(
-                identity.tenantId(), identity.executionId(), identity.generation())
+                identity.tenantId(), identity.executionId(), identity.generation(), identity.occurrence())
             .orElseThrow(() -> new IllegalStateException("callback registration is not available"));
         return AwsDurableActionResponse.bound(bindings.bind(registration.bind(identity)));
     }

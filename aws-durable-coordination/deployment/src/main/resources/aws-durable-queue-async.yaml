@@ -17,6 +17,15 @@ Parameters:
       Set validated only after confirming a fresh table has no retained executions,
       or completing and validating the retained table's generation-claim migration
       with unfenced writers quiesced. This is an operator attestation, not an automatic data check.
+  CallbackOccurrenceMigrationValidation:
+    Type: String
+    AllowedValues: [validated]
+    ConstraintDescription: Must be validated before enabling occurrence-aware callback writers
+    Description: >-
+      Set validated only for a fresh table, or after legacy callback executions have
+      drained and their writers are quiesced or isolated on their original table.
+      Retained coordinator, action, wake-up and repair versions must remain protocol-compatible.
+      This attestation does not migrate callback rows or inspect retained executions.
   AwaitInteractionStreamArn: {Type: String}
   SemanticDynamoResourceArns:
     Type: CommaDelimitedList
@@ -38,6 +47,11 @@ Rules:
     Assertions:
       - Assert: !Equals [!Ref CallbackGenerationMigrationValidation, validated]
         AssertDescription: Callback writers require a validated generation-claim migration or a fresh table
+
+  CallbackOccurrenceMigrationValidated:
+    Assertions:
+      - Assert: !Equals [!Ref CallbackOccurrenceMigrationValidation, validated]
+        AssertDescription: Callback writers require validated occurrence protocol isolation or a fresh table
 
 Globals:
   Function:

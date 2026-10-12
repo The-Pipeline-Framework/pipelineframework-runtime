@@ -31,11 +31,13 @@ class AwsDurableTerminalReconcilerTest {
             .thenReturn(Optional.of(registration));
         when(actions.invoke(AwsDurableActionRequest.status(registration.checkpoint())))
             .thenReturn(AwsDurableActionResponse.status("WAITING_EXTERNAL"));
-        when(actions.invoke(AwsDurableActionRequest.executionAwaits(registration.checkpoint())))
-            .thenReturn(AwsDurableActionResponse.awaitCheckpoints(java.util.List.of(
+        when(actions.invoke(AwsDurableActionRequest.pendingAwait(registration.checkpoint())))
+            .thenReturn(AwsDurableActionResponse.pendingAwait(registration.awaitIdentity().orElseThrow()));
+        when(actions.invoke(AwsDurableActionRequest.awaitCheckpoint(registration.awaitIdentity().orElseThrow())))
+            .thenReturn(AwsDurableActionResponse.awaitCheckpoint(
                 new AwsDurableAwaitCheckpoint(
                     "tenant-a", "execution-a", "interaction-a", "correlation-a", "unit-a", "await-a",
-                    "COMPLETED", "pipeline-a", "contract-a", "release-a"))));
+                    "COMPLETED", "pipeline-a", "contract-a", "release-a")));
         if (superseded) {
             org.mockito.Mockito.doThrow(new AwsDurableStaleGenerationException())
                 .when(bindings).bind(org.mockito.ArgumentMatchers.any());
@@ -49,6 +51,32 @@ class AwsDurableTerminalReconcilerTest {
 
         verify(bindings, org.mockito.Mockito.times(2)).bind(org.mockito.ArgumentMatchers.any());
         verify(replacements, org.mockito.Mockito.times(2)).startReplacement(org.mockito.ArgumentMatchers.any());
+    }
+
+    @Test
+    void providerLossBeforeSecondRegistrationRecoversCurrentAwaitWithoutRebindingOldCallback() {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var replacements = mock(AwsDurableReplacementStarter.class);
+        var registration = registration();
+        when(bindings.findRegistrationByProviderExecutionArn("arn:closed")).thenReturn(Optional.of(registration));
+        var current = new org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity(
+            "tenant-a", "execution-a", "interaction-2", "correlation-2", 1);
+        AwsDurableActionInvoker actions = request -> switch (request.operation()) {
+            case STATUS -> AwsDurableActionResponse.status("WAITING_EXTERNAL");
+            case QUERY_PENDING_AWAIT -> AwsDurableActionResponse.pendingAwait(current);
+            case READ_AWAIT_CHECKPOINT -> AwsDurableActionResponse.awaitCheckpoint(new AwsDurableAwaitCheckpoint(
+                "tenant-a", "execution-a", "interaction-2", "correlation-2", "unit-2", "step-2", "WAITING",
+                "pipeline-a", "contract-a", "release-a"));
+            default -> throw new AssertionError("repair must not list historical Await records");
+        };
+        when(replacements.startReplacement(org.mockito.ArgumentMatchers.any())).thenReturn(true);
+        assertThat(new AwsDurableTerminalReconciler(bindings, actions, replacements,
+            arn -> AwsDurableProviderExecutionState.MISSING).reconcile("arn:closed")).isTrue();
+        verify(bindings, org.mockito.Mockito.never()).bind(org.mockito.ArgumentMatchers.any());
+        var captured = org.mockito.ArgumentCaptor.forClass(org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding.class);
+        verify(replacements).startReplacement(captured.capture());
+        assertThat(captured.getValue().awaitIdentity().interactionId()).isEqualTo("interaction-2");
+        assertThat(captured.getValue().awaitIdentity().occurrence()).isEqualTo(2);
     }
 
     @Test
@@ -103,7 +131,7 @@ class AwsDurableTerminalReconcilerTest {
         when(bindings.findRegistrationByProviderExecutionArn("arn:closed")).thenReturn(Optional.of(registration()));
         when(actions.invoke(AwsDurableActionRequest.status(registration().checkpoint())))
             .thenReturn(AwsDurableActionResponse.status("WAITING_EXTERNAL"));
-        when(actions.invoke(AwsDurableActionRequest.executionAwaits(registration().checkpoint())))
+        when(actions.invoke(AwsDurableActionRequest.pendingAwait(registration().checkpoint())))
             .thenReturn(AwsDurableActionResponse.awaitCheckpoints(java.util.List.of()));
 
         assertThatThrownBy(() -> new AwsDurableTerminalReconciler(
@@ -117,6 +145,7 @@ class AwsDurableTerminalReconcilerTest {
         return new AwsDurableCallbackRegistration(
             new AwsDurableDriverCheckpoint(new AwsDurableExecutionCheckpoint(
                 "tenant-a", "execution-a", "pipeline-a", "contract-a", "release-a"), 1),
-            "provider-a", "arn:closed", "callback-a", 100, 1_000);
+            "provider-a", "arn:closed", "callback-a", 100, 1_000, Optional.of(new org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity(
+                "tenant-a", "execution-a", "interaction-a", "correlation-a", 1)));
     }
 }

@@ -154,6 +154,16 @@ public record AwsDurableActionRequest(
             base.expectedVersion(), base.reason(), base.generation());
     }
 
+    public static AwsDurableActionRequest register(
+        AwsDurableDriverCheckpoint checkpoint, AwsDurableAwaitIdentity identity,
+        String providerExecutionName, String providerExecutionArn, String providerCallbackId) {
+        AwsDurableActionRequest base = register(checkpoint, providerExecutionName, providerExecutionArn, providerCallbackId);
+        return new AwsDurableActionRequest(base.operation(), base.tenantId(), base.executionId(), base.idempotencyKey(),
+            base.pipelineId(), base.contractVersion(), base.releaseVersion(), base.inputJson(), Optional.of(identity),
+            base.providerExecutionName(), base.providerExecutionArn(), base.providerCallbackId(),
+            base.expectedVersion(), base.reason(), base.generation());
+    }
+
     private static AwsDurableActionRequest forExecution(AwsDurableOperation operation, AwsDurableDriverCheckpoint checkpoint) {
         return new AwsDurableActionRequest(
             operation,

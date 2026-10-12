@@ -105,6 +105,14 @@ public interface PipelineControlPlane {
         String tenantId,
         String interactionId);
 
+    /**
+     * Observes the primary interaction of the Await unit currently parking an execution.
+     * Completion status is preserved: a completed interaction may still have pending consequences.
+     * This bounded semantic observation contains no hosting or callback identity.
+     */
+    Uni<Optional<AwaitSemanticCheckpoint>> getCurrentAwaitSemanticCheckpoint(
+        String tenantId, String executionId);
+
     /** Reads bounded provider-neutral Await checkpoints for one TPF execution. */
     Uni<List<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoints(
         String tenantId,

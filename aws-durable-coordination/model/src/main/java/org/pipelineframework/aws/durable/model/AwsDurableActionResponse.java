@@ -35,6 +35,11 @@ public record AwsDurableActionResponse(
             Optional.empty(), Optional.empty(), Optional.empty(), List.of(), false);
     }
 
+    public static AwsDurableActionResponse observation(String status, Optional<AwsDurableAwaitCheckpoint> checkpoint) {
+        return new AwsDurableActionResponse(Optional.empty(), false, Optional.of(status), Optional.empty(),
+            Optional.empty(), checkpoint, List.of(), false);
+    }
+
     public static AwsDurableActionResponse result(String resultJson) {
         return new AwsDurableActionResponse(
             Optional.empty(), false, Optional.empty(),

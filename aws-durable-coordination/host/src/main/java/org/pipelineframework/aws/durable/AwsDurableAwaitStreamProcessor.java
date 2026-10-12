@@ -73,9 +73,13 @@ public final class AwsDurableAwaitStreamProcessor {
             return AwsDurableWakeupDisposition.RETRY;
         }
         AwsDurableCallbackRegistration current = registration.orElseThrow();
+        if (current.awaitIdentity().filter(pinned -> !pinned.interactionId().equals(semantic.interactionId())
+            || !pinned.correlationId().equals(semantic.correlationId())).isPresent()) {
+            return AwsDurableWakeupDisposition.ACKNOWLEDGE; // Its pinned registration event repairs the other interaction.
+        }
         AwsDurableAwaitIdentity identity = new AwsDurableAwaitIdentity(
             semantic.tenantId(), semantic.executionId(), semantic.interactionId(),
-            semantic.correlationId(), current.checkpoint().generation());
+            semantic.correlationId(), current.checkpoint().generation(), current.occurrence());
         try {
             bindings.bind(current.bind(identity));
         } catch (AwsDurableStaleGenerationException stale) {
@@ -100,15 +104,17 @@ public final class AwsDurableAwaitStreamProcessor {
             return AwsDurableWakeupDisposition.ACKNOWLEDGE;
         }
         AwsDurableCallbackRegistration registration = decoded.orElseThrow();
-        var response = actions.invoke(AwsDurableActionRequest.executionAwaits(registration.checkpoint()));
-        Optional<AwsDurableAwaitCheckpoint> latest = response.awaitCheckpoints().stream().findFirst();
+        AwsDurableAwaitIdentity pinned = registration.awaitIdentity()
+            .orElseThrow(() -> new IllegalStateException("legacy registration requires a validated protocol upgrade"));
+        Optional<AwsDurableAwaitCheckpoint> latest = actions.invoke(AwsDurableActionRequest.awaitCheckpoint(pinned))
+            .awaitCheckpoint();
         if (latest.isEmpty()) {
             return AwsDurableWakeupDisposition.RETRY;
         }
         AwsDurableAwaitCheckpoint semantic = latest.orElseThrow();
         AwsDurableAwaitIdentity identity = new AwsDurableAwaitIdentity(
             semantic.tenantId(), semantic.executionId(), semantic.interactionId(), semantic.correlationId(),
-            registration.checkpoint().generation());
+            registration.checkpoint().generation(), registration.occurrence());
         try {
             bindings.bind(registration.bind(identity));
         } catch (AwsDurableStaleGenerationException stale) {
@@ -133,7 +139,10 @@ public final class AwsDurableAwaitStreamProcessor {
                 required(image, "provider_execution_arn"),
                 required(image, "provider_callback_id"),
                 Long.parseLong(requiredNumber(image, "created_at_epoch_ms")),
-                Long.parseLong(requiredNumber(image, "expires_at_epoch_s"))));
+                Long.parseLong(requiredNumber(image, "expires_at_epoch_s")),
+                text(image, "interaction_id").map(interaction -> new AwsDurableAwaitIdentity(checkpoint.tenantId(),
+                    checkpoint.executionId(), interaction, required(image, "correlation_id"), checkpoint.generation(),
+                    Long.parseLong(requiredNumber(image, "occurrence"))))));
         } catch (IllegalArgumentException malformed) {
             return Optional.empty();
         }

@@ -222,6 +222,43 @@ class QueueAsyncCoordinatorTest {
     }
 
     @Test
+    void currentAwaitReadFollowsParkedUnitWithoutListingHistoricalInteractionsOrDroppingCompletedOnes() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        @SuppressWarnings("unchecked")
+        ExecutionRecord<Object, Object> waiting = mock(ExecutionRecord.class);
+        when(waiting.status()).thenReturn(ExecutionStatus.WAITING_EXTERNAL);
+        when(waiting.awaitUnitId()).thenReturn("unit-1");
+        when(waiting.executionId()).thenReturn("exec-1");
+        when(executionStateStore.getExecution("tenant-1", "exec-1"))
+            .thenReturn(Uni.createFrom().item(Optional.of(waiting)),
+                Uni.createFrom().item(Optional.of(createRecord("tenant-1", "exec-1", "key-1"))));
+        AwaitUnitRecord unit = mock(AwaitUnitRecord.class);
+        when(unit.tenantId()).thenReturn("tenant-1");
+        when(unit.executionId()).thenReturn("exec-1");
+        when(unit.unitId()).thenReturn("unit-1");
+        when(unit.primaryInteractionId()).thenReturn("interaction-1");
+        when(awaitCoordinator.getUnit("tenant-1", "unit-1")).thenReturn(Uni.createFrom().item(unit));
+        when(awaitCoordinator.getInteraction("tenant-1", "interaction-1"))
+            .thenReturn(Uni.createFrom().item(Optional.of(awaitRecord())));
+
+        var observed = coordinator.getCurrentAwaitSemanticCheckpoint("tenant-1", "exec-1").await().indefinitely().orElseThrow();
+
+        assertEquals("interaction-1", observed.interactionId());
+        assertEquals(AwaitInteractionStatus.COMPLETED, observed.status());
+        verify(awaitCoordinator, never()).findByExecution(any(), any(), org.mockito.ArgumentMatchers.anyInt());
+        verify(awaitCoordinator, never()).findByUnit(any(), any());
+    }
+
+    @Test
+    void currentAwaitReadReturnsEmptyAfterExecutionLeavesWaiting() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        when(executionStateStore.getExecution("tenant-1", "exec-1"))
+            .thenReturn(Uni.createFrom().item(Optional.of(createRecord("tenant-1", "exec-1", "key-1"))));
+        assertTrue(coordinator.getCurrentAwaitSemanticCheckpoint("tenant-1", "exec-1").await().indefinitely().isEmpty());
+        verifyNoInteractions(awaitCoordinator);
+    }
+
+    @Test
     void semanticCheckpointReadsApplyTenantAdmissionBeforeStorageAccess() {
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         ControlPlaneAdmissionPolicy policy = mock(ControlPlaneAdmissionPolicy.class);
@@ -239,7 +276,9 @@ class QueueAsyncCoordinatorTest {
 
         ArgumentCaptor<ControlPlaneAdmissionRequest> requests =
             ArgumentCaptor.forClass(ControlPlaneAdmissionRequest.class);
-        verify(policy, times(2)).admit(requests.capture());
+        assertThrows(ControlPlaneAdmissionException.class, () -> coordinator
+            .getCurrentAwaitSemanticCheckpoint("tenant-denied", "exec-1").await().indefinitely());
+        verify(policy, times(3)).admit(requests.capture());
         assertTrue(requests.getAllValues().stream().allMatch(request ->
             request.operation() == ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT));
         verifyNoInteractions(awaitCoordinator);
