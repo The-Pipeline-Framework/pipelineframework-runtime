@@ -202,6 +202,12 @@ class QueueAsyncCoordinator {
         releaseVersion);
   }
 
+  Uni<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint> getExecutionSemanticCheckpoint(
+      String tenantId, String executionId) {
+    if (!ensureQueueModeReady()) return Uni.createFrom().failure(queueModeDisabledException());
+    return executionReadModel().getExecutionSemanticCheckpoint(tenantId, executionId);
+  }
+
   Uni<ExecutionStatusDto> getExecutionStatus(String tenantId, String executionId) {
     if (!ensureQueueModeReady()) {
       return Uni.createFrom().failure(queueModeDisabledException());

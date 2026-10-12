@@ -63,9 +63,28 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             case QUERY_PENDING_AWAIT -> pendingAwait(request);
             case READ_AWAIT_CHECKPOINT -> awaitCheckpoint(request);
             case READ_EXECUTION_AWAITS -> executionAwaits(request);
+            case REGISTER_EXECUTION -> registerExecution(request);
             case REGISTER_CALLBACK -> register(request);
             case BIND_CALLBACK -> bind(request);
         };
+    }
+
+    private AwsDurableActionResponse registerExecution(AwsDurableActionRequest request) {
+        var semantic = controlPlane.getExecutionSemanticCheckpoint(request.tenantId(), required(request.executionId(), "executionId"))
+            .await().atMost(actionTimeout);
+        if (!request.tenantId().equals(semantic.tenantId())
+            || !required(request.executionId(), "executionId").equals(semantic.executionId())
+            || !required(request.pipelineId(), "pipelineId").equals(semantic.pipelineId())
+            || !required(request.contractVersion(), "contractVersion").equals(semantic.contractVersion())
+            || !required(request.releaseVersion(), "releaseVersion").equals(semantic.releaseVersion())) {
+            throw new IllegalStateException("recovery locator does not match semantic execution");
+        }
+        return AwsDurableActionResponse.bound(bindings.registerRecovery(
+            new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(
+                new org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint(
+                    new AwsDurableExecutionCheckpoint(semantic.tenantId(), semantic.executionId(), semantic.pipelineId(),
+                        semantic.contractVersion(), semantic.releaseVersion()), request.generation()),
+                required(request.providerExecutionName(), "providerExecutionName"), required(request.providerExecutionArn(), "providerExecutionArn"))));
     }
 
     private AwsDurableActionResponse submit(AwsDurableActionRequest request) {

@@ -85,6 +85,12 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     }
 
     @Override
+    public Uni<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint> getExecutionSemanticCheckpoint(
+        String tenantId, String executionId) {
+        return queueAsyncCoordinator.getExecutionSemanticCheckpoint(tenantId, executionId);
+    }
+
+    @Override
     public Uni<ExecutionStatusDto> getExecutionStatus(String tenantId, String executionId) {
         return queueAsyncCoordinator.getExecutionStatus(tenantId, executionId);
     }

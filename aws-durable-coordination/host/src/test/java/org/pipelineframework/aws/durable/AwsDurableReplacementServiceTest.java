@@ -19,6 +19,7 @@ class AwsDurableReplacementServiceTest {
     @Test
     void startsNextGenerationFromSemanticCheckpoint() {
         AwsDurableExecutionStarter starter = mock(AwsDurableExecutionStarter.class);
+        when(starter.pinnedToExecution(org.mockito.ArgumentMatchers.anyString())).thenReturn(starter);
         AwsDurableCallbackBinding binding = binding();
         AwsDurableAwaitCheckpointReader checkpoints = (tenant, interaction) -> Optional.of(
             new AwsDurableAwaitCheckpoint(
@@ -36,6 +37,7 @@ class AwsDurableReplacementServiceTest {
     @Test
     void missingSemanticCheckpointDoesNotStartReplacement() {
         AwsDurableExecutionStarter starter = mock(AwsDurableExecutionStarter.class);
+        when(starter.pinnedToExecution(org.mockito.ArgumentMatchers.anyString())).thenReturn(starter);
 
         assertThat(new AwsDurableReplacementService((tenant, interaction) -> Optional.empty(), starter, mock(AwsDurableCallbackBindingRepository.class))
             .startReplacement(binding())).isFalse();
@@ -45,6 +47,7 @@ class AwsDurableReplacementServiceTest {
     void retriesProviderStartAfterTheGenerationClaimSurvivesALostAcknowledgement() {
         var repository = mock(AwsDurableCallbackBindingRepository.class);
         var starter = mock(AwsDurableExecutionStarter.class);
+        when(starter.pinnedToExecution(org.mockito.ArgumentMatchers.anyString())).thenReturn(starter);
         AwsDurableAwaitCheckpointReader checkpoints = (tenant, interaction) -> Optional.of(
             new AwsDurableAwaitCheckpoint(tenant, "execution-a", interaction, "correlation-a", "unit-a", "await-a",
                 "COMPLETED", "pipeline-a", "contract-a", "release-a"));
@@ -71,6 +74,7 @@ class AwsDurableReplacementServiceTest {
     void laterGenerationDoesNotStartAnObsoleteReplacement() {
         var repository = mock(AwsDurableCallbackBindingRepository.class);
         var starter = mock(AwsDurableExecutionStarter.class);
+        when(starter.pinnedToExecution(org.mockito.ArgumentMatchers.anyString())).thenReturn(starter);
         when(repository.claimGeneration(org.mockito.ArgumentMatchers.any())).thenReturn(AwsDurableGenerationAdmission.STALE);
         AwsDurableAwaitCheckpointReader checkpoints = (tenant, interaction) -> Optional.of(
             new AwsDurableAwaitCheckpoint(tenant, "execution-a", interaction, "correlation-a", "unit-a", "await-a",

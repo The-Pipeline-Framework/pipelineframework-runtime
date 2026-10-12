@@ -63,7 +63,7 @@ final class ProofControlPlaneActionAdapter {
         Objects.requireNonNull(request, "request");
         return switch (request.operation()) {
             case SUBMIT -> submit(request);
-            case STATUS, RESULT, REDRIVE, SWEEP, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT,
+            case STATUS, RESULT, REDRIVE, SWEEP, REGISTER_EXECUTION, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT,
                 READ_EXECUTION_AWAITS -> actions.invoke(request);
             case REGISTER_CALLBACK, BIND_CALLBACK -> throw new IllegalArgumentException(
                 request.operation() + " is an AWS Durable host operation");

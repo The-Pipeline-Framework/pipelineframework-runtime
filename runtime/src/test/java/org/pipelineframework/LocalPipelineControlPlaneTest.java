@@ -56,6 +56,16 @@ class LocalPipelineControlPlaneTest {
   }
 
   @Test
+  void semanticExecutionObservationDelegatesToTheExistingOwner() {
+    var checkpoint = new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint("tenant", "execution",
+        "pipeline", "contract", "release", ExecutionStatus.WAIT_RETRY);
+    when(queueAsyncCoordinator.getExecutionSemanticCheckpoint("tenant", "execution"))
+        .thenReturn(Uni.createFrom().item(checkpoint));
+    assertEquals(checkpoint, controlPlane.getExecutionSemanticCheckpoint("tenant", "execution").await().indefinitely());
+    verify(queueAsyncCoordinator).getExecutionSemanticCheckpoint("tenant", "execution");
+  }
+
+  @Test
   void executePipelineAsyncDelegatesToCoordinator() {
     RunAsyncAcceptedDto expected = new RunAsyncAcceptedDto("exec-1", false, "/pipeline/executions/exec-1", 10L);
     when(queueAsyncCoordinator.executePipelineAsync("input", "tenant-1", "idem-1", false))

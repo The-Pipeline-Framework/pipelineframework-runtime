@@ -1,70 +1,61 @@
 package org.pipelineframework.aws.durable;
 
+import java.time.Duration;
 import java.util.Objects;
+import java.util.Optional;
 
-import org.pipelineframework.aws.durable.model.AwsDurableActionRequest;
-import org.pipelineframework.aws.durable.model.AwsDurableAwaitCheckpoint;
-import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
+import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionInput;
+import org.pipelineframework.aws.durable.model.AwsDurableExecutionStatusPoll;
+import org.pipelineframework.orchestrator.PipelineControlPlane;
 
-/** Bounded repair for one terminal provider execution event. */
+/** Targeted reconstruction from semantic execution state, independent of callback rows. */
 public final class AwsDurableTerminalReconciler {
     private final AwsDurableCallbackBindingRepository bindings;
-    private final AwsDurableActionInvoker actions;
-    private final AwsDurableReplacementStarter replacements;
+    private final PipelineControlPlane controlPlane;
+    private final AwsDurableExecutionStarter starter;
     private final AwsDurableProviderExecutionInspector providerExecutions;
+    private final Duration timeout;
 
-    public AwsDurableTerminalReconciler(
-        AwsDurableCallbackBindingRepository bindings,
-        AwsDurableActionInvoker actions,
-        AwsDurableReplacementStarter replacements,
-        AwsDurableProviderExecutionInspector providerExecutions
-    ) {
+    public AwsDurableTerminalReconciler(AwsDurableCallbackBindingRepository bindings,
+        PipelineControlPlane controlPlane, AwsDurableExecutionStarter starter,
+        AwsDurableProviderExecutionInspector providerExecutions, Duration timeout) {
         this.bindings = Objects.requireNonNull(bindings, "bindings");
-        this.actions = Objects.requireNonNull(actions, "actions");
-        this.replacements = Objects.requireNonNull(replacements, "replacements");
+        this.controlPlane = Objects.requireNonNull(controlPlane, "controlPlane");
+        this.starter = Objects.requireNonNull(starter, "starter");
         this.providerExecutions = Objects.requireNonNull(providerExecutions, "providerExecutions");
+        this.timeout = Objects.requireNonNull(timeout, "timeout");
+        if (timeout.isNegative() || timeout.isZero()) throw new IllegalArgumentException("timeout must be positive");
     }
 
     public boolean reconcile(String providerExecutionArn) {
-        AwsDurableProviderExecutionState providerState = providerExecutions.inspect(providerExecutionArn);
-        if (providerState == AwsDurableProviderExecutionState.ACTIVE
-            || providerState == AwsDurableProviderExecutionState.SUCCEEDED) {
+        var providerState = providerExecutions.inspect(providerExecutionArn);
+        if (providerState == AwsDurableProviderExecutionState.ACTIVE || providerState == AwsDurableProviderExecutionState.SUCCEEDED) {
             return false;
         }
-        var registration = bindings.findRegistrationByProviderExecutionArn(providerExecutionArn)
-            .orElseThrow(() -> new IllegalStateException(
-                "provider registration is not visible; retry targeted reconciliation"));
-        String semanticStatus = actions.invoke(AwsDurableActionRequest.status(registration.checkpoint()))
-            .executionStatus().orElseThrow(() -> new IllegalStateException("TPF execution status is unavailable"));
-        if (!"WAITING_EXTERNAL".equals(semanticStatus)) {
+        var locator = bindings.findRecoveryByProviderExecutionArn(providerExecutionArn)
+            .orElseThrow(() -> new IllegalStateException("execution recovery locator is not visible; retry targeted reconciliation"));
+        var original = locator.checkpoint();
+        var semantic = controlPlane.getExecutionSemanticCheckpoint(original.tenantId(), original.executionId()).await().atMost(timeout);
+        if (!original.tenantId().equals(semantic.tenantId()) || !original.executionId().equals(semantic.executionId())
+            || !original.pipelineId().equals(semantic.pipelineId()) || !original.contractVersion().equals(semantic.contractVersion())
+            || !original.releaseVersion().equals(semantic.releaseVersion())) {
+            throw new IllegalStateException("recovery locator does not match semantic execution identity and release");
+        }
+        if (new AwsDurableExecutionStatusPoll(semantic.status().name()).terminal()) return false;
+        // Validate the retained numeric target before fencing the old generation.
+        var pinnedStarter = starter.pinnedToExecution(providerExecutionArn);
+        long generation = Math.addExact(original.generation(), 1);
+        var checkpoint = new AwsDurableExecutionCheckpoint(semantic.tenantId(), semantic.executionId(),
+            semantic.pipelineId(), semantic.contractVersion(), semantic.releaseVersion());
+        if (bindings.claimGeneration(new AwsDurableDriverCheckpoint(checkpoint, generation)) == AwsDurableGenerationAdmission.STALE) {
             return false;
         }
-        registration.awaitIdentity()
-            .orElseThrow(() -> new IllegalStateException("legacy registration requires a validated protocol upgrade"));
-        var current = actions.invoke(AwsDurableActionRequest.pendingAwait(registration.checkpoint()))
-            .awaitIdentity().orElseThrow(() -> new IllegalStateException("current Await checkpoint is unavailable; retry reconciliation"));
-        AwsDurableAwaitCheckpoint checkpoint = actions.invoke(AwsDurableActionRequest.awaitCheckpoint(current)).awaitCheckpoint()
-            .orElseThrow(() -> new IllegalStateException("current Await checkpoint is unavailable; retry reconciliation"));
-        boolean sameInteraction = registration.awaitIdentity().map(identity ->
-            identity.interactionId().equals(checkpoint.interactionId())
-                && identity.correlationId().equals(checkpoint.correlationId())).orElse(true);
-        var identity = new AwsDurableAwaitIdentity(checkpoint.tenantId(), checkpoint.executionId(),
-            checkpoint.interactionId(), checkpoint.correlationId(), registration.checkpoint().generation(),
-            sameInteraction ? registration.occurrence() : Math.addExact(registration.occurrence(), 1));
-        var binding = sameInteraction ? registration.bind(identity)
-            : new org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding(identity,
-                registration.providerExecutionName(), registration.providerExecutionArn(), registration.providerCallbackId(),
-                org.pipelineframework.aws.durable.model.AwsDurableBindingStatus.OPEN,
-                registration.createdAtEpochMs(), registration.expiresAtEpochS());
-        if (sameInteraction) {
-            try {
-                bindings.bind(binding);
-            } catch (AwsDurableStaleGenerationException stale) {
-                // The successor claim fences this binding, but its provider start may still need replay.
-            }
-        }
-        // A later semantic Await is a reconstruction locator, never authority to bind the old callback to it.
-        if (!replacements.startReplacement(binding)) {
+        var input = new AwsDurableExecutionInput(semantic.tenantId(), semantic.executionId(), semantic.pipelineId(),
+            semantic.contractVersion(), semantic.releaseVersion(), "{}", Optional.of(semantic.executionId()), generation);
+        var response = pinnedStarter.start(input);
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
             throw new IllegalStateException("replacement admission is unresolved; retry reconciliation");
         }
         return true;

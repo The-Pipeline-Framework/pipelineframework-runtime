@@ -61,7 +61,7 @@ class AwsDurableHostServicesStreamTest {
             .thenReturn(Uni.createFrom().failure(new IllegalStateException("semantic store unavailable")));
         var processor = new AwsDurableAwaitStreamProcessor(mock(AwsDurableCallbackBindingRepository.class),
             mock(AwsDurableActionInvoker.class), mock(AwsDurableWakeupService.class),
-            "arn:await-stream", "arn:binding-stream", services::observeAwaitStream);
+            "arn:await-stream", "arn:binding-stream", services::observeAwaitStream, ignoredRegistration -> Optional.empty());
         var record = record(Map.of("tenant_id", string("tenant"), "interaction_id", string("interaction")));
         record.setEventSourceARN("arn:await-stream");
         record.setEventName("MODIFY");

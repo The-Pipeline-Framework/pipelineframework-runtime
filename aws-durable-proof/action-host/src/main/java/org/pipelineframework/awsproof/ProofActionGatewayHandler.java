@@ -33,7 +33,7 @@ public final class ProofActionGatewayHandler implements RequestHandler<AwsDurabl
         Objects.requireNonNull(request, "request");
         descriptorRegistry.register(descriptorFactory.create());
         return switch (request.operation()) {
-            case SUBMIT, STATUS, RESULT, REDRIVE, SWEEP, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT,
+            case SUBMIT, STATUS, RESULT, REDRIVE, SWEEP, REGISTER_EXECUTION, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT,
                 READ_EXECUTION_AWAITS ->
                 controlPlaneActions.handle(request);
             case REGISTER_CALLBACK, BIND_CALLBACK -> durableHostActions.handle(request);

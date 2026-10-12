@@ -38,6 +38,9 @@ public interface PipelineControlPlane {
 
     Uni<ExecutionStatusDto> getExecutionStatus(String tenantId, String executionId);
 
+    /** Observes semantic execution identity, release pin and status through one admitted point read. */
+    Uni<ExecutionSemanticCheckpoint> getExecutionSemanticCheckpoint(String tenantId, String executionId);
+
     <T> Uni<T> getExecutionResult(String tenantId, String executionId, Class<?> outputType, boolean outputStreaming);
 
     Uni<Object> getExecutionResultPayload(String tenantId, String executionId);

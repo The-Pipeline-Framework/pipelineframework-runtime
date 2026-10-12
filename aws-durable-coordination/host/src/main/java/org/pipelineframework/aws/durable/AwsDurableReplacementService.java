@@ -49,7 +49,7 @@ public final class AwsDurableReplacementService implements AwsDurableReplacement
         if (bindings.claimGeneration(claim) == AwsDurableGenerationAdmission.STALE) {
             return true; // A later generation already owns recovery; do not start an obsolete replacement.
         }
-        var response = starter.start(input);
+        var response = starter.pinnedToExecution(binding.providerExecutionArn()).start(input);
         return response.statusCode() >= 200 && response.statusCode() < 300;
     }
 }

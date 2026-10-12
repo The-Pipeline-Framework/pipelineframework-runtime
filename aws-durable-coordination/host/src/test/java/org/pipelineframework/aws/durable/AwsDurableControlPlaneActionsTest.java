@@ -22,6 +22,32 @@ import org.pipelineframework.orchestrator.PipelineControlPlane;
 class AwsDurableControlPlaneActionsTest {
 
     @Test
+    void recoveryRegistrationRequiresTheAuthoritativeSemanticRelease() {
+        var controlPlane = mock(PipelineControlPlane.class);
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var locator = new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(
+            driverCheckpoint(), "provider-name", "provider-arn");
+        when(controlPlane.getExecutionSemanticCheckpoint("tenant-1", "execution-1"))
+            .thenReturn(Uni.createFrom().item(new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint(
+                "tenant-1", "execution-1", "pipeline-1", "contract-1", "release-1",
+                org.pipelineframework.orchestrator.ExecutionStatus.RUNNING)));
+        when(bindings.registerRecovery(locator)).thenReturn(true);
+        var actions = new AwsDurableControlPlaneActions(controlPlane, bindings, input -> input,
+            new ObjectMapper(), Duration.ofSeconds(5), Duration.ofDays(1));
+        actions.invoke(AwsDurableActionRequest.registerExecution(driverCheckpoint(), "provider-name", "provider-arn"));
+        verify(bindings).registerRecovery(locator);
+
+        when(controlPlane.getExecutionSemanticCheckpoint("tenant-1", "execution-1"))
+            .thenReturn(Uni.createFrom().item(new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint(
+                "tenant-1", "execution-1", "pipeline-1", "contract-1", "different-release",
+                org.pipelineframework.orchestrator.ExecutionStatus.RUNNING)));
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> actions.invoke(
+            AwsDurableActionRequest.registerExecution(driverCheckpoint(), "provider-name", "provider-arn")))
+            .isInstanceOf(IllegalStateException.class).hasMessageContaining("semantic execution");
+        org.mockito.Mockito.verifyNoMoreInteractions(bindings);
+    }
+
+    @Test
     void currentAwaitUsesSemanticLocatorInsteadOfHistoricalOrdering() {
         PipelineControlPlane controlPlane = mock(PipelineControlPlane.class);
         when(controlPlane.getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1"))

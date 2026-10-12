@@ -32,7 +32,7 @@ final class ProofDurableHostActionAdapter {
         return switch (request.operation()) {
             case REGISTER_CALLBACK -> registerCallback(request);
             case BIND_CALLBACK -> bindCallback(request);
-            case SUBMIT, STATUS, RESULT, REDRIVE, SWEEP, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT,
+            case SUBMIT, STATUS, RESULT, REDRIVE, SWEEP, REGISTER_EXECUTION, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT,
                 READ_EXECUTION_AWAITS ->
                 throw new IllegalArgumentException(request.operation() + " is a TPF control-plane operation");
         };

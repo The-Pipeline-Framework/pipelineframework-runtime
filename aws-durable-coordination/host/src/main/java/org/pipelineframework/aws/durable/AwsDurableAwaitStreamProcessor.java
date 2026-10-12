@@ -24,13 +24,16 @@ public final class AwsDurableAwaitStreamProcessor {
     private final String bindingStreamArn;
     private final Function<DynamodbEvent.DynamodbStreamRecord, Optional<AwsDurableAwaitCheckpoint>> observations;
 
+    private final Function<AwsDurableCallbackRegistration, Optional<AwsDurableWakeupDisposition>> terminalSettlements;
+
     public AwsDurableAwaitStreamProcessor(
         AwsDurableCallbackBindingRepository bindings,
         AwsDurableActionInvoker actions,
         AwsDurableWakeupService wakeups,
         String awaitStreamArn,
         String bindingStreamArn,
-        Function<DynamodbEvent.DynamodbStreamRecord, Optional<AwsDurableAwaitCheckpoint>> observations
+        Function<DynamodbEvent.DynamodbStreamRecord, Optional<AwsDurableAwaitCheckpoint>> observations,
+        Function<AwsDurableCallbackRegistration, Optional<AwsDurableWakeupDisposition>> terminalSettlements
     ) {
         this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.actions = Objects.requireNonNull(actions, "actions");
@@ -41,6 +44,7 @@ public final class AwsDurableAwaitStreamProcessor {
             throw new IllegalArgumentException("semantic and mechanical streams must be distinct");
         }
         this.observations = Objects.requireNonNull(observations, "observations");
+        this.terminalSettlements = Objects.requireNonNull(terminalSettlements, "terminalSettlements");
     }
 
     public AwsDurableWakeupDisposition process(DynamodbEvent.DynamodbStreamRecord record) {
@@ -104,6 +108,8 @@ public final class AwsDurableAwaitStreamProcessor {
             return AwsDurableWakeupDisposition.ACKNOWLEDGE;
         }
         AwsDurableCallbackRegistration registration = decoded.orElseThrow();
+        var terminal = terminalSettlements.apply(registration);
+        if (terminal.isPresent()) return terminal.orElseThrow();
         AwsDurableAwaitIdentity pinned = registration.awaitIdentity()
             .orElseThrow(() -> new IllegalStateException("legacy registration requires a validated protocol upgrade"));
         Optional<AwsDurableAwaitCheckpoint> latest = actions.invoke(AwsDurableActionRequest.awaitCheckpoint(pinned))

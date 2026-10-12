@@ -219,6 +219,55 @@ class AwsDurableDeploymentContractTest {
         assertTrue(responseConsumption, "Item continuation recovery uses the existing SQS worker response protocol");
     }
 
+    @Test
+    void terminalExecutionStreamHasExactRoutingAndFailureDeliveryAuthority() throws Exception {
+        JsonNode template = template();
+        JsonNode resources = template.path("Resources");
+        JsonNode properties = resources.path("ExecutionWakeupFunction").path("Properties");
+        assertEquals("ExecutionWakeupHandler", properties.path("Environment").path("Variables")
+            .path("QUARKUS_LAMBDA_HANDLER").asText());
+        assertEquals("ExecutionStateStreamArn", properties.path("Environment").path("Variables")
+            .path("TPF_AWS_DURABLE_EXECUTION_STREAM_ARN").asText());
+        JsonNode stream = properties.path("Events").path("ExecutionState").path("Properties");
+        assertEquals("ExecutionStateStreamArn", stream.path("Stream").asText());
+        assertEquals("StreamEvent", stream.path("<<").asText());
+        String policy = resources.path("WakeupRole").path("Properties").path("Policies").toString();
+        assertTrue(policy.contains("ExecutionStateStreamArn"));
+        assertTrue(policy.contains("lambda:SendDurableExecutionCallbackFailure"));
+        JsonNode parameter = template.path("Parameters").path("ExecutionRecoveryMigrationValidation");
+        assertFalse(parameter.has("Default"));
+        assertEquals("validated", parameter.path("AllowedValues").get(0).asText());
+        JsonNode validation = template.path("Rules").path("ExecutionRecoveryMigrationValidated")
+            .path("Assertions").get(0).path("Assert");
+        assertEquals("ExecutionRecoveryMigrationValidation", validation.get(0).asText());
+        assertEquals("validated", validation.get(1).asText());
+    }
+
+    @Test
+    void retainedCoordinatorInvokesNumberedRetainedActionCodeWithRetainedVersionIam() throws Exception {
+        JsonNode resources = resources();
+        assertEquals("ActionVersion", resources.path("DurableFunction").path("Properties")
+            .path("Environment").path("Variables").path("TPF_AWS_DURABLE_ACTION_FUNCTION").asText());
+        for (String name : new String[]{"ActionFunction", "ActionVersion"}) {
+            assertEquals("Retain", resources.path(name).path("DeletionPolicy").asText());
+            assertEquals("Retain", resources.path(name).path("UpdateReplacePolicy").asText());
+        }
+        assertEquals("ActionCodeSha256", resources.path("ActionVersion").path("Properties").path("CodeSha256").asText());
+        assertEquals("TPF semantic action ${VersionPublicationId}", resources.path("ActionVersion")
+            .path("Properties").path("Description").asText());
+        assertEquals("TPF AWS Durable ${VersionPublicationId}; action ${ActionVersion.Version}", resources.path("DurableVersion")
+            .path("Properties").path("Description").asText());
+        assertFalse(template().path("Parameters").path("VersionPublicationId").has("Default"));
+        boolean retainedVersionsAllowed = false;
+        for (JsonNode statement : resources.path("DurableRole").path("Properties")
+                .path("Policies").get(0).path("PolicyDocument").path("Statement")) {
+            retainedVersionsAllowed |= "lambda:InvokeFunction".equals(statement.path("Action").asText())
+                && statement.path("Resource").asText().endsWith("${AWS::StackName}-action:*");
+        }
+        assertTrue(retainedVersionsAllowed, "Updating the role must keep permission to retained action versions");
+        assertFalse(resources.path("WorkFunction").has("DeletionPolicy"), "Worker resources must not inherit action-code retention");
+    }
+
     private void assertVisibility(JsonNode resources, String queue, String function) {
         JsonNode properties = resources.path(function).path("Properties");
         int timeout = properties.path("Timeout").asInt(

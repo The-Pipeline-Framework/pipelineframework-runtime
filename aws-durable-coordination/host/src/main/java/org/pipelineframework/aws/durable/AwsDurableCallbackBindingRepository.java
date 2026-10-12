@@ -129,6 +129,48 @@ public final class AwsDurableCallbackBindingRepository {
         }
     }
 
+    public boolean registerRecovery(org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator locator) {
+        var checkpoint = locator.checkpoint();
+        if (claimGeneration(checkpoint) == AwsDurableGenerationAdmission.STALE) throw new AwsDurableStaleGenerationException();
+        var item = Map.ofEntries(
+            Map.entry(PK, string(locator.partitionKey())), Map.entry(SK, string(locator.sortKey())),
+            Map.entry(RECORD_TYPE, string("RECOVERY")),
+            Map.entry("tenant_id", string(checkpoint.tenantId())), Map.entry("execution_id", string(checkpoint.executionId())),
+            Map.entry("pipeline_id", string(checkpoint.pipelineId())), Map.entry("contract_version", string(checkpoint.contractVersion())),
+            Map.entry("release_version", string(checkpoint.releaseVersion())), Map.entry("generation", number(checkpoint.generation())),
+            Map.entry("provider_execution_name", string(locator.providerExecutionName())),
+            Map.entry("provider_execution_arn", string(locator.providerExecutionArn())));
+        var operations = generationConditions(locator.partitionKey(), checkpoint.generation());
+        operations.add(TransactWriteItem.builder().put(immutablePut(item)).build());
+        try {
+            dynamo.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(operations).build());
+            return true;
+        } catch (TransactionCanceledException conflict) {
+            requireCurrentGeneration(checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
+            var existing = read(locator.partitionKey(), locator.sortKey());
+            if (existing.isEmpty()) throw conflict;
+            if (!locator.equals(recoveryFromItem(existing))) throw new IllegalStateException("recovery locator is already owned", conflict);
+            return false;
+        }
+    }
+
+    public Optional<org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator> findRecoveryByProviderExecutionArn(String arn) {
+        var response = dynamo.query(QueryRequest.builder().tableName(tableName)
+            .indexName(PROVIDER_REGISTRATION_INDEX)
+            .keyConditionExpression("#arn = :arn AND begins_with(#sk, :recovery)")
+            .expressionAttributeNames(Map.of("#arn", "provider_execution_arn", "#sk", SK))
+            .expressionAttributeValues(Map.of(":arn", string(required(arn, "providerExecutionArn")), ":recovery", string("RECOVERY#")))
+            .scanIndexForward(false).limit(1).build());
+        return response.items().stream().findFirst().map(this::recoveryFromItem);
+    }
+
+    private org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator recoveryFromItem(Map<String, AttributeValue> item) {
+        return new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(
+            new AwsDurableDriverCheckpoint(new AwsDurableExecutionCheckpoint(text(item, "tenant_id"), text(item, "execution_id"),
+                text(item, "pipeline_id"), text(item, "contract_version"), text(item, "release_version")),
+                Long.parseLong(item.get("generation").n())), text(item, "provider_execution_name"), text(item, "provider_execution_arn"));
+    }
+
     public boolean register(AwsDurableCallbackRegistration registration) {
         Objects.requireNonNull(registration, "registration");
         AwsDurableDriverCheckpoint checkpoint = registration.checkpoint();

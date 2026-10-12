@@ -24,6 +24,22 @@ class AwsDurableAwaitStreamProcessorTest {
     private static final String AWAIT_STREAM = "arn:aws:dynamodb:eu-west-1:123456789012:table/await/stream/2026-10-12T00:00:00.000";
     private static final String BINDING_STREAM = "arn:aws:dynamodb:eu-west-1:123456789012:table/bindings/stream/2026-10-12T00:00:00.000";
 
+    @Test
+    void lateRegistrationSettlesTerminalExecutionBeforeReadingItsAwait() {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var actions = mock(AwsDurableActionInvoker.class);
+        var wakeups = mock(AwsDurableWakeupService.class);
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, AWAIT_STREAM, BINDING_STREAM,
+            ignored -> { throw new AssertionError("registration must not decode semantic images"); },
+            observed -> {
+                assertThat(observed).isEqualTo(registration());
+                return Optional.of(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+            });
+        assertThat(processor.process(record(BINDING_STREAM, registrationImage(registration()))))
+            .isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        org.mockito.Mockito.verifyNoInteractions(bindings, actions, wakeups);
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     void registrationStreamRetainsCompletedAwaitRepairEvenWhenTheBindingIsFenced(boolean superseded) {
@@ -44,7 +60,7 @@ class AwsDurableAwaitStreamProcessorTest {
             .thenReturn(AwsDurableWakeupDisposition.RETRY);
 
         AwsDurableWakeupDisposition disposition = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, AWAIT_STREAM, BINDING_STREAM,
-            ignored -> { throw new AssertionError("mechanical records must not enter the semantic decoder"); })
+            ignored -> { throw new AssertionError("mechanical records must not enter the semantic decoder"); }, ignoredRegistration -> Optional.empty())
             .process(record(BINDING_STREAM, registrationImage(registration)));
 
         assertThat(disposition).isEqualTo(AwsDurableWakeupDisposition.RETRY);
@@ -71,7 +87,7 @@ class AwsDurableAwaitStreamProcessorTest {
         };
         when(wakeups.wake(second)).thenReturn(AwsDurableWakeupDisposition.ACKNOWLEDGE);
         var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, AWAIT_STREAM, BINDING_STREAM,
-            ignored -> { throw new AssertionError("mechanical registration is not a semantic row"); });
+            ignored -> { throw new AssertionError("mechanical registration is not a semantic row"); }, ignoredRegistration -> Optional.empty());
         assertThat(processor.process(record(BINDING_STREAM, registrationImage(registration))))
             .isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
         verify(bindings).bind(registration.bind(second));
@@ -89,7 +105,7 @@ class AwsDurableAwaitStreamProcessorTest {
             original.checkpoint(), original.providerExecutionName(), original.providerExecutionArn(), "second-callback", 100, 1000,
             Optional.of(second))));
         var processor = new AwsDurableAwaitStreamProcessor(bindings, mock(AwsDurableActionInvoker.class), wakeups,
-            AWAIT_STREAM, BINDING_STREAM, ignored -> Optional.of(semantic("COMPLETED")));
+            AWAIT_STREAM, BINDING_STREAM, ignored -> Optional.of(semantic("COMPLETED")), ignoredRegistration -> Optional.empty());
         assertThat(processor.process(record(AWAIT_STREAM, Map.of()))).isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
         verify(bindings, org.mockito.Mockito.never()).bind(org.mockito.ArgumentMatchers.any());
         org.mockito.Mockito.verifyNoInteractions(wakeups);
@@ -100,7 +116,7 @@ class AwsDurableAwaitStreamProcessorTest {
         var bindings = mock(AwsDurableCallbackBindingRepository.class);
         var processor = new AwsDurableAwaitStreamProcessor(bindings, mock(AwsDurableActionInvoker.class),
             mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM,
-            ignored -> Optional.of(semantic("COMPLETED")));
+            ignored -> Optional.of(semantic("COMPLETED")), ignoredRegistration -> Optional.empty());
         assertThat(processor.process(record(AWAIT_STREAM, Map.of()))).isEqualTo(AwsDurableWakeupDisposition.RETRY);
     }
 
@@ -113,7 +129,7 @@ class AwsDurableAwaitStreamProcessorTest {
         when(bindings.findLatestRegistration("tenant", "execution")).thenReturn(Optional.of(registration()));
         when(wakeups.wake(org.mockito.ArgumentMatchers.any())).thenReturn(AwsDurableWakeupDisposition.ACKNOWLEDGE);
         var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, AWAIT_STREAM, BINDING_STREAM,
-            ignored -> Optional.of(semantic(actualStatus)));
+            ignored -> Optional.of(semantic(actualStatus)), ignoredRegistration -> Optional.empty());
         var image = new HashMap<>(registrationImage(registration()));
         image.put("status", string(imageStatus));
         image.put("execution_id", string("stale-execution"));
@@ -135,7 +151,7 @@ class AwsDurableAwaitStreamProcessorTest {
     void missingSemanticObservationKeepsTheRecordRetryable() {
         var bindings = mock(AwsDurableCallbackBindingRepository.class);
         var processor = new AwsDurableAwaitStreamProcessor(bindings, mock(AwsDurableActionInvoker.class),
-            mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM, ignored -> Optional.empty());
+            mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM, ignored -> Optional.empty(), ignoredRegistration -> Optional.empty());
         assertThat(processor.process(record(AWAIT_STREAM, Map.of()))).isEqualTo(AwsDurableWakeupDisposition.RETRY);
         org.mockito.Mockito.verifyNoInteractions(bindings);
     }
@@ -144,7 +160,7 @@ class AwsDurableAwaitStreamProcessorTest {
     void unexpectedStreamIsReportedAsABatchFailure() {
         var processor = new AwsDurableAwaitStreamProcessor(mock(AwsDurableCallbackBindingRepository.class),
             mock(AwsDurableActionInvoker.class), mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM,
-            ignored -> { throw new AssertionError("unexpected source must not be decoded"); });
+            ignored -> { throw new AssertionError("unexpected source must not be decoded"); }, ignoredRegistration -> Optional.empty());
         var record = record(AWAIT_STREAM + "-other", Map.of());
         record.getDynamodb().setSequenceNumber("unexpected");
         var event = new DynamodbEvent();
@@ -158,7 +174,7 @@ class AwsDurableAwaitStreamProcessorTest {
     void removalDoesNotTurnExpiryIntoSemanticCompletion(String source) {
         var processor = new AwsDurableAwaitStreamProcessor(mock(AwsDurableCallbackBindingRepository.class),
             mock(AwsDurableActionInvoker.class), mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM,
-            ignored -> { throw new AssertionError("deletion is not a completion signal"); });
+            ignored -> { throw new AssertionError("deletion is not a completion signal"); }, ignoredRegistration -> Optional.empty());
         var record = record(source, Map.of());
         record.setEventName("REMOVE");
         assertThat(processor.process(record)).isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
@@ -168,7 +184,7 @@ class AwsDurableAwaitStreamProcessorTest {
     void nonRegistrationMechanicalRecordsNeverEnterTheSemanticPath() {
         var processor = new AwsDurableAwaitStreamProcessor(mock(AwsDurableCallbackBindingRepository.class),
             mock(AwsDurableActionInvoker.class), mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM,
-            ignored -> { throw new AssertionError("mechanical evidence must stay mechanical"); });
+            ignored -> { throw new AssertionError("mechanical evidence must stay mechanical"); }, ignoredRegistration -> Optional.empty());
         assertThat(processor.process(record(BINDING_STREAM, Map.of("record_type", string("GENERATION_CLAIM")))))
             .isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
     }
