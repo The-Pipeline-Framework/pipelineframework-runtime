@@ -3,31 +3,33 @@ package org.pipelineframework.aws.durable;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.amazonaws.services.lambda.runtime.events.DynamodbEvent;
 import com.amazonaws.services.lambda.runtime.events.models.dynamodb.AttributeValue;
 import com.amazonaws.services.lambda.runtime.events.models.dynamodb.StreamRecord;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
-import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.pipelineframework.aws.durable.model.AwsDurableAwaitCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
+import org.pipelineframework.aws.durable.model.AwsDurableBindingStatus;
+import org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding;
 import org.pipelineframework.aws.durable.model.AwsDurableCallbackRegistration;
 import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
 import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
-import org.pipelineframework.aws.durable.model.AwsDurableBindingStatus;
-import org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding;
 import software.amazon.awssdk.services.lambda.LambdaClient;
 import software.amazon.awssdk.services.lambda.model.CallbackStartedDetails;
 import software.amazon.awssdk.services.lambda.model.Event;
@@ -59,6 +61,42 @@ class AwsDurableCallbackClientTest {
             assertThat(request.durableExecutionArn()).isEqualTo(binding().providerExecutionArn());
             assertThat(request.maxItems()).isBetween(1, 1000);
         });
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 3})
+    void rejectsANonAdvancingMarkerOnTheFirstRepeatedResponse(int advancingPages) {
+        AtomicInteger calls = new AtomicInteger();
+        when(lambda.getDurableExecutionHistory(any(GetDurableExecutionHistoryRequest.class)))
+            .thenAnswer(ignored -> {
+                int call = calls.incrementAndGet();
+                return page(call == 1 ? List.of(started()) : List.of(),
+                    "page-" + Math.min(call, advancingPages));
+            });
+
+        assertThatThrownBy(() -> client.state(binding()))
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("repeated page marker")
+            .hasMessageContaining("retry reconciliation");
+        assertThat(calls).hasValue(advancingPages + 1);
+
+        var requests = org.mockito.ArgumentCaptor.forClass(GetDurableExecutionHistoryRequest.class);
+        verify(lambda, times(advancingPages + 1)).getDurableExecutionHistory(requests.capture());
+        assertThat(requests.getAllValues().get(0).marker()).isNull();
+        for (int page = 1; page <= advancingPages; page++) {
+            assertThat(requests.getAllValues().get(page).marker()).isEqualTo("page-" + page);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " "})
+    void blankNextMarkerCompletesHistoryAfterAnAdvancingPage(String finalMarker) {
+        when(lambda.getDurableExecutionHistory(any(GetDurableExecutionHistoryRequest.class)))
+            .thenReturn(page(List.of(started()), "next-page"),
+                page(List.of(terminal(EventType.CALLBACK_SUCCEEDED)), finalMarker));
+
+        assertThat(client.state(binding())).isEqualTo(AwsDurableProviderCallbackState.SUCCEEDED);
+        verify(lambda, times(2)).getDurableExecutionHistory(any(GetDurableExecutionHistoryRequest.class));
     }
 
     @Test
