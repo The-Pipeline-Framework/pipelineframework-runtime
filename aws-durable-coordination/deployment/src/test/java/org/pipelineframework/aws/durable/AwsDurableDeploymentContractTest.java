@@ -159,6 +159,66 @@ class AwsDurableDeploymentContractTest {
             function.path("Events").path("CallbackBinding").path("Properties").path("Stream"));
     }
 
+    @Test
+    void suspendedDueWorkHasIndependentBoundedSchedulingAndFailureDelivery() throws Exception {
+        JsonNode template = template();
+        JsonNode resources = template.path("Resources");
+        JsonNode function = resources.path("DueWorkFunction").path("Properties");
+        assertEquals("DueWorkRole.Arn", function.path("Role").asText());
+        JsonNode variables = function.path("Environment").path("Variables");
+        assertEquals("DueWorkHandler", variables.path("QUARKUS_LAMBDA_HANDLER").asText());
+        // Jackson exposes YAML merge aliases; the SAM translator resolves them.
+        assertEquals("ActionEnvironment", variables.path("<<").asText());
+        assertEquals("true", resources.path("ActionFunction").path("Properties").path("Environment")
+            .path("Variables").path("PIPELINE_ORCHESTRATOR_PROCESS_LOOPS_DISABLED").asText());
+        assertEquals("DueWorkSweepLimit", variables.path("PIPELINE_ORCHESTRATOR_SWEEP_LIMIT").asText());
+        assertEquals(1, template.path("Parameters").path("DueWorkSweepLimit").path("MinValue").asInt());
+        JsonNode tick = function.path("Events").path("Tick").path("Properties");
+        int maximumConcurrency = tick.path("ScalingConfig").path("MaximumConcurrency").asInt();
+        assertEquals(2, maximumConcurrency, "SQS must cap concurrent batches before Lambda throttling");
+        assertTrue(function.path("ReservedConcurrentExecutions").asInt() >= maximumConcurrency,
+            "The dedicated function must reserve capacity for every admitted SQS batch");
+        assertEquals(1, tick.path("BatchSize").asInt());
+        assertEquals("DueWorkQueue.Arn", tick.path("Queue").asText());
+        assertEquals("ReportBatchItemFailures", tick.path("FunctionResponseTypes").get(0).asText());
+        assertVisibility(resources, "DueWorkQueue", "DueWorkFunction");
+        assertEquals("DueWorkDlq.Arn", resources.path("DueWorkQueue").path("Properties")
+            .path("RedrivePolicy").path("deadLetterTargetArn").asText());
+        JsonNode rule = resources.path("DueWorkRule").path("Properties");
+        assertEquals("rate(1 minute)", rule.path("ScheduleExpression").asText());
+        JsonNode target = rule.path("Targets").get(0);
+        assertEquals("DueWorkQueue.Arn", target.path("Arn").asText());
+        assertEquals(3600, target.path("RetryPolicy").path("MaximumEventAgeInSeconds").asInt());
+        assertEquals("DueWorkDlq.Arn", target.path("DeadLetterConfig").path("Arn").asText());
+        JsonNode grant = resources.path("DueWorkQueuePolicy").path("Properties")
+            .path("PolicyDocument").path("Statement").get(0);
+        assertEquals("events.amazonaws.com", grant.path("Principal").path("Service").asText());
+        assertEquals("DueWorkRule.Arn", grant.path("Condition").path("ArnEquals").path("aws:SourceArn").asText());
+        assertEquals(2, grant.path("Resource").size());
+        assertEquals("DueWorkDlq.QueueName", resources.path("DueWorkDlqAlarm").path("Properties")
+            .path("Dimensions").get(0).path("Value").asText());
+        assertEquals("ApproximateAgeOfOldestMessage", resources.path("DueWorkAgeAlarm").path("Properties")
+            .path("MetricName").asText());
+    }
+
+    @Test
+    void dueWorkRoleCanRecoverSemanticWorkWithoutProviderOrCallbackAuthority() throws Exception {
+        JsonNode statements = resources().path("DueWorkRole").path("Properties")
+            .path("Policies").get(0).path("PolicyDocument").path("Statement");
+        boolean semanticWrites = false;
+        boolean responseConsumption = false;
+        for (JsonNode statement : statements) {
+            assertFalse(statement.toString().contains("CallbackBindingTable"));
+            assertFalse(statement.toString().contains("lambda:"));
+            semanticWrites |= "SemanticDynamoResourceArns".equals(statement.path("Resource").asText())
+                && statement.path("Action").toString().contains("dynamodb:TransactWriteItems");
+            responseConsumption |= statement.path("Action").toString().contains("sqs:ReceiveMessage")
+                && statement.path("Resource").toString().contains("TransitionResponseQueue.Arn");
+        }
+        assertTrue(semanticWrites);
+        assertTrue(responseConsumption, "Item continuation recovery uses the existing SQS worker response protocol");
+    }
+
     private void assertVisibility(JsonNode resources, String queue, String function) {
         JsonNode properties = resources.path(function).path("Properties");
         int timeout = properties.path("Timeout").asInt(

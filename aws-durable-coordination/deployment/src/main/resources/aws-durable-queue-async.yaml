@@ -40,6 +40,8 @@ Parameters:
   AwaitCompletionHandler: {Type: String, Default: aws-durable-await-completion}
   TransitionWorkerHandler: {Type: String, Default: aws-durable-transition-worker}
   AwaitWakeupHandler: {Type: String, Default: aws-durable-await-wakeup}
+  DueWorkHandler: {Type: String, Default: aws-durable-due-work}
+  DueWorkSweepLimit: {Type: Number, Default: 100, MinValue: 1, MaxValue: 1000}
   ReconciliationHandler: {Type: String, Default: aws-durable-reconcile}
 
 Rules:
@@ -127,6 +129,43 @@ Resources:
   StreamFailureDlq:
     Type: AWS::SQS::Queue
     Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+
+  DueWorkDlq:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+  DueWorkQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 720
+      MessageRetentionPeriod: 86400
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt DueWorkDlq.Arn, maxReceiveCount: 5}
+
+  DueWorkRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: bounded-semantic-due-work
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: [!GetAtt DueWorkQueue.Arn, !GetAtt TransitionResponseQueue.Arn]
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: [!GetAtt WorkQueue.Arn, !GetAtt TransitionRequestQueue.Arn]
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
+                  dynamodb:BatchGetItem, dynamodb:ConditionCheckItem, dynamodb:TransactWriteItems,
+                  dynamodb:Query, dynamodb:DescribeTable]
+                Resource: !Ref SemanticDynamoResourceArns
 
   DurableRole:
     Type: AWS::IAM::Role
@@ -403,6 +442,51 @@ Resources:
             <<: *StreamEvent
             Stream: !GetAtt CallbackBindingTable.StreamArn
 
+  DueWorkFunction:
+    <<: *ActionFunction
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-due-work'
+      Role: !GetAtt DueWorkRole.Arn
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: !Ref DueWorkHandler
+          PIPELINE_ORCHESTRATOR_SWEEP_LIMIT: !Ref DueWorkSweepLimit
+      Events:
+        Tick:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DueWorkQueue.Arn
+            BatchSize: 1
+            ScalingConfig: {MaximumConcurrency: 2}
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  DueWorkRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: 'rate(1 minute)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DueWorkQueue.Arn
+          Id: bounded-semantic-due-work
+          Input: '{"kind":"tpf-due-work-tick"}'
+          RetryPolicy: {MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 10}
+          DeadLetterConfig: {Arn: !GetAtt DueWorkDlq.Arn}
+  DueWorkQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref DueWorkQueue, !Ref DueWorkDlq]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: [!GetAtt DueWorkQueue.Arn, !GetAtt DueWorkDlq.Arn]
+            Condition: {ArnEquals: {'aws:SourceArn': !GetAtt DueWorkRule.Arn}}
+
   ReconciliationFunction:
     <<: *ActionFunction
     Properties:
@@ -459,6 +543,20 @@ Resources:
       <<: *QueueAlarmProperties
       Dimensions: [{Name: QueueName, Value: !GetAtt StreamFailureDlq.QueueName}]
 
+  DueWorkDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      Dimensions: [{Name: QueueName, Value: !GetAtt DueWorkDlq.QueueName}]
+  DueWorkAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      MetricName: ApproximateAgeOfOldestMessage
+      Threshold: 180
+      EvaluationPeriods: 3
+      Dimensions: [{Name: QueueName, Value: !GetAtt DueWorkQueue.QueueName}]
+
 Outputs:
   DurableAliasArn: {Value: !Ref DurableAliasResource}
   IngressFunctionArn: {Value: !GetAtt IngressFunction.Arn}
@@ -469,3 +567,5 @@ Outputs:
   TransitionRequestQueueUrl: {Value: !Ref TransitionRequestQueue}
   TransitionResponseQueueUrl: {Value: !Ref TransitionResponseQueue}
   StreamFailureQueueUrl: {Value: !Ref StreamFailureDlq}
+  DueWorkQueueUrl: {Value: !Ref DueWorkQueue}
+  DueWorkDlqUrl: {Value: !Ref DueWorkDlq}
