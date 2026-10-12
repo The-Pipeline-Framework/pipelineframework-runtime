@@ -51,6 +51,7 @@ public final class AwsDurableCallbackClient {
         List<Event> events = new ArrayList<>();
         String marker = "";
         for (int page = 0; page < MAX_HISTORY_PAGES; page++) {
+        for (int page = 0; page < MAX_HISTORY_PAGES; page++) {
             var request = GetDurableExecutionHistoryRequest.builder()
                 .durableExecutionArn(executionArn)
                 .includeExecutionData(true)
@@ -60,10 +61,14 @@ public final class AwsDurableCallbackClient {
             }
             var response = lambda.getDurableExecutionHistory(request.build());
             events.addAll(response.events());
-            marker = Optional.ofNullable(response.nextMarker()).orElse("");
-            if (marker.isBlank()) {
+            String next = Optional.ofNullable(response.nextMarker()).orElse("");
+            if (next.isBlank()) {
                 return List.copyOf(events);
             }
+            if (next.equals(marker)) {
+                throw new IllegalStateException("Durable history inspection received a repeated page marker; retry reconciliation");
+            }
+            marker = next;
         }
         // An incomplete history cannot establish whether a callback is still open or closed.
         throw new IllegalStateException("Durable history inspection exceeded its page budget; retry reconciliation");
