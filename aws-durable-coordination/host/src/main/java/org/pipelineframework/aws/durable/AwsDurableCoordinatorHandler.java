@@ -87,6 +87,11 @@ public final class AwsDurableCoordinatorHandler
                     requiredCheckpoint(actions.invoke(AwsDurableActionRequest.submit(input))),
                     input.generation())));
 
+        context.step("register-execution-recovery", Boolean.class, ignored ->
+            actions.invoke(AwsDurableActionRequest.registerExecution(checkpoint,
+                AwsDurableExecutionNames.durableExecutionName(input.tenantId(), input.idempotencyKey(), input.generation()),
+                context.getExecutionArn())).bindingCreated());
+
         int awaitIndex = 0;
         AwsDurableExecutionStatusPoll terminal = waitForBlockedOrTerminal(checkpoint, context, awaitIndex);
         while (!terminal.terminal()) {

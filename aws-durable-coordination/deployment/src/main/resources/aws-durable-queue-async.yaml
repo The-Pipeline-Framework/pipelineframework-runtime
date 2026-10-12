@@ -6,6 +6,11 @@ Parameters:
   DurableArtifactBucket: {Type: String}
   DurableArtifactKey: {Type: String}
   DurableCodeSha256: {Type: String}
+  ActionCodeSha256: {Type: String}
+  VersionPublicationId:
+    Type: String
+    AllowedPattern: '[A-Za-z0-9._-]{1,64}'
+    Description: Unique release/configuration revision; change whenever either package or its configuration changes
   ActionArtifactUri:
     Type: String
     Description: S3 URI for the generated Quarkus action and worker Lambda package
@@ -26,7 +31,19 @@ Parameters:
       drained and their writers are quiesced or isolated on their original table.
       Retained coordinator, action, wake-up and repair versions must remain protocol-compatible.
       This attestation does not migrate callback rows or inspect retained executions.
+  ExecutionRecoveryMigrationValidation:
+    Type: String
+    AllowedValues: [validated]
+    ConstraintDescription: Validate retained execution recovery locators and compatible pinned packages before deployment
+    Description: >-
+      Set validated only for a fresh host without retained executions, or after validating
+      a retained locator and generation claim for every live execution. Drain or isolate
+      legacy coordinators that lack locator registration or invoke unqualified action code.
+      Retain the original numbered coordinator and action packages for recovery.
   AwaitInteractionStreamArn: {Type: String}
+  ExecutionStateStreamArn:
+    Type: String
+    Description: Exact Stream ARN of the TPF execution state table for terminal callback settlement
   SemanticDynamoResourceArns:
     Type: CommaDelimitedList
     Description: Exact TPF semantic table and index ARNs required by the action host
@@ -40,11 +57,16 @@ Parameters:
   AwaitCompletionHandler: {Type: String, Default: aws-durable-await-completion}
   TransitionWorkerHandler: {Type: String, Default: aws-durable-transition-worker}
   AwaitWakeupHandler: {Type: String, Default: aws-durable-await-wakeup}
+  ExecutionWakeupHandler: {Type: String, Default: aws-durable-execution-wakeup}
   DueWorkHandler: {Type: String, Default: aws-durable-due-work}
   DueWorkSweepLimit: {Type: Number, Default: 100, MinValue: 1, MaxValue: 1000}
   ReconciliationHandler: {Type: String, Default: aws-durable-reconcile}
 
 Rules:
+  ExecutionRecoveryMigrationValidated:
+    Assertions:
+      - Assert: !Equals [!Ref ExecutionRecoveryMigrationValidation, validated]
+        AssertDescription: Execution recovery requires validated locators and pinned package compatibility
   CallbackGenerationMigrationValidated:
     Assertions:
       - Assert: !Equals [!Ref CallbackGenerationMigrationValidation, validated]
@@ -186,7 +208,7 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:*'
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-action'
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-action:*'
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt DurableDlq.Arn
@@ -283,13 +305,13 @@ Resources:
                 Resource: !Ref SemanticDynamoResourceArns
               - Effect: Allow
                 Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
-                Resource: [!Ref AwaitInteractionStreamArn, !GetAtt CallbackBindingTable.StreamArn]
+                Resource: [!Ref AwaitInteractionStreamArn, !Ref ExecutionStateStreamArn, !GetAtt CallbackBindingTable.StreamArn]
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt StreamFailureDlq.Arn
               - Effect: Allow
                 Action: [lambda:GetDurableExecution, lambda:GetDurableExecutionHistory,
-                  lambda:SendDurableExecutionCallbackSuccess, lambda:InvokeFunction]
+                  lambda:SendDurableExecutionCallbackSuccess, lambda:SendDurableExecutionCallbackFailure, lambda:InvokeFunction]
                 Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:*'
               - Effect: Allow
                 Action: lambda:InvokeFunction
@@ -318,7 +340,7 @@ Resources:
         ExecutionTimeout: !Ref DurableExecutionTimeoutSeconds
         RetentionPeriodInDays: !Ref DurableRetentionDays
       Environment:
-        Variables: {TPF_AWS_DURABLE_ACTION_FUNCTION: !Ref ActionFunction}
+        Variables: {TPF_AWS_DURABLE_ACTION_FUNCTION: !Ref ActionVersion}
 
   DurableVersion:
     Type: AWS::Lambda::Version
@@ -327,7 +349,7 @@ Resources:
     Properties:
       FunctionName: !Ref DurableFunction
       CodeSha256: !Ref DurableCodeSha256
-      Description: TPF AWS Durable QUEUE_ASYNC coordination host
+      Description: !Sub 'TPF AWS Durable ${VersionPublicationId}; action ${ActionVersion.Version}'
   DurableAliasResource:
     Type: AWS::Lambda::Alias
     Properties:
@@ -335,8 +357,10 @@ Resources:
       FunctionName: !Ref DurableFunction
       FunctionVersion: !GetAtt DurableVersion.Version
 
-  ActionFunction: &ActionFunction
+  ActionFunction:
     Type: AWS::Serverless::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties: &ActionProperties
       FunctionName: !Sub '${AWS::StackName}-action'
       CodeUri: !Ref ActionArtifactUri
@@ -359,6 +383,15 @@ Resources:
           TPF_AWS_DURABLE_QUALIFIER: !Ref DurableAlias
           QUARKUS_LAMBDA_HANDLER: !Ref ActionHandler
 
+  ActionVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref ActionFunction
+      CodeSha256: !Ref ActionCodeSha256
+      Description: !Sub 'TPF semantic action ${VersionPublicationId}'
+
   IngressFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -375,7 +408,7 @@ Resources:
           TPF_AWS_DURABLE_QUALIFIER: !Ref DurableAlias
 
   WorkFunction:
-    <<: *ActionFunction
+    Type: AWS::Serverless::Function
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-work'
@@ -388,7 +421,7 @@ Resources:
           FunctionResponseTypes: [ReportBatchItemFailures], ScalingConfig: {MaximumConcurrency: 32}}}
 
   AwaitCompletionFunction:
-    <<: *ActionFunction
+    Type: AWS::Serverless::Function
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-await-completion'
@@ -400,7 +433,7 @@ Resources:
           FunctionResponseTypes: [ReportBatchItemFailures]}}
 
   TransitionWorkerFunction:
-    <<: *ActionFunction
+    Type: AWS::Serverless::Function
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-transition-worker'
@@ -413,7 +446,7 @@ Resources:
           FunctionResponseTypes: [ReportBatchItemFailures], ScalingConfig: {MaximumConcurrency: 32}}}
 
   AwaitWakeupFunction:
-    <<: *ActionFunction
+    Type: AWS::Serverless::Function
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-await-wakeup'
@@ -442,8 +475,26 @@ Resources:
             <<: *StreamEvent
             Stream: !GetAtt CallbackBindingTable.StreamArn
 
+  ExecutionWakeupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-execution-wakeup'
+      Role: !GetAtt WakeupRole.Arn
+      Environment:
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: !Ref ExecutionWakeupHandler
+          TPF_AWS_DURABLE_EXECUTION_STREAM_ARN: !Ref ExecutionStateStreamArn
+      Events:
+        ExecutionState:
+          Type: DynamoDB
+          Properties:
+            <<: *StreamEvent
+            Stream: !Ref ExecutionStateStreamArn
+
   DueWorkFunction:
-    <<: *ActionFunction
+    Type: AWS::Serverless::Function
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-due-work'
@@ -488,7 +539,7 @@ Resources:
             Condition: {ArnEquals: {'aws:SourceArn': !GetAtt DueWorkRule.Arn}}
 
   ReconciliationFunction:
-    <<: *ActionFunction
+    Type: AWS::Serverless::Function
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-reconcile'

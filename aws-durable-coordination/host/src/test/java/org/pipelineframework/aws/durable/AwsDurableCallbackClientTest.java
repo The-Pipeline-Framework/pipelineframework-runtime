@@ -45,6 +45,19 @@ class AwsDurableCallbackClientTest {
     private final AwsDurableCallbackClient client = new AwsDurableCallbackClient(lambda, new ObjectMapper());
 
     @Test
+    void sendsFailureWithMechanicalErrorAndNoCompletionPayload() {
+        client.sendFailure(binding(), "FAILED");
+        var request = org.mockito.ArgumentCaptor.forClass(
+            software.amazon.awssdk.services.lambda.model.SendDurableExecutionCallbackFailureRequest.class);
+        verify(lambda).sendDurableExecutionCallbackFailure(request.capture());
+        assertThat(request.getValue().callbackId()).isEqualTo(binding().providerCallbackId());
+        assertThat(request.getValue().error().errorType()).isEqualTo("TPF_TERMINAL_FAILED");
+        assertThat(request.getValue().error().errorData()).isNull();
+        verify(lambda, org.mockito.Mockito.never()).sendDurableExecutionCallbackSuccess(
+            any(software.amazon.awssdk.services.lambda.model.SendDurableExecutionCallbackSuccessRequest.class));
+    }
+
+    @Test
     void followsMarkersThroughAnEmptyPageBeforeClassifyingSuccess() {
         when(lambda.getDurableExecutionHistory(any(GetDurableExecutionHistoryRequest.class)))
             .thenReturn(page(List.of(started()), "second"), page(List.of(), "third"),
@@ -158,7 +171,7 @@ class AwsDurableCallbackClientTest {
                 "COMPLETED", "pipeline-a", "contract-a", "release-a"));
         var wakeups = new AwsDurableWakeupService(checkpoints, bindings, client, replacements);
         var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, "arn:await-stream", "arn:binding-stream",
-            ignored -> checkpoints.read(identity.tenantId(), identity.interactionId()));
+            ignored -> checkpoints.read(identity.tenantId(), identity.interactionId()), ignoredRegistration -> Optional.empty());
         doThrow(ResourceNotFoundException.builder().message("uncertain callback delivery").build())
             .when(lambda).sendDurableExecutionCallbackSuccess(any(SendDurableExecutionCallbackSuccessRequest.class));
         AtomicInteger pageNumber = new AtomicInteger();

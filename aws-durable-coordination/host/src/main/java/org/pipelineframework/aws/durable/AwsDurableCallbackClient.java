@@ -39,6 +39,15 @@ public final class AwsDurableCallbackClient {
         }
     }
 
+    public void sendFailure(AwsDurableCallbackBinding binding, String terminalStatus) {
+        lambda.sendDurableExecutionCallbackFailure(
+            software.amazon.awssdk.services.lambda.model.SendDurableExecutionCallbackFailureRequest.builder()
+                .callbackId(binding.providerCallbackId())
+                .error(error -> error.errorType("TPF_TERMINAL_" + terminalStatus)
+                    .errorMessage("TPF execution is terminal; this callback cannot admit completion"))
+                .build());
+    }
+
     public AwsDurableProviderCallbackState state(AwsDurableCallbackBinding binding) {
         try {
             return AwsDurableHistory.callbackState(history(binding.providerExecutionArn()), binding.providerCallbackId());

@@ -56,8 +56,8 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
 public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExecutionAdmissionStore {
     private static final Logger LOG = Logger.getLogger(DynamoExecutionStateStore.class);
 
-    private static final String TENANT_ID = "tenant_id";
-    private static final String EXECUTION_ID = "execution_id";
+    static final String TENANT_ID = "tenant_id";
+    static final String EXECUTION_ID = "execution_id";
     private static final String EXECUTION_KEY = "execution_key";
     private static final String PIPELINE_ID = "pipeline_id";
     private static final String CONTRACT_VERSION = "contract_version";

@@ -67,6 +67,35 @@ class ExecutionReadModelTest {
   }
 
   @Test
+  void executionCheckpointObservesReleaseAndStatusThroughOneAdmittedPointRead() {
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.allow());
+    @SuppressWarnings("unchecked")
+    ExecutionRecord<Object, Object> record = org.mockito.Mockito.mock(ExecutionRecord.class);
+    when(record.tenantId()).thenReturn("tenant-1"); when(record.executionId()).thenReturn("exec-1");
+    when(record.pipelineId()).thenReturn("pipeline-a"); when(record.contractVersion()).thenReturn("contract-a");
+    when(record.releaseVersion()).thenReturn("release-a"); when(record.status()).thenReturn(ExecutionStatus.RUNNING);
+    when(executionStateStore.getExecution("tenant-1", "exec-1")).thenReturn(Uni.createFrom().item(Optional.of(record)));
+    assertEquals(new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint("tenant-1", "exec-1",
+        "pipeline-a", "contract-a", "release-a", ExecutionStatus.RUNNING),
+        readModel.getExecutionSemanticCheckpoint("tenant-1", "exec-1").await().indefinitely());
+    verify(executionStateStore).getExecution("tenant-1", "exec-1");
+    var admission = org.mockito.ArgumentCaptor.forClass(ControlPlaneAdmissionRequest.class);
+    verify(admissionPolicy).admit(admission.capture());
+    assertEquals(org.pipelineframework.orchestrator.ControlPlaneAdmissionOperation.GET_EXECUTION_STATUS,
+        admission.getValue().operation());
+  }
+
+  @Test
+  void executionCheckpointDenialRunsBeforeStorage() {
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.deny("read-denied", "no reads"));
+    assertThrows(ControlPlaneAdmissionException.class, () ->
+        readModel.getExecutionSemanticCheckpoint("tenant-1", "exec-1").await().indefinitely());
+    org.mockito.Mockito.verifyNoInteractions(executionStateStore);
+  }
+
+  @Test
   void statusReturnsExecutionStatusDto() {
     when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
     when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.allow());

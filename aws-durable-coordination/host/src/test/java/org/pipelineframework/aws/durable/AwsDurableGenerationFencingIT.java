@@ -47,15 +47,44 @@ class AwsDurableGenerationFencingIT {
                 AwsBasicCredentials.create(LOCALSTACK.getAccessKey(), LOCALSTACK.getSecretKey()))).build();
         dynamo.createTable(request -> request.tableName(TABLE).billingMode(BillingMode.PAY_PER_REQUEST)
             .attributeDefinitions(AttributeDefinition.builder().attributeName("pk").attributeType(ScalarAttributeType.S).build(),
-                AttributeDefinition.builder().attributeName("sk").attributeType(ScalarAttributeType.S).build())
+                AttributeDefinition.builder().attributeName("sk").attributeType(ScalarAttributeType.S).build(),
+                AttributeDefinition.builder().attributeName("provider_execution_arn").attributeType(ScalarAttributeType.S).build())
             .keySchema(KeySchemaElement.builder().attributeName("pk").keyType(KeyType.HASH).build(),
-                KeySchemaElement.builder().attributeName("sk").keyType(KeyType.RANGE).build()));
+                KeySchemaElement.builder().attributeName("sk").keyType(KeyType.RANGE).build())
+            .globalSecondaryIndexes(index -> index.indexName(AwsDurableCallbackBindingRepository.PROVIDER_REGISTRATION_INDEX)
+                .keySchema(KeySchemaElement.builder().attributeName("provider_execution_arn").keyType(KeyType.HASH).build(),
+                    KeySchemaElement.builder().attributeName("sk").keyType(KeyType.RANGE).build())
+                .projection(projection -> projection.projectionType(software.amazon.awssdk.services.dynamodb.model.ProjectionType.ALL))));
         dynamo.waiter().waitUntilTableExists(request -> request.tableName(TABLE));
     }
 
     @AfterAll
     static void closeClient() {
         dynamo.close();
+    }
+
+    @Test
+    void recoveryLocatorSurvivesCallbackDeletionAndRejectsConflictingOrStaleAuthority() {
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, TABLE);
+        var registration = registration(UUID.randomUUID().toString(), 1);
+        var locator = new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(registration.checkpoint(),
+            registration.providerExecutionName(), registration.providerExecutionArn());
+        assertThat(repository.registerRecovery(locator)).isTrue();
+        assertThat(repository.registerRecovery(locator)).isFalse();
+        assertThatThrownBy(() -> repository.registerRecovery(new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(
+            locator.checkpoint(), "conflicting", "arn:conflicting"))).isInstanceOf(IllegalStateException.class);
+        repository.register(registration);
+        dynamo.deleteItem(request -> request.tableName(TABLE).key(java.util.Map.of(
+            "pk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(registration.partitionKey()).build(),
+            "sk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(registration.sortKey()).build())));
+        assertThat(repository.findRegistration(registration.checkpoint().tenantId(), registration.checkpoint().executionId(), 1)).isEmpty();
+        assertThat(repository.findRecoveryByProviderExecutionArn(locator.providerExecutionArn())).contains(locator);
+        var item = dynamo.getItem(request -> request.tableName(TABLE).consistentRead(true).key(java.util.Map.of(
+            "pk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(locator.partitionKey()).build(),
+            "sk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(locator.sortKey()).build()))).item();
+        assertThat(item).doesNotContainKey("expires_at_epoch_s");
+        repository.claimGeneration(new AwsDurableDriverCheckpoint(locator.checkpoint().execution(), 2));
+        assertThatThrownBy(() -> repository.registerRecovery(locator)).isInstanceOf(AwsDurableStaleGenerationException.class);
     }
 
     @Test

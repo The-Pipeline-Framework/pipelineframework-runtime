@@ -65,6 +65,7 @@ class AwsDurableCoordinatorHandlerTest {
             }
             case STATUS -> resumed.get() ? AwsDurableActionResponse.status("SUCCEEDED") : waiting(checkpoint, "interaction-a", "correlation-a");
             case RESULT -> AwsDurableActionResponse.result("{\"approved\":true}");
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REDRIVE -> throw new AssertionError("driver must not re-drive implicitly");
             case QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, BIND_CALLBACK ->
@@ -104,6 +105,7 @@ class AwsDurableCoordinatorHandlerTest {
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case STATUS -> waiting(checkpoint, "interaction-a", "correlation-a");
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REGISTER_CALLBACK -> {
                 callback.set(request.providerCallbackId().orElseThrow());
@@ -128,6 +130,7 @@ class AwsDurableCoordinatorHandlerTest {
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case STATUS -> AwsDurableActionResponse.status(polls.getAndIncrement() == 0 ? "WAITING_EXTERNAL" : "SUCCEEDED");
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case RESULT -> AwsDurableActionResponse.result("{}");
             default -> throw new AssertionError("missing current Await must not register a callback");
@@ -152,6 +155,7 @@ class AwsDurableCoordinatorHandlerTest {
                 resultRead.set(true);
                 yield AwsDurableActionResponse.result("{}");
             }
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REDRIVE -> throw new AssertionError("driver must not re-drive implicitly");
             case QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, BIND_CALLBACK ->
@@ -168,6 +172,30 @@ class AwsDurableCoordinatorHandlerTest {
 
         assertThat(failed.getStatus()).isEqualTo(ExecutionStatus.FAILED);
         assertThat(resultRead).isFalse();
+    }
+
+    @Test
+    void parkedCallbackFailureSettlesTheDurableExecutionWithoutRunningMoreBusinessWork() {
+        var checkpoint = new AwsDurableExecutionCheckpoint("tenant", "execution", "pipeline", "contract", "release");
+        var callback = new AtomicReference<String>();
+        var actions = (AwsDurableActionInvoker) request -> switch (request.operation()) {
+            case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
+            case STATUS -> waiting(checkpoint, "interaction", "correlation");
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
+            case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
+            case REGISTER_CALLBACK -> {
+                callback.set(request.providerCallbackId().orElseThrow());
+                yield AwsDurableActionResponse.bound(true);
+            }
+            default -> throw new AssertionError("terminal callback must not read results or re-drive business work");
+        };
+        var runner = LocalDurableTestRunner.create(AwsDurableExecutionInput.class,
+            new AwsDurableCoordinatorHandler(actions)).withOutputType(AwsDurableExecutionOutput.class);
+        var input = new AwsDurableExecutionInput("tenant", "key", "pipeline", "contract", "release", "{}", Optional.empty(), 1);
+        assertThat(runner.run(input).getStatus()).isEqualTo(ExecutionStatus.PENDING);
+        runner.failCallback(callback.get(), software.amazon.awssdk.services.lambda.model.ErrorObject.builder()
+            .errorType("TPF_TERMINAL_FAILED").errorMessage("TPF Await timeout has failed the execution").build());
+        assertThat(runner.runUntilComplete(input).getStatus()).isEqualTo(ExecutionStatus.FAILED);
     }
 
     @Test
@@ -188,6 +216,7 @@ class AwsDurableCoordinatorHandlerTest {
                 ? waiting(checkpoint, "interaction-" + (completedAwaits.get() + 1), "correlation-" + (completedAwaits.get() + 1))
                 : AwsDurableActionResponse.status("SUCCEEDED");
             case RESULT -> AwsDurableActionResponse.result("{\"awaits\":2}");
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REDRIVE, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, BIND_CALLBACK ->
                 throw new AssertionError("unexpected driver action " + request.operation());
@@ -232,6 +261,7 @@ class AwsDurableCoordinatorHandlerTest {
             }
             case STATUS -> AwsDurableActionResponse.status("SUCCEEDED");
             case RESULT -> AwsDurableActionResponse.result("{\"approved\":true}");
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REGISTER_CALLBACK, BIND_CALLBACK -> {
                 callbackBound.set(true);

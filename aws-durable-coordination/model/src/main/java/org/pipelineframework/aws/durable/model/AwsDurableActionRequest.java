@@ -59,6 +59,15 @@ public record AwsDurableActionRequest(
             input.generation());
     }
 
+    public static AwsDurableActionRequest registerExecution(AwsDurableDriverCheckpoint checkpoint,
+        String providerExecutionName, String providerExecutionArn) {
+        var base = forExecution(AwsDurableOperation.REGISTER_EXECUTION, checkpoint);
+        return new AwsDurableActionRequest(base.operation(), base.tenantId(), base.executionId(),
+            base.idempotencyKey(), base.pipelineId(), base.contractVersion(), base.releaseVersion(), base.inputJson(),
+            Optional.empty(), Optional.of(providerExecutionName), Optional.of(providerExecutionArn),
+            Optional.empty(), Optional.empty(), Optional.empty(), base.generation());
+    }
+
     public static AwsDurableActionRequest status(AwsDurableDriverCheckpoint checkpoint) {
         return forExecution(AwsDurableOperation.STATUS, checkpoint);
     }

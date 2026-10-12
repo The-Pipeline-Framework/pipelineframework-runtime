@@ -57,6 +57,14 @@ class ExecutionReadModel {
             (T) new ExecutionResultView(record).typedResult(outputType, outputStreaming, payloadCodec));
   }
 
+  Uni<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint> getExecutionSemanticCheckpoint(
+      String tenantId, String executionId) {
+    return readExecution(tenantId, executionId, ControlPlaneAdmissionOperation.GET_EXECUTION_STATUS)
+        .onItem().transform(record -> new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint(
+            record.tenantId(), record.executionId(), record.pipelineId(), record.contractVersion(),
+            record.releaseVersion(), record.status()));
+  }
+
   Uni<Object> getExecutionResultPayload(String tenantId, String executionId) {
     return readExecution(tenantId, executionId, ControlPlaneAdmissionOperation.GET_EXECUTION_RESULT)
         .onItem().transform(record -> new ExecutionResultView(record).rawPayload());
