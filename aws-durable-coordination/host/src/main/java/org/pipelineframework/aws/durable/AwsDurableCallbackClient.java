@@ -18,6 +18,8 @@ import software.amazon.awssdk.services.lambda.model.SendDurableExecutionCallback
 
 /** AWS callback and history client. Provider history is mechanical state, never semantic authority. */
 public final class AwsDurableCallbackClient {
+    private static final int MAX_HISTORY_PAGES = 100;
+
     private final LambdaClient lambda;
     private final ObjectMapper mapper;
 
@@ -48,7 +50,8 @@ public final class AwsDurableCallbackClient {
     private List<Event> history(String executionArn) {
         List<Event> events = new ArrayList<>();
         String marker = "";
-        do {
+        for (int page = 0; page < MAX_HISTORY_PAGES; page++) {
+        for (int page = 0; page < MAX_HISTORY_PAGES; page++) {
             var request = GetDurableExecutionHistoryRequest.builder()
                 .durableExecutionArn(executionArn)
                 .includeExecutionData(true)
@@ -58,8 +61,16 @@ public final class AwsDurableCallbackClient {
             }
             var response = lambda.getDurableExecutionHistory(request.build());
             events.addAll(response.events());
-            marker = Optional.ofNullable(response.nextMarker()).orElse("");
-        } while (!marker.isBlank());
-        return List.copyOf(events);
+            String next = Optional.ofNullable(response.nextMarker()).orElse("");
+            if (next.isBlank()) {
+                return List.copyOf(events);
+            }
+            if (next.equals(marker)) {
+                throw new IllegalStateException("Durable history inspection received a repeated page marker; retry reconciliation");
+            }
+            marker = next;
+        }
+        // An incomplete history cannot establish whether a callback is still open or closed.
+        throw new IllegalStateException("Durable history inspection exceeded its page budget; retry reconciliation");
     }
 }
