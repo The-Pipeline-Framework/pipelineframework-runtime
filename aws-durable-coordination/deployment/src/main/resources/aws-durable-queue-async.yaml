@@ -448,7 +448,7 @@ Resources:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-due-work'
       Role: !GetAtt DueWorkRole.Arn
-      ReservedConcurrentExecutions: 1
+      ReservedConcurrentExecutions: 2
       Environment:
         Variables:
           <<: *ActionEnvironment
@@ -460,6 +460,7 @@ Resources:
           Properties:
             Queue: !GetAtt DueWorkQueue.Arn
             BatchSize: 1
+            ScalingConfig: {MaximumConcurrency: 2}
             FunctionResponseTypes: [ReportBatchItemFailures]
 
   DueWorkRule:

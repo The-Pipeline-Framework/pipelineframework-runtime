@@ -164,7 +164,6 @@ class AwsDurableDeploymentContractTest {
         JsonNode template = template();
         JsonNode resources = template.path("Resources");
         JsonNode function = resources.path("DueWorkFunction").path("Properties");
-        assertEquals(1, function.path("ReservedConcurrentExecutions").asInt());
         assertEquals("DueWorkRole.Arn", function.path("Role").asText());
         JsonNode variables = function.path("Environment").path("Variables");
         assertEquals("DueWorkHandler", variables.path("QUARKUS_LAMBDA_HANDLER").asText());
@@ -175,6 +174,10 @@ class AwsDurableDeploymentContractTest {
         assertEquals("DueWorkSweepLimit", variables.path("PIPELINE_ORCHESTRATOR_SWEEP_LIMIT").asText());
         assertEquals(1, template.path("Parameters").path("DueWorkSweepLimit").path("MinValue").asInt());
         JsonNode tick = function.path("Events").path("Tick").path("Properties");
+        int maximumConcurrency = tick.path("ScalingConfig").path("MaximumConcurrency").asInt();
+        assertEquals(2, maximumConcurrency, "SQS must cap concurrent batches before Lambda throttling");
+        assertTrue(function.path("ReservedConcurrentExecutions").asInt() >= maximumConcurrency,
+            "The dedicated function must reserve capacity for every admitted SQS batch");
         assertEquals(1, tick.path("BatchSize").asInt());
         assertEquals("DueWorkQueue.Arn", tick.path("Queue").asText());
         assertEquals("ReportBatchItemFailures", tick.path("FunctionResponseTypes").get(0).asText());
