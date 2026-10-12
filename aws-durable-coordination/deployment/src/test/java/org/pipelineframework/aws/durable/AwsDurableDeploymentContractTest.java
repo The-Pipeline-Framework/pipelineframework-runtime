@@ -92,6 +92,28 @@ class AwsDurableDeploymentContractTest {
         assertTrue(indexGranted, "Targeted repair must be authorised to query its new index");
     }
 
+    @Test
+    void callbackWritersCanConditionTransactionsOnGenerationAuthority() throws Exception {
+        JsonNode resources = resources();
+        for (String role : new String[]{"ActionRole", "WakeupRole"}) {
+            boolean granted = false;
+            for (JsonNode statement : resources.path(role).path("Properties").path("Policies").get(0)
+                    .path("PolicyDocument").path("Statement")) {
+                boolean checksGeneration = false;
+                for (JsonNode action : statement.path("Action")) {
+                    checksGeneration |= "dynamodb:ConditionCheckItem".equals(action.asText());
+                }
+                if (checksGeneration) {
+                    granted |= "CallbackBindingTable.Arn".equals(statement.path("Resource").asText());
+                    for (JsonNode resource : statement.path("Resource")) {
+                        granted |= "CallbackBindingTable.Arn".equals(resource.asText());
+                    }
+                }
+            }
+            assertTrue(granted, role + " must condition writes on the callback table generation fence");
+        }
+    }
+
     private void assertVisibility(JsonNode resources, String queue, String function) {
         JsonNode properties = resources.path(function).path("Properties");
         int timeout = properties.path("Timeout").asInt(

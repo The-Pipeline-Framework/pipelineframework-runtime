@@ -56,7 +56,7 @@ public final class AwsDurableHostServices {
     private AwsDurableReplacementService replacementService() {
         return new AwsDurableReplacementService(checkpointReader(), new AwsDurableExecutionStarter(
             lambda, mapper, requiredEnvironment("TPF_AWS_DURABLE_FUNCTION"),
-            requiredEnvironment("TPF_AWS_DURABLE_QUALIFIER")));
+            requiredEnvironment("TPF_AWS_DURABLE_QUALIFIER")), bindings());
     }
 
     private AwsDurableAwaitCheckpointReader checkpointReader() {

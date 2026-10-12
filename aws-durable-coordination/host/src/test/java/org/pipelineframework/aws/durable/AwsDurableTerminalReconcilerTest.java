@@ -17,8 +17,9 @@ import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
 import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
 
 class AwsDurableTerminalReconcilerTest {
-    @Test
-    void reconstructsOneBindingAndStartsOneReplacement() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void retriesReplacementAdmissionEvenAfterItsClaimFencesTheOldBinding(boolean superseded) {
         AwsDurableCallbackBindingRepository bindings = mock(AwsDurableCallbackBindingRepository.class);
         AwsDurableActionInvoker actions = mock(AwsDurableActionInvoker.class);
         AwsDurableReplacementStarter replacements = mock(AwsDurableReplacementStarter.class);
@@ -35,13 +36,19 @@ class AwsDurableTerminalReconcilerTest {
                 new AwsDurableAwaitCheckpoint(
                     "tenant-a", "execution-a", "interaction-a", "correlation-a", "unit-a", "await-a",
                     "COMPLETED", "pipeline-a", "contract-a", "release-a"))));
-        when(replacements.startReplacement(org.mockito.ArgumentMatchers.any())).thenReturn(true);
+        if (superseded) {
+            org.mockito.Mockito.doThrow(new AwsDurableStaleGenerationException())
+                .when(bindings).bind(org.mockito.ArgumentMatchers.any());
+        }
+        when(replacements.startReplacement(org.mockito.ArgumentMatchers.any())).thenReturn(false, true);
+        var reconciler = new AwsDurableTerminalReconciler(bindings, actions, replacements, providerExecutions);
 
-        assertThat(new AwsDurableTerminalReconciler(bindings, actions, replacements, providerExecutions)
-            .reconcile("arn:closed")).isTrue();
+        assertThatThrownBy(() -> reconciler.reconcile("arn:closed"))
+            .hasMessageContaining("replacement admission is unresolved");
+        assertThat(reconciler.reconcile("arn:closed")).isTrue();
 
-        verify(bindings).bind(org.mockito.ArgumentMatchers.any());
-        verify(replacements).startReplacement(org.mockito.ArgumentMatchers.any());
+        verify(bindings, org.mockito.Mockito.times(2)).bind(org.mockito.ArgumentMatchers.any());
+        verify(replacements, org.mockito.Mockito.times(2)).startReplacement(org.mockito.ArgumentMatchers.any());
     }
 
     @Test

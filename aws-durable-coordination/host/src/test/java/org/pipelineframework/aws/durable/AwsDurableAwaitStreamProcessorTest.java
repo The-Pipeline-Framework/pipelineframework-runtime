@@ -21,8 +21,9 @@ import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
 
 class AwsDurableAwaitStreamProcessorTest {
 
-    @Test
-    void registrationStreamRepairsCompletedAwaitThatArrivedFirst() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void registrationStreamRetainsCompletedAwaitRepairEvenWhenTheBindingIsFenced(boolean superseded) {
         AwsDurableCallbackBindingRepository bindings = mock(AwsDurableCallbackBindingRepository.class);
         AwsDurableActionInvoker actions = mock(AwsDurableActionInvoker.class);
         AwsDurableWakeupService wakeups = mock(AwsDurableWakeupService.class);
@@ -32,13 +33,17 @@ class AwsDurableAwaitStreamProcessorTest {
             "pipeline", "contract", "release");
         when(actions.invoke(org.mockito.ArgumentMatchers.any()))
             .thenReturn(AwsDurableActionResponse.awaitCheckpoints(List.of(semantic)));
+        if (superseded) {
+            org.mockito.Mockito.doThrow(new AwsDurableStaleGenerationException())
+                .when(bindings).bind(org.mockito.ArgumentMatchers.any());
+        }
         when(wakeups.wake(org.mockito.ArgumentMatchers.any()))
-            .thenReturn(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+            .thenReturn(AwsDurableWakeupDisposition.RETRY);
 
         AwsDurableWakeupDisposition disposition = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups)
             .process(record(registrationImage(registration)));
 
-        assertThat(disposition).isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        assertThat(disposition).isEqualTo(AwsDurableWakeupDisposition.RETRY);
         verify(bindings).bind(registration.bind(new org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity(
             "tenant", "execution", "interaction", "correlation", 2)));
         verify(wakeups).wake(new org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity(

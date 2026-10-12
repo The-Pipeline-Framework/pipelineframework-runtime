@@ -42,10 +42,19 @@ public final class AwsDurableWakeupService {
         }
         Optional<AwsDurableCallbackBinding> binding = bindings.find(
             identity.tenantId(), identity.interactionId(), identity.generation());
+        if (bindings.isSuperseded(identity.tenantId(), identity.executionId(), identity.generation())) {
+            Optional<AwsDurableCallbackBinding> obsolete = binding.or(() -> bindings.findRegistration(
+                identity.tenantId(), identity.executionId(), identity.generation()).map(value -> value.bind(identity)));
+            return obsolete.isPresent() && replacements.startReplacement(obsolete.orElseThrow())
+                ? AwsDurableWakeupDisposition.ACKNOWLEDGE : AwsDurableWakeupDisposition.RETRY;
+        }
         if (binding.isEmpty()) {
             return AwsDurableWakeupDisposition.RETRY;
         }
         AwsDurableCallbackBinding current = binding.orElseThrow();
+        if (!bindings.isCurrentGeneration(identity.tenantId(), identity.executionId(), identity.generation())) {
+            return AwsDurableWakeupDisposition.RETRY;
+        }
         Optional<AwsDurableCallbackBinding> latest = bindings.findLatest(
             identity.tenantId(), identity.interactionId());
         if (latest.isPresent()
@@ -56,6 +65,10 @@ public final class AwsDurableWakeupService {
             return AwsDurableWakeupDisposition.ACKNOWLEDGE;
         }
         try {
+            if (bindings.isSuperseded(identity.tenantId(), identity.executionId(), identity.generation())) {
+                return replacements.startReplacement(current)
+                    ? AwsDurableWakeupDisposition.ACKNOWLEDGE : AwsDurableWakeupDisposition.RETRY;
+            }
             callbacks.sendSuccess(current, new AwsDurableCallbackSignal(
                 identity.tenantId(), identity.executionId(), identity.interactionId(),
                 identity.correlationId(), identity.generation(), semantic.status()));

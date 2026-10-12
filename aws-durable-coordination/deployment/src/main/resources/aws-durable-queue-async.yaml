@@ -160,7 +160,7 @@ Resources:
                   dynamodb:Query, dynamodb:DescribeTable]
                 Resource: !Ref SemanticDynamoResourceArns
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:ConditionCheckItem, dynamodb:Query]
                 Resource: !GetAtt CallbackBindingTable.Arn
               - Effect: Allow
                 Action: sqs:SendMessage
@@ -206,7 +206,7 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:ConditionCheckItem, dynamodb:Query]
                 Resource:
                   - !GetAtt CallbackBindingTable.Arn
                   - !Sub '${CallbackBindingTable.Arn}/index/provider-execution-index'

@@ -46,7 +46,11 @@ public final class AwsDurableTerminalReconciler {
         var binding = registration.bind(new AwsDurableAwaitIdentity(
             checkpoint.tenantId(), checkpoint.executionId(), checkpoint.interactionId(),
             checkpoint.correlationId(), registration.checkpoint().generation()));
-        bindings.bind(binding);
+        try {
+            bindings.bind(binding);
+        } catch (AwsDurableStaleGenerationException stale) {
+            // The successor claim fences this binding, but its provider start may still need replay.
+        }
         if (!replacements.startReplacement(binding)) {
             throw new IllegalStateException("replacement admission is unresolved; retry reconciliation");
         }

@@ -62,7 +62,11 @@ public final class AwsDurableAwaitStreamProcessor {
         AwsDurableAwaitIdentity identity = new AwsDurableAwaitIdentity(
             tenantId.orElseThrow(), executionId.orElseThrow(), interactionId.orElseThrow(),
             correlationId.orElseThrow(), current.checkpoint().generation());
-        bindings.bind(current.bind(identity));
+        try {
+            bindings.bind(current.bind(identity));
+        } catch (AwsDurableStaleGenerationException stale) {
+            // Completion still needs to replay an unresolved replacement start.
+        }
         return "COMPLETED".equals(status.orElseThrow())
             ? wakeups.wake(identity)
             : AwsDurableWakeupDisposition.ACKNOWLEDGE;
@@ -83,7 +87,11 @@ public final class AwsDurableAwaitStreamProcessor {
         AwsDurableAwaitIdentity identity = new AwsDurableAwaitIdentity(
             semantic.tenantId(), semantic.executionId(), semantic.interactionId(), semantic.correlationId(),
             registration.checkpoint().generation());
-        bindings.bind(registration.bind(identity));
+        try {
+            bindings.bind(registration.bind(identity));
+        } catch (AwsDurableStaleGenerationException stale) {
+            // Completion still needs to replay an unresolved replacement start.
+        }
         return "COMPLETED".equals(semantic.status())
             ? wakeups.wake(identity)
             : AwsDurableWakeupDisposition.ACKNOWLEDGE;

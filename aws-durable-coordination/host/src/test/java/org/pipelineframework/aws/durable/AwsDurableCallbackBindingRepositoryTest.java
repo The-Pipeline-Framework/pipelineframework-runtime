@@ -13,11 +13,11 @@ import org.pipelineframework.aws.durable.model.AwsDurableCallbackRegistration;
 import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
 import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
-import software.amazon.awssdk.services.dynamodb.model.ConditionalCheckFailedException;
+import software.amazon.awssdk.services.dynamodb.model.TransactionCanceledException;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItemsRequest;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItemsResponse;
 import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.GetItemResponse;
-import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
-import software.amazon.awssdk.services.dynamodb.model.PutItemResponse;
 import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
 import software.amazon.awssdk.services.dynamodb.model.QueryResponse;
 
@@ -101,14 +101,88 @@ class AwsDurableCallbackBindingRepositoryTest {
         DynamoDbClient dynamo, AwsDurableCallbackBindingRepository repository,
         AwsDurableCallbackRegistration original
     ) {
-        when(dynamo.putItem(any(PutItemRequest.class))).thenReturn(PutItemResponse.builder().build());
+        var rows = new java.util.HashMap<String, Map<String, AttributeValue>>();
+        when(dynamo.transactWriteItems(any(TransactWriteItemsRequest.class))).thenAnswer(call -> {
+            TransactWriteItemsRequest request = call.getArgument(0);
+            request.transactItems().stream().filter(item -> item.put() != null)
+                .forEach(item -> rows.put(item.put().item().get("sk").s(), item.put().item()));
+            return TransactWriteItemsResponse.builder().build();
+        });
         assertThat(repository.register(original)).isTrue();
-        var stored = org.mockito.ArgumentCaptor.forClass(PutItemRequest.class);
-        verify(dynamo).putItem(stored.capture());
-        when(dynamo.getItem(any(GetItemRequest.class)))
-            .thenReturn(GetItemResponse.builder().item(stored.getValue().item()).build());
-        when(dynamo.putItem(any(PutItemRequest.class)))
-            .thenThrow(ConditionalCheckFailedException.builder().message("existing authority").build());
+        when(dynamo.getItem(any(GetItemRequest.class))).thenAnswer(call -> {
+            GetItemRequest request = call.getArgument(0);
+            return GetItemResponse.builder().item(rows.getOrDefault(request.key().get("sk").s(), Map.of())).build();
+        });
+        when(dynamo.transactWriteItems(any(TransactWriteItemsRequest.class)))
+            .thenThrow(TransactionCanceledException.builder().message("existing authority").build());
+    }
+
+
+    @Test
+    void successorClaimAtomicallyFencesThePredecessorWithoutExpiringEitherRecord() {
+        DynamoDbClient dynamo = mock(DynamoDbClient.class);
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, "bindings");
+        var checkpoint = new AwsDurableDriverCheckpoint(registration("callback-a", 100, 1000).checkpoint().execution(), 2);
+
+        assertThat(repository.claimGeneration(checkpoint)).isEqualTo(AwsDurableGenerationAdmission.CREATED);
+
+        var captured = org.mockito.ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+        verify(dynamo).transactWriteItems(captured.capture());
+        var operations = captured.getValue().transactItems();
+        assertThat(operations).hasSize(3);
+        assertThat(operations.get(0).put().item().get("sk").s()).isEqualTo("CLAIM#2");
+        assertThat(operations.get(1).conditionCheck().key().get("sk").s()).isEqualTo("CLAIM#1");
+        assertThat(operations.get(1).conditionCheck().expressionAttributeValues())
+            .containsEntry(":release", AttributeValue.fromS("release-a"));
+        assertThat(operations.get(2).put().item().get("sk").s()).isEqualTo("SUCCESSOR#1");
+        assertThat(operations.get(0).put().item()).doesNotContainKey("expires_at_epoch_s");
+        assertThat(operations.get(2).put().item()).doesNotContainKey("expires_at_epoch_s");
+    }
+
+    @Test
+    void bindingAdmissionChecksTheGenerationFenceAndRegisteredCallbackInOneTransaction() {
+        DynamoDbClient dynamo = mock(DynamoDbClient.class);
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, "bindings");
+
+        assertThat(repository.bind(binding("callback-a", 100, 1000))).isTrue();
+
+        var captured = org.mockito.ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+        verify(dynamo).transactWriteItems(captured.capture());
+        var checks = captured.getValue().transactItems();
+        assertThat(checks).hasSize(4);
+        assertThat(checks.get(0).conditionCheck().key().get("sk").s()).isEqualTo("CLAIM#1");
+        assertThat(checks.get(1).conditionCheck().key().get("sk").s()).isEqualTo("SUCCESSOR#1");
+        assertThat(checks.get(1).conditionCheck().conditionExpression()).isEqualTo("attribute_not_exists(#pk)");
+        assertThat(checks.get(2).conditionCheck().expressionAttributeValues())
+            .containsEntry(":callback", AttributeValue.fromS("callback-a"));
+    }
+
+    @Test
+    void successorFenceRejectsStaleBindingEvenWhenCallbackRowsHaveExpired() {
+        DynamoDbClient dynamo = mock(DynamoDbClient.class);
+        when(dynamo.transactWriteItems(any(TransactWriteItemsRequest.class)))
+            .thenThrow(TransactionCanceledException.builder().build());
+        when(dynamo.getItem(any(GetItemRequest.class))).thenAnswer(call -> {
+            GetItemRequest request = call.getArgument(0);
+            assertThat(request.consistentRead()).isTrue();
+            return GetItemResponse.builder().item(request.key().get("sk").s().equals("SUCCESSOR#1")
+                ? Map.of("generation", AttributeValue.fromN("2")) : Map.of()).build();
+        });
+
+        assertThatThrownBy(() -> new AwsDurableCallbackBindingRepository(dynamo, "bindings")
+            .bind(binding("callback-a", 100, 1000))).isInstanceOf(AwsDurableStaleGenerationException.class);
+    }
+
+    @Test
+    void missingPredecessorKeepsGenerationAdmissionRetryable() {
+        DynamoDbClient dynamo = mock(DynamoDbClient.class);
+        var cancellation = TransactionCanceledException.builder().message("missing predecessor").build();
+        when(dynamo.transactWriteItems(any(TransactWriteItemsRequest.class))).thenThrow(cancellation);
+        when(dynamo.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().build());
+        var checkpoint = new AwsDurableDriverCheckpoint(registration("callback-a", 100, 1000).checkpoint().execution(), 2);
+
+        assertThatThrownBy(() -> new AwsDurableCallbackBindingRepository(dynamo, "bindings")
+            .claimGeneration(checkpoint)).isSameAs(cancellation);
     }
 
     @Test

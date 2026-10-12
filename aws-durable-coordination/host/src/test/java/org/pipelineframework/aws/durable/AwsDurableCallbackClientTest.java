@@ -150,6 +150,7 @@ class AwsDurableCallbackClientTest {
                     "tenant-a", "execution-a", "pipeline-a", "contract-a", "release-a"), 1),
                 current.providerExecutionName(), current.providerExecutionArn(), current.providerCallbackId(),
                 100, 1000)));
+        when(bindings.isCurrentGeneration("tenant-a", "execution-a", 1)).thenReturn(true);
         when(bindings.find("tenant-a", "interaction-a", 1)).thenReturn(Optional.of(current));
         when(bindings.findLatest("tenant-a", "interaction-a")).thenReturn(Optional.of(current));
         AwsDurableAwaitCheckpointReader checkpoints = (tenant, interaction) -> Optional.of(
