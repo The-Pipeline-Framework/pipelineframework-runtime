@@ -135,6 +135,18 @@ class AwsDurableDeploymentContractTest {
         }
     }
 
+    @Test
+    void wakeupRoutesExactSemanticAndMechanicalStreamSources() throws Exception {
+        JsonNode function = resources().path("AwaitWakeupFunction").path("Properties");
+        JsonNode variables = function.path("Environment").path("Variables");
+        assertEquals("AwaitInteractionStreamArn", variables.path("TPF_AWS_DURABLE_AWAIT_STREAM_ARN").asText());
+        assertEquals("CallbackBindingTable.StreamArn", variables.path("TPF_AWS_DURABLE_BINDING_STREAM_ARN").asText());
+        assertEquals(variables.path("TPF_AWS_DURABLE_AWAIT_STREAM_ARN"),
+            function.path("Events").path("AwaitState").path("Properties").path("Stream"));
+        assertEquals(variables.path("TPF_AWS_DURABLE_BINDING_STREAM_ARN"),
+            function.path("Events").path("CallbackBinding").path("Properties").path("Stream"));
+    }
+
     private void assertVisibility(JsonNode resources, String queue, String function) {
         JsonNode properties = resources.path(function).path("Properties");
         int timeout = properties.path("Timeout").asInt(

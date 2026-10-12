@@ -366,7 +366,11 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-await-wakeup'
       Role: !GetAtt WakeupRole.Arn
       Environment:
-        Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref AwaitWakeupHandler}
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: !Ref AwaitWakeupHandler
+          TPF_AWS_DURABLE_AWAIT_STREAM_ARN: !Ref AwaitInteractionStreamArn
+          TPF_AWS_DURABLE_BINDING_STREAM_ARN: !GetAtt CallbackBindingTable.StreamArn
       Events:
         AwaitState:
           Type: DynamoDB

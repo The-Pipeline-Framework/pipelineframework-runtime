@@ -1,6 +1,8 @@
 package org.pipelineframework.aws.durable;
 
 import java.time.Duration;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -8,6 +10,7 @@ import jakarta.inject.Inject;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.pipelineframework.aws.durable.model.AwsDurableAwaitCheckpoint;
 import org.pipelineframework.orchestrator.PipelineControlPlane;
+import org.pipelineframework.awaitable.store.DynamoAwaitInteractionKeyDecoder;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.lambda.LambdaClient;
 
@@ -40,7 +43,24 @@ public final class AwsDurableHostServices {
     }
 
     public AwsDurableAwaitStreamProcessor streamProcessor() {
-        return new AwsDurableAwaitStreamProcessor(bindings(), actions(), wakeups());
+        return new AwsDurableAwaitStreamProcessor(bindings(), actions(), wakeups(),
+            requiredEnvironment("TPF_AWS_DURABLE_AWAIT_STREAM_ARN"),
+            requiredEnvironment("TPF_AWS_DURABLE_BINDING_STREAM_ARN"), this::observeAwaitStream);
+    }
+
+    Optional<AwsDurableAwaitCheckpoint> observeAwaitStream(
+        com.amazonaws.services.lambda.runtime.events.DynamodbEvent.DynamodbStreamRecord record
+    ) {
+        var keys = Optional.ofNullable(record.getDynamodb())
+            .map(com.amazonaws.services.lambda.runtime.events.models.dynamodb.StreamRecord::getKeys)
+            .orElseThrow(() -> new IllegalArgumentException("DynamoDB Stream keys are unavailable"));
+        var locator = new DynamoAwaitInteractionKeyDecoder().decode(keys.entrySet().stream()
+            .collect(Collectors.toMap(java.util.Map.Entry::getKey,
+                entry -> Optional.ofNullable(entry.getValue().getS())
+                    .orElseThrow(() -> new IllegalArgumentException("DynamoDB key must be a string")))));
+        return checkpointReader().read(locator.tenantId(), locator.interactionId())
+            .filter(checkpoint -> locator.tenantId().equals(checkpoint.tenantId())
+                && locator.interactionId().equals(checkpoint.interactionId()));
     }
 
     public AwsDurableTerminalReconciler terminalReconciler() {

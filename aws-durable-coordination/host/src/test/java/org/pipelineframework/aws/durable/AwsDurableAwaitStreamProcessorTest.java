@@ -8,6 +8,7 @@ import static org.mockito.Mockito.when;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import com.amazonaws.services.lambda.runtime.events.DynamodbEvent;
 import com.amazonaws.services.lambda.runtime.events.models.dynamodb.AttributeValue;
@@ -20,6 +21,8 @@ import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
 import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
 
 class AwsDurableAwaitStreamProcessorTest {
+    private static final String AWAIT_STREAM = "arn:aws:dynamodb:eu-west-1:123456789012:table/await/stream/2026-10-12T00:00:00.000";
+    private static final String BINDING_STREAM = "arn:aws:dynamodb:eu-west-1:123456789012:table/bindings/stream/2026-10-12T00:00:00.000";
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
@@ -40,8 +43,9 @@ class AwsDurableAwaitStreamProcessorTest {
         when(wakeups.wake(org.mockito.ArgumentMatchers.any()))
             .thenReturn(AwsDurableWakeupDisposition.RETRY);
 
-        AwsDurableWakeupDisposition disposition = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups)
-            .process(record(registrationImage(registration)));
+        AwsDurableWakeupDisposition disposition = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, AWAIT_STREAM, BINDING_STREAM,
+            ignored -> { throw new AssertionError("mechanical records must not enter the semantic decoder"); })
+            .process(record(BINDING_STREAM, registrationImage(registration)));
 
         assertThat(disposition).isEqualTo(AwsDurableWakeupDisposition.RETRY);
         verify(bindings).bind(registration.bind(new org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity(
@@ -52,18 +56,85 @@ class AwsDurableAwaitStreamProcessorTest {
 
     @Test
     void awaitRecordRetriesUntilRegistrationExists() {
-        AwsDurableCallbackBindingRepository bindings = mock(AwsDurableCallbackBindingRepository.class);
-        AwsDurableAwaitStreamProcessor processor = new AwsDurableAwaitStreamProcessor(
-            bindings, mock(AwsDurableActionInvoker.class), mock(AwsDurableWakeupService.class));
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, mock(AwsDurableActionInvoker.class),
+            mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM,
+            ignored -> Optional.of(semantic("COMPLETED")));
+        assertThat(processor.process(record(AWAIT_STREAM, Map.of()))).isEqualTo(AwsDurableWakeupDisposition.RETRY);
+    }
 
-        Map<String, AttributeValue> image = new HashMap<>();
-        image.put("tenant_id", string("tenant"));
-        image.put("execution_id", string("execution"));
-        image.put("interaction_id", string("interaction"));
-        image.put("correlation_id", string("correlation"));
-        image.put("status", string("COMPLETED"));
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"WAITING,COMPLETED", "COMPLETED,WAITING"})
+    void semanticObservationOverridesStaleImagesAndMechanicalLookingFields(String actualStatus, String imageStatus) {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var actions = mock(AwsDurableActionInvoker.class);
+        var wakeups = mock(AwsDurableWakeupService.class);
+        when(bindings.findLatestRegistration("tenant", "execution")).thenReturn(Optional.of(registration()));
+        when(wakeups.wake(org.mockito.ArgumentMatchers.any())).thenReturn(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, AWAIT_STREAM, BINDING_STREAM,
+            ignored -> Optional.of(semantic(actualStatus)));
+        var image = new HashMap<>(registrationImage(registration()));
+        image.put("status", string(imageStatus));
+        image.put("execution_id", string("stale-execution"));
+        image.put("correlation_id", string("stale-correlation"));
 
-        assertThat(processor.process(record(image))).isEqualTo(AwsDurableWakeupDisposition.RETRY);
+        assertThat(processor.process(record(AWAIT_STREAM, image))).isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        var identity = new org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity(
+            "tenant", "execution", "interaction", "correlation", 2);
+        verify(bindings).bind(registration().bind(identity));
+        org.mockito.Mockito.verifyNoInteractions(actions);
+        if ("COMPLETED".equals(actualStatus)) {
+            verify(wakeups).wake(identity);
+        } else {
+            org.mockito.Mockito.verifyNoInteractions(wakeups);
+        }
+    }
+
+    @Test
+    void missingSemanticObservationKeepsTheRecordRetryable() {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, mock(AwsDurableActionInvoker.class),
+            mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM, ignored -> Optional.empty());
+        assertThat(processor.process(record(AWAIT_STREAM, Map.of()))).isEqualTo(AwsDurableWakeupDisposition.RETRY);
+        org.mockito.Mockito.verifyNoInteractions(bindings);
+    }
+
+    @Test
+    void unexpectedStreamIsReportedAsABatchFailure() {
+        var processor = new AwsDurableAwaitStreamProcessor(mock(AwsDurableCallbackBindingRepository.class),
+            mock(AwsDurableActionInvoker.class), mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM,
+            ignored -> { throw new AssertionError("unexpected source must not be decoded"); });
+        var record = record(AWAIT_STREAM + "-other", Map.of());
+        record.getDynamodb().setSequenceNumber("unexpected");
+        var event = new DynamodbEvent();
+        event.setRecords(List.of(record));
+        assertThat(new AwsDurableAwaitStreamBatchAdapter().handle(event, processor::process).getBatchItemFailures())
+            .extracting(item -> item.getItemIdentifier()).containsExactly("unexpected");
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {AWAIT_STREAM, BINDING_STREAM})
+    void removalDoesNotTurnExpiryIntoSemanticCompletion(String source) {
+        var processor = new AwsDurableAwaitStreamProcessor(mock(AwsDurableCallbackBindingRepository.class),
+            mock(AwsDurableActionInvoker.class), mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM,
+            ignored -> { throw new AssertionError("deletion is not a completion signal"); });
+        var record = record(source, Map.of());
+        record.setEventName("REMOVE");
+        assertThat(processor.process(record)).isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+    }
+
+    @Test
+    void nonRegistrationMechanicalRecordsNeverEnterTheSemanticPath() {
+        var processor = new AwsDurableAwaitStreamProcessor(mock(AwsDurableCallbackBindingRepository.class),
+            mock(AwsDurableActionInvoker.class), mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM,
+            ignored -> { throw new AssertionError("mechanical evidence must stay mechanical"); });
+        assertThat(processor.process(record(BINDING_STREAM, Map.of("record_type", string("GENERATION_CLAIM")))))
+            .isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+    }
+
+    private static AwsDurableAwaitCheckpoint semantic(String status) {
+        return new AwsDurableAwaitCheckpoint("tenant", "execution", "interaction", "correlation", "unit", "step",
+            status, "pipeline", "contract", "release");
     }
 
     private static AwsDurableCallbackRegistration registration() {
@@ -90,8 +161,10 @@ class AwsDurableAwaitStreamProcessorTest {
         return image;
     }
 
-    private static DynamodbEvent.DynamodbStreamRecord record(Map<String, AttributeValue> image) {
+    private static DynamodbEvent.DynamodbStreamRecord record(String source, Map<String, AttributeValue> image) {
         DynamodbEvent.DynamodbStreamRecord record = new DynamodbEvent.DynamodbStreamRecord();
+        record.setEventSourceARN(source);
+        record.setEventName("MODIFY");
         StreamRecord stream = new StreamRecord();
         stream.setNewImage(image);
         record.setDynamodb(stream);

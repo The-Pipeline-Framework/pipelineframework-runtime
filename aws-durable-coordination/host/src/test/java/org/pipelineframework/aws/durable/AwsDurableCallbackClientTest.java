@@ -157,7 +157,8 @@ class AwsDurableCallbackClientTest {
             new AwsDurableAwaitCheckpoint(tenant, "execution-a", interaction, "correlation-a", "unit-a", "await-a",
                 "COMPLETED", "pipeline-a", "contract-a", "release-a"));
         var wakeups = new AwsDurableWakeupService(checkpoints, bindings, client, replacements);
-        var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups);
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, "arn:await-stream", "arn:binding-stream",
+            ignored -> checkpoints.read(identity.tenantId(), identity.interactionId()));
         doThrow(ResourceNotFoundException.builder().message("uncertain callback delivery").build())
             .when(lambda).sendDurableExecutionCallbackSuccess(any(SendDurableExecutionCallbackSuccessRequest.class));
         AtomicInteger pageNumber = new AtomicInteger();
@@ -174,6 +175,8 @@ class AwsDurableCallbackClientTest {
             "interaction_id", new AttributeValue().withS(identity.interactionId()),
             "correlation_id", new AttributeValue().withS(identity.correlationId()),
             "status", new AttributeValue().withS("COMPLETED")));
+        record.setEventSourceARN("arn:await-stream");
+        record.setEventName("MODIFY");
         record.setDynamodb(stream);
         var event = new DynamodbEvent();
         event.setRecords(List.of(record));

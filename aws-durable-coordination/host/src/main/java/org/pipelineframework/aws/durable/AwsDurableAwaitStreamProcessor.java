@@ -3,6 +3,7 @@ package org.pipelineframework.aws.durable;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Function;
 
 import com.amazonaws.services.lambda.runtime.events.DynamodbEvent;
 import com.amazonaws.services.lambda.runtime.events.models.dynamodb.AttributeValue;
@@ -19,57 +20,78 @@ public final class AwsDurableAwaitStreamProcessor {
     private final AwsDurableCallbackBindingRepository bindings;
     private final AwsDurableActionInvoker actions;
     private final AwsDurableWakeupService wakeups;
+    private final String awaitStreamArn;
+    private final String bindingStreamArn;
+    private final Function<DynamodbEvent.DynamodbStreamRecord, Optional<AwsDurableAwaitCheckpoint>> observations;
 
     public AwsDurableAwaitStreamProcessor(
         AwsDurableCallbackBindingRepository bindings,
         AwsDurableActionInvoker actions,
-        AwsDurableWakeupService wakeups
+        AwsDurableWakeupService wakeups,
+        String awaitStreamArn,
+        String bindingStreamArn,
+        Function<DynamodbEvent.DynamodbStreamRecord, Optional<AwsDurableAwaitCheckpoint>> observations
     ) {
         this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.actions = Objects.requireNonNull(actions, "actions");
         this.wakeups = Objects.requireNonNull(wakeups, "wakeups");
+        this.awaitStreamArn = requiredArn(awaitStreamArn, "awaitStreamArn");
+        this.bindingStreamArn = requiredArn(bindingStreamArn, "bindingStreamArn");
+        if (awaitStreamArn.equals(bindingStreamArn)) {
+            throw new IllegalArgumentException("semantic and mechanical streams must be distinct");
+        }
+        this.observations = Objects.requireNonNull(observations, "observations");
     }
 
     public AwsDurableWakeupDisposition process(DynamodbEvent.DynamodbStreamRecord record) {
         Objects.requireNonNull(record, "record");
+        boolean semantic = awaitStreamArn.equals(record.getEventSourceARN());
+        if (!semantic && !bindingStreamArn.equals(record.getEventSourceARN())) {
+            throw new IllegalArgumentException("unexpected DynamoDB Stream source");
+        }
+        if ("REMOVE".equals(record.getEventName())) {
+            return AwsDurableWakeupDisposition.ACKNOWLEDGE;
+        }
+        if (!"INSERT".equals(record.getEventName()) && !"MODIFY".equals(record.getEventName())) {
+            throw new IllegalArgumentException("unsupported DynamoDB Stream event");
+        }
+        if (semantic) {
+            return observations.apply(record).map(this::processAwait).orElse(AwsDurableWakeupDisposition.RETRY);
+        }
         Map<String, AttributeValue> image = Optional.ofNullable(record.getDynamodb())
             .map(com.amazonaws.services.lambda.runtime.events.models.dynamodb.StreamRecord::getNewImage)
             .orElse(Map.of());
-        if (image.isEmpty()) {
-            return AwsDurableWakeupDisposition.ACKNOWLEDGE;
-        }
         return AwsDurableCallbackBindingRepository.REGISTRATION.equals(text(image, "record_type").orElse(""))
             ? processRegistration(image)
-            : processAwait(image);
+            : AwsDurableWakeupDisposition.ACKNOWLEDGE;
     }
 
-    private AwsDurableWakeupDisposition processAwait(Map<String, AttributeValue> image) {
-        Optional<String> tenantId = text(image, "tenant_id");
-        Optional<String> executionId = text(image, "execution_id");
-        Optional<String> interactionId = text(image, "interaction_id");
-        Optional<String> correlationId = text(image, "correlation_id");
-        Optional<String> status = text(image, "status");
-        if (tenantId.isEmpty() || executionId.isEmpty() || interactionId.isEmpty()
-            || correlationId.isEmpty() || status.isEmpty()) {
-            return AwsDurableWakeupDisposition.ACKNOWLEDGE;
-        }
+    private AwsDurableWakeupDisposition processAwait(AwsDurableAwaitCheckpoint semantic) {
         Optional<AwsDurableCallbackRegistration> registration = bindings.findLatestRegistration(
-            tenantId.orElseThrow(), executionId.orElseThrow());
+            semantic.tenantId(), semantic.executionId());
         if (registration.isEmpty()) {
             return AwsDurableWakeupDisposition.RETRY;
         }
         AwsDurableCallbackRegistration current = registration.orElseThrow();
         AwsDurableAwaitIdentity identity = new AwsDurableAwaitIdentity(
-            tenantId.orElseThrow(), executionId.orElseThrow(), interactionId.orElseThrow(),
-            correlationId.orElseThrow(), current.checkpoint().generation());
+            semantic.tenantId(), semantic.executionId(), semantic.interactionId(),
+            semantic.correlationId(), current.checkpoint().generation());
         try {
             bindings.bind(current.bind(identity));
         } catch (AwsDurableStaleGenerationException stale) {
             // Completion still needs to replay an unresolved replacement start.
         }
-        return "COMPLETED".equals(status.orElseThrow())
+        return "COMPLETED".equals(semantic.status())
             ? wakeups.wake(identity)
             : AwsDurableWakeupDisposition.ACKNOWLEDGE;
+    }
+
+    private static String requiredArn(String value, String name) {
+        Objects.requireNonNull(value, name);
+        if (value.isBlank()) {
+            throw new IllegalArgumentException(name + " is required");
+        }
+        return value;
     }
 
     private AwsDurableWakeupDisposition processRegistration(Map<String, AttributeValue> image) {

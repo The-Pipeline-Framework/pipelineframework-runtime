@@ -74,8 +74,8 @@ public class DynamoAwaitInteractionStore implements
     private static final String ACTIVE_DEADLINE_PARTITION = "active";
     private static final String READY_CONTINUATION_PARTITION = "ready";
 
-    private static final String TENANT_ID = "tenant_id";
-    private static final String INTERACTION_ID = "interaction_id";
+    static final String TENANT_ID = "tenant_id";
+    static final String INTERACTION_ID = "interaction_id";
     private static final String LOOKUP_KEY = "lookup_key";
     private static final String LOOKUP_KIND = "lookup_kind";
     private static final String EXECUTION_ID = "execution_id";
