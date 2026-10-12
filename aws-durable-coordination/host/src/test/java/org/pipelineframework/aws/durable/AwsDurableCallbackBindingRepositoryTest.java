@@ -4,6 +4,8 @@ import java.util.Map;
 import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
 import org.pipelineframework.aws.durable.model.AwsDurableBindingStatus;
 import org.pipelineframework.aws.durable.model.AwsDurableCallbackBinding;
@@ -11,10 +13,16 @@ import org.pipelineframework.aws.durable.model.AwsDurableCallbackRegistration;
 import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
 import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
+import software.amazon.awssdk.services.dynamodb.model.ConditionalCheckFailedException;
+import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.GetItemResponse;
+import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.PutItemResponse;
 import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
 import software.amazon.awssdk.services.dynamodb.model.QueryResponse;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -54,6 +62,53 @@ class AwsDurableCallbackBindingRepositoryTest {
         assertThat(AwsDurableCallbackBindingRepository.sameRegistrationAuthority(
             registration("callback-a", 100, 1_000),
             registration("callback-b", 100, 1_000))).isFalse();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "other-pipeline, 1, release-a",
+        "pipeline-a, other-contract, release-a",
+        "pipeline-a, 1, other-release"
+    })
+    void conflictingSemanticCheckpointCannotReplayRegistration(
+        String pipelineId, String contractVersion, String releaseVersion
+    ) {
+        DynamoDbClient dynamo = mock(DynamoDbClient.class);
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, "bindings");
+        var original = registration("callback-a", 100, 1_000);
+        persistThenConflict(dynamo, repository, original);
+        var candidate = new AwsDurableCallbackRegistration(
+            new AwsDurableDriverCheckpoint(new AwsDurableExecutionCheckpoint(
+                "tenant-a", "execution-a", pipelineId, contractVersion, releaseVersion), 1),
+            original.providerExecutionName(), original.providerExecutionArn(), original.providerCallbackId(),
+            200, 2_000);
+
+        assertThatThrownBy(() -> repository.register(candidate))
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("already owned");
+    }
+
+    @Test
+    void actualRegistrationReplayAcceptsChangedHousekeepingTimes() {
+        DynamoDbClient dynamo = mock(DynamoDbClient.class);
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, "bindings");
+        persistThenConflict(dynamo, repository, registration("callback-a", 100, 1_000));
+
+        assertThat(repository.register(registration("callback-a", 200, 2_000))).isFalse();
+    }
+
+    private static void persistThenConflict(
+        DynamoDbClient dynamo, AwsDurableCallbackBindingRepository repository,
+        AwsDurableCallbackRegistration original
+    ) {
+        when(dynamo.putItem(any(PutItemRequest.class))).thenReturn(PutItemResponse.builder().build());
+        assertThat(repository.register(original)).isTrue();
+        var stored = org.mockito.ArgumentCaptor.forClass(PutItemRequest.class);
+        verify(dynamo).putItem(stored.capture());
+        when(dynamo.getItem(any(GetItemRequest.class)))
+            .thenReturn(GetItemResponse.builder().item(stored.getValue().item()).build());
+        when(dynamo.putItem(any(PutItemRequest.class)))
+            .thenThrow(ConditionalCheckFailedException.builder().message("existing authority").build());
     }
 
     @Test

@@ -290,9 +290,7 @@ public final class AwsDurableCallbackBindingRepository {
         AwsDurableCallbackRegistration existing,
         AwsDurableCallbackRegistration candidate
     ) {
-        return existing.checkpoint().tenantId().equals(candidate.checkpoint().tenantId())
-            && existing.checkpoint().executionId().equals(candidate.checkpoint().executionId())
-            && existing.checkpoint().generation() == candidate.checkpoint().generation()
+        return existing.checkpoint().equals(candidate.checkpoint())
             && existing.providerExecutionName().equals(candidate.providerExecutionName())
             && existing.providerExecutionArn().equals(candidate.providerExecutionArn())
             && existing.providerCallbackId().equals(candidate.providerCallbackId());
