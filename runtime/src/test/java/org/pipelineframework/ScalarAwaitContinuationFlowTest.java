@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
+import org.pipelineframework.awaitable.AwaitUnitOccurrence;
 import org.pipelineframework.awaitable.AwaitUnitRecord;
 import org.pipelineframework.awaitable.AwaitUnitStatus;
 import org.pipelineframework.orchestrator.CreateExecutionResult;
@@ -44,15 +45,16 @@ class ScalarAwaitContinuationFlowTest {
             now,
             9_999_999_999L))
         .await().indefinitely();
+    String unitId = awaitUnitId(created.record());
     store.markWaitingExternal(
             "tenant-1",
             created.record().executionId(),
             created.record().version(),
             "transition",
-            "unit-1",
+            unitId,
             2,
             now)
-        .await().indefinitely();
+        .await().indefinitely().orElseThrow();
     when(dispatcher.enqueueNow(any())).thenAnswer(invocation -> {
       ControlPlaneProjection projection = journal.projection("tenant-1", created.record().executionId())
           .await().indefinitely();
@@ -68,8 +70,8 @@ class ScalarAwaitContinuationFlowTest {
         });
 
     flow.release(new AwaitContinuationPlan.ReleaseScalar(
-            scalarRecord(created.record().executionId()),
-            scalarUnit(created.record().executionId()),
+            scalarRecord(created.record().executionId(), unitId),
+            scalarUnit(created.record().executionId(), unitId),
             3),
             now)
         .await().indefinitely();
@@ -77,7 +79,13 @@ class ScalarAwaitContinuationFlowTest {
     verify(dispatcher).enqueueNow(new ExecutionWorkItem("tenant-1", created.record().executionId()));
   }
 
-  private static AwaitInteractionRecord scalarRecord(String executionId) {
+  private static String awaitUnitId(org.pipelineframework.orchestrator.ExecutionRecord<?, ?> record) {
+    return new AwaitUnitOccurrence(
+        "tenant-1", record.executionId(), record.executionId(), "AwaitPaymentProvider", 2,
+        record.awaitOccurrenceCause().orElseThrow()).unitId();
+  }
+
+  private static AwaitInteractionRecord scalarRecord(String executionId, String unitId) {
     return new AwaitInteractionRecord(
         "tenant-1",
         executionId,
@@ -92,7 +100,7 @@ class ScalarAwaitContinuationFlowTest {
         AwaitInteractionStatus.COMPLETED,
         Map.of("value", "request"),
         Map.of("value", "response"),
-        "unit-1",
+        unitId,
         null,
         "user-1",
         null,
@@ -105,10 +113,10 @@ class ScalarAwaitContinuationFlowTest {
         999_999L);
   }
 
-  private static AwaitUnitRecord scalarUnit(String executionId) {
+  private static AwaitUnitRecord scalarUnit(String executionId, String unitId) {
     return new AwaitUnitRecord(
         "tenant-1",
-        "unit-1",
+        unitId,
         executionId,
         "AwaitPaymentProvider",
         2,

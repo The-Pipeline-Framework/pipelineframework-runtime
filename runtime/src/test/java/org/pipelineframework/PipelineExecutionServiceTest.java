@@ -315,6 +315,7 @@ class PipelineExecutionServiceTest {
         List<Object> steps = List.of(new Object());
         AtomicReference<AwaitContinuationMode> continuationMode = new AtomicReference<>();
         AtomicReference<TerminalOutputOwnership> terminalOutputOwnership = new AtomicReference<>();
+        AtomicReference<Optional<String>> occurrenceCause = new AtomicReference<>();
         when(releaseIdentityResolver.validateCommandIdentity(any(), isNull())).thenReturn(Optional.empty());
         when(pipelineStepResolver.loadPipelineSteps()).thenReturn(steps);
         when(pipelineRunner.runFromStepUntilWithContext(any(), eq(steps), eq(0), eq(1)))
@@ -322,6 +323,7 @@ class PipelineExecutionServiceTest {
                 var context = org.pipelineframework.awaitable.AwaitExecutionContextHolder.get();
                 continuationMode.set(context.continuationMode());
                 terminalOutputOwnership.set(context.terminalOutputOwnership());
+                occurrenceCause.set(context.awaitOccurrenceCause());
                 return new PipelineRunner.ExecutionResult(Multi.createFrom().empty(), telemetryContext);
             });
 
@@ -332,12 +334,14 @@ class PipelineExecutionServiceTest {
         assertEquals(AwaitContinuationMode.LIVE_IF_SUPPORTED, continuationMode.get());
         assertEquals(TerminalOutputOwnership.TRANSITION_WORKER, terminalOutputOwnership.get());
 
-        TransitionResultEnvelope portableEnvelope = service.executePortableTransition(transitionCommand(codec, 0, -1))
+        TransitionResultEnvelope portableEnvelope = service.executePortableTransition(
+            transitionCommand(codec, 0, -1, Optional.of("await-cause-v1")))
             .await().indefinitely();
 
         assertEquals(TransitionWorkerOutcome.COMPLETED, portableEnvelope.outcome());
         assertEquals(AwaitContinuationMode.DURABLE_HANDOFF, continuationMode.get());
         assertEquals(TerminalOutputOwnership.COORDINATOR, terminalOutputOwnership.get());
+        assertEquals(Optional.of("await-cause-v1"), occurrenceCause.get());
     }
 
     @Test
@@ -677,6 +681,15 @@ class PipelineExecutionServiceTest {
         int currentStepIndex,
         int stopBeforeStepIndex
     ) {
+        return transitionCommand(codec, currentStepIndex, stopBeforeStepIndex, Optional.empty());
+    }
+
+    private static TransitionCommandEnvelope transitionCommand(
+        JsonTransitionPayloadCodec codec,
+        int currentStepIndex,
+        int stopBeforeStepIndex,
+        Optional<String> awaitOccurrenceCause
+    ) {
         var payload = codec.encode("input");
         return new TransitionCommandEnvelope(
             "tenant-1",
@@ -693,7 +706,13 @@ class PipelineExecutionServiceTest {
             "trace-1",
             payload.payloadTypeId(),
             payload.payloadEncoding(),
-            payload.payload());
+            payload.payload(),
+            ExecutionRedriveIntent.REPLAY,
+            -1,
+            Optional.empty(),
+            Optional.empty(),
+            Optional.empty(),
+            awaitOccurrenceCause);
     }
 
     private static PipelineContractDescriptor portableLiveItemizedContract(

@@ -1,5 +1,9 @@
 package org.pipelineframework;
 
+import org.pipelineframework.orchestrator.AwaitSemanticSelection;
+
+import org.pipelineframework.awaitable.AwaitInteractionCursor;
+
 import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -202,6 +206,18 @@ class QueueAsyncCoordinator {
         releaseVersion);
   }
 
+  Uni<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint> getExecutionSemanticCheckpoint(
+      String tenantId, String executionId) {
+    if (!ensureQueueModeReady()) return Uni.createFrom().failure(queueModeDisabledException());
+    return executionReadModel().getExecutionSemanticCheckpoint(tenantId, executionId);
+  }
+
+  Uni<Optional<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(
+      String tenantId, String clientKey) {
+    if (!ensureQueueModeReady()) return Uni.createFrom().failure(queueModeDisabledException());
+    return executionReadModel().getExecutionSemanticCheckpointByClientKey(tenantId, clientKey);
+  }
+
   Uni<ExecutionStatusDto> getExecutionStatus(String tenantId, String executionId) {
     if (!ensureQueueModeReady()) {
       return Uni.createFrom().failure(queueModeDisabledException());
@@ -354,112 +370,34 @@ class QueueAsyncCoordinator {
     });
   }
 
+  Uni<org.pipelineframework.orchestrator.AwaitCompletionObservation> getAwaitCompletionObservation(
+      String tenantId, String interactionId) {
+    return Uni.createFrom().deferred(() -> executionReadModel().getAwaitCompletionObservation(tenantId, interactionId));
+  }
+
+  Uni<org.pipelineframework.orchestrator.AwaitCompletionObservationPage> queryAwaitCompletionObservations(
+      String tenantId, int limit, Optional<org.pipelineframework.awaitable.AwaitCompletionCursor> cursor) {
+    return Uni.createFrom().deferred(() -> executionReadModel().queryAwaitCompletionObservations(tenantId, limit, cursor));
+  }
+
   Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(
-      String tenantId,
-      String interactionId) {
-    return Uni.createFrom().deferred(() -> {
-      if (!ensureQueueModeReady()) {
-        return Uni.createFrom().failure(queueModeDisabledException());
-      }
-      String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
-      RuntimeException admissionFailure = admissionFailure(admissionRequest(
-          resolvedTenant,
-          ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT,
-          null,
-          "api",
-          explicitTenant(tenantId)));
-      if (admissionFailure != null) {
-        return Uni.createFrom().failure(admissionFailure);
-      }
-      return awaitCoordinator.getInteraction(resolvedTenant, interactionId)
-          .onItem().transformToUni(interaction -> interaction
-              .map(record -> executionStateStore.getExecution(resolvedTenant, record.executionId())
-                  .onItem().transform(execution -> execution.map(parent -> new AwaitSemanticCheckpoint(
-                      record.tenantId(),
-                      record.executionId(),
-                      record.interactionId(),
-                      record.correlationId(),
-                      record.unitId(),
-                      record.stepId(),
-                      record.status(),
-                      parent.pipelineId(),
-                      parent.contractVersion(),
-                      parent.releaseVersion()))))
-              .orElseGet(() -> Uni.createFrom().item(Optional.empty())));
-    });
+      String tenantId, String interactionId) {
+    return Uni.createFrom().deferred(() -> executionReadModel().getAwaitSemanticCheckpoint(tenantId, interactionId));
   }
 
   Uni<Optional<AwaitSemanticCheckpoint>> getCurrentAwaitSemanticCheckpoint(
       String tenantId, String executionId) {
-    return Uni.createFrom().deferred(() -> {
-      if (!ensureQueueModeReady()) {
-        return Uni.createFrom().failure(queueModeDisabledException());
-      }
-      if (executionId == null || executionId.isBlank()) {
-        return Uni.createFrom().failure(new IllegalArgumentException("executionId must not be blank"));
-      }
-      String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
-      RuntimeException denied = admissionFailure(admissionRequest(resolvedTenant,
-          ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT, executionId, "api", explicitTenant(tenantId)));
-      if (denied != null) {
-        return Uni.createFrom().failure(denied);
-      }
-      return executionStateStore.getExecution(resolvedTenant, executionId)
-          .onItem().transformToUni(parent -> parent
-              .filter(record -> record.status() == org.pipelineframework.orchestrator.ExecutionStatus.WAITING_EXTERNAL)
-              .filter(record -> record.awaitUnitId() != null && !record.awaitUnitId().isBlank())
-              .map(record -> awaitCoordinator.getUnit(resolvedTenant, record.awaitUnitId())
-                  .onItem().transformToUni(unit -> {
-                    if (!record.executionId().equals(unit.executionId()) || !resolvedTenant.equals(unit.tenantId())) {
-                      return Uni.createFrom().failure(new IllegalStateException("Await unit does not belong to execution"));
-                    }
-                    return Optional.ofNullable(unit.primaryInteractionId()).filter(id -> !id.isBlank())
-                        .map(id -> getAwaitSemanticCheckpoint(resolvedTenant, id)
-                            .onItem().transform(checkpoint -> checkpoint.map(value -> {
-                              if (!record.executionId().equals(value.executionId())
-                                  || !unit.unitId().equals(value.unitId())) {
-                                throw new IllegalStateException("primary Await interaction does not belong to unit");
-                              }
-                              return value;
-                            })))
-                        .orElseGet(() -> Uni.createFrom().item(Optional.<AwaitSemanticCheckpoint>empty()));
-                  }))
-              .orElseGet(() -> Uni.createFrom().item(Optional.<AwaitSemanticCheckpoint>empty())));
-    });
+    return Uni.createFrom().deferred(() -> executionReadModel().getCurrentAwaitSemanticCheckpoint(tenantId, executionId));
+  }
+
+  Uni<AwaitSemanticSelection> getCurrentAwaitSemanticCheckpoint(
+      String tenantId, String executionId, Optional<AwaitInteractionCursor> cursor) {
+    return Uni.createFrom().deferred(() -> executionReadModel().getCurrentAwaitSemanticCheckpoint(tenantId, executionId, cursor));
   }
 
   Uni<List<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoints(
-      String tenantId,
-      String executionId,
-      int limit) {
-    return Uni.createFrom().deferred(() -> {
-      if (!ensureQueueModeReady()) {
-        return Uni.createFrom().failure(queueModeDisabledException());
-      }
-      if (executionId == null || executionId.isBlank()) {
-        return Uni.createFrom().failure(new IllegalArgumentException("executionId must not be blank"));
-      }
-      String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
-      RuntimeException admissionFailure = admissionFailure(admissionRequest(
-          resolvedTenant,
-          ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT,
-          executionId,
-          "api",
-          explicitTenant(tenantId)));
-      if (admissionFailure != null) {
-        return Uni.createFrom().failure(admissionFailure);
-      }
-      return executionStateStore.getExecution(resolvedTenant, executionId)
-          .onItem().transformToUni(execution -> execution
-              .map(parent -> awaitCoordinator.findByExecution(resolvedTenant, executionId, limit <= 0 ? 100 : limit)
-                  .onItem().transform(records -> records.stream()
-                      .map(record -> new AwaitSemanticCheckpoint(
-                          record.tenantId(), record.executionId(), record.interactionId(), record.correlationId(),
-                          record.unitId(), record.stepId(), record.status(), parent.pipelineId(),
-                          parent.contractVersion(), parent.releaseVersion()))
-                      .toList()))
-              .orElseGet(() -> Uni.createFrom().item(List.of())));
-    });
+      String tenantId, String executionId, int limit) {
+    return Uni.createFrom().deferred(() -> executionReadModel().getAwaitSemanticCheckpoints(tenantId, executionId, limit));
   }
 
   Uni<AwaitItemContinuationResult> processAwaitItemContinuation(
@@ -726,6 +664,7 @@ class QueueAsyncCoordinator {
             orchestratorConfig,
             executionInputPolicy,
             executionStateStore,
+            awaitCoordinator,
             admissionPolicy(),
             this::pipelineId,
             this::releaseVersion,

@@ -42,7 +42,8 @@ public class InMemoryAwaitUnitStore implements AwaitUnitStore {
                 String scopedId = scopedUnitId(command.tenantId(), command.unitId());
                 AwaitUnitRecord existing = unitsByScopedId.get(scopedId);
                 if (existing != null) {
-                    return existing;
+                    return requireSameOwner(existing, command.tenantId(), command.unitId(), command.executionId(),
+                        command.stepId(), command.stepIndex(), command.cardinality());
                 }
                 AwaitUnitRecord created = new AwaitUnitRecord(
                     command.tenantId(),
@@ -88,7 +89,7 @@ public class InMemoryAwaitUnitStore implements AwaitUnitStore {
                 String scopedId = scopedUnitId(record.tenantId(), record.unitId());
                 AwaitUnitRecord existing = unitsByScopedId.get(scopedId);
                 if (existing != null) {
-                    return existing;
+                    return requireImportedOwner(existing, record);
                 }
                 unitsByScopedId.put(scopedId, record);
                 completedItemsByScopedId.put(scopedId, new HashSet<>(record.completedItemKeys()));
@@ -97,13 +98,59 @@ public class InMemoryAwaitUnitStore implements AwaitUnitStore {
         });
     }
 
+    private AwaitUnitRecord requireSameOwner(AwaitUnitRecord existing, String tenantId, String unitId,
+        String executionId, String stepId, int stepIndex, String cardinality) {
+        if (!existing.tenantId().equals(tenantId) || !existing.unitId().equals(unitId)
+            || !existing.executionId().equals(executionId) || !existing.stepId().equals(stepId)
+            || existing.stepIndex() != stepIndex || !existing.cardinality().equals(cardinality)) {
+            throw new IllegalStateException("Await unit identity conflicts with its immutable owner");
+        }
+        return existing;
+    }
+
+    private AwaitUnitRecord requireImportedOwner(AwaitUnitRecord existing, AwaitUnitRecord incoming) {
+        requireSameOwner(existing, incoming.tenantId(), incoming.unitId(), incoming.executionId(),
+            incoming.stepId(), incoming.stepIndex(), incoming.cardinality());
+        if (org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(incoming.unitId()).isPresent()
+            && incoming.primaryInteractionId() != null
+            && !incoming.primaryInteractionId().equals(existing.primaryInteractionId())) {
+            throw new IllegalStateException("Qualified Await import conflicts with retained primary membership");
+        }
+        return existing;
+    }
+
     @Override
     public Uni<Optional<AwaitUnitRecord>> attachPrimaryInteraction(
         String tenantId,
         String unitId,
         String interactionId,
         long nowEpochMs) {
-        return update(tenantId, unitId, nowEpochMs, current -> new AwaitUnitRecord(
+        var occurrence = org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(unitId);
+        if (occurrence.isPresent()) {
+            if (interactionId == null || interactionId.isBlank() || !occurrence.orElseThrow().tenantId().equals(tenantId)) {
+                return Uni.createFrom().failure(new IllegalArgumentException("Qualified primary attachment requires its tenant and interaction"));
+            }
+            return Uni.createFrom().item(() -> {
+                synchronized (lock) {
+                    purgeExpired(nowEpochMs);
+                    String scopedId = scopedUnitId(tenantId, unitId);
+                    AwaitUnitRecord current = unitsByScopedId.get(scopedId);
+                    if (current == null) return Optional.empty();
+                    if (interactionId.equals(current.primaryInteractionId())) return Optional.of(current);
+                    if (current.primaryInteractionId() != null || current.status().terminal() || current.dispatchComplete()) {
+                        return Optional.empty();
+                    }
+                    AwaitUnitRecord attached = withPrimary(current, interactionId, nowEpochMs);
+                    unitsByScopedId.put(scopedId, attached);
+                    return Optional.of(attached);
+                }
+            });
+        }
+        return update(tenantId, unitId, nowEpochMs, current -> withPrimary(current, interactionId, nowEpochMs));
+    }
+
+    private AwaitUnitRecord withPrimary(AwaitUnitRecord current, String interactionId, long nowEpochMs) {
+        return new AwaitUnitRecord(
             current.tenantId(),
             current.unitId(),
             current.executionId(),
@@ -119,7 +166,7 @@ public class InMemoryAwaitUnitStore implements AwaitUnitStore {
             current.dispatchComplete(),
             current.createdAtEpochMs(),
             nowEpochMs,
-            current.ttlEpochS()));
+            current.ttlEpochS());
     }
 
     @Override

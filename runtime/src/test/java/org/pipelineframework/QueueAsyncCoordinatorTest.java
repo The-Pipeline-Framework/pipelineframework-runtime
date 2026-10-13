@@ -63,10 +63,13 @@ import org.pipelineframework.awaitable.AwaitCompletionCommand;
 import org.pipelineframework.awaitable.AwaitCompletionResult;
 import org.pipelineframework.awaitable.AwaitCoordinator;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
+import org.pipelineframework.awaitable.AwaitInteractionCursor;
+import org.pipelineframework.awaitable.AwaitInteractionPage;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.AwaitLiveCompletionRegistry;
 import org.pipelineframework.awaitable.AwaitSuspendedException;
 import org.pipelineframework.awaitable.AwaitUnitRecord;
+import org.pipelineframework.awaitable.AwaitUnitOccurrence;
 import org.pipelineframework.awaitable.AwaitUnitStatus;
 import org.pipelineframework.checkpoint.CheckpointPublicationService;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
@@ -259,6 +262,160 @@ class QueueAsyncCoordinatorTest {
     }
 
     @Test
+    void currentItemisedAwaitSelectsAnUnresolvedMemberWithoutExecutionHistoryTruncation() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        ExecutionRecord<Object, Object> waiting = mock(ExecutionRecord.class);
+        when(waiting.status()).thenReturn(ExecutionStatus.WAITING_EXTERNAL);
+        when(waiting.awaitUnitId()).thenReturn("unit-1");
+        when(waiting.executionId()).thenReturn("exec-1");
+        when(executionStateStore.getExecution("tenant-1", "exec-1"))
+            .thenReturn(Uni.createFrom().item(Optional.of(waiting)),
+                Uni.createFrom().item(Optional.of(createRecord("tenant-1", "exec-1", "key-1"))));
+        AwaitUnitRecord unit = mock(AwaitUnitRecord.class);
+        when(unit.tenantId()).thenReturn("tenant-1");
+        when(unit.executionId()).thenReturn("exec-1");
+        when(unit.unitId()).thenReturn("unit-1");
+        when(awaitCoordinator.getUnit("tenant-1", "unit-1")).thenReturn(Uni.createFrom().item(unit));
+        when(waiting.pipelineId()).thenReturn("pipeline-1");
+        when(waiting.contractVersion()).thenReturn("contract-1");
+        when(waiting.releaseVersion()).thenReturn("release-1");
+        var members = new java.util.ArrayList<AwaitInteractionRecord>();
+        for (int item = 0; item < 101; item++) {
+            members.add(itemAwaitRecord(item, AwaitInteractionStatus.COMPLETED, "done"));
+        }
+        var cursor = new AwaitInteractionCursor("tenant-1", "unit-1", "after-first-100");
+        when(awaitCoordinator.findByUnitPage("tenant-1", "unit-1", 100, Optional.empty()))
+            .thenReturn(Uni.createFrom().item(new AwaitInteractionPage(members.subList(0, 100), Optional.of(cursor))));
+        var next = unresolvedItem(101);
+        when(awaitCoordinator.findByUnitPage("tenant-1", "unit-1", 100, Optional.of(cursor)))
+            .thenReturn(Uni.createFrom().item(new AwaitInteractionPage(
+                java.util.List.of(members.getLast(), unresolvedItem(102), next), Optional.empty())));
+        when(awaitCoordinator.getInteraction("tenant-1", "interaction-101"))
+            .thenReturn(Uni.createFrom().item(Optional.of(next)));
+        // Keep the parent parked across bounded observations; the second page must not depend on execution history.
+        when(executionStateStore.getExecution("tenant-1", "exec-1"))
+            .thenReturn(Uni.createFrom().item(Optional.of(waiting)));
+
+        var first = coordinator.getCurrentAwaitSemanticCheckpoint("tenant-1", "exec-1", Optional.empty())
+            .await().indefinitely();
+        assertTrue(first.checkpoint().isEmpty());
+        assertEquals(Optional.of(cursor), first.nextCursor());
+        var observed = coordinator.getCurrentAwaitSemanticCheckpoint("tenant-1", "exec-1", first.nextCursor())
+            .await().indefinitely().checkpoint().orElseThrow();
+
+        assertEquals("interaction-101", observed.interactionId());
+        assertEquals(AwaitInteractionStatus.DISPATCHED, observed.status());
+        verify(awaitCoordinator, never()).findByExecution(any(), any(), org.mockito.ArgumentMatchers.anyInt());
+        verify(awaitCoordinator, never()).findByUnit(any(), any());
+    }
+
+    @Test
+    void currentItemisedAwaitRechecksStaleIndexEntryBeforeSelectingNextPendingMember() {
+        currentItemUnit();
+        var stale = unresolvedItem(0);
+        var pending = unresolvedItem(1);
+        when(awaitCoordinator.findByUnitPage("tenant-1", "unit-1", 100, Optional.empty()))
+            .thenReturn(Uni.createFrom().item(new AwaitInteractionPage(java.util.List.of(stale, pending), Optional.empty())));
+        when(awaitCoordinator.getInteraction("tenant-1", "interaction-0"))
+            .thenReturn(Uni.createFrom().item(Optional.of(itemAwaitRecord(0, AwaitInteractionStatus.COMPLETED, "done"))));
+        when(awaitCoordinator.getInteraction("tenant-1", "interaction-1"))
+            .thenReturn(Uni.createFrom().item(Optional.of(pending)));
+        assertEquals("interaction-1", coordinator.getCurrentAwaitSemanticCheckpoint("tenant-1", "exec-1", Optional.empty())
+            .await().indefinitely().checkpoint().orElseThrow().interactionId());
+    }
+
+    @Test
+    void emptyFilteredPagePreservesCursorAndDoesNotReleaseParent() {
+        currentItemUnit();
+        var cursor = new AwaitInteractionCursor("tenant-1", "unit-1", "next-page");
+        when(awaitCoordinator.findByUnitPage("tenant-1", "unit-1", 100, Optional.empty()))
+            .thenReturn(Uni.createFrom().item(new AwaitInteractionPage(java.util.List.of(), Optional.of(cursor))));
+        var selection = coordinator.getCurrentAwaitSemanticCheckpoint("tenant-1", "exec-1", Optional.empty())
+            .await().indefinitely();
+        assertTrue(selection.checkpoint().isEmpty());
+        assertEquals(Optional.of(cursor), selection.nextCursor());
+        verify(awaitCoordinator, never()).getInteraction(any(), any());
+    }
+
+    @Test
+    void allCompletedMembersDoNotImplyParentConsequencesHaveFinished() {
+        currentItemUnit();
+        when(awaitCoordinator.findByUnitPage("tenant-1", "unit-1", 100, Optional.empty()))
+            .thenReturn(Uni.createFrom().item(new AwaitInteractionPage(java.util.List.of(
+                itemAwaitRecord(0, AwaitInteractionStatus.COMPLETED, "done")), Optional.empty())));
+        var selection = coordinator.getCurrentAwaitSemanticCheckpoint("tenant-1", "exec-1", Optional.empty())
+            .await().indefinitely();
+        assertTrue(selection.checkpoint().isEmpty());
+        assertTrue(selection.nextCursor().isEmpty());
+        verify(executionStateStore).getExecution("tenant-1", "exec-1");
+        assertTrue(org.mockito.Mockito.mockingDetails(executionStateStore).getInvocations().stream()
+            .allMatch(invocation -> java.util.Set.of("getExecution", "supportsLeaseRenewal", "startupValidationError")
+                .contains(invocation.getMethod().getName())));
+    }
+
+    @Test
+    void currentAwaitRejectsForeignUnitCursorBeforeInteractionRead() {
+        currentItemUnit();
+        AwaitUnitRecord foreign = mock(AwaitUnitRecord.class);
+        when(foreign.tenantId()).thenReturn("tenant-1");
+        when(foreign.executionId()).thenReturn("foreign-execution");
+        when(awaitCoordinator.getUnit("tenant-1", "foreign-unit")).thenReturn(Uni.createFrom().item(foreign));
+        assertThrows(IllegalArgumentException.class, () -> coordinator.getCurrentAwaitSemanticCheckpoint(
+            "tenant-1", "exec-1", Optional.of(new AwaitInteractionCursor("tenant-1", "foreign-unit", "position")))
+            .await().indefinitely());
+        verify(awaitCoordinator, never()).findByUnitPage(any(), any(), org.mockito.ArgumentMatchers.anyInt(), any());
+        verify(awaitCoordinator, never()).getInteraction(any(), any());
+    }
+
+    @Test
+    void validatedCursorFromPriorUnitResetsObservationAfterExecutionAdvances() {
+        currentItemUnit();
+        AwaitUnitRecord old = mock(AwaitUnitRecord.class);
+        when(old.tenantId()).thenReturn("tenant-1");
+        when(old.executionId()).thenReturn("exec-1");
+        when(awaitCoordinator.getUnit("tenant-1", "prior-unit")).thenReturn(Uni.createFrom().item(old));
+        var selection = coordinator.getCurrentAwaitSemanticCheckpoint("tenant-1", "exec-1",
+            Optional.of(new AwaitInteractionCursor("tenant-1", "prior-unit", "opaque-position"))).await().indefinitely();
+        assertTrue(selection.cursorReset());
+        assertTrue(selection.checkpoint().isEmpty());
+        assertTrue(selection.nextCursor().isEmpty());
+        verify(awaitCoordinator, never()).findByUnitPage(any(), any(), org.mockito.ArgumentMatchers.anyInt(), any());
+        verify(awaitCoordinator, never()).getInteraction(any(), any());
+    }
+
+    @Test
+    void foreignTenantCursorCannotReadAnyInteractionOrPriorUnit() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        assertThrows(IllegalArgumentException.class, () -> coordinator.getCurrentAwaitSemanticCheckpoint(
+            "tenant-1", "exec-1", Optional.of(new AwaitInteractionCursor("tenant-other", "prior-unit", "position")))
+            .await().indefinitely());
+        verifyNoInteractions(awaitCoordinator);
+        verify(executionStateStore, never()).getExecution(any(), any());
+    }
+
+    private void currentItemUnit() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        ExecutionRecord<Object, Object> waiting = mock(ExecutionRecord.class);
+        when(waiting.status()).thenReturn(ExecutionStatus.WAITING_EXTERNAL);
+        when(waiting.awaitUnitId()).thenReturn("unit-1");
+        when(waiting.executionId()).thenReturn("exec-1");
+        org.mockito.Mockito.lenient().when(waiting.pipelineId()).thenReturn("pipeline-1");
+        org.mockito.Mockito.lenient().when(waiting.contractVersion()).thenReturn("contract-1");
+        org.mockito.Mockito.lenient().when(waiting.releaseVersion()).thenReturn("release-1");
+        when(executionStateStore.getExecution("tenant-1", "exec-1"))
+            .thenReturn(Uni.createFrom().item(Optional.of(waiting)));
+        AwaitUnitRecord unit = mock(AwaitUnitRecord.class);
+        when(unit.tenantId()).thenReturn("tenant-1");
+        when(unit.executionId()).thenReturn("exec-1");
+        when(unit.unitId()).thenReturn("unit-1");
+        when(awaitCoordinator.getUnit("tenant-1", "unit-1")).thenReturn(Uni.createFrom().item(unit));
+    }
+
+    private AwaitInteractionRecord unresolvedItem(int index) {
+        return itemAwaitRecord(index, AwaitInteractionStatus.DISPATCHED, "pending");
+    }
+
+    @Test
     void semanticCheckpointReadsApplyTenantAdmissionBeforeStorageAccess() {
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         ControlPlaneAdmissionPolicy policy = mock(ControlPlaneAdmissionPolicy.class);
@@ -278,7 +435,9 @@ class QueueAsyncCoordinatorTest {
             ArgumentCaptor.forClass(ControlPlaneAdmissionRequest.class);
         assertThrows(ControlPlaneAdmissionException.class, () -> coordinator
             .getCurrentAwaitSemanticCheckpoint("tenant-denied", "exec-1").await().indefinitely());
-        verify(policy, times(3)).admit(requests.capture());
+        assertThrows(ControlPlaneAdmissionException.class, () -> coordinator
+            .getCurrentAwaitSemanticCheckpoint("tenant-denied", "exec-1", Optional.empty()).await().indefinitely());
+        verify(policy, times(4)).admit(requests.capture());
         assertTrue(requests.getAllValues().stream().allMatch(request ->
             request.operation() == ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT));
         verifyNoInteractions(awaitCoordinator);
@@ -575,6 +734,8 @@ class QueueAsyncCoordinatorTest {
     void sweepOnceRedispatchesPersistedDueExecutionsAndReturnsSummary() {
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         when(orchestratorConfig.sweepLimit()).thenReturn(100);
+        when(awaitCoordinator.findDueTimeoutConsequences(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.eq(100)))
+            .thenReturn(Uni.createFrom().item(java.util.List.of()));
         when(awaitCoordinator.findTimedOut(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.eq(100)))
             .thenReturn(Uni.createFrom().item(java.util.List.of()));
         when(executionStateStore.findDueExecutions(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyInt()))
@@ -1913,16 +2074,20 @@ class QueueAsyncCoordinatorTest {
                 now,
                 now + 100000))
             .await().indefinitely();
+        String unitId = new AwaitUnitOccurrence(
+            "tenant-1", parent.record().executionId(), parent.record().executionId(), "AwaitPaymentProvider", 2,
+            parent.record().awaitOccurrenceCause().orElseThrow()).unitId();
         store.markWaitingExternal(
                 "tenant-1",
                 parent.record().executionId(),
                 parent.record().version(),
                 "transition",
-                "unit-1",
+                unitId,
                 2,
                 now)
-            .await().indefinitely();
-        AwaitUnitRecord unit = awaitUnit("unit-1", AwaitUnitStatus.COMPLETED, 2, 2, true, null);
+            .await().indefinitely().orElseThrow();
+        AwaitUnitRecord unit = awaitUnit(unitId, parent.record().executionId(),
+            AwaitUnitStatus.COMPLETED, 2, 2, true, null);
         AtomicReference<AwaitUnitRecord> durableUnit = new AtomicReference<>(unit);
         when(awaitCoordinator.getUnit("tenant-1", unit.unitId()))
             .thenAnswer(ignored -> Uni.createFrom().item(durableUnit.get()));
@@ -1935,7 +2100,7 @@ class QueueAsyncCoordinatorTest {
             });
 
         coordinator.recordAwaitItemContinuation(
-                itemAwaitRecord(parent.record().executionId(), 1, AwaitInteractionStatus.COMPLETED, "second"),
+                itemAwaitRecord(parent.record().executionId(), 1, AwaitInteractionStatus.COMPLETED, "second", unitId),
                 unit,
                 4,
                 new ExecutionInputSnapshot(ExecutionInputShape.UNI, "second-normalized"),
@@ -1945,7 +2110,7 @@ class QueueAsyncCoordinatorTest {
         verify(workDispatcher, never()).enqueueNow(any());
 
         coordinator.recordAwaitItemContinuation(
-                itemAwaitRecord(parent.record().executionId(), 0, AwaitInteractionStatus.COMPLETED, "first"),
+                itemAwaitRecord(parent.record().executionId(), 0, AwaitInteractionStatus.COMPLETED, "first", unitId),
                 unit,
                 4,
                 new ExecutionInputSnapshot(ExecutionInputShape.UNI, "first-normalized"),
@@ -1965,7 +2130,7 @@ class QueueAsyncCoordinatorTest {
         assertEquals(List.of("out-0", "out-1"), snapshot.payload());
         ExecutionRecord<Object, Object> firstChild = store.getExecutionByKey(
                 "tenant-1",
-                "parent-key:await-item:unit-1:0")
+                "parent-key:await-item:" + unitId + ":0")
             .await().indefinitely()
             .orElseThrow();
         assertInstanceOf(ExecutionInputSnapshot.class, firstChild.inputPayload());
@@ -1975,9 +2140,9 @@ class QueueAsyncCoordinatorTest {
         verify(workDispatcher).enqueueNow(new ExecutionWorkItem("tenant-1", parent.record().executionId()));
         ControlPlaneProjection projection = journal.projection("tenant-1", parent.record().executionId()).await().indefinitely();
         assertTrue(projection.factKeys().contains("continuation-segment-created:"
-            + parent.record().executionId() + ":segment:await-item:unit-1:0"));
+            + parent.record().executionId() + ":segment:await-item:" + unitId + ":0"));
         assertTrue(projection.factKeys().contains("continuation-segment-created:"
-            + parent.record().executionId() + ":segment:await-item:unit-1:1"));
+            + parent.record().executionId() + ":segment:await-item:" + unitId + ":1"));
         assertTrue(projection.factKeys().contains("continuation-segment-created:"
             + parent.record().executionId() + ":segment:4"));
     }
@@ -2010,8 +2175,13 @@ class QueueAsyncCoordinatorTest {
             1L,
             1L,
             99999999L);
+        when(awaitCoordinator.findDueTimeoutConsequences(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.eq(100)))
+            .thenReturn(Uni.createFrom().item(java.util.List.of()));
         when(awaitCoordinator.findTimedOut(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.eq(100)))
             .thenReturn(Uni.createFrom().item(java.util.List.of(interaction)));
+        when(awaitCoordinator.reconcileTimedOut(org.mockito.ArgumentMatchers.eq(interaction), org.mockito.ArgumentMatchers.anyLong()))
+            .thenReturn(Uni.createFrom().voidItem());
+        when(awaitCoordinator.completeTimeoutConsequences(interaction)).thenReturn(Uni.createFrom().voidItem());
         when(awaitCoordinator.markTimedOut(org.mockito.ArgumentMatchers.eq(interaction), org.mockito.ArgumentMatchers.anyLong()))
             .thenReturn(Uni.createFrom().item(Optional.of(interaction)));
         when(executionStateStore.getExecution("tenant-1", "exec-1"))
@@ -2271,6 +2441,15 @@ class QueueAsyncCoordinatorTest {
         int itemIndex,
         AwaitInteractionStatus status,
         String decision) {
+        return itemAwaitRecord(executionId, itemIndex, status, decision, "unit-1");
+    }
+
+    private AwaitInteractionRecord itemAwaitRecord(
+        String executionId,
+        int itemIndex,
+        AwaitInteractionStatus status,
+        String decision,
+        String unitId) {
         return new AwaitInteractionRecord(
             "tenant-1",
             executionId,
@@ -2285,7 +2464,7 @@ class QueueAsyncCoordinatorTest {
             status,
             java.util.Map.of("value", "request-" + itemIndex),
             decision == null ? null : java.util.Map.of("value", decision),
-            "unit-1",
+            unitId,
             itemIndex,
             "user-1",
             null,
@@ -2305,10 +2484,28 @@ class QueueAsyncCoordinatorTest {
         int completedItemCount,
         boolean dispatchComplete,
         String primaryInteractionId) {
+        String executionId = AwaitUnitOccurrence.fromUnitId(unitId)
+            .map(AwaitUnitOccurrence::executionId)
+            .orElse("exec-1");
+        return awaitUnit(unitId, executionId, status, expectedItemCount, completedItemCount,
+            dispatchComplete, primaryInteractionId);
+    }
+
+    private AwaitUnitRecord awaitUnit(
+        String unitId,
+        String executionId,
+        AwaitUnitStatus status,
+        Integer expectedItemCount,
+        int completedItemCount,
+        boolean dispatchComplete,
+        String primaryInteractionId) {
+        AwaitUnitOccurrence.fromUnitId(unitId).ifPresent(occurrence -> assertTrue(
+            occurrence.matches("tenant-1", executionId, "AwaitPaymentProvider", 2),
+            "qualified Await unit must match the fixture execution and step"));
         return new AwaitUnitRecord(
             "tenant-1",
             unitId,
-            "exec-1",
+            executionId,
             "AwaitPaymentProvider",
             2,
             "ONE_TO_ONE",

@@ -82,7 +82,8 @@ public class DynamoAwaitUnitStore implements AwaitUnitStore {
         return blocking(() -> {
             Optional<AwaitUnitRecord> existing = getBlocking(command.tenantId(), command.unitId(), command.nowEpochMs());
             if (existing.isPresent()) {
-                return existing.get();
+                return requireSameOwner(existing.orElseThrow(), command.tenantId(), command.unitId(), command.executionId(),
+                    command.stepId(), command.stepIndex(), command.cardinality());
             }
             AwaitUnitRecord created = new AwaitUnitRecord(
                 command.tenantId(),
@@ -106,13 +107,15 @@ public class DynamoAwaitUnitStore implements AwaitUnitStore {
                 dynamoClient().putItem(PutItemRequest.builder()
                     .tableName(unitTable())
                     .item(toItem(created))
-                    .conditionExpression("(attribute_not_exists(#tenant) AND attribute_not_exists(#unit)) OR #ttl < :now")
+                    .conditionExpression("(attribute_not_exists(#tenant) AND attribute_not_exists(#unit)) OR (#ttl > :zero AND #ttl <= :now)")
                     .expressionAttributeNames(Map.of("#tenant", TENANT_ID, "#unit", UNIT_ID, "#ttl", TTL_EPOCH_S))
-                    .expressionAttributeValues(Map.of(":now", AttributeValue.builder().n(String.valueOf(nowEpochS)).build()))
+                    .expressionAttributeValues(Map.of(":now", avN(nowEpochS), ":zero", avN(0)))
                     .build());
                 return created;
             } catch (ConditionalCheckFailedException ignored) {
                 return getBlocking(command.tenantId(), command.unitId(), command.nowEpochMs())
+                    .map(retained -> requireSameOwner(retained, command.tenantId(), command.unitId(), command.executionId(),
+                        command.stepId(), command.stepIndex(), command.cardinality()))
                     .orElseThrow(() -> new IllegalStateException("Await unit create lost race but no unit was found"));
             }
         });
@@ -139,9 +142,31 @@ public class DynamoAwaitUnitStore implements AwaitUnitStore {
                 return record;
             } catch (ConditionalCheckFailedException ignored) {
                 return getBlocking(record.tenantId(), record.unitId(), System.currentTimeMillis())
+                    .map(retained -> requireImportedOwner(retained, record))
                     .orElseThrow(() -> new IllegalStateException("Await unit import lost race but no unit was found"));
             }
         });
+    }
+
+    private AwaitUnitRecord requireSameOwner(AwaitUnitRecord existing, String tenantId, String unitId,
+        String executionId, String stepId, int stepIndex, String cardinality) {
+        if (!existing.tenantId().equals(tenantId) || !existing.unitId().equals(unitId)
+            || !existing.executionId().equals(executionId) || !existing.stepId().equals(stepId)
+            || existing.stepIndex() != stepIndex || !existing.cardinality().equals(cardinality)) {
+            throw new IllegalStateException("Await unit identity conflicts with its immutable owner");
+        }
+        return existing;
+    }
+
+    private AwaitUnitRecord requireImportedOwner(AwaitUnitRecord existing, AwaitUnitRecord incoming) {
+        requireSameOwner(existing, incoming.tenantId(), incoming.unitId(), incoming.executionId(),
+            incoming.stepId(), incoming.stepIndex(), incoming.cardinality());
+        if (org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(incoming.unitId()).isPresent()
+            && incoming.primaryInteractionId() != null
+            && !incoming.primaryInteractionId().equals(existing.primaryInteractionId())) {
+            throw new IllegalStateException("Qualified Await import conflicts with retained primary membership");
+        }
+        return existing;
     }
 
     @Override
@@ -150,6 +175,30 @@ public class DynamoAwaitUnitStore implements AwaitUnitStore {
         String unitId,
         String interactionId,
         long nowEpochMs) {
+        var occurrence = org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(unitId);
+        if (occurrence.isPresent()) {
+            if (interactionId == null || interactionId.isBlank() || !occurrence.orElseThrow().tenantId().equals(tenantId)) {
+                return Uni.createFrom().failure(new IllegalArgumentException("Qualified primary attachment requires its tenant and interaction"));
+            }
+            return blocking(() -> {
+                var scope = occurrence.orElseThrow();
+                var attached = updateBlocking(tenantId, unitId,
+                    "SET #primary = :primary, #updated = :updated, #version = #version + :one",
+                    Map.of("#primary", PRIMARY_INTERACTION_ID, "#updated", UPDATED_AT_EPOCH_MS, "#version", VERSION,
+                        "#dispatch", DISPATCH_COMPLETE, "#ttl", TTL_EPOCH_S,
+                        "#execution", EXECUTION_ID, "#step", STEP_ID, "#stepIndex", STEP_INDEX),
+                    Map.of(":primary", avS(interactionId), ":updated", avN(nowEpochMs), ":one", avN(1),
+                        ":open", AttributeValue.builder().bool(false).build(), ":zero", avN(0), ":nowSec", avN(nowEpochMs / 1000),
+                        ":execution", avS(scope.executionId()), ":step", avS(scope.stepId()), ":stepIndex", avN(scope.stepIndex())),
+                    existingNonTerminalCondition() + " AND attribute_not_exists(#primary)"
+                        + " AND (attribute_not_exists(#dispatch) OR #dispatch = :open)"
+                        + " AND (attribute_not_exists(#ttl) OR #ttl = :zero OR #ttl > :nowSec)"
+                        + " AND #execution = :execution AND #step = :step AND #stepIndex = :stepIndex");
+                if (attached.isPresent()) return attached;
+                return getBlocking(tenantId, unitId, nowEpochMs)
+                    .filter(retained -> interactionId.equals(retained.primaryInteractionId()));
+            });
+        }
         return update(
             tenantId,
             unitId,
@@ -344,6 +393,7 @@ public class DynamoAwaitUnitStore implements AwaitUnitStore {
         Map<String, AttributeValue> item = dynamoClient().getItem(GetItemRequest.builder()
             .tableName(unitTable())
             .key(Map.of(TENANT_ID, avS(tenantId), UNIT_ID, avS(unitId)))
+            .consistentRead(true)
             .build()).item();
         if (item == null || item.isEmpty()) {
             return Optional.empty();

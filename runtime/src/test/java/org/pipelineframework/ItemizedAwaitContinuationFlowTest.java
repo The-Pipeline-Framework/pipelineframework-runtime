@@ -22,6 +22,7 @@ import org.pipelineframework.awaitable.AwaitCoordinator;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.AwaitUnitRecord;
+import org.pipelineframework.awaitable.AwaitUnitOccurrence;
 import org.pipelineframework.awaitable.AwaitUnitStatus;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
 import org.pipelineframework.orchestrator.CreateExecutionResult;
@@ -146,16 +147,17 @@ class ItemizedAwaitContinuationFlowTest {
             now,
             9_999_999_999L))
         .await().indefinitely();
+    String unitId = awaitUnitId(parent.record());
     store.markWaitingExternal(
             "tenant-1",
             parent.record().executionId(),
             parent.record().version(),
             "transition",
-            "unit-1",
+            unitId,
             2,
             now)
-        .await().indefinitely();
-    AwaitUnitRecord unit = awaitUnit(parent.record().executionId(), AwaitUnitStatus.COMPLETED, 2, 2, true);
+        .await().indefinitely().orElseThrow();
+    AwaitUnitRecord unit = awaitUnit(unitId, parent.record().executionId(), AwaitUnitStatus.COMPLETED, 2, 2, true);
     AtomicReference<AwaitUnitRecord> durableUnit = new AtomicReference<>(unit);
     when(awaitCoordinator.getUnit("tenant-1", unit.unitId()))
         .thenAnswer(ignored -> Uni.createFrom().item(durableUnit.get()));
@@ -167,7 +169,7 @@ class ItemizedAwaitContinuationFlowTest {
         });
 
     flow.captureOutput(
-            itemAwaitRecord(parent.record().executionId(), 1, AwaitInteractionStatus.COMPLETED, "second"),
+            itemAwaitRecord(parent.record().executionId(), 1, AwaitInteractionStatus.COMPLETED, "second", unitId),
             unit,
             4,
             new ExecutionInputSnapshot(ExecutionInputShape.UNI, "second-normalized"),
@@ -177,7 +179,7 @@ class ItemizedAwaitContinuationFlowTest {
     verify(workDispatcher, never()).enqueueNow(any());
 
     flow.captureOutput(
-            itemAwaitRecord(parent.record().executionId(), 0, AwaitInteractionStatus.COMPLETED, "first"),
+            itemAwaitRecord(parent.record().executionId(), 0, AwaitInteractionStatus.COMPLETED, "first", unitId),
             unit,
             4,
             new ExecutionInputSnapshot(ExecutionInputShape.UNI, "first-normalized"),
@@ -257,18 +259,19 @@ class ItemizedAwaitContinuationFlowTest {
             now,
             9_999_999_999L))
         .await().indefinitely();
+    String unitId = awaitUnitId(parent.record());
     store.markWaitingExternal(
             "tenant-1",
             parent.record().executionId(),
             parent.record().version(),
             "transition",
-            "unit-1",
+            unitId,
             2,
             now)
-        .await().indefinitely();
+        .await().indefinitely().orElseThrow();
     ExecutionRecord<Object, Object> waitingParent = store.getExecution("tenant-1", parent.record().executionId())
         .await().indefinitely().orElseThrow();
-    AwaitUnitRecord unit = awaitUnit(waitingParent.executionId(), AwaitUnitStatus.COMPLETED, 2, 2, true);
+    AwaitUnitRecord unit = awaitUnit(unitId, waitingParent.executionId(), AwaitUnitStatus.COMPLETED, 2, 2, true);
     AtomicReference<AwaitUnitRecord> durableUnit = new AtomicReference<>(unit);
     when(awaitCoordinator.getUnit("tenant-1", unit.unitId()))
         .thenAnswer(ignored -> Uni.createFrom().item(durableUnit.get()));
@@ -501,6 +504,15 @@ class ItemizedAwaitContinuationFlowTest {
       int itemIndex,
       AwaitInteractionStatus status,
       String response) {
+    return itemAwaitRecord(executionId, itemIndex, status, response, "unit-1");
+  }
+
+  private static AwaitInteractionRecord itemAwaitRecord(
+      String executionId,
+      int itemIndex,
+      AwaitInteractionStatus status,
+      String response,
+      String unitId) {
     return new AwaitInteractionRecord(
         "tenant-1",
         executionId,
@@ -515,7 +527,7 @@ class ItemizedAwaitContinuationFlowTest {
         status,
         Map.of("value", "request-" + itemIndex),
         Map.of("value", response),
-        "unit-1",
+        unitId,
         itemIndex,
         "user-1",
         null,
@@ -534,9 +546,19 @@ class ItemizedAwaitContinuationFlowTest {
       Integer expectedItemCount,
       int completedItemCount,
       boolean dispatchComplete) {
+    return awaitUnit("unit-1", executionId, status, expectedItemCount, completedItemCount, dispatchComplete);
+  }
+
+  private static AwaitUnitRecord awaitUnit(
+      String unitId,
+      String executionId,
+      AwaitUnitStatus status,
+      Integer expectedItemCount,
+      int completedItemCount,
+      boolean dispatchComplete) {
     return new AwaitUnitRecord(
         "tenant-1",
-        "unit-1",
+        unitId,
         executionId,
         "AwaitPaymentProvider",
         2,
@@ -553,6 +575,12 @@ class ItemizedAwaitContinuationFlowTest {
         1L,
         2L,
         999_999L);
+  }
+
+  private static String awaitUnitId(ExecutionRecord<?, ?> record) {
+    return new AwaitUnitOccurrence(
+        "tenant-1", record.executionId(), record.executionId(), "AwaitPaymentProvider", 2,
+        record.awaitOccurrenceCause().orElseThrow()).unitId();
   }
 
   private static AwaitUnitRecord withContinuationFact(AwaitUnitRecord unit, int itemIndex) {

@@ -40,6 +40,27 @@ import org.pipelineframework.orchestrator.TransitionAwaitSuspension;
 class AwaitCoordinatorCompletionTest {
 
     @Test
+    void qualifiedScalarCreateMustObservePrimaryAttachmentWinner() {
+        var coordinator = coordinator(new InMemoryAwaitInteractionStore());
+        var units = org.mockito.Mockito.spy(new InMemoryAwaitUnitStore());
+        org.mockito.Mockito.doReturn(Uni.createFrom().item(Optional.empty())).when(units)
+            .attachPrimaryInteraction(org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.anyLong());
+        coordinator.unitStores = new SimpleInstance<>(List.<AwaitUnitStore>of(units));
+        AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant-1", "exec-1", 1,
+            AwaitContinuationMode.DURABLE_HANDOFF, TerminalOutputOwnership.TRANSITION_WORKER,
+            Map.of(), Optional.empty(), Optional.of("initial-v1")));
+        try {
+            assertThrows(IllegalStateException.class, () -> coordinator.createOrGet(
+                descriptor("FraudCheck"), "tenant-1", "exec-1", 1, "cause",
+                Map.of("paymentRecordId", "p-1"), "alice", "review").await().indefinitely());
+        } finally {
+            AwaitExecutionContextHolder.clear();
+        }
+    }
+
+    @Test
     void pageIdentityScopeSeparatesDerivedIdentitiesButRetainsLogicalExecutionId() {
         AwaitCoordinator coordinator = coordinator(new InMemoryAwaitInteractionStore());
         AwaitCompletionDescriptor descriptor = descriptor("FraudCheck");

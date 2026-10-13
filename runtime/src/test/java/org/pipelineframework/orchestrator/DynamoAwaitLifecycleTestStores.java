@@ -1,6 +1,7 @@
 package org.pipelineframework.orchestrator;
 
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
 
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -15,6 +16,7 @@ public final class DynamoAwaitLifecycleTestStores {
     PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
     PipelineOrchestratorConfig.DynamoConfig dynamo = mock(PipelineOrchestratorConfig.DynamoConfig.class);
     when(config.dynamo()).thenReturn(dynamo);
+    lenient().when(dynamo.awaitCompletionLifecycleTable()).thenReturn(prefix + "_completion_lifecycle");
     when(config.executionTtlDays()).thenReturn(1);
     when(dynamo.executionTable()).thenReturn(prefix + "_execution");
     when(dynamo.executionKeyTable()).thenReturn(prefix + "_execution_key");
@@ -27,6 +29,7 @@ public final class DynamoAwaitLifecycleTestStores {
     PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
     PipelineOrchestratorConfig.DynamoConfig dynamo = mock(PipelineOrchestratorConfig.DynamoConfig.class);
     when(config.dynamo()).thenReturn(dynamo);
+    lenient().when(dynamo.awaitCompletionLifecycleTable()).thenReturn(prefix + "_completion_lifecycle");
     when(dynamo.executionTable()).thenReturn(prefix + "_execution");
     return new DynamoExecutionStateStore(client, config);
   }
@@ -46,6 +49,7 @@ public final class DynamoAwaitLifecycleTestStores {
     PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
     PipelineOrchestratorConfig.DynamoConfig dynamo = mock(PipelineOrchestratorConfig.DynamoConfig.class);
     when(config.dynamo()).thenReturn(dynamo);
+    lenient().when(dynamo.awaitCompletionLifecycleTable()).thenReturn(prefix + "_completion_lifecycle");
     when(dynamo.executionTable()).thenReturn(prefix + "_execution");
     when(dynamo.executionPayloadTable()).thenReturn(prefix + "_execution_payload");
     return new DynamoExecutionStateStore(client, config);

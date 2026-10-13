@@ -50,6 +50,7 @@ class DynamoTypedAwaitImportIT {
                 LOCALSTACK.getAccessKey(), LOCALSTACK.getSecretKey()))).build();
         table(PREFIX + "_interaction", "tenant_id", "interaction_id");
         table(PREFIX + "_interaction_key", "lookup_key", null);
+        table(PREFIX + "_completion_lifecycle", "pk", "sk");
     }
 
     @AfterAll
@@ -147,6 +148,43 @@ class DynamoTypedAwaitImportIT {
             projections.incrementAndGet();
             return new ProjectedDecision(request.id(), completion.status());
         }
+    }
+
+    @Test
+    void boundedUnitPagingRetainsImportedMembersSharingThePhysicalIndexSortKey() {
+        var store = store();
+        String unitId = "paging-" + UUID.randomUUID();
+        var first = importedUnitItem("c", "a#b", unitId);
+        var second = importedUnitItem("b#c", "a", unitId);
+        store.importRecord(first).await().indefinitely();
+        store.importRecord(second).await().indefinitely();
+
+        // GSI order is provider-defined. Completeness and a resumable full key are the contract.
+        var observed = new java.util.ArrayList<String>();
+        java.util.Optional<AwaitInteractionCursor> cursor = java.util.Optional.empty();
+        var positions = new java.util.HashSet<String>();
+        for (int pageNumber = 0; pageNumber < 3; pageNumber++) {
+            var page = store.findByUnitPage("tenant", unitId, 1, cursor).await().indefinitely();
+            assertTrue(page.interactions().size() <= 1);
+            observed.addAll(page.interactions().stream().map(AwaitInteractionRecord::interactionId).toList());
+            cursor = page.nextCursor();
+            cursor.ifPresent(value -> assertTrue(positions.add(value.position()), "Cursor must advance"));
+            if (cursor.isEmpty()) break;
+        }
+        assertTrue(cursor.isEmpty(), "A finite unchanged unit must exhaust");
+        assertEquals(2, observed.size(), "Each imported identity must occur exactly once");
+        assertEquals(java.util.Set.of(first.interactionId(), second.interactionId()), java.util.Set.copyOf(observed));
+    }
+
+    private AwaitInteractionRecord importedUnitItem(String interactionId, String causationId, String unitId) {
+        var template = interaction(AwaitInteractionStatus.WAITING, null);
+        return new AwaitInteractionRecord(template.tenantId(), template.executionId(), template.stepId(),
+            template.stepIndex(), template.outputType(), interactionId, "correlation-" + interactionId,
+            causationId, "idem-" + interactionId, template.version(), template.status(),
+            template.requestPayload(), template.responsePayload(), unitId, 0, template.actor(),
+            template.assignee(), template.group(), template.transportType(), template.transportMetadata(),
+            template.deadlineEpochMs(), template.createdAtEpochMs(), template.updatedAtEpochMs(),
+            template.ttlEpochS(), template.transportOutputType());
     }
 
     @Test
@@ -308,9 +346,19 @@ class DynamoTypedAwaitImportIT {
             attributes.add(AttributeDefinition.builder().attributeName(range).attributeType(ScalarAttributeType.S).build());
             keys.add(KeySchemaElement.builder().attributeName(range).keyType(KeyType.RANGE).build());
         }
-        dynamo.createTable(CreateTableRequest.builder().tableName(name).attributeDefinitions(attributes).keySchema(keys)
-            .provisionedThroughput(ProvisionedThroughput.builder().readCapacityUnits(10L).writeCapacityUnits(10L).build()).build());
-        dynamo.waiter().waitUntilTableExists(request -> request.tableName(name));
+        var throughput = ProvisionedThroughput.builder().readCapacityUnits(10L).writeCapacityUnits(10L).build();
+        var request = CreateTableRequest.builder().tableName(name).keySchema(keys).provisionedThroughput(throughput);
+        if (name.equals(PREFIX + "_interaction")) {
+            attributes.add(AttributeDefinition.builder().attributeName("query_unit_key").attributeType(ScalarAttributeType.S).build());
+            attributes.add(AttributeDefinition.builder().attributeName("query_unit_sort").attributeType(ScalarAttributeType.S).build());
+            request.globalSecondaryIndexes(GlobalSecondaryIndex.builder().indexName("await-interaction-by-unit")
+                .keySchema(KeySchemaElement.builder().attributeName("query_unit_key").keyType(KeyType.HASH).build(),
+                    KeySchemaElement.builder().attributeName("query_unit_sort").keyType(KeyType.RANGE).build())
+                .projection(Projection.builder().projectionType(ProjectionType.ALL).build())
+                .provisionedThroughput(throughput).build());
+        }
+        dynamo.createTable(request.attributeDefinitions(attributes).build());
+        dynamo.waiter().waitUntilTableExists(waiterRequest -> waiterRequest.tableName(name));
     }
 
     public record Request(String id) {}
