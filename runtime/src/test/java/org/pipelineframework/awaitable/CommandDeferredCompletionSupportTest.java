@@ -151,7 +151,7 @@ public class CommandDeferredCompletionSupportTest {
             provider.operation.callbacks().getFirst(), "test.EndpointResolver", "test.Authenticator");
         var failProjection = new java.util.concurrent.atomic.AtomicBoolean(projectionUnavailableOnce);
         var descriptor = new AwaitCompletionDescriptor("StartJob", String.class.getName(), String.class.getName(), "ONE_TO_ONE",
-            acknowledgeAfterDeadline ? Duration.ofMillis(500) : Duration.ofMinutes(1),
+            Duration.ofMinutes(1),
             "signedResumeToken", "", Map.of(), List.of(), String.class.getName(), String.class.getName(),
             Function.identity(), Function.identity(), "test.AckProjector", null,
             true, Optional.of(selection), String.class.getName(),
@@ -188,7 +188,7 @@ public class CommandDeferredCompletionSupportTest {
             assertFalse(result.isDone());
         }
         if (acknowledgeAfterDeadline) {
-            Thread.sleep(Math.max(0L, record.deadlineEpochMs() - System.currentTimeMillis()) + 20L);
+            expireStoredDeadlineAfterStaging(record.interactionId());
         }
         provider.operation.response.complete(new CommandOutcome.Succeeded<>("accepted", CommandConfirmation.none(), List.of()));
         if (acknowledgeAfterDeadline) {
@@ -250,6 +250,30 @@ public class CommandDeferredCompletionSupportTest {
         assertEquals(1, provider.operation.dispatches.get());
         assertEquals(Optional.of("accepted"), interactions.get("tenant", record.interactionId())
             .await().indefinitely().orElseThrow().commandAcknowledgement());
+    }
+
+    private void expireStoredDeadlineAfterStaging(String interactionId) throws ReflectiveOperationException {
+        var lockField = InMemoryAwaitInteractionStore.class.getDeclaredField("lock");
+        var recordsField = InMemoryAwaitInteractionStore.class.getDeclaredField("interactionsByScopedId");
+        lockField.setAccessible(true);
+        recordsField.setAccessible(true);
+        synchronized (lockField.get(interactions)) {
+            @SuppressWarnings("unchecked")
+            var records = (Map<String, AwaitInteractionRecord>) recordsField.get(interactions);
+            var entry = records.entrySet().stream()
+                .filter(candidate -> candidate.getValue().interactionId().equals(interactionId))
+                .findFirst().orElseThrow();
+            var current = entry.getValue();
+            assertEquals(AwaitInteractionStatus.COMPLETION_OBSERVED, current.status());
+            entry.setValue(new AwaitInteractionRecord(current.tenantId(), current.executionId(), current.stepId(),
+                current.stepIndex(), current.outputType(), current.interactionId(), current.correlationId(),
+                current.causationId(), current.idempotencyKey(), current.version(), current.status(),
+                current.requestPayload(), current.responsePayload(), current.unitId(), current.itemIndex(),
+                current.actor(), current.assignee(), current.group(), current.transportType(),
+                current.transportMetadata(), System.currentTimeMillis() - 1L, current.createdAtEpochMs(),
+                current.updatedAtEpochMs(), current.ttlEpochS(), current.transportOutputType(),
+                current.commandAcknowledgement(), current.stagedCompletionPayload()));
+        }
     }
 
     private AwaitCoordinator coordinator() {

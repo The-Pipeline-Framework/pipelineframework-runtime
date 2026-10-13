@@ -72,8 +72,8 @@ public record AwaitCompletionDescriptor(
         this(stepId, inputType, outputType, cardinality, timeout, correlationStrategy, transportType,
             transportConfig, idempotencyKeyFields, transportInputType, transportOutputType,
             inputToTransport, outputFromTransport, completionProjectorId, completionProjector,
-            requestAwareCompletion, callback, Optional.of(commandAcknowledgementType),
-            Optional.of(commandCompletionProjector));
+            requestAwareCompletion, callback, Optional.ofNullable(commandAcknowledgementType),
+            Optional.ofNullable(commandCompletionProjector));
     }
 
     public boolean acknowledgementAwareCommandCompletion() {
