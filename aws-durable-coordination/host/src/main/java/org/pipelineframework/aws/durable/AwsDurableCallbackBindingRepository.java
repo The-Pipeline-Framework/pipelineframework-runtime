@@ -1,10 +1,16 @@
 package org.pipelineframework.aws.durable;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
 import java.time.Instant;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.UUID;
 
 import org.pipelineframework.aws.durable.model.AwsDurableAwaitIdentity;
@@ -35,13 +41,30 @@ public final class AwsDurableCallbackBindingRepository {
     public static final String BINDING = "BINDING";
     public static final String REGISTRATION = "REGISTRATION";
     public static final String DELIVERY = "DELIVERY";
+    public static final String CALLBACK_ACCEPTED = "CALLBACK_ACCEPTED";
+    public static final String DRIVER_RESUMED = "DRIVER_RESUMED";
+    public static final String CALLBACK_LATENCY = "CALLBACK_LATENCY";
+    public static final String REPAIR_FIRST_OBSERVED = "REPAIR_FIRST_OBSERVED";
 
+    private final AwsDurableHostTelemetry telemetry;
     private final DynamoDbClient dynamo;
     private final String tableName;
+    private final Clock clock;
 
     public AwsDurableCallbackBindingRepository(DynamoDbClient dynamo, String tableName) {
+        this(dynamo, tableName, new AwsDurableHostTelemetry());
+    }
+
+    AwsDurableCallbackBindingRepository(DynamoDbClient dynamo, String tableName, AwsDurableHostTelemetry telemetry) {
+        this(dynamo, tableName, telemetry, Clock.systemUTC());
+    }
+
+    AwsDurableCallbackBindingRepository(DynamoDbClient dynamo, String tableName,
+        AwsDurableHostTelemetry telemetry, Clock clock) {
+        this.telemetry = Objects.requireNonNull(telemetry);
         this.dynamo = Objects.requireNonNull(dynamo, "dynamo");
         this.tableName = required(tableName, "tableName");
+        this.clock = Objects.requireNonNull(clock, "clock");
     }
 
     /** Generation claims and successor fences never expire with disposable callback rows. */
@@ -72,6 +95,8 @@ public final class AwsDurableCallbackBindingRepository {
         }
         try {
             dynamo.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(operations).build());
+            observe(AwsDurableHostTelemetry.Stage.GENERATION, AwsDurableHostTelemetry.Outcome.CREATED,
+                checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
             return AwsDurableGenerationAdmission.CREATED;
         } catch (TransactionCanceledException conflict) {
             Map<String, AttributeValue> existing = read(partition, claimKey(checkpoint.generation()));
@@ -79,11 +104,17 @@ public final class AwsDurableCallbackBindingRepository {
                 throw conflict; // Missing predecessor, contention or infrastructure failure remains retryable.
             }
             if (!existing.equals(claim)) {
+                observe(AwsDurableHostTelemetry.Stage.GENERATION, AwsDurableHostTelemetry.Outcome.CONFLICT,
+                    checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
                 throw new IllegalStateException("generation is already owned by another semantic checkpoint", conflict);
             }
             if (!read(partition, successorKey(checkpoint.generation())).isEmpty()) {
+                observe(AwsDurableHostTelemetry.Stage.GENERATION, AwsDurableHostTelemetry.Outcome.STALE,
+                    checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
                 return AwsDurableGenerationAdmission.STALE;
             }
+            observe(AwsDurableHostTelemetry.Stage.GENERATION, AwsDurableHostTelemetry.Outcome.REPLAYED,
+                checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
             return AwsDurableGenerationAdmission.REPLAYED;
         }
     }
@@ -117,36 +148,185 @@ public final class AwsDurableCallbackBindingRepository {
         operations.add(TransactWriteItem.builder().put(immutablePut(toItem(binding))).build());
         try {
             dynamo.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(operations).build());
+            observe(AwsDurableHostTelemetry.Stage.BINDING, AwsDurableHostTelemetry.Outcome.CREATED,
+                identity.tenantId(), identity.executionId(), identity.generation());
             return true;
         } catch (TransactionCanceledException conflict) {
             requireCurrentGeneration(identity.tenantId(), identity.executionId(), identity.generation());
             AwsDurableCallbackBinding existing = find(identity.tenantId(), identity.interactionId(),
                 identity.generation(), identity.occurrence()).orElseThrow(() -> conflict);
             if (!sameBindingAuthority(existing, binding)) {
+                observe(AwsDurableHostTelemetry.Stage.BINDING, AwsDurableHostTelemetry.Outcome.CONFLICT,
+                    identity.tenantId(), identity.executionId(), identity.generation());
                 throw new IllegalStateException("callback binding generation is already owned by another callback", conflict);
+            }
+            observe(AwsDurableHostTelemetry.Stage.BINDING, AwsDurableHostTelemetry.Outcome.REPLAYED,
+                identity.tenantId(), identity.executionId(), identity.generation());
+            return false;
+        }
+    }
+
+    public boolean registerAdmission(org.pipelineframework.aws.durable.model.AwsDurableAdmissionLocator locator) {
+        Objects.requireNonNull(locator, "locator");
+        var item = new java.util.HashMap<String, AttributeValue>(Map.ofEntries(
+            Map.entry(PK, string(locator.partitionKey())), Map.entry(SK, string(locator.sortKey())),
+            Map.entry(RECORD_TYPE, string("ADMISSION")), Map.entry("tenant_id", string(locator.tenantId())),
+            Map.entry("client_key", string(locator.clientKey())), Map.entry("pipeline_id", string(locator.pipelineId())),
+            Map.entry("contract_version", string(locator.contractVersion())), Map.entry("release_version", string(locator.releaseVersion())),
+            Map.entry("generation", number(locator.generation())),
+            Map.entry("provider_execution_name", string(locator.providerExecutionName())),
+            Map.entry("provider_execution_arn", string(locator.providerExecutionArn()))));
+        locator.executionId().ifPresent(id -> item.put("execution_id", string(id)));
+        try {
+            dynamo.putItem(software.amazon.awssdk.services.dynamodb.model.PutItemRequest.builder()
+                .tableName(tableName).item(item)
+                .conditionExpression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
+                .expressionAttributeNames(Map.of("#pk", PK, "#sk", SK)).build());
+            return true;
+        } catch (software.amazon.awssdk.services.dynamodb.model.ConditionalCheckFailedException conflict) {
+            var existing = read(locator.partitionKey(), locator.sortKey());
+            if (existing.isEmpty()) throw conflict;
+            if (!locator.equals(admissionFromItem(existing))) {
+                throw new IllegalStateException("admission locator is already owned", conflict);
             }
             return false;
         }
+    }
+
+    /**
+     * Retains the first host observation of one provider execution for sampled repair age.
+     * This is mechanical evidence only and is deliberately independent of callback retention.
+     */
+    public OptionalLong recordRepairFirstObservedAt(String providerExecutionArn) {
+        String arn = required(providerExecutionArn, "providerExecutionArn");
+        long observedAt = clock.millis();
+        if (observedAt < 0) return OptionalLong.empty();
+        String partition = repairPartition(arn);
+        Map<String, AttributeValue> item = Map.ofEntries(
+            Map.entry(PK, string(partition)), Map.entry(SK, string("REPAIR#FIRST_OBSERVED")),
+            Map.entry(RECORD_TYPE, string(REPAIR_FIRST_OBSERVED)),
+            Map.entry("repair_provider_execution_arn", string(arn)),
+            Map.entry("first_observed_at_epoch_ms", number(observedAt)),
+            Map.entry("timestamp_source", string("HOST_FIRST_OBSERVED")));
+        try {
+            dynamo.putItem(PutItemRequest.builder().tableName(tableName).item(item)
+                .conditionExpression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
+                .expressionAttributeNames(Map.of("#pk", PK, "#sk", SK)).build());
+            return OptionalLong.of(observedAt);
+        } catch (ConditionalCheckFailedException alreadyObserved) {
+            Map<String, AttributeValue> existing = read(partition, "REPAIR#FIRST_OBSERVED");
+            String recordType = optionalText(existing, RECORD_TYPE).orElse("");
+            String retainedArn = optionalText(existing, "repair_provider_execution_arn").orElse("");
+            String timestampSource = optionalText(existing, "timestamp_source").orElse("");
+            if (!REPAIR_FIRST_OBSERVED.equals(recordType) || !arn.equals(retainedArn)
+                || !"HOST_FIRST_OBSERVED".equals(timestampSource)) {
+                throw new IllegalStateException("repair observation key is owned by another provider execution", alreadyObserved);
+            }
+            OptionalLong firstObserved = optionalLong(existing, "first_observed_at_epoch_ms");
+            if (firstObserved.isEmpty() || firstObserved.getAsLong() < 0) {
+                throw new IllegalStateException("repair observation timestamp is missing or invalid", alreadyObserved);
+            }
+            return firstObserved;
+        }
+    }
+
+    private static String repairPartition(String providerExecutionArn) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(providerExecutionArn.getBytes(StandardCharsets.UTF_8));
+            return "REPAIR#" + HexFormat.of().formatHex(digest);
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
+    }
+
+    public Optional<org.pipelineframework.aws.durable.model.AwsDurableAdmissionLocator> findAdmissionByProviderExecutionArn(String arn) {
+        var response = dynamo.query(QueryRequest.builder().tableName(tableName).indexName(PROVIDER_REGISTRATION_INDEX)
+            .keyConditionExpression("#arn = :arn AND begins_with(#sk, :admission)")
+            .expressionAttributeNames(Map.of("#arn", "provider_execution_arn", "#sk", SK))
+            .expressionAttributeValues(Map.of(":arn", string(required(arn, "providerExecutionArn")), ":admission", string("ADMISSION#")))
+            .scanIndexForward(false).limit(1).build());
+        return response.items().stream().findFirst().map(this::admissionFromItem);
+    }
+
+    private org.pipelineframework.aws.durable.model.AwsDurableAdmissionLocator admissionFromItem(Map<String, AttributeValue> item) {
+        return new org.pipelineframework.aws.durable.model.AwsDurableAdmissionLocator(text(item, "tenant_id"),
+            text(item, "client_key"), text(item, "pipeline_id"), text(item, "contract_version"), text(item, "release_version"),
+            Optional.ofNullable(item.get("execution_id")).map(AttributeValue::s), Long.parseLong(item.get("generation").n()),
+            text(item, "provider_execution_name"), text(item, "provider_execution_arn"));
+    }
+
+    public boolean registerRecovery(org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator locator) {
+        var checkpoint = locator.checkpoint();
+        if (claimGeneration(checkpoint) == AwsDurableGenerationAdmission.STALE) {
+            observe(AwsDurableHostTelemetry.Stage.GENERATION, AwsDurableHostTelemetry.Outcome.STALE_REJECTED,
+                checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
+            throw new AwsDurableStaleGenerationException();
+        }
+        var item = Map.ofEntries(
+            Map.entry(PK, string(locator.partitionKey())), Map.entry(SK, string(locator.sortKey())),
+            Map.entry(RECORD_TYPE, string("RECOVERY")),
+            Map.entry("tenant_id", string(checkpoint.tenantId())), Map.entry("execution_id", string(checkpoint.executionId())),
+            Map.entry("pipeline_id", string(checkpoint.pipelineId())), Map.entry("contract_version", string(checkpoint.contractVersion())),
+            Map.entry("release_version", string(checkpoint.releaseVersion())), Map.entry("generation", number(checkpoint.generation())),
+            Map.entry("provider_execution_name", string(locator.providerExecutionName())),
+            Map.entry("provider_execution_arn", string(locator.providerExecutionArn())));
+        var operations = generationConditions(locator.partitionKey(), checkpoint.generation());
+        operations.add(TransactWriteItem.builder().put(immutablePut(item)).build());
+        try {
+            dynamo.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(operations).build());
+            return true;
+        } catch (TransactionCanceledException conflict) {
+            requireCurrentGeneration(checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
+            var existing = read(locator.partitionKey(), locator.sortKey());
+            if (existing.isEmpty()) throw conflict;
+            if (!locator.equals(recoveryFromItem(existing))) throw new IllegalStateException("recovery locator is already owned", conflict);
+            return false;
+        }
+    }
+
+    public Optional<org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator> findRecoveryByProviderExecutionArn(String arn) {
+        var response = dynamo.query(QueryRequest.builder().tableName(tableName)
+            .indexName(PROVIDER_REGISTRATION_INDEX)
+            .keyConditionExpression("#arn = :arn AND begins_with(#sk, :recovery)")
+            .expressionAttributeNames(Map.of("#arn", "provider_execution_arn", "#sk", SK))
+            .expressionAttributeValues(Map.of(":arn", string(required(arn, "providerExecutionArn")), ":recovery", string("RECOVERY#")))
+            .scanIndexForward(false).limit(1).build());
+        return response.items().stream().findFirst().map(this::recoveryFromItem);
+    }
+
+    private org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator recoveryFromItem(Map<String, AttributeValue> item) {
+        return new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(
+            new AwsDurableDriverCheckpoint(new AwsDurableExecutionCheckpoint(text(item, "tenant_id"), text(item, "execution_id"),
+                text(item, "pipeline_id"), text(item, "contract_version"), text(item, "release_version")),
+                Long.parseLong(item.get("generation").n())), text(item, "provider_execution_name"), text(item, "provider_execution_arn"));
     }
 
     public boolean register(AwsDurableCallbackRegistration registration) {
         Objects.requireNonNull(registration, "registration");
         AwsDurableDriverCheckpoint checkpoint = registration.checkpoint();
         if (claimGeneration(checkpoint) == AwsDurableGenerationAdmission.STALE) {
+            observe(AwsDurableHostTelemetry.Stage.GENERATION, AwsDurableHostTelemetry.Outcome.STALE_REJECTED,
+                checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
             throw new AwsDurableStaleGenerationException();
         }
         var operations = generationConditions(registration.partitionKey(), checkpoint.generation());
         operations.add(TransactWriteItem.builder().put(immutablePut(toItem(registration))).build());
         try {
             dynamo.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(operations).build());
+            observe(AwsDurableHostTelemetry.Stage.REGISTRATION, AwsDurableHostTelemetry.Outcome.CREATED,
+                checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
             return true;
         } catch (TransactionCanceledException conflict) {
             requireCurrentGeneration(checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
             AwsDurableCallbackRegistration existing = findRegistration(
                 checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation(), registration.occurrence()).orElseThrow(() -> conflict);
             if (!sameRegistrationAuthority(existing, registration)) {
+                observe(AwsDurableHostTelemetry.Stage.REGISTRATION, AwsDurableHostTelemetry.Outcome.CONFLICT,
+                    checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
                 throw new IllegalStateException("callback registration generation is already owned by another callback", conflict);
             }
+            observe(AwsDurableHostTelemetry.Stage.REGISTRATION, AwsDurableHostTelemetry.Outcome.REPLAYED,
+                checkpoint.tenantId(), checkpoint.executionId(), checkpoint.generation());
             return false;
         }
     }
@@ -169,11 +349,18 @@ public final class AwsDurableCallbackBindingRepository {
 
     private void requireCurrentGeneration(String tenantId, String executionId, long generation) {
         if (isSuperseded(tenantId, executionId, generation)) {
+            observe(AwsDurableHostTelemetry.Stage.GENERATION, AwsDurableHostTelemetry.Outcome.STALE_REJECTED,
+                tenantId, executionId, generation);
             throw new AwsDurableStaleGenerationException();
         }
         if (!isCurrentGeneration(tenantId, executionId, generation)) {
             throw new IllegalStateException("provider generation claim is unavailable");
         }
+    }
+
+    private void observe(AwsDurableHostTelemetry.Stage stage, AwsDurableHostTelemetry.Outcome outcome,
+        String tenantId, String executionId, long generation) {
+        telemetry.record(stage, outcome, tenantId.length() + ":" + tenantId + executionId, generation);
     }
 
     private Map<String, AttributeValue> read(String partition, String sort) {
@@ -313,6 +500,131 @@ public final class AwsDurableCallbackBindingRepository {
         }
     }
 
+    /** Persists only a normal provider API acknowledgement; generic delivery rows are not timing evidence. */
+    public void recordCallbackAccepted(AwsDurableCallbackBinding binding, long acceptedAtEpochMs) {
+        Objects.requireNonNull(binding, "binding");
+        if (acceptedAtEpochMs < 0) return;
+        AwsDurableAwaitIdentity identity = binding.awaitIdentity();
+        try {
+            Optional<AwsDurableCallbackRegistration> registration = timingRegistration(binding);
+            if (registration.isEmpty()) return;
+            Map<String, AttributeValue> item = timingFact(binding, registration.orElseThrow(), acceptedKey(identity), CALLBACK_ACCEPTED,
+                binding.expiresAtEpochS(), Map.of("callback_success_observed_at_epoch_ms", number(acceptedAtEpochMs),
+                    "timestamp_source", string("HOST_API_ACK_OBSERVATION")));
+            putOnce(item);
+            recordLatencyIfReady(binding);
+        } catch (RuntimeException unavailable) {
+            // Timing evidence is best effort and cannot change callback authority or disposition.
+        }
+    }
+
+    /** Captures the first verified driver action after a callback wakeup, once per generation/occurrence. */
+    public void recordDriverResumed(AwsDurableAwaitIdentity identity) {
+        Objects.requireNonNull(identity, "identity");
+        try {
+            Optional<AwsDurableCallbackBinding> binding = find(identity.tenantId(), identity.interactionId(),
+                identity.generation(), identity.occurrence());
+            if (binding.isEmpty() || !binding.orElseThrow().awaitIdentity().equals(identity)) return;
+            AwsDurableCallbackBinding current = binding.orElseThrow();
+            Optional<AwsDurableCallbackRegistration> registration = timingRegistration(current);
+            if (registration.isEmpty()) return;
+            long resumedAt = clock.millis();
+            if (resumedAt < 0) return;
+            Map<String, AttributeValue> item = timingFact(current, registration.orElseThrow(), resumedKey(identity), DRIVER_RESUMED,
+                current.expiresAtEpochS(), Map.of("resumed_at_epoch_ms", number(resumedAt)));
+            putOnce(item);
+            recordLatencyIfReady(current);
+        } catch (RuntimeException unavailable) {
+            // Resume timing evidence is best effort; the durable driver action still succeeds.
+        }
+    }
+
+    private void recordLatencyIfReady(AwsDurableCallbackBinding binding) {
+        AwsDurableAwaitIdentity identity = binding.awaitIdentity();
+        Map<String, AttributeValue> accepted = read(binding.partitionKey(), acceptedKey(identity));
+        Map<String, AttributeValue> resumed = read(binding.partitionKey(), resumedKey(identity));
+        Optional<AwsDurableCallbackRegistration> registration = timingRegistration(binding);
+        if (registration.isEmpty()) return;
+        if (accepted.isEmpty() || resumed.isEmpty()
+            || !factMatches(accepted, binding, registration.orElseThrow(), CALLBACK_ACCEPTED)
+            || !factMatches(resumed, binding, registration.orElseThrow(), DRIVER_RESUMED)
+            || !"HOST_API_ACK_OBSERVATION".equals(text(accepted, "timestamp_source"))) return;
+        long acceptedAt = longValue(accepted, "callback_success_observed_at_epoch_ms");
+        long resumedAt = longValue(resumed, "resumed_at_epoch_ms");
+        boolean measured = resumedAt >= acceptedAt;
+        long latency = measured ? resumedAt - acceptedAt : -1;
+        var markerValues = new java.util.HashMap<String, AttributeValue>();
+        markerValues.put("latency_outcome", string(measured ? "MEASURED" : "UNKNOWN"));
+        if (measured) markerValues.put("latency_ms", number(latency));
+        Map<String, AttributeValue> marker = timingFact(binding, registration.orElseThrow(), latencyKey(identity), CALLBACK_LATENCY,
+            binding.expiresAtEpochS(), markerValues);
+        // This claim is exact locally; a crash after the claim and before emit may lose a sample.
+        // The timing row never changes callback, Await, or execution authority.
+        if (putOnce(marker)) {
+            telemetry.recordCallbackResume(identity.tenantId() + "\u0000" + identity.executionId()
+                + "\u0000" + identity.interactionId(), identity.generation(),
+                measured ? java.util.OptionalLong.of(latency) : java.util.OptionalLong.empty());
+        }
+    }
+
+    private Optional<AwsDurableCallbackRegistration> timingRegistration(AwsDurableCallbackBinding binding) {
+        AwsDurableAwaitIdentity identity = binding.awaitIdentity();
+        return findRegistration(identity.tenantId(), identity.executionId(), identity.generation(), identity.occurrence())
+            .filter(registration -> registration.awaitIdentity().filter(identity::equals).isPresent())
+            .filter(registration -> registration.providerCallbackId().equals(binding.providerCallbackId())
+                && registration.providerExecutionArn().equals(binding.providerExecutionArn()));
+    }
+
+    private Map<String, AttributeValue> timingFact(AwsDurableCallbackBinding binding,
+        AwsDurableCallbackRegistration registration, String sortKey,
+        String type, long expiresAtEpochS, Map<String, AttributeValue> values) {
+        AwsDurableAwaitIdentity identity = binding.awaitIdentity();
+        var item = new java.util.HashMap<String, AttributeValue>();
+        item.put(PK, string(identity.tenantId() + "#" + identity.interactionId()));
+        item.put(SK, string(sortKey));
+        item.put(RECORD_TYPE, string(type));
+        item.put("tenant_id", string(identity.tenantId()));
+        item.put("execution_id", string(identity.executionId()));
+        item.put("interaction_id", string(identity.interactionId()));
+        item.put("generation", number(identity.generation()));
+        item.put("occurrence", number(identity.occurrence()));
+        item.put("provider_execution_arn", string(binding.providerExecutionArn()));
+        item.put("provider_callback_id", string(binding.providerCallbackId()));
+        item.put("pipeline_id", string(registration.checkpoint().pipelineId()));
+        item.put("contract_version", string(registration.checkpoint().contractVersion()));
+        item.put("release_version", string(registration.checkpoint().releaseVersion()));
+        item.put("expires_at_epoch_s", number(expiresAtEpochS));
+        item.putAll(values);
+        return Map.copyOf(item);
+    }
+
+    private static boolean factMatches(Map<String, AttributeValue> item, AwsDurableCallbackBinding binding,
+        AwsDurableCallbackRegistration registration, String type) {
+        AwsDurableAwaitIdentity identity = binding.awaitIdentity();
+        return type.equals(text(item, RECORD_TYPE))
+            && identity.tenantId().equals(text(item, "tenant_id"))
+            && identity.executionId().equals(text(item, "execution_id"))
+            && identity.interactionId().equals(text(item, "interaction_id"))
+            && identity.generation() == longValue(item, "generation")
+            && identity.occurrence() == longValue(item, "occurrence")
+            && binding.providerExecutionArn().equals(text(item, "provider_execution_arn"))
+            && binding.providerCallbackId().equals(text(item, "provider_callback_id"))
+            && registration.checkpoint().pipelineId().equals(text(item, "pipeline_id"))
+            && registration.checkpoint().contractVersion().equals(text(item, "contract_version"))
+            && registration.checkpoint().releaseVersion().equals(text(item, "release_version"));
+    }
+
+    private boolean putOnce(Map<String, AttributeValue> item) {
+        try {
+            dynamo.putItem(PutItemRequest.builder().tableName(tableName).item(item)
+                .conditionExpression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
+                .expressionAttributeNames(Map.of("#pk", PK, "#sk", SK)).build());
+            return true;
+        } catch (ConditionalCheckFailedException duplicate) {
+            return false;
+        }
+    }
+
     private Map<String, AttributeValue> toItem(AwsDurableCallbackBinding binding) {
         AwsDurableAwaitIdentity identity = binding.awaitIdentity();
         return Map.ofEntries(
@@ -440,6 +752,18 @@ public final class AwsDurableCallbackBindingRepository {
         return "DELIVERED#" + generation + (occurrence == 1 ? "" : "#OCCURRENCE#" + occurrence);
     }
 
+    private static String acceptedKey(AwsDurableAwaitIdentity identity) {
+        return "CALLBACK_ACCEPTED#GEN#" + identity.generation() + "#OCC#" + identity.occurrence();
+    }
+
+    private static String resumedKey(AwsDurableAwaitIdentity identity) {
+        return "DRIVER_RESUMED#GEN#" + identity.generation() + "#OCC#" + identity.occurrence();
+    }
+
+    private static String latencyKey(AwsDurableAwaitIdentity identity) {
+        return "CALLBACK_LATENCY#GEN#" + identity.generation() + "#OCC#" + identity.occurrence();
+    }
+
     private static AttributeValue string(String value) {
         return AttributeValue.builder().s(required(value, "attribute value")).build();
     }
@@ -457,6 +781,19 @@ public final class AwsDurableCallbackBindingRepository {
         String value = Optional.ofNullable(item.get(name)).map(AttributeValue::n)
             .orElseThrow(() -> new IllegalStateException("binding attribute is missing: " + name));
         return Long.parseLong(value);
+    }
+
+    private static Optional<String> optionalText(Map<String, AttributeValue> item, String name) {
+        return Optional.ofNullable(item.get(name)).map(AttributeValue::s).filter(value -> !value.isBlank());
+    }
+
+    private static OptionalLong optionalLong(Map<String, AttributeValue> item, String name) {
+        try {
+            return Optional.ofNullable(item.get(name)).map(AttributeValue::n).map(Long::parseLong)
+                .map(OptionalLong::of).orElseGet(OptionalLong::empty);
+        } catch (NumberFormatException invalid) {
+            return OptionalLong.empty();
+        }
     }
 
     private static String required(String value, String name) {

@@ -3,9 +3,88 @@ Transform: AWS::Serverless-2016-10-31
 Description: Supported TPF QUEUE_ASYNC coordination host using AWS Lambda Durable Functions
 
 Parameters:
+  AlarmTopicArn:
+    Type: String
+    AllowedPattern: 'arn:[a-z-]+:sns:[a-z0-9-]+:[0-9]{12}:.+'
+    Description: Owned notification destination; validate subscription and response ownership before admission
+  DeploymentPreflightValidation:
+    Type: String
+    AllowedValues: [validated]
+    Description: >-
+      Set only after validating region, Java21 Durable SDK/runtime capability, account
+      start/checkpoint/history quotas, reserved concurrency, operation/state/payload budgets,
+      semantic table/index readiness, encryption key policies, retained release compatibility
+      and notification delivery. This attestation performs no AWS probes or provisioning.
+  ReleaseIsolationMode:
+    Type: String
+    AllowedValues: [FRESH_RELEASE_ISOLATED_STACK, DRAINED_RELEASE_MIGRATION]
+    Description: Fresh release uses isolated stack queues, callback table and semantic state namespace; migration requires every old execution and queue/stream/DLQ obligation drained with producers quiesced
+  ReleaseIsolationValidation:
+    Type: String
+    AllowedValues: [validated]
+    Description: Explicitly attest the selected isolation mode; moving shared consumers or coordinator aliases while retained executions need the previous release is forbidden
+  TransitionWorkerPlacement:
+    Type: String
+    AllowedValues: [FUNCTION, COMPUTE]
+    Description: COMPUTE disables only transition Lambda consumption; one external consumer must own the signed request queue
+  ComputeTransitionConsumerValidation:
+    Type: String
+    AllowedValues: [not-applicable, validated]
+    Description: For COMPUTE validate exclusive queue ownership, pinned release/digest, signing keys and retry/DLQ protocol
+  LogRetentionDays: {Type: Number, Default: 30, AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]}
+  HostKmsKeyArn:
+    Type: String
+    AllowedPattern: 'arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
+    Description: Retained CMK with validated Lambda Durable, DynamoDB, SQS, EventBridge and scoped Logs service/key policies
+  SemanticKmsKeyArns:
+    Type: CommaDelimitedList
+    AllowedPattern: 'arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
+    Description: Exact externally owned semantic table and release artifact CMKs; validate scoped key policies and retention in preflight
+  DurableEstimatedOperations: {Type: Number, MinValue: 1, MaxValue: 3000}
+  DurableEstimatedWrittenStateBytes: {Type: Number, MinValue: 1, MaxValue: 104857600}
+  DurableActionTimeoutSeconds: {Type: Number, Default: 120, MinValue: 1, MaxValue: 900}
+  CallbackRetentionSeconds: {Type: Number, MinValue: 1}
+  OutstandingCompletionObservationAlarmCount:
+    Type: Number
+    Default: 100
+    MinValue: 0
+    Description: Maximum scoped OUTSTANDING observations in five minutes; repeated reads count separately and are not a population inventory
+  CompletionReleaseLatencyAlarmMilliseconds:
+    Type: Number
+    MinValue: 1
+    Description: Operator-owned threshold for sampled native admission-to-release latency; this does not measure provider callback-to-resume latency
+  CallbackResumeLatencyAlarmMilliseconds:
+    Type: Number
+    MinValue: 1
+    Description: Operator-owned threshold for host API-success observation to first resumed action samples; missing acknowledgements and history-only success are unmeasured
+  RepairAgeAlarmMilliseconds:
+    Type: Number
+    MinValue: 1
+    Description: Operator-owned threshold for age sampled on targeted repair attempts; not a complete open-repair inventory and samples may stop after retry exhaustion
+  PipelineId: {Type: String, AllowedPattern: '[A-Za-z0-9._:/-]{1,128}'}
+  ContractVersion: {Type: String, AllowedPattern: '[A-Za-z0-9._:/-]{1,128}', Description: Exact compiler-generated semantic contract version of the pinned release}
+  ReleaseArtifactId: {Type: String, AllowedPattern: '[A-Za-z0-9._:/-]{1,128}', Description: Exact primary deployable artifact identifier in the pinned release descriptor}
+  ReleaseVersion: {Type: String, AllowedPattern: '[A-Za-z0-9._:/-]{1,128}'}
+  ReleaseArtifactDigest: {Type: String, AllowedPattern: '[a-f0-9]{64}'}
+  ReleaseArtifactBucket: {Type: String, AllowedPattern: '[a-z0-9.-]{3,63}'}
+  ExecutionTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
+  ExecutionKeyTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
+  ExecutionPayloadTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
+  AwaitInteractionTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
+  AwaitInteractionKeyTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
+  AwaitCompletionLifecycleTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}', Description: 'Externally owned pk/sk table for immutable native admission and release facts; TTL ttl_epoch_s, PITR and deletion protection; fresh/drained protocol namespace required'}
+  AwaitUnitTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
+  AwaitAdmissionTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
+  ReleaseTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
+  WorkerTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
   DurableArtifactBucket: {Type: String}
   DurableArtifactKey: {Type: String}
-  DurableCodeSha256: {Type: String}
+  DurableCodeSha256: {Type: String, AllowedPattern: '[A-Za-z0-9+/]{43}='}
+  ActionCodeSha256: {Type: String, AllowedPattern: '[A-Za-z0-9+/]{43}='}
+  VersionPublicationId:
+    Type: String
+    AllowedPattern: '[A-Za-z0-9._-]{1,64}'
+    Description: Unique release/configuration revision; change whenever either package or its configuration changes
   ActionArtifactUri:
     Type: String
     Description: S3 URI for the generated Quarkus action and worker Lambda package
@@ -26,13 +105,43 @@ Parameters:
       drained and their writers are quiesced or isolated on their original table.
       Retained coordinator, action, wake-up and repair versions must remain protocol-compatible.
       This attestation does not migrate callback rows or inspect retained executions.
+  ExecutionRecoveryMigrationValidation:
+    Type: String
+    AllowedValues: [validated]
+    ConstraintDescription: Validate retained execution recovery locators and compatible pinned packages before deployment
+    Description: >-
+      Set validated only for a fresh host without retained executions, or after validating
+      a retained locator and generation claim for every live execution. Drain or isolate
+      legacy coordinators that lack locator registration or invoke unqualified action code.
+      Retain the original numbered coordinator and action packages for recovery.
   AwaitInteractionStreamArn: {Type: String}
+  ExecutionStateStreamArn:
+    Type: String
+    Description: Exact Stream ARN of the TPF execution state table for terminal callback settlement
   SemanticDynamoResourceArns:
     Type: CommaDelimitedList
     Description: Exact TPF semantic table and index ARNs required by the action host
-  ResumeTokenSecret: {Type: String, NoEcho: true, MinLength: 32}
-  WorkerSharedSecret: {Type: String, NoEcho: true, MinLength: 32}
-  DurableExecutionTimeoutSeconds: {Type: Number, Default: 2592000, MinValue: 1, MaxValue: 31536000}
+  ResumeTokenSecretArn:
+    Type: String
+    AllowedPattern: 'arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}'
+  ResumeTokenSecretVersion: {Type: String, AllowedPattern: '[A-Za-z0-9-]{32,64}'}
+  WorkerSharedSecretArn:
+    Type: String
+    AllowedPattern: 'arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}'
+  WorkerSharedSecretVersion: {Type: String, AllowedPattern: '[A-Za-z0-9-]{32,64}'}
+  SigningKmsKeyArn:
+    Type: String
+    AllowedPattern: 'arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
+    Description: Retained CMK of both signing secrets; reads are constrained to Secrets Manager and those exact secret ARNs
+  SigningSecretAccessArns:
+    Type: CommaDelimitedList
+    AllowedPattern: 'arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}'
+    Description: Exact current and retained signing secret ARNs; retain access while numbered host versions or executions require them
+  SigningKmsAccessArns:
+    Type: CommaDelimitedList
+    AllowedPattern: 'arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
+    Description: Exact current and retained signing CMKs; do not remove keys needed by retained signing secret versions
+  DurableExecutionTimeoutSeconds: {Type: Number, Default: 2592000, MinValue: 1, MaxValue: 31622400}
   DurableRetentionDays: {Type: Number, Default: 30, MinValue: 1, MaxValue: 90}
   DurableAlias: {Type: String, Default: live, AllowedPattern: '[A-Za-z0-9-_]+'}
   ActionHandler: {Type: String, Default: aws-durable-action}
@@ -40,9 +149,40 @@ Parameters:
   AwaitCompletionHandler: {Type: String, Default: aws-durable-await-completion}
   TransitionWorkerHandler: {Type: String, Default: aws-durable-transition-worker}
   AwaitWakeupHandler: {Type: String, Default: aws-durable-await-wakeup}
+  ExecutionWakeupHandler: {Type: String, Default: aws-durable-execution-wakeup}
+  DueWorkHandler: {Type: String, Default: aws-durable-due-work}
+  DueWorkSweepLimit: {Type: Number, Default: 100, MinValue: 1, MaxValue: 1000}
   ReconciliationHandler: {Type: String, Default: aws-durable-reconcile}
 
+Conditions:
+  FunctionTransitionConsumer: !Equals [!Ref TransitionWorkerPlacement, FUNCTION]
+
 Rules:
+  ReleaseIsolationValidated:
+    Assertions:
+      - Assert: !Equals [!Ref ReleaseIsolationValidation, validated]
+        AssertDescription: Require a fresh release-isolated stack or fully drained migration; compatible in-place upgrades are not accepted
+  CurrentSigningReferencesAccessible:
+    Assertions:
+      - Assert: !Contains [!Ref SigningSecretAccessArns, !Ref ResumeTokenSecretArn]
+        AssertDescription: Resume signing reference must be included in the scoped secret access set
+      - Assert: !Contains [!Ref SigningSecretAccessArns, !Ref WorkerSharedSecretArn]
+        AssertDescription: Worker signing reference must be included in the scoped secret access set
+      - Assert: !Contains [!Ref SigningKmsAccessArns, !Ref SigningKmsKeyArn]
+        AssertDescription: Current signing CMK must be included in the retained CMK access set
+  ExecutionRecoveryMigrationValidated:
+    Assertions:
+      - Assert: !Equals [!Ref ExecutionRecoveryMigrationValidation, validated]
+        AssertDescription: Execution recovery requires validated locators and pinned package compatibility
+  DeploymentPreflightValidated:
+    Assertions:
+      - Assert: !Equals [!Ref DeploymentPreflightValidation, validated]
+        AssertDescription: Deployment requires explicit provider, quota, encryption and release preflight
+  ExclusiveComputeTransitionConsumer:
+    RuleCondition: !Equals [!Ref TransitionWorkerPlacement, COMPUTE]
+    Assertions:
+      - Assert: !Equals [!Ref ComputeTransitionConsumerValidation, validated]
+        AssertDescription: COMPUTE requires one validated consumer and no Lambda competitor
   CallbackGenerationMigrationValidated:
     Assertions:
       - Assert: !Equals [!Ref CallbackGenerationMigrationValidation, validated]
@@ -66,7 +206,8 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      SSESpecification: {SSEEnabled: true}
+      SSESpecification: {SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !Ref HostKmsKeyArn}
+      DeletionProtectionEnabled: true
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - {AttributeName: pk, AttributeType: S}
@@ -92,43 +233,125 @@ Resources:
       PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
 
   WorkDlq:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
   WorkQueue:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
     Properties:
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: !Ref HostKmsKeyArn
       VisibilityTimeout: 5400
       RedrivePolicy: {deadLetterTargetArn: !GetAtt WorkDlq.Arn, maxReceiveCount: 5}
   AwaitCompletionDlq:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
   AwaitCompletionQueue:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
     Properties:
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: !Ref HostKmsKeyArn
       VisibilityTimeout: 720
       RedrivePolicy: {deadLetterTargetArn: !GetAtt AwaitCompletionDlq.Arn, maxReceiveCount: 5}
   TransitionDlq:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
   TransitionRequestQueue:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
     Properties:
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: !Ref HostKmsKeyArn
       VisibilityTimeout: 5400
       RedrivePolicy: {deadLetterTargetArn: !GetAtt TransitionDlq.Arn, maxReceiveCount: 5}
   TransitionResponseQueue:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {VisibilityTimeout: 720, MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+    Properties: {VisibilityTimeout: 720, MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
   DurableDlq:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
   StreamFailureDlq:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
+
+  DueWorkDlq:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
+  DueWorkQueue:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref HostKmsKeyArn
+      VisibilityTimeout: 720
+      MessageRetentionPeriod: 86400
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt DueWorkDlq.Arn, maxReceiveCount: 5}
+
+  DueWorkRole:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: bounded-semantic-due-work
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SigningSecretAccessArns
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref SigningKmsAccessArns
+                Condition:
+                  StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                  StringLike:
+                    kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !Ref HostKmsKeyArn
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !Ref SemanticKmsKeyArns
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: [!GetAtt DueWorkQueue.Arn, !GetAtt TransitionResponseQueue.Arn]
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ReleaseArtifactBucket}/tpf/releases/*'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
+                  dynamodb:BatchGetItem, dynamodb:ConditionCheckItem, dynamodb:TransactWriteItems,
+                  dynamodb:Query, dynamodb:DescribeTable]
+                Resource: !Ref SemanticDynamoResourceArns
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: [!GetAtt WorkQueue.Arn, !GetAtt TransitionRequestQueue.Arn, !GetAtt WorkDlq.Arn]
 
   DurableRole:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -143,16 +366,21 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !Ref HostKmsKeyArn
+              - Effect: Allow
                 Action: ['lambda:CheckpointDurableExecution', 'lambda:GetDurableExecutionState']
                 Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:*'
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-action'
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-action:*'
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt DurableDlq.Arn
 
   IngressRole:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -165,10 +393,18 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !Ref HostKmsKeyArn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DurableDlq.Arn
+              - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !Ref DurableAliasResource
+                Resource: !Ref DurableVersion
 
   ActionRole:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -183,6 +419,28 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SigningSecretAccessArns
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref SigningKmsAccessArns
+                Condition:
+                  StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                  StringLike:
+                    kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !Ref HostKmsKeyArn
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !Ref SemanticKmsKeyArns
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: !GetAtt TransitionResponseQueue.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ReleaseArtifactBucket}/tpf/releases/*'
+              - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
                   dynamodb:BatchGetItem, dynamodb:ConditionCheckItem, dynamodb:TransactWriteItems,
                   dynamodb:Query, dynamodb:DescribeTable]
@@ -195,6 +453,8 @@ Resources:
                 Resource: [!GetAtt WorkQueue.Arn, !GetAtt TransitionRequestQueue.Arn]
 
   WorkerRole:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -209,6 +469,22 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SigningSecretAccessArns
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref SigningKmsAccessArns
+                Condition:
+                  StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                  StringLike:
+                    kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !Ref HostKmsKeyArn
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !Ref SemanticKmsKeyArns
+              - Effect: Allow
                 Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
                 Resource: [!GetAtt WorkQueue.Arn, !GetAtt AwaitCompletionQueue.Arn, !GetAtt TransitionRequestQueue.Arn]
               - Effect: Allow
@@ -216,10 +492,14 @@ Resources:
                 Resource: [!GetAtt TransitionResponseQueue.Arn, !GetAtt WorkDlq.Arn,
                   !GetAtt AwaitCompletionDlq.Arn, !GetAtt TransitionDlq.Arn]
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
+                  dynamodb:BatchGetItem, dynamodb:ConditionCheckItem, dynamodb:TransactWriteItems,
+                  dynamodb:Query, dynamodb:DescribeTable]
                 Resource: !Ref SemanticDynamoResourceArns
 
   WakeupRole:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -234,6 +514,25 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref SemanticKmsKeyArns
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SigningSecretAccessArns
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref SigningKmsAccessArns
+                Condition:
+                  StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                  StringLike:
+                    kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !Ref HostKmsKeyArn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt RepairFailureDlq.Arn
+              - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:ConditionCheckItem, dynamodb:Query]
                 Resource:
                   - !GetAtt CallbackBindingTable.Arn
@@ -244,17 +543,17 @@ Resources:
                 Resource: !Ref SemanticDynamoResourceArns
               - Effect: Allow
                 Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
-                Resource: [!Ref AwaitInteractionStreamArn, !GetAtt CallbackBindingTable.StreamArn]
+                Resource: [!Ref AwaitInteractionStreamArn, !Ref ExecutionStateStreamArn, !GetAtt CallbackBindingTable.StreamArn]
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt StreamFailureDlq.Arn
               - Effect: Allow
                 Action: [lambda:GetDurableExecution, lambda:GetDurableExecutionHistory,
-                  lambda:SendDurableExecutionCallbackSuccess, lambda:InvokeFunction]
+                  lambda:SendDurableExecutionCallbackSuccess, lambda:SendDurableExecutionCallbackFailure, lambda:InvokeFunction]
                 Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:*'
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !GetAtt ActionFunction.Arn
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-action:*'
 
   DurableFunction:
     Type: AWS::Lambda::Function
@@ -265,6 +564,7 @@ Resources:
     UpdateReplacePolicy: Retain
     Metadata:
       cfn-lint: {config: {ignore_checks: [E3002]}}
+    DependsOn: DurableFunctionLogs
     Properties:
       FunctionName: !Sub '${AWS::StackName}-durable'
       Code: {S3Bucket: !Ref DurableArtifactBucket, S3Key: !Ref DurableArtifactKey}
@@ -275,21 +575,27 @@ Resources:
       MemorySize: 1024
       Timeout: 900
       DeadLetterConfig: {TargetArn: !GetAtt DurableDlq.Arn}
+      KmsKeyArn: !Ref HostKmsKeyArn
+      ReservedConcurrentExecutions: 32
       DurableConfig:
+        KMSKeyArn: !Ref HostKmsKeyArn
         ExecutionTimeout: !Ref DurableExecutionTimeoutSeconds
         RetentionPeriodInDays: !Ref DurableRetentionDays
       Environment:
-        Variables: {TPF_AWS_DURABLE_ACTION_FUNCTION: !Ref ActionFunction}
+        Variables: {TPF_AWS_DURABLE_ACTION_FUNCTION: !Ref ActionVersion, TPF_AWS_DURABLE_PUBLICATION_ID: !Ref VersionPublicationId}
 
   DurableVersion:
     Type: AWS::Lambda::Version
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      RuntimePolicy: {UpdateRuntimeOn: FunctionUpdate}
       FunctionName: !Ref DurableFunction
       CodeSha256: !Ref DurableCodeSha256
-      Description: TPF AWS Durable QUEUE_ASYNC coordination host
+      Description: !Sub 'TPF AWS Durable ${VersionPublicationId}; action ${ActionVersion.Version}'
   DurableAliasResource:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::Lambda::Alias
     Properties:
       Name: !Ref DurableAlias
@@ -297,7 +603,10 @@ Resources:
       FunctionVersion: !GetAtt DurableVersion.Version
 
   ActionFunction: &ActionFunction
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::Serverless::Function
+    DependsOn: ActionFunctionLogs
     Properties: &ActionProperties
       FunctionName: !Sub '${AWS::StackName}-action'
       CodeUri: !Ref ActionArtifactUri
@@ -305,25 +614,52 @@ Resources:
       Role: !GetAtt ActionRole.Arn
       MemorySize: 1536
       Timeout: 120
+      ReservedConcurrentExecutions: 32
+      KmsKeyArn: !Ref HostKmsKeyArn
       Environment:
         Variables: &ActionEnvironment
-          PIPELINE_ORCHESTRATOR_COORDINATION_HOST: AWS_DURABLE
-          PIPELINE_ORCHESTRATOR_PROCESS_LOOPS_DISABLED: 'true'
-          PIPELINE_ORCHESTRATOR_QUEUE_URL: !Ref WorkQueue
-          PIPELINE_ORCHESTRATOR_DLQ_URL: !Ref WorkDlq
-          PIPELINE_ORCHESTRATOR_RESUME_TOKEN_SECRET: !Ref ResumeTokenSecret
-          PIPELINE_ORCHESTRATOR_WORKER_SQS_REQUEST_QUEUE_URL: !Ref TransitionRequestQueue
-          PIPELINE_ORCHESTRATOR_WORKER_SQS_RESPONSE_QUEUE_URL: !Ref TransitionResponseQueue
-          PIPELINE_ORCHESTRATOR_WORKER_SQS_SHARED_SECRET: !Ref WorkerSharedSecret
+          # Environment changes qualify a new publication even when the package SHA is unchanged.
+          TPF_AWS_DURABLE_PUBLICATION_ID: !Ref VersionPublicationId
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
+            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref DurableActionTimeoutSeconds
+          TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref CallbackRetentionSeconds
+          TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref DeploymentPreflightValidation
+          TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref DurableEstimatedOperations
+          TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref DurableEstimatedWrittenStateBytes
+          TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref DurableExecutionTimeoutSeconds
+          TPF_AWS_DURABLE_RETENTION_DAYS: !Ref DurableRetentionDays
+          TPF_AWS_DURABLE_WORKER_TIMEOUT_SECONDS: '900'
+          TPF_AWS_DURABLE_SQS_VISIBILITY_SECONDS: '5400'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !Ref WorkerSharedSecretArn
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !Ref WorkerSharedSecretVersion
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
           TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
           TPF_AWS_DURABLE_QUALIFIER: !Ref DurableAlias
           QUARKUS_LAMBDA_HANDLER: !Ref ActionHandler
 
+  ActionVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RuntimePolicy: {UpdateRuntimeOn: FunctionUpdate}
+      FunctionName: !Ref ActionFunction
+      CodeSha256: !Ref ActionCodeSha256
+      Description: !Sub 'TPF semantic action ${VersionPublicationId}'
+
   IngressFunction:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::Lambda::Function
+    DependsOn: IngressFunctionLogs
     Properties:
       Code: {S3Bucket: !Ref DurableArtifactBucket, S3Key: !Ref DurableArtifactKey}
+      FunctionName: !Sub '${AWS::StackName}-ingress'
+      KmsKeyArn: !Ref HostKmsKeyArn
+      ReservedConcurrentExecutions: 16
       Handler: org.pipelineframework.aws.durable.AwsDurableIngressHandler::handleRequest
       Runtime: java21
       Architectures: [arm64]
@@ -332,11 +668,23 @@ Resources:
       Timeout: 30
       Environment:
         Variables:
+          TPF_AWS_DURABLE_PUBLICATION_ID: !Ref VersionPublicationId
           TPF_AWS_DURABLE_FUNCTION: !Ref DurableFunction
-          TPF_AWS_DURABLE_QUALIFIER: !Ref DurableAlias
+          TPF_AWS_DURABLE_QUALIFIER: !GetAtt DurableVersion.Version
+
+  IngressVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RuntimePolicy: {UpdateRuntimeOn: FunctionUpdate}
+      FunctionName: !Ref IngressFunction
+      CodeSha256: !Ref DurableCodeSha256
+      Description: !Sub 'TPF ingress ${VersionPublicationId}'
 
   WorkFunction:
     <<: *ActionFunction
+    DependsOn: WorkFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-work'
@@ -344,24 +692,21 @@ Resources:
       Timeout: 900
       Environment:
         Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref WorkHandler}
-      Events:
-        Work: {Type: SQS, Properties: {Queue: !GetAtt WorkQueue.Arn, BatchSize: 1,
-          FunctionResponseTypes: [ReportBatchItemFailures], ScalingConfig: {MaximumConcurrency: 32}}}
 
   AwaitCompletionFunction:
     <<: *ActionFunction
+    DependsOn: AwaitCompletionFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-await-completion'
       Role: !GetAtt WorkerRole.Arn
       Environment:
         Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref AwaitCompletionHandler}
-      Events:
-        AwaitCompletion: {Type: SQS, Properties: {Queue: !GetAtt AwaitCompletionQueue.Arn, BatchSize: 1,
-          FunctionResponseTypes: [ReportBatchItemFailures]}}
 
   TransitionWorkerFunction:
+    Condition: FunctionTransitionConsumer
     <<: *ActionFunction
+    DependsOn: TransitionWorkerFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-transition-worker'
@@ -369,12 +714,10 @@ Resources:
       Timeout: 900
       Environment:
         Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref TransitionWorkerHandler}
-      Events:
-        Transition: {Type: SQS, Properties: {Queue: !GetAtt TransitionRequestQueue.Arn, BatchSize: 1,
-          FunctionResponseTypes: [ReportBatchItemFailures], ScalingConfig: {MaximumConcurrency: 32}}}
 
   AwaitWakeupFunction:
     <<: *ActionFunction
+    DependsOn: AwaitWakeupFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-await-wakeup'
@@ -385,26 +728,212 @@ Resources:
           QUARKUS_LAMBDA_HANDLER: !Ref AwaitWakeupHandler
           TPF_AWS_DURABLE_AWAIT_STREAM_ARN: !Ref AwaitInteractionStreamArn
           TPF_AWS_DURABLE_BINDING_STREAM_ARN: !GetAtt CallbackBindingTable.StreamArn
-      Events:
-        AwaitState:
-          Type: DynamoDB
-          Properties: &StreamEvent
-            Stream: !Ref AwaitInteractionStreamArn
-            StartingPosition: TRIM_HORIZON
-            BatchSize: 10
-            BisectBatchOnFunctionError: true
-            MaximumRecordAgeInSeconds: 3600
-            MaximumRetryAttempts: 5
-            FunctionResponseTypes: [ReportBatchItemFailures]
-            DestinationConfig: {OnFailure: {Destination: !GetAtt StreamFailureDlq.Arn}}
-        CallbackBinding:
-          Type: DynamoDB
-          Properties:
-            <<: *StreamEvent
-            Stream: !GetAtt CallbackBindingTable.StreamArn
+
+  ExecutionWakeupFunction:
+    <<: *ActionFunction
+    DependsOn: ExecutionWakeupFunctionLogs
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-execution-wakeup'
+      Role: !GetAtt WakeupRole.Arn
+      Environment:
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: !Ref ExecutionWakeupHandler
+          TPF_AWS_DURABLE_EXECUTION_STREAM_ARN: !Ref ExecutionStateStreamArn
+
+  DueWorkFunction:
+    <<: *ActionFunction
+    DependsOn: DueWorkFunctionLogs
+    Properties:
+      <<: *ActionProperties
+      FunctionName: !Sub '${AWS::StackName}-due-work'
+      Role: !GetAtt DueWorkRole.Arn
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables:
+          <<: *ActionEnvironment
+          QUARKUS_LAMBDA_HANDLER: !Ref DueWorkHandler
+          PIPELINE_ORCHESTRATOR_SWEEP_LIMIT: !Ref DueWorkSweepLimit
+
+  WorkVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RuntimePolicy: {UpdateRuntimeOn: FunctionUpdate}
+      FunctionName: !Ref WorkFunction
+      CodeSha256: !Ref ActionCodeSha256
+      Description: !Sub 'TPF Work ${VersionPublicationId}'
+
+  AwaitCompletionVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RuntimePolicy: {UpdateRuntimeOn: FunctionUpdate}
+      FunctionName: !Ref AwaitCompletionFunction
+      CodeSha256: !Ref ActionCodeSha256
+      Description: !Sub 'TPF AwaitCompletion ${VersionPublicationId}'
+
+  TransitionWorkerVersion:
+    Type: AWS::Lambda::Version
+    Condition: FunctionTransitionConsumer
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RuntimePolicy: {UpdateRuntimeOn: FunctionUpdate}
+      FunctionName: !Ref TransitionWorkerFunction
+      CodeSha256: !Ref ActionCodeSha256
+      Description: !Sub 'TPF TransitionWorker ${VersionPublicationId}'
+
+  AwaitWakeupVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RuntimePolicy: {UpdateRuntimeOn: FunctionUpdate}
+      FunctionName: !Ref AwaitWakeupFunction
+      CodeSha256: !Ref ActionCodeSha256
+      Description: !Sub 'TPF AwaitWakeup ${VersionPublicationId}'
+
+  ExecutionWakeupVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RuntimePolicy: {UpdateRuntimeOn: FunctionUpdate}
+      FunctionName: !Ref ExecutionWakeupFunction
+      CodeSha256: !Ref ActionCodeSha256
+      Description: !Sub 'TPF ExecutionWakeup ${VersionPublicationId}'
+
+  DueWorkVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RuntimePolicy: {UpdateRuntimeOn: FunctionUpdate}
+      FunctionName: !Ref DueWorkFunction
+      CodeSha256: !Ref ActionCodeSha256
+      Description: !Sub 'TPF DueWork ${VersionPublicationId}'
+
+  ReconciliationVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RuntimePolicy: {UpdateRuntimeOn: FunctionUpdate}
+      FunctionName: !Ref ReconciliationFunction
+      CodeSha256: !Ref ActionCodeSha256
+      Description: !Sub 'TPF Reconciliation ${VersionPublicationId}'
+
+  WorkFunctionWork:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref WorkVersion
+      EventSourceArn: !GetAtt WorkQueue.Arn
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig: {MaximumConcurrency: 32}
+
+  AwaitCompletionFunctionAwaitCompletion:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref AwaitCompletionVersion
+      EventSourceArn: !GetAtt AwaitCompletionQueue.Arn
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig: {MaximumConcurrency: 32}
+
+  TransitionWorkerFunctionTransition:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: FunctionTransitionConsumer
+    Properties:
+      FunctionName: !Ref TransitionWorkerVersion
+      EventSourceArn: !GetAtt TransitionRequestQueue.Arn
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig: {MaximumConcurrency: 32}
+
+  DueWorkFunctionTick:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref DueWorkVersion
+      EventSourceArn: !GetAtt DueWorkQueue.Arn
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig: {MaximumConcurrency: 2}
+
+  AwaitWakeupFunctionAwaitState:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Lambda::EventSourceMapping
+    Properties: &StreamMapping
+      FunctionName: !Ref AwaitWakeupVersion
+      EventSourceArn: !Ref AwaitInteractionStreamArn
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 10
+      BisectBatchOnFunctionError: true
+      MetricsConfig: {Metrics: [EventCount]}
+      MaximumRecordAgeInSeconds: 3600
+      MaximumRetryAttempts: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      DestinationConfig: {OnFailure: {Destination: !GetAtt StreamFailureDlq.Arn}}
+  AwaitWakeupFunctionCallbackBinding:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      <<: *StreamMapping
+      EventSourceArn: !GetAtt CallbackBindingTable.StreamArn
+  ExecutionWakeupFunctionExecutionState:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      <<: *StreamMapping
+      FunctionName: !Ref ExecutionWakeupVersion
+      EventSourceArn: !Ref ExecutionStateStreamArn
+
+  DueWorkRule:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: 'rate(1 minute)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DueWorkQueue.Arn
+          Id: bounded-semantic-due-work
+          Input: '{"kind":"tpf-due-work-tick"}'
+          RetryPolicy: {MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 10}
+          DeadLetterConfig: {Arn: !GetAtt DueWorkDlq.Arn}
+  DueWorkQueuePolicy:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref DueWorkQueue, !Ref DueWorkDlq]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: [!GetAtt DueWorkQueue.Arn, !GetAtt DueWorkDlq.Arn]
+            Condition: {ArnEquals: {'aws:SourceArn': !GetAtt DueWorkRule.Arn}}
 
   ReconciliationFunction:
     <<: *ActionFunction
+    DependsOn: ReconciliationFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-reconcile'
@@ -413,7 +942,49 @@ Resources:
       Environment:
         Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref ReconciliationHandler}
 
+  ReconciliationInvokeConfig:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ReconciliationFunction
+      Qualifier: !GetAtt ReconciliationVersion.Version
+      MaximumEventAgeInSeconds: 3600
+      MaximumRetryAttempts: 2
+      DestinationConfig: {OnFailure: {Destination: !GetAtt RepairFailureDlq.Arn}}
+  IngressInvokeConfig:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref IngressFunction
+      Qualifier: !GetAtt IngressVersion.Version
+      MaximumEventAgeInSeconds: 3600
+      MaximumRetryAttempts: 2
+      DestinationConfig: {OnFailure: {Destination: !GetAtt DurableDlq.Arn}}
+  RepairFailureDlq:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
+  RepairFailureQueuePolicy:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref RepairFailureDlq]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt RepairFailureDlq.Arn
+            Condition:
+              ArnEquals: {aws:SourceArn: !GetAtt DurableTerminalRule.Arn}
   DurableTerminalRule:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::Events::Rule
     Properties:
       EventPattern:
@@ -422,18 +993,26 @@ Resources:
         detail:
           functionArn:
             - prefix: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:'
-      Targets: [{Arn: !GetAtt ReconciliationFunction.Arn, Id: targeted-durable-reconciliation}]
+      Targets:
+        - Arn: !Ref ReconciliationVersion
+          Id: targeted-durable-reconciliation
+          RetryPolicy: {MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 5}
+          DeadLetterConfig: {Arn: !GetAtt RepairFailureDlq.Arn}
   DurableTerminalPermission:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Type: AWS::Lambda::Permission
     Properties:
       Action: lambda:InvokeFunction
-      FunctionName: !Ref ReconciliationFunction
+      FunctionName: !Ref ReconciliationVersion
       Principal: events.amazonaws.com
       SourceArn: !GetAtt DurableTerminalRule.Arn
 
   WorkDlqAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties: &QueueAlarmProperties
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
       EvaluationPeriods: 1
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
@@ -459,13 +1038,597 @@ Resources:
       <<: *QueueAlarmProperties
       Dimensions: [{Name: QueueName, Value: !GetAtt StreamFailureDlq.QueueName}]
 
+  DurableFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-durable'
+      KmsKeyId: !Ref HostKmsKeyArn
+      RetentionInDays: !Ref LogRetentionDays
+  ExecutionWakeupFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-execution-wakeup'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !Ref HostKmsKeyArn
+  DueWorkFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-due-work'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !Ref HostKmsKeyArn
+  DurableFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: &DurableFunctionAlarmProperties
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-durable'}]
+  DurableFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *DurableFunctionAlarmProperties
+      MetricName: Throttles
+  DurableOperationBudgetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *DurableFunctionAlarmProperties
+      # Native provider metric is cumulative per execution. Sum would add unrelated executions.
+      MetricName: DurableExecutionOperations
+      Statistic: Maximum
+      Threshold: 2700
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+  DurableWrittenStateBudgetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *DurableFunctionAlarmProperties
+      MetricName: DurableExecutionStorageWrittenBytes
+      Statistic: Maximum
+      Threshold: 90000000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+  ActionFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-action'
+      KmsKeyId: !Ref HostKmsKeyArn
+      RetentionInDays: !Ref LogRetentionDays
+  ActionFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: &ActionFunctionAlarmProperties
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-action'}]
+  ActionFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ActionFunctionAlarmProperties
+      MetricName: Throttles
+  IngressFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-ingress'
+      KmsKeyId: !Ref HostKmsKeyArn
+      RetentionInDays: !Ref LogRetentionDays
+  IngressFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: &IngressFunctionAlarmProperties
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-ingress'}]
+  IngressFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *IngressFunctionAlarmProperties
+      MetricName: Throttles
+  WorkFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-work'
+      KmsKeyId: !Ref HostKmsKeyArn
+      RetentionInDays: !Ref LogRetentionDays
+  WorkFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: &WorkFunctionAlarmProperties
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-work'}]
+  WorkFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *WorkFunctionAlarmProperties
+      MetricName: Throttles
+  AwaitCompletionFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-await-completion'
+      KmsKeyId: !Ref HostKmsKeyArn
+      RetentionInDays: !Ref LogRetentionDays
+  AwaitCompletionFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: &AwaitCompletionFunctionAlarmProperties
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-await-completion'}]
+  AwaitCompletionFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitCompletionFunctionAlarmProperties
+      MetricName: Throttles
+  TransitionWorkerFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Condition: FunctionTransitionConsumer
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-transition-worker'
+      KmsKeyId: !Ref HostKmsKeyArn
+      RetentionInDays: !Ref LogRetentionDays
+  TransitionWorkerFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: FunctionTransitionConsumer
+    Properties: &TransitionWorkerFunctionAlarmProperties
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-transition-worker'}]
+  TransitionWorkerFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: FunctionTransitionConsumer
+    Properties:
+      <<: *TransitionWorkerFunctionAlarmProperties
+      MetricName: Throttles
+  AwaitWakeupFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-await-wakeup'
+      KmsKeyId: !Ref HostKmsKeyArn
+      RetentionInDays: !Ref LogRetentionDays
+  AwaitWakeupFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: &AwaitWakeupFunctionAlarmProperties
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-await-wakeup'}]
+  AwaitWakeupFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      MetricName: Throttles
+  ReconciliationFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-reconcile'
+      KmsKeyId: !Ref HostKmsKeyArn
+      RetentionInDays: !Ref LogRetentionDays
+  ReconciliationFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: &ReconciliationFunctionAlarmProperties
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-reconcile'}]
+  ReconciliationFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ReconciliationFunctionAlarmProperties
+      MetricName: Throttles
+  DurableDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      Dimensions: [{Name: QueueName, Value: !GetAtt DurableDlq.QueueName}]
+  RepairFailureDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      Dimensions: [{Name: QueueName, Value: !GetAtt RepairFailureDlq.QueueName}]
+  WorkQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      MetricName: ApproximateAgeOfOldestMessage
+      Threshold: 300
+      Dimensions: [{Name: QueueName, Value: !GetAtt WorkQueue.QueueName}]
+  AwaitCompletionQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      MetricName: ApproximateAgeOfOldestMessage
+      Threshold: 300
+      Dimensions: [{Name: QueueName, Value: !GetAtt AwaitCompletionQueue.QueueName}]
+  TransitionRequestQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      MetricName: ApproximateAgeOfOldestMessage
+      Threshold: 300
+      Dimensions: [{Name: QueueName, Value: !GetAtt TransitionRequestQueue.QueueName}]
+  TransitionResponseQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      MetricName: ApproximateAgeOfOldestMessage
+      Threshold: 300
+      Dimensions: [{Name: QueueName, Value: !GetAtt TransitionResponseQueue.QueueName}]
+  AwaitStreamAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      MetricName: IteratorAge
+      Statistic: Maximum
+      Threshold: 60000
+  AwaitStateDroppedEventAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      MetricName: DroppedEventCount
+      Dimensions: [{Name: EventSourceMappingUUID, Value: !Ref AwaitWakeupFunctionAwaitState}]
+  CallbackBindingDroppedEventAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      MetricName: DroppedEventCount
+      Dimensions: [{Name: EventSourceMappingUUID, Value: !Ref AwaitWakeupFunctionCallbackBinding}]
+  StreamDestinationDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      MetricName: DestinationDeliveryFailures
+  RepairDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ReconciliationFunctionAlarmProperties
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Dimensions: [{Name: RuleName, Value: !Ref DurableTerminalRule}]
+  IngressAsyncDroppedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *IngressFunctionAlarmProperties
+      MetricName: AsyncEventsDropped
+  RepairAsyncDroppedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ReconciliationFunctionAlarmProperties
+      MetricName: AsyncEventsDropped
+
+  ExecutionWakeupFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
+  ExecutionWakeupFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      MetricName: Throttles
+      Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
+  DueWorkFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ActionFunctionAlarmProperties
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref DueWorkFunction}]
+  DueWorkFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ActionFunctionAlarmProperties
+      MetricName: Throttles
+      Dimensions: [{Name: FunctionName, Value: !Ref DueWorkFunction}]
+  ExecutionStateDroppedEventAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      MetricName: DroppedEventCount
+      Dimensions: [{Name: EventSourceMappingUUID, Value: !Ref ExecutionWakeupFunctionExecutionState}]
+  ExecutionStreamAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      MetricName: IteratorAge
+      Statistic: Maximum
+      Threshold: 60000
+      Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
+  ExecutionStreamDestinationDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      MetricName: DestinationDeliveryFailures
+      Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
+  DueWorkDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      Dimensions: [{Name: QueueName, Value: !GetAtt DueWorkDlq.QueueName}]
+  DueWorkAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *QueueAlarmProperties
+      MetricName: ApproximateAgeOfOldestMessage
+      Statistic: Maximum
+      Threshold: 120
+      Dimensions: [{Name: QueueName, Value: !GetAtt DueWorkQueue.QueueName}]
+  DueWorkDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ReconciliationFunctionAlarmProperties
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Dimensions: [{Name: RuleName, Value: !Ref DueWorkRule}]
+
+  CompletionObservationUnknownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ActionFunctionAlarmProperties
+      AlarmDescription: Native completion observations could not establish release; sampled reads do not constitute a global inventory
+      Namespace: TPF/AwsDurable
+      MetricName: CompletionObservationCount
+      Period: 300
+      Threshold: 0
+      Dimensions: [{Name: Stage, Value: COMPLETION}, {Name: Outcome, Value: UNKNOWN}]
+  CompletionObservationOutstandingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ActionFunctionAlarmProperties
+      AlarmDescription: Observed outstanding native completions exceed the configured read-count threshold; repeated reads count separately and absent samples do not establish global zero or health
+      Namespace: TPF/AwsDurable
+      MetricName: CompletionObservationCount
+      Statistic: Sum
+      Period: 300
+      Threshold: !Ref OutstandingCompletionObservationAlarmCount
+      Dimensions: [{Name: Stage, Value: COMPLETION}, {Name: Outcome, Value: OUTSTANDING}]
+  CompletionReleaseLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ActionFunctionAlarmProperties
+      AlarmDescription: Maximum known native admission-to-release latency among sampled released completions; absence of samples does not establish health
+      Namespace: TPF/AwsDurable
+      MetricName: AdmissionToReleaseLatencyMilliseconds
+      Statistic: Maximum
+      Period: 300
+      Threshold: !Ref CompletionReleaseLatencyAlarmMilliseconds
+      Dimensions: [{Name: Stage, Value: COMPLETION}, {Name: Outcome, Value: RELEASED}]
+  CallbackResumeObservedLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ActionFunctionAlarmProperties
+      AlarmDescription: Maximum host API-success observation to first verified resumed action sample; missing or lost samples do not establish provider latency or health
+      Namespace: TPF/AwsDurable
+      MetricName: CallbackToFirstResumedActionMilliseconds
+      Statistic: Maximum
+      Period: 300
+      Threshold: !Ref CallbackResumeLatencyAlarmMilliseconds
+      Dimensions: [{Name: Stage, Value: CALLBACK_RESUME}, {Name: Outcome, Value: MEASURED}]
+  CallbackResumeUnknownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ActionFunctionAlarmProperties
+      AlarmDescription: Callback resume observations have invalid timestamps; this sample cannot measure lost acknowledgements or missing history timestamps
+      Namespace: TPF/AwsDurable
+      MetricName: CallbackResumeUnknownCount
+      Period: 300
+      Threshold: 0
+      Dimensions: [{Name: Stage, Value: CALLBACK_RESUME}, {Name: Outcome, Value: UNKNOWN}]
+  RepairObservedAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ReconciliationFunctionAlarmProperties
+      AlarmDescription: Maximum repair age sampled from the first retained host observation on targeted attempts; missing samples or accepted replacement do not establish convergence
+      Namespace: TPF/AwsDurable
+      MetricName: RepairAgeMilliseconds
+      Statistic: Maximum
+      Period: 300
+      Threshold: !Ref RepairAgeAlarmMilliseconds
+      Dimensions: [{Name: Stage, Value: REPAIR}, {Name: Outcome, Value: REPAIR_AGE_SAMPLED}]
+  RepairObservedAgeUnknownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ReconciliationFunctionAlarmProperties
+      AlarmDescription: Targeted repair age samples are missing or invalid; retry exhaustion and DLQs remain separate alarms
+      Namespace: TPF/AwsDurable
+      MetricName: RepairAgeUnknownCount
+      Period: 300
+      Threshold: 0
+      Dimensions: [{Name: Stage, Value: REPAIR}, {Name: Outcome, Value: REPAIR_AGE_UNKNOWN}]
+  WakeupProviderUnknownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      Namespace: TPF/AwsDurable
+      MetricName: HostOutcomeCount
+      Period: 300
+      Threshold: 5
+      Dimensions: [{Name: Stage, Value: WAKEUP}, {Name: Outcome, Value: PROVIDER_UNKNOWN}]
+  WakeupTransientFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      Namespace: TPF/AwsDurable
+      MetricName: HostOutcomeCount
+      Period: 300
+      Threshold: 5
+      Dimensions: [{Name: Stage, Value: WAKEUP}, {Name: Outcome, Value: TRANSIENT_FAILURE}]
+  ReplacementRejectedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      Namespace: TPF/AwsDurable
+      MetricName: HostOutcomeCount
+      Period: 300
+      Threshold: 5
+      Dimensions: [{Name: Stage, Value: REPLACEMENT}, {Name: Outcome, Value: REJECTED}]
+  ReplacementFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      Namespace: TPF/AwsDurable
+      MetricName: HostOutcomeCount
+      Period: 300
+      Threshold: 5
+      Dimensions: [{Name: Stage, Value: REPLACEMENT}, {Name: Outcome, Value: FAILED}]
+  RepairFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      Namespace: TPF/AwsDurable
+      MetricName: HostOutcomeCount
+      Period: 300
+      Threshold: 5
+      Dimensions: [{Name: Stage, Value: REPAIR}, {Name: Outcome, Value: FAILED}]
+
+  IngressDestinationDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *IngressFunctionAlarmProperties
+      MetricName: DestinationDeliveryFailures
+  RepairDestinationDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *ReconciliationFunctionAlarmProperties
+      MetricName: DestinationDeliveryFailures
+  DurableDeadLetterDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *DurableFunctionAlarmProperties
+      MetricName: DeadLetterErrors
+
+  CallbackBindingConflictAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      Namespace: TPF/AwsDurable
+      MetricName: HostOutcomeCount
+      Period: 300
+      Threshold: 5
+      Dimensions: [{Name: Stage, Value: BINDING}, {Name: Outcome, Value: CONFLICT}]
+  CallbackRegistrationConflictAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      Namespace: TPF/AwsDurable
+      MetricName: HostOutcomeCount
+      Period: 300
+      Threshold: 5
+      Dimensions: [{Name: Stage, Value: REGISTRATION}, {Name: Outcome, Value: CONFLICT}]
+  GenerationClaimConflictAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      Namespace: TPF/AwsDurable
+      MetricName: HostOutcomeCount
+      Period: 300
+      Threshold: 5
+      Dimensions: [{Name: Stage, Value: GENERATION}, {Name: Outcome, Value: CONFLICT}]
+  StaleGenerationRejectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      <<: *AwaitWakeupFunctionAlarmProperties
+      Namespace: TPF/AwsDurable
+      MetricName: HostOutcomeCount
+      Period: 300
+      Threshold: 5
+      Dimensions: [{Name: Stage, Value: GENERATION}, {Name: Outcome, Value: STALE_REJECTED}]
+
 Outputs:
+  TransitionWorkerPlacement: {Value: !Ref TransitionWorkerPlacement}
+  TransitionWorkerProtocolIdentity: {Value: !Sub '${PipelineId}/${ContractVersion}/${ReleaseVersion}/${ReleaseArtifactId}/${ReleaseArtifactDigest}'}
   DurableAliasArn: {Value: !Ref DurableAliasResource}
-  IngressFunctionArn: {Value: !GetAtt IngressFunction.Arn}
-  ActionFunctionArn: {Value: !GetAtt ActionFunction.Arn}
+  IngressFunctionArn: {Value: !Ref IngressVersion}
+  ActionFunctionArn: {Value: !Ref ActionVersion}
   CallbackBindingTableName: {Value: !Ref CallbackBindingTable}
   WorkQueueUrl: {Value: !Ref WorkQueue}
   AwaitCompletionQueueUrl: {Value: !Ref AwaitCompletionQueue}
   TransitionRequestQueueUrl: {Value: !Ref TransitionRequestQueue}
   TransitionResponseQueueUrl: {Value: !Ref TransitionResponseQueue}
   StreamFailureQueueUrl: {Value: !Ref StreamFailureDlq}
+  DueWorkQueueUrl: {Value: !Ref DueWorkQueue}
+  DueWorkDlqUrl: {Value: !Ref DueWorkDlq}
+  DeploymentReleaseManifest:
+    Description: Export this resolved manifest to the immutable release bundle before admission; never overwrite a prior publication manifest
+    Value: !Sub
+      - |
+        {"schemaVersion":1,"stackId":"${AWS::StackId}","pipelineId":"${PipelineId}","contractVersion":"${ContractVersion}","releaseId":"${ReleaseVersion}","artifactId":"${ReleaseArtifactId}","artifactSha256":"${ReleaseArtifactDigest}","actionCodeSha256":"${ActionCodeSha256}","durableCodeSha256":"${DurableCodeSha256}","publicationId":"${VersionPublicationId}","placement":"${TransitionWorkerPlacement}","isolationMode":"${ReleaseIsolationMode}","runtimeUpdateMode":"FunctionUpdate","functionVersionArns":{"durable":"${DurableVersion}","action":"${ActionVersion}","ingress":"${IngressVersion}","work":"${WorkVersion}","transition":"${TransitionVersionArn}","awaitCompletion":"${AwaitCompletionVersion}","awaitWakeup":"${AwaitWakeupVersion}","executionWakeup":"${ExecutionWakeupVersion}","dueWork":"${DueWorkVersion}","reconciliation":"${ReconciliationVersion}"},"queueUrls":{"work":"${WorkQueue}","workDlq":"${WorkDlq}","awaitCompletion":"${AwaitCompletionQueue}","awaitCompletionDlq":"${AwaitCompletionDlq}","transitionRequest":"${TransitionRequestQueue}","transitionResponse":"${TransitionResponseQueue}","transitionDlq":"${TransitionDlq}","dueWork":"${DueWorkQueue}","dueWorkDlq":"${DueWorkDlq}","streamFailure":"${StreamFailureDlq}","repairFailure":"${RepairFailureDlq}","durableDlq":"${DurableDlq}"},"mappingIds":{"work":"${WorkFunctionWork}","awaitCompletion":"${AwaitCompletionFunctionAwaitCompletion}","transition":"${TransitionMappingId}","awaitState":"${AwaitWakeupFunctionAwaitState}","callbackBinding":"${AwaitWakeupFunctionCallbackBinding}","executionState":"${ExecutionWakeupFunctionExecutionState}","dueWork":"${DueWorkFunctionTick}"},"signing":{"resumeToken":{"arn":"${ResumeTokenSecretArn}","versionId":"${ResumeTokenSecretVersion}"},"worker":{"arn":"${WorkerSharedSecretArn}","versionId":"${WorkerSharedSecretVersion}"},"currentKmsKeyArn":"${SigningKmsKeyArn}","retainedSecretAccessArns":["${SigningSecretArns}"],"retainedKmsAccessArns":["${SigningKeyArns}"]},"hostKmsKeyArn":"${HostKmsKeyArn}","semanticKmsKeyArns":["${SemanticKeyArns}"]}
+      - TransitionVersionArn: !If [FunctionTransitionConsumer, !Ref TransitionWorkerVersion, '']
+        TransitionMappingId: !If [FunctionTransitionConsumer, !Ref TransitionWorkerFunctionTransition, '']
+        SigningSecretArns: !Join ['","', !Ref SigningSecretAccessArns]
+        SigningKeyArns: !Join ['","', !Ref SigningKmsAccessArns]
+        SemanticKeyArns: !Join ['","', !Ref SemanticKmsKeyArns]

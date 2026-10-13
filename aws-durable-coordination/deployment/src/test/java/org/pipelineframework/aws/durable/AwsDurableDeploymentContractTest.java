@@ -72,7 +72,7 @@ class AwsDurableDeploymentContractTest {
         while (entries.hasNext()) {
             var entry = entries.next();
             if ("AWS::SQS::Queue".equals(entry.getValue().path("Type").asText())) {
-                assertTrue(entry.getValue().path("Properties").path("SqsManagedSseEnabled").asBoolean(),
+                assertEquals("HostKmsKeyArn", entry.getValue().path("Properties").path("KmsMasterKeyId").asText(),
                     entry.getKey());
             }
         }
@@ -154,9 +154,9 @@ class AwsDurableDeploymentContractTest {
         assertEquals("AwaitInteractionStreamArn", variables.path("TPF_AWS_DURABLE_AWAIT_STREAM_ARN").asText());
         assertEquals("CallbackBindingTable.StreamArn", variables.path("TPF_AWS_DURABLE_BINDING_STREAM_ARN").asText());
         assertEquals(variables.path("TPF_AWS_DURABLE_AWAIT_STREAM_ARN"),
-            function.path("Events").path("AwaitState").path("Properties").path("Stream"));
+            resources().path("AwaitWakeupFunctionAwaitState").path("Properties").path("EventSourceArn"));
         assertEquals(variables.path("TPF_AWS_DURABLE_BINDING_STREAM_ARN"),
-            function.path("Events").path("CallbackBinding").path("Properties").path("Stream"));
+            resources().path("AwaitWakeupFunctionCallbackBinding").path("Properties").path("EventSourceArn"));
     }
 
     private void assertVisibility(JsonNode resources, String queue, String function) {

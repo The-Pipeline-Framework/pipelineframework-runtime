@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -48,26 +49,35 @@ class AwsDurableCoordinatorHandlerTest {
         assertThat(replayed.resumeExecutionId()).contains("execution-a");
     }
 
-    @Test
-    void callbackWakeupCarriesTheTpfIdentityAndPinnedRelease() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void callbackWakeupCarriesTheTpfIdentityAndPinnedRelease(boolean failResumeObservation) throws Exception {
         AwsDurableExecutionCheckpoint checkpoint = new AwsDurableExecutionCheckpoint(
             "tenant-a", "execution-a", "pipeline-a", "contract-a", "release-a");
         AwsDurableAwaitIdentity await = new AwsDurableAwaitIdentity(
             "tenant-a", "execution-a", "interaction-a", "correlation-a", 1);
         AtomicReference<String> callbackId = new AtomicReference<>();
         AtomicBoolean resumed = new AtomicBoolean();
+        AtomicInteger resumeMarkerCalls = new AtomicInteger();
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case REGISTER_CALLBACK -> {
                 callbackId.set(request.providerCallbackId().orElseThrow());
                 assertThat(request.awaitIdentity()).contains(await);
                 yield AwsDurableActionResponse.bound(true);
             }
+            case RECORD_AWAIT_RESUMED -> {
+                assertThat(request.awaitIdentity()).contains(await);
+                resumeMarkerCalls.incrementAndGet();
+                if (failResumeObservation) throw new IllegalStateException("observation action unavailable");
+                yield AwsDurableActionResponse.bound(true);
+            }
             case STATUS -> resumed.get() ? AwsDurableActionResponse.status("SUCCEEDED") : waiting(checkpoint, "interaction-a", "correlation-a");
             case RESULT -> AwsDurableActionResponse.result("{\"approved\":true}");
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REDRIVE -> throw new AssertionError("driver must not re-drive implicitly");
-            case QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, BIND_CALLBACK ->
+            case QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS, BIND_CALLBACK ->
                 throw new AssertionError("driver must register before resolving the TPF Await identity");
         };
         AwsDurableCoordinatorHandler handler = new AwsDurableCoordinatorHandler(actions);
@@ -94,6 +104,7 @@ class AwsDurableCoordinatorHandlerTest {
         assertThat(completed.getResult()).isEqualTo(new AwsDurableExecutionOutput(
             "tenant-a", "execution-a", "pipeline-a", "contract-a", "release-a", 1,
             "{\"approved\":true}"));
+        assertThat(resumeMarkerCalls).hasValue(1);
     }
 
     @org.junit.jupiter.params.ParameterizedTest
@@ -101,12 +112,18 @@ class AwsDurableCoordinatorHandlerTest {
     void rejectsCallbackForWrongInteractionOrOccurrence(boolean wrongOccurrence) throws Exception {
         var checkpoint = new AwsDurableExecutionCheckpoint("tenant-a", "execution-a", "pipeline-a", "contract-a", "release-a");
         var callback = new AtomicReference<String>();
+        AtomicBoolean resumeMarkerInvoked = new AtomicBoolean();
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case STATUS -> waiting(checkpoint, "interaction-a", "correlation-a");
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REGISTER_CALLBACK -> {
                 callback.set(request.providerCallbackId().orElseThrow());
+                yield AwsDurableActionResponse.bound(true);
+            }
+            case RECORD_AWAIT_RESUMED -> {
+                resumeMarkerInvoked.set(true);
                 yield AwsDurableActionResponse.bound(true);
             }
             default -> throw new AssertionError("invalid callback must not advance execution");
@@ -119,6 +136,7 @@ class AwsDurableCoordinatorHandlerTest {
             "tenant-a", "execution-a", wrongOccurrence ? "interaction-a" : "old-interaction", "correlation-a", 1,
             "COMPLETED", wrongOccurrence ? 2 : 1)));
         assertThat(runner.runUntilComplete(input).getStatus()).isEqualTo(ExecutionStatus.FAILED);
+        assertThat(resumeMarkerInvoked).isFalse();
     }
 
     @Test
@@ -126,6 +144,7 @@ class AwsDurableCoordinatorHandlerTest {
         var checkpoint = new AwsDurableExecutionCheckpoint("tenant-a", "execution-a", "pipeline-a", "contract-a", "release-a");
         var polls = new java.util.concurrent.atomic.AtomicInteger();
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case STATUS -> AwsDurableActionResponse.status(polls.getAndIncrement() == 0 ? "WAITING_EXTERNAL" : "SUCCEEDED");
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
@@ -140,11 +159,62 @@ class AwsDurableCoordinatorHandlerTest {
     }
 
     @Test
+    void durablePollingCarriesCursorPastCompletedHistoryAndClearsItAfterWakeup() throws Exception {
+        var execution = new AwsDurableExecutionCheckpoint("tenant-a", "execution-page", "pipeline-a", "contract-a", "release-a");
+        var cursor = new org.pipelineframework.awaitable.AwaitInteractionCursor("tenant-a", "unit-page", "opaque-next-page");
+        var polls = new java.util.concurrent.atomic.AtomicInteger();
+        AtomicBoolean completed = new AtomicBoolean();
+        AtomicReference<String> callbackId = new AtomicReference<>();
+        AwsDurableActionInvoker actions = request -> switch (request.operation()) {
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
+            case SUBMIT -> AwsDurableActionResponse.submitted(execution, false);
+            case STATUS -> {
+                if (completed.get()) {
+                    assertThat(request.awaitSelectionCursor()).isEmpty();
+                    yield AwsDurableActionResponse.status("SUCCEEDED");
+                }
+                if (polls.getAndIncrement() == 0) {
+                    assertThat(request.awaitSelectionCursor()).isEmpty();
+                    yield AwsDurableActionResponse.observation("WAITING_EXTERNAL", Optional.empty())
+                        .withAwaitSelectionCursor(Optional.of(cursor));
+                }
+                assertThat(request.awaitSelectionCursor()).contains(cursor);
+                yield waiting(execution, "interaction-101", "correlation-101");
+            }
+            case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
+            case REGISTER_CALLBACK -> {
+                assertThat(request.awaitIdentity()).hasValueSatisfying(identity ->
+                    assertThat(identity.interactionId()).isEqualTo("interaction-101"));
+                callbackId.set(request.providerCallbackId().orElseThrow());
+                yield AwsDurableActionResponse.bound(true);
+            }
+            case RECORD_AWAIT_RESUMED -> AwsDurableActionResponse.bound(true);
+            case RESULT -> AwsDurableActionResponse.result("{}");
+            default -> throw new AssertionError("unexpected action " + request.operation());
+        };
+        var runner = LocalDurableTestRunner.create(AwsDurableExecutionInput.class, new AwsDurableCoordinatorHandler(actions))
+            .withOutputType(AwsDurableExecutionOutput.class);
+        var input = new AwsDurableExecutionInput("tenant-a", "key-page", "pipeline-a", "contract-a", "release-a", "{}", Optional.empty(), 1);
+        // Continue polling performs a second bounded status action before parking on the selected item's callback.
+        assertThat(runner.run(input).getStatus()).isEqualTo(ExecutionStatus.PENDING);
+        runner.advanceTime();
+        var pending = runner.run(input);
+        assertThat(pending.getStatus()).isEqualTo(ExecutionStatus.PENDING);
+        assertThat(callbackId.get()).isNotBlank();
+        completed.set(true);
+        runner.completeCallback(callbackId.get(), JSON.writeValueAsString(new AwsDurableCallbackSignal(
+            "tenant-a", "execution-page", "interaction-101", "correlation-101", 1, "COMPLETED")));
+        assertThat(runner.runUntilComplete(input).isSucceeded()).isTrue();
+        assertThat(polls).hasValue(2);
+    }
+
+    @Test
     void terminalTpfFailureStopsPollingAndFailsTheDurableExecution() throws Exception {
         AwsDurableExecutionCheckpoint checkpoint = new AwsDurableExecutionCheckpoint(
             "tenant-a", "execution-failed", "pipeline-a", "contract-a", "release-a");
         AtomicBoolean resultRead = new AtomicBoolean();
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case REGISTER_CALLBACK -> throw new AssertionError("terminal state must not register a callback");
             case STATUS -> AwsDurableActionResponse.status("FAILED");
@@ -154,7 +224,7 @@ class AwsDurableCoordinatorHandlerTest {
             }
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REDRIVE -> throw new AssertionError("driver must not re-drive implicitly");
-            case QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, BIND_CALLBACK ->
+            case QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS, BIND_CALLBACK, RECORD_AWAIT_RESUMED ->
                 throw new AssertionError("driver must register before resolving the TPF Await identity");
         };
         AwsDurableCoordinatorHandler handler = new AwsDurableCoordinatorHandler(actions);
@@ -178,18 +248,20 @@ class AwsDurableCoordinatorHandlerTest {
         var registrations = new java.util.ArrayList<AwsDurableAwaitIdentity>();
         java.util.concurrent.atomic.AtomicInteger completedAwaits = new java.util.concurrent.atomic.AtomicInteger();
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case REGISTER_CALLBACK -> {
                 callbackId.set(request.providerCallbackId().orElseThrow());
                 registrations.add(request.awaitIdentity().orElseThrow());
                 yield AwsDurableActionResponse.bound(true);
             }
+            case RECORD_AWAIT_RESUMED -> AwsDurableActionResponse.bound(true);
             case STATUS -> completedAwaits.get() < 2
                 ? waiting(checkpoint, "interaction-" + (completedAwaits.get() + 1), "correlation-" + (completedAwaits.get() + 1))
                 : AwsDurableActionResponse.status("SUCCEEDED");
             case RESULT -> AwsDurableActionResponse.result("{\"awaits\":2}");
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
-            case REDRIVE, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, BIND_CALLBACK ->
+            case REDRIVE, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS, BIND_CALLBACK ->
                 throw new AssertionError("unexpected driver action " + request.operation());
         };
         AwsDurableExecutionInput input = new AwsDurableExecutionInput(
@@ -226,6 +298,7 @@ class AwsDurableCoordinatorHandlerTest {
         AtomicBoolean submitted = new AtomicBoolean();
         AtomicBoolean callbackBound = new AtomicBoolean();
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
+            case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SUBMIT -> {
                 submitted.set(true);
                 throw new AssertionError("replacement driver must not submit again");
@@ -237,8 +310,9 @@ class AwsDurableCoordinatorHandlerTest {
                 callbackBound.set(true);
                 throw new AssertionError("terminal TPF state must not register a replacement callback");
             }
-            case QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS ->
+            case QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS ->
                 throw new AssertionError("terminal TPF state has no pending Await");
+            case RECORD_AWAIT_RESUMED -> throw new AssertionError("terminal TPF state has no resumed Await");
             case REDRIVE -> throw new AssertionError("driver must not re-drive implicitly");
         };
         AwsDurableExecutionInput input = AwsDurableExecutionInput.resume(

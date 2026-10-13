@@ -45,7 +45,7 @@ public final class AwsDurableHostServices {
     public AwsDurableAwaitStreamProcessor streamProcessor() {
         return new AwsDurableAwaitStreamProcessor(bindings(), actions(), wakeups(),
             requiredEnvironment("TPF_AWS_DURABLE_AWAIT_STREAM_ARN"),
-            requiredEnvironment("TPF_AWS_DURABLE_BINDING_STREAM_ARN"), this::observeAwaitStream);
+            requiredEnvironment("TPF_AWS_DURABLE_BINDING_STREAM_ARN"), this::observeAwaitStream, terminalCallbacks()::settle);
     }
 
     Optional<AwsDurableAwaitCheckpoint> observeAwaitStream(
@@ -63,9 +63,16 @@ public final class AwsDurableHostServices {
                 && locator.interactionId().equals(checkpoint.interactionId()));
     }
 
+    public AwsDurableTerminalCallbackSettler terminalCallbacks() {
+        return new AwsDurableTerminalCallbackSettler(controlPlane, bindings(),
+            new AwsDurableCallbackClient(lambda, mapper), duration("TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS", 30));
+    }
+
     public AwsDurableTerminalReconciler terminalReconciler() {
         return new AwsDurableTerminalReconciler(
-            bindings(), actions(), replacementService(), new LambdaAwsDurableProviderExecutionInspector(lambda));
+            bindings(), controlPlane, new AwsDurableExecutionStarter(lambda, mapper,
+                requiredEnvironment("TPF_AWS_DURABLE_FUNCTION"), requiredEnvironment("TPF_AWS_DURABLE_QUALIFIER")),
+            new LambdaAwsDurableProviderExecutionInspector(lambda), duration("TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS", 30));
     }
 
     private AwsDurableWakeupService wakeups() {
