@@ -90,6 +90,8 @@ public class DynamoAwaitInteractionStore implements
     private static final String STATUS = "status";
     private static final String REQUEST_PAYLOAD_JSON = "request_payload_json";
     private static final String RESPONSE_PAYLOAD_JSON = "response_payload_json";
+    private static final String COMMAND_ACKNOWLEDGEMENT_JSON = "command_acknowledgement_json";
+    private static final String STAGED_COMPLETION_JSON = "staged_completion_json";
     private static final String UNIT_ID = "unit_id";
     private static final String ITEM_INDEX = "item_index";
     private static final String ACTOR = "actor";
@@ -370,6 +372,40 @@ public class DynamoAwaitInteractionStore implements
             return transitionStatus(expected.tenantId(), expected.interactionId(), expected.version(), expected.status(),
                 next.status(), serializePayload(expected, AwaitDurablePayloadResolver.Slot.RESPONSE, next.responsePayload()),
                 next.actor(), next.transportMetadata(), nowEpochMs);
+        });
+    }
+
+    @Override
+    public Uni<Optional<AwaitInteractionRecord>> compareAndSetCommandCompletion(
+        AwaitInteractionRecord expected, AwaitInteractionRecord replacement) {
+        if (!expected.permitsCommandCompletionReplacement(replacement)) {
+            return Uni.createFrom().failure(new IllegalArgumentException("Invalid Command completion transition"));
+        }
+        return blocking(() -> {
+            Optional<AwaitInteractionRecord> durable = getBlocking(expected.tenantId(), expected.interactionId(),
+                replacement.updatedAtEpochMs());
+            if (durable.isEmpty()) {
+                return Optional.empty();
+            }
+            AwaitInteractionRecord current = durable.orElseThrow();
+            if (current.version() != expected.version() || current.status() != expected.status()) {
+                return Optional.empty();
+            }
+            // Dynamo rehydrates canonical request/acknowledgement records on each read. Their
+            // classes need not implement value-equals, so compare the persisted JSON shape while
+            // the version/status condition below remains the atomic write authority.
+            if (!PipelineJson.mapper().valueToTree(current).equals(PipelineJson.mapper().valueToTree(expected))) {
+                throw new IllegalArgumentException("Command completion CAS expected state differs from durable state");
+            }
+            return transitionStatus(expected.tenantId(), expected.interactionId(), expected.version(),
+                expected.status(), replacement.status(),
+                serializePayload(replacement, AwaitDurablePayloadResolver.Slot.RESPONSE, replacement.responsePayload()),
+                replacement.actor(), replacement.transportMetadata(), replacement.updatedAtEpochMs(), false,
+                serializeOptionalPayload(replacement, AwaitDurablePayloadResolver.Slot.COMMAND_ACKNOWLEDGEMENT,
+                    replacement.commandAcknowledgement()),
+                serializeOptionalPayload(replacement, AwaitDurablePayloadResolver.Slot.STAGED_COMPLETION,
+                    replacement.stagedCompletionPayload()),
+                expected.stagedCompletionPayload().isPresent() && replacement.stagedCompletionPayload().isEmpty());
         });
     }
 
@@ -805,6 +841,24 @@ public class DynamoAwaitInteractionStore implements
         Map<String, Object> transportMetadata,
         long nowEpochMs,
         boolean projectItemContinuation) {
+        return transitionStatus(tenantId, interactionId, expectedVersion, requiredStatus, status,
+            responsePayloadJson, actor, transportMetadata, nowEpochMs, projectItemContinuation, null, null, false);
+    }
+
+    private Optional<AwaitInteractionRecord> transitionStatus(
+        String tenantId,
+        String interactionId,
+        long expectedVersion,
+        AwaitInteractionStatus requiredStatus,
+        AwaitInteractionStatus status,
+        String responsePayloadJson,
+        String actor,
+        Map<String, Object> transportMetadata,
+        long nowEpochMs,
+        boolean projectItemContinuation,
+        String acknowledgementJson,
+        String stagedCompletionJson,
+        boolean clearStagedCompletion) {
         Map<String, String> names = new HashMap<>();
         names.put("#version", VERSION);
         names.put("#status", STATUS);
@@ -822,6 +876,16 @@ public class DynamoAwaitInteractionStore implements
         if (responsePayloadJson != null) {
             names.put("#response", RESPONSE_PAYLOAD_JSON);
             values.put(":response", avS(responsePayloadJson));
+        }
+        if (acknowledgementJson != null) {
+            names.put("#acknowledgement", COMMAND_ACKNOWLEDGEMENT_JSON);
+            values.put(":acknowledgement", avS(acknowledgementJson));
+        }
+        if (stagedCompletionJson != null || clearStagedCompletion) {
+            names.put("#stagedCompletion", STAGED_COMPLETION_JSON);
+        }
+        if (stagedCompletionJson != null) {
+            values.put(":stagedCompletion", avS(stagedCompletionJson));
         }
         if (actor != null && !actor.isBlank()) {
             names.put("#actor", ACTOR);
@@ -852,6 +916,12 @@ public class DynamoAwaitInteractionStore implements
         if (responsePayloadJson != null) {
             update.append(", #response = :response");
         }
+        if (acknowledgementJson != null) {
+            update.append(", #acknowledgement = :acknowledgement");
+        }
+        if (stagedCompletionJson != null) {
+            update.append(", #stagedCompletion = :stagedCompletion");
+        }
         if (actor != null && !actor.isBlank()) {
             update.append(", #actor = :actor");
         }
@@ -866,6 +936,9 @@ public class DynamoAwaitInteractionStore implements
         if (status.terminal()) {
             update.append(" REMOVE #pendingTenantKey, #pendingAssigneeKey, #pendingGroupKey, #pendingStepKey, ")
                 .append("#pendingDeadlineSort, #deadlineKey, #deadlineSort");
+        }
+        if (clearStagedCompletion) {
+            update.append(status.terminal() ? ", #stagedCompletion" : " REMOVE #stagedCompletion");
         }
         String condition = "#version = :expected AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)";
         if (requiredStatus != null) {
@@ -1109,6 +1182,12 @@ public class DynamoAwaitInteractionStore implements
         putIfPresent(item, CAUSATION_ID, record.causationId());
         putIfPresent(item, RESPONSE_PAYLOAD_JSON,
             serializePayload(record, AwaitDurablePayloadResolver.Slot.RESPONSE, record.responsePayload()));
+        putIfPresent(item, COMMAND_ACKNOWLEDGEMENT_JSON,
+            serializeOptionalPayload(record, AwaitDurablePayloadResolver.Slot.COMMAND_ACKNOWLEDGEMENT,
+                record.commandAcknowledgement()));
+        putIfPresent(item, STAGED_COMPLETION_JSON,
+            serializeOptionalPayload(record, AwaitDurablePayloadResolver.Slot.STAGED_COMPLETION,
+                record.stagedCompletionPayload()));
         putIfPresent(item, UNIT_ID, record.unitId());
         if (record.itemIndex() != null) {
             item.put(ITEM_INDEX, avN(record.itemIndex()));
@@ -1126,7 +1205,11 @@ public class DynamoAwaitInteractionStore implements
         return withPayloads(
             stored,
             deserializePayload(stored, AwaitDurablePayloadResolver.Slot.REQUEST, readString(item, REQUEST_PAYLOAD_JSON)),
-            deserializePayload(stored, AwaitDurablePayloadResolver.Slot.RESPONSE, readString(item, RESPONSE_PAYLOAD_JSON)));
+            deserializePayload(stored, AwaitDurablePayloadResolver.Slot.RESPONSE, readString(item, RESPONSE_PAYLOAD_JSON)),
+            deserializeOptionalPayload(stored, AwaitDurablePayloadResolver.Slot.COMMAND_ACKNOWLEDGEMENT,
+                readString(item, COMMAND_ACKNOWLEDGEMENT_JSON)),
+            deserializeOptionalPayload(stored, AwaitDurablePayloadResolver.Slot.STAGED_COMPLETION,
+                readString(item, STAGED_COMPLETION_JSON)));
     }
 
     /**
@@ -1165,14 +1248,16 @@ public class DynamoAwaitInteractionStore implements
             readString(item, TRANSPORT_OUTPUT_TYPE));
     }
 
-    private AwaitInteractionRecord withPayloads(AwaitInteractionRecord stored, Object requestPayload, Object responsePayload) {
+    private AwaitInteractionRecord withPayloads(AwaitInteractionRecord stored, Object requestPayload,
+        Object responsePayload, Optional<Object> commandAcknowledgement,
+        Optional<Object> stagedCompletionPayload) {
         return new AwaitInteractionRecord(
             stored.tenantId(), stored.executionId(), stored.stepId(), stored.stepIndex(), stored.outputType(),
             stored.interactionId(), stored.correlationId(), stored.causationId(), stored.idempotencyKey(),
             stored.version(), stored.status(), requestPayload, responsePayload, stored.unitId(), stored.itemIndex(),
             stored.actor(), stored.assignee(), stored.group(), stored.transportType(), stored.transportMetadata(),
             stored.deadlineEpochMs(), stored.createdAtEpochMs(), stored.updatedAtEpochMs(), stored.ttlEpochS(),
-            stored.transportOutputType());
+            stored.transportOutputType(), commandAcknowledgement, stagedCompletionPayload);
     }
 
     private String serializePayload(AwaitInteractionRecord interaction, AwaitDurablePayloadResolver.Slot slot, Object payload) {
@@ -1183,6 +1268,16 @@ public class DynamoAwaitInteractionStore implements
             return toJson(payload);
         }
         return durablePayloadResolver.encode(interaction, slot, restoreTransitionTypedPayload(interaction, slot, payload));
+    }
+
+    private String serializeOptionalPayload(AwaitInteractionRecord interaction,
+        AwaitDurablePayloadResolver.Slot slot, Optional<Object> payload) {
+        return payload.map(value -> serializePayload(interaction, slot, value)).orElse(null);
+    }
+
+    private Optional<Object> deserializeOptionalPayload(AwaitInteractionRecord interaction,
+        AwaitDurablePayloadResolver.Slot slot, String payload) {
+        return Optional.ofNullable(deserializePayload(interaction, slot, payload));
     }
 
     private Object restoreTransitionTypedPayload(

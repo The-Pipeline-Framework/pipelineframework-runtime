@@ -28,7 +28,7 @@ import org.pipelineframework.config.pipeline.PipelineJson;
 /** Resolves pinned-release plans for the canonical request/response fields of await interactions. */
 @ApplicationScoped
 public class AwaitDurablePayloadResolver {
-    public enum Slot { REQUEST, RESPONSE }
+    public enum Slot { REQUEST, RESPONSE, COMMAND_ACKNOWLEDGEMENT, STAGED_COMPLETION }
 
     /** Direct override for focused tests; production selection is provider-name based. */
     ExecutionStateStore executionStateStore;
@@ -130,7 +130,22 @@ public class AwaitDurablePayloadResolver {
         PinnedExecution execution = owningExecution(interaction);
         PipelineReleaseRecord release = pinnedRelease(interaction.tenantId(), execution);
         AwaitCompletionDescriptor descriptor = descriptors.descriptorByStepIdNow(interaction.stepId());
-        String requestedTypeId = slot == Slot.REQUEST ? descriptor.inputType() : interaction.outputType();
+        String requestedTypeId = switch (slot) {
+            case REQUEST -> descriptor.inputType();
+            case RESPONSE -> interaction.outputType();
+            case COMMAND_ACKNOWLEDGEMENT -> {
+                if (!descriptor.acknowledgementAwareCommandCompletion()) {
+                    throw new IllegalStateException("Command acknowledgement is unavailable in the pinned descriptor");
+                }
+                yield descriptor.commandAcknowledgementType().orElseThrow();
+            }
+            case STAGED_COMPLETION -> {
+                if (!descriptor.acknowledgementAwareCommandCompletion()) {
+                    throw new IllegalStateException("Staged callback is unavailable in the pinned descriptor");
+                }
+                yield descriptor.transportOutputType();
+            }
+        };
         var resolvedDefinition = CanonicalPayloadBindingLookup.resolve(
             release.contract().canonicalTypes(), requestedTypeId);
         String canonicalTypeId = resolvedDefinition
@@ -150,7 +165,7 @@ public class AwaitDurablePayloadResolver {
                 throw new IllegalStateException("pinned release canonical catalog fingerprint is unavailable");
             }
         } else if (release.contract().schemaVersion() == 1) {
-            runtimeType = slot == Slot.REQUEST ? descriptor.inputType() : interaction.outputType();
+            runtimeType = requestedTypeId;
             expression = fingerprint(canonicalTypeId);
             catalog = release.contract().contractHash();
         } else {

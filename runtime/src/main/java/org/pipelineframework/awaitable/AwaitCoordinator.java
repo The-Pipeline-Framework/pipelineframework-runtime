@@ -370,8 +370,10 @@ public class AwaitCoordinator {
         AwaitCompletionCommand normalized = normalizeCompletionCommand(command);
         return resolveForCompletion(normalized)
             .onItem().transformToUni(record -> validateCompletionAdmission(record, normalized)
-                .onItem().transform(safeCommand -> completionContract(record, safeCommand)))
-            .onItem().transformToUni(validated -> interactionStore().complete(validated.command()))
+                .onItem().transformToUni(safeCommand -> record.acknowledgementAwareCommandCallback()
+                    ? completeAcknowledgedCommand(record, safeCommand, 8)
+                    : Uni.createFrom().item(completionContract(record, safeCommand))
+                        .chain(validated -> interactionStore().complete(validated.command()))))
             .invoke(result -> {
                 if (!result.duplicate() && result.record().status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
                     recordAdmissionLifecycle(AwaitReplayLifecycleEvent.COMPLETION_OBSERVED, result.record());
@@ -407,6 +409,88 @@ public class AwaitCoordinator {
         return settleCommandDispatch(expected, settlement, 8);
     }
 
+    public Uni<CommandCompletionSettlementResult> settleCommandDispatch(AwaitInteractionRecord expected,
+        CommandDispatchSettlement settlement, Optional<Object> acknowledgement) {
+        if (!expected.acknowledgementAwareCommandCallback()) {
+            return settleCommandDispatch(expected, settlement);
+        }
+        return settleAcknowledgedCommand(expected, settlement, acknowledgement, 8);
+    }
+
+    private Uni<CommandCompletionSettlementResult> settleAcknowledgedCommand(AwaitInteractionRecord expected,
+        CommandDispatchSettlement settlement, Optional<Object> acknowledgement, int remainingRaces) {
+        if (remainingRaces == 0) {
+            return Uni.createFrom().failure(new IllegalStateException("Command acknowledgement settlement contention"));
+        }
+        return interactionStore().get(expected.tenantId(), expected.interactionId()).chain(found -> {
+            AwaitInteractionRecord current = found.orElseThrow(() ->
+                new AwaitInteractionNotFoundException("Command interaction disappeared"));
+            AwaitCompletionDescriptor descriptor = descriptorFor(current);
+            validateDurableOutputContract(current, descriptor);
+            if (current.status().terminal() || current.status() == AwaitInteractionStatus.DISPATCHED
+                || current.status() == AwaitInteractionStatus.WAITING) {
+                return Uni.createFrom().item(new CommandCompletionSettlementResult(current, false));
+            }
+            if (current.status() != AwaitInteractionStatus.DISPATCHING
+                && current.status() != AwaitInteractionStatus.COMPLETION_OBSERVED) {
+                return Uni.createFrom().failure(new IllegalStateException("Invalid Command acknowledgement state"));
+            }
+            Map<String, Object> metadata = new java.util.LinkedHashMap<>(current.transportMetadata());
+            Optional<Object> acceptedAcknowledgement = current.commandAcknowledgement().isPresent()
+                ? current.commandAcknowledgement()
+                : settlement == CommandDispatchSettlement.SUCCEEDED
+                    ? acknowledgement.map(value -> coerceCommandAcknowledgement(descriptor, value))
+                    : Optional.empty();
+            boolean accepted = acceptedAcknowledgement.isPresent();
+            metadata.put("commandSettlement", accepted ? CommandDispatchSettlement.SUCCEEDED.name() : settlement.name());
+            Optional<Object> staged = current.stagedCompletionPayload();
+            Object response = current.responsePayload();
+            AwaitInteractionStatus status;
+            long nowEpochMs = System.currentTimeMillis();
+            if (current.deadlineEpochMs() <= nowEpochMs) {
+                status = AwaitInteractionStatus.TIMED_OUT;
+            } else if (accepted && staged.isPresent()) {
+                try {
+                    response = projectAcknowledgedCompletion(current, descriptor, acceptedAcknowledgement.orElseThrow(),
+                        staged.orElseThrow(), completionMetadata(current));
+                    status = AwaitInteractionStatus.COMPLETED;
+                    metadata.put("completionDelivery", "dispatch");
+                } catch (CommandCompletionRejectedException invalidEarlyCallback) {
+                    // Authenticated but identity-incompatible early evidence is discarded; later valid
+                    // delivery may still complete against the durable acknowledgement.
+                    staged = Optional.empty();
+                    status = AwaitInteractionStatus.DISPATCHED;
+                    metadata.put("rejectedEarlyCallback", true);
+                } catch (RuntimeException projectionUnavailable) {
+                    // Keep both evidence slots durable so redrive can retry projection without
+                    // redispatching the effect or asking the provider to resend its callback.
+                    status = AwaitInteractionStatus.COMPLETION_OBSERVED;
+                    metadata.put("completionProjectionPending", true);
+                }
+            } else if (accepted) {
+                status = AwaitInteractionStatus.DISPATCHED;
+            } else if (settlement == CommandDispatchSettlement.AMBIGUOUS) {
+                status = staged.isEmpty() ? AwaitInteractionStatus.DISPATCHED : AwaitInteractionStatus.COMPLETION_OBSERVED;
+            } else if (settlement == CommandDispatchSettlement.RETRYABLE && staged.isEmpty()) {
+                status = AwaitInteractionStatus.WAITING;
+            } else {
+                status = AwaitInteractionStatus.FAILED;
+                metadata.put("completionFailure", "contradictory-provider-evidence");
+            }
+            AwaitInteractionRecord next = commandState(current, status, response, current.actor(), metadata,
+                acceptedAcknowledgement, staged, nowEpochMs);
+            return interactionStore().compareAndSetCommandCompletion(current, next)
+                .chain(updated -> updated.map(record -> {
+                    if (record.status() == AwaitInteractionStatus.DISPATCHED
+                        || record.status() == AwaitInteractionStatus.COMPLETED) {
+                        recordInteractionDispatched(record);
+                    }
+                    return Uni.createFrom().item(new CommandCompletionSettlementResult(record,
+                        record.status() == AwaitInteractionStatus.COMPLETED));
+                }).orElseGet(() -> settleAcknowledgedCommand(current, settlement, acknowledgement, remainingRaces - 1)));
+        });
+    }
+
     private Uni<CommandCompletionSettlementResult> settleCommandDispatch(AwaitInteractionRecord expected,
         CommandDispatchSettlement settlement, int remainingRaces) {
         if (remainingRaces == 0) {
@@ -427,6 +511,102 @@ public class AwaitCoordinator {
                             new CommandCompletionSettlementResult(record, record.status() == AwaitInteractionStatus.COMPLETED)))
                         .orElseGet(() -> settleCommandDispatch(current, settlement, remainingRaces - 1)));
             });
+    }
+
+    private Uni<AwaitCompletionResult> completeAcknowledgedCommand(AwaitInteractionRecord initial,
+        AwaitCompletionCommand command, int remainingRaces) {
+        if (remainingRaces == 0) {
+            return Uni.createFrom().failure(new IllegalStateException("Command callback admission contention"));
+        }
+        return interactionStore().get(initial.tenantId(), initial.interactionId()).chain(found -> {
+            AwaitInteractionRecord current = found.orElseThrow(() ->
+                new AwaitInteractionNotFoundException("Command interaction disappeared"));
+            if (current.status().terminal() && current.status() != AwaitInteractionStatus.COMPLETED) {
+                return Uni.createFrom().failure(new AwaitInteractionTerminalException(
+                    "Await interaction is terminal: " + current.status()));
+            }
+            AwaitCompletionDescriptor descriptor = descriptorFor(current);
+            validateDurableOutputContract(current, descriptor);
+            Object callback = descriptor.outputFromTransport().apply(
+                coerceTransportPayload(current, command.responsePayload()));
+            if (callback == null) {
+                return Uni.createFrom().failure(new CommandCompletionRejectedException(
+                    "Callback produced no completion payload"));
+            }
+            if (current.stagedCompletionPayload().isPresent()) {
+                boolean same = PipelineJson.mapper().valueToTree(current.stagedCompletionPayload().orElseThrow())
+                    .equals(PipelineJson.mapper().valueToTree(callback));
+                if (!same) {
+                    return Uni.createFrom().failure(new CommandCompletionRejectedException(
+                        "Callback contradicts an admitted completion"));
+                }
+                return Uni.createFrom().item(new AwaitCompletionResult(current, true));
+            }
+            if (current.status() == AwaitInteractionStatus.COMPLETED) {
+                return Uni.createFrom().failure(new CommandCompletionRejectedException(
+                    "Completed interaction has no matching callback evidence"));
+            }
+            if (current.deadlineEpochMs() <= command.nowEpochMs()) {
+                return Uni.createFrom().failure(new AwaitInteractionTerminalException(
+                    "Await interaction timed out before completion"));
+            }
+            if (current.status() != AwaitInteractionStatus.DISPATCHING
+                && current.status() != AwaitInteractionStatus.DISPATCHED
+                && current.status() != AwaitInteractionStatus.COMPLETION_OBSERVED) {
+                return Uni.createFrom().failure(new CommandCompletionRejectedException(
+                    "Callback cannot be admitted while Command interaction is " + current.status()));
+            }
+            boolean acknowledged = current.commandAcknowledgement().isPresent();
+            Object response;
+            try {
+                response = acknowledged
+                    ? projectAcknowledgedCompletion(current, descriptor, current.commandAcknowledgement().orElseThrow(), callback,
+                        new AwaitCompletionMetadata(current.interactionId(), command.actor(),
+                            Instant.ofEpochMilli(command.nowEpochMs())))
+                    : current.responsePayload();
+            } catch (CommandCompletionRejectedException invalidCallback) {
+                return Uni.createFrom().failure(new CommandCompletionRejectedException(
+                    "Callback does not match the Command acknowledgement"));
+            }
+            AwaitInteractionRecord next = commandState(current,
+                acknowledged ? AwaitInteractionStatus.COMPLETED : AwaitInteractionStatus.COMPLETION_OBSERVED,
+                response, command.actor(), current.transportMetadata(), current.commandAcknowledgement(),
+                Optional.of(callback), command.nowEpochMs());
+            return interactionStore().compareAndSetCommandCompletion(current, next)
+                .chain(updated -> updated.map(record -> Uni.createFrom().item(new AwaitCompletionResult(record, false)))
+                    .orElseGet(() -> completeAcknowledgedCommand(current, command, remainingRaces - 1)));
+        });
+    }
+
+    private Object coerceCommandAcknowledgement(AwaitCompletionDescriptor descriptor, Object acknowledgement) {
+        try {
+            Class<?> expectedType = AwaitPayloadSupport.resolvePayloadClass(descriptor.commandAcknowledgementType().orElseThrow(),
+                Thread.currentThread().getContextClassLoader());
+            return AwaitPayloadSupport.coercePayload(acknowledgement, expectedType);
+        } catch (ClassNotFoundException failure) {
+            throw new IllegalStateException("Command acknowledgement type is unavailable", failure);
+        }
+    }
+
+    private Object projectAcknowledgedCompletion(AwaitInteractionRecord record, AwaitCompletionDescriptor descriptor,
+        Object acknowledgement, Object callback, AwaitCompletionMetadata metadata) {
+        Object canonicalRequest = restoreCanonicalRequestPayload(descriptor, record.requestPayload());
+        Object canonicalAcknowledgement = coerceCommandAcknowledgement(descriptor, acknowledgement);
+        Object projected = descriptor.commandCompletionProjector().orElseThrow().project(canonicalRequest,
+            canonicalAcknowledgement, callback, metadata);
+        return coerceCanonicalPayload(record, projected);
+    }
+
+    private static AwaitInteractionRecord commandState(AwaitInteractionRecord current,
+        AwaitInteractionStatus status, Object response, String actor, Map<String, Object> metadata,
+        Optional<Object> acknowledgement, Optional<Object> stagedCompletion, long nowEpochMs) {
+        return new AwaitInteractionRecord(current.tenantId(), current.executionId(), current.stepId(),
+            current.stepIndex(), current.outputType(), current.interactionId(), current.correlationId(),
+            current.causationId(), current.idempotencyKey(), current.version() + 1, status,
+            current.requestPayload(), response, current.unitId(), current.itemIndex(), actor,
+            current.assignee(), current.group(), current.transportType(), metadata,
+            current.deadlineEpochMs(), current.createdAtEpochMs(), nowEpochMs, current.ttlEpochS(),
+            current.transportOutputType(), acknowledgement, stagedCompletion);
     }
 
     private Uni<AwaitCompletionCommand> validateCompletionAdmission(
@@ -1348,10 +1528,16 @@ public class AwaitCoordinator {
         Map<String, Object> metadata = new java.util.LinkedHashMap<>(traceMetadata);
         metadata.remove("completionMode");
         metadata.remove("callbackSelection");
+        metadata.remove("commandCompletionMode");
+        metadata.remove("commandAcknowledgementType");
         descriptor.callback().ifPresent(callback -> {
             metadata.put("completionMode", "CONNECTOR_CALLBACK");
             metadata.put("callbackSelection", callback.contractMetadata());
         });
+        if (descriptor.acknowledgementAwareCommandCompletion()) {
+            metadata.put("commandCompletionMode", "ACKNOWLEDGEMENT_REQUIRED");
+            metadata.put("commandAcknowledgementType", descriptor.commandAcknowledgementType().orElseThrow());
+        }
         metadata.remove(COMPLETION_PROJECTOR_METADATA);
         if (descriptor.requestAwareCompletion()) {
             metadata.put(COMPLETION_PROJECTOR_METADATA, descriptor.completionProjectorId());
@@ -1368,11 +1554,19 @@ public class AwaitCoordinator {
                 .equals(record.transportMetadata().get("callbackSelection")))) {
             throw new PinnedCompletionProjectorMismatchException("Await callback contract does not match the pinned interaction");
         }
+        if (record.acknowledgementAwareCommandCallback() != descriptor.acknowledgementAwareCommandCompletion()
+            || (record.acknowledgementAwareCommandCallback() && !descriptor.commandAcknowledgementType().orElseThrow()
+                .equals(record.transportMetadata().get("commandAcknowledgementType")))) {
+            throw new PinnedCompletionProjectorMismatchException("Await Command completion mode or acknowledgement type changed");
+        }
         if (!descriptor.requestAwareCompletion()) {
             return; // Ignore reserved metadata supplied to legacy non-request-aware interactions.
         }
         Object pinned = record.transportMetadata().get(COMPLETION_PROJECTOR_METADATA);
         if (pinned == null) {
+            if (record.acknowledgementAwareCommandCallback()) {
+                throw new PinnedCompletionProjectorMismatchException("Await Command completion projector identity is missing");
+            }
             return; // Compatibility for interactions created before projector identity was persisted.
         }
         String current = descriptor.completionProjectorId();

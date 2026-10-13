@@ -26,6 +26,9 @@ public final class AwaitCompletionAdmissionFailures {
         if (root instanceof AwaitCompletionTenantMismatchException) {
             return "tenant_mismatch";
         }
+        if (root instanceof CommandCompletionRejectedException) {
+            return "command_completion_rejected";
+        }
         return "unknown";
     }
 
