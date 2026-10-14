@@ -1,6 +1,7 @@
 package org.pipelineframework.awaitable.store;
 
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
 
 import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
@@ -31,6 +32,7 @@ public final class DynamoAwaitLifecycleTestStores {
     PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
     PipelineOrchestratorConfig.DynamoConfig dynamo = mock(PipelineOrchestratorConfig.DynamoConfig.class);
     when(config.dynamo()).thenReturn(dynamo);
+    lenient().when(dynamo.awaitCompletionLifecycleTable()).thenReturn(tablePrefix + "_completion_lifecycle");
     when(dynamo.awaitInteractionTable()).thenReturn(tablePrefix + "_interaction");
     when(dynamo.awaitInteractionKeyTable()).thenReturn(tablePrefix + "_interaction_key");
     return new DynamoAwaitInteractionStore(client, config, resolver);
@@ -49,6 +51,7 @@ public final class DynamoAwaitLifecycleTestStores {
     PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
     PipelineOrchestratorConfig.DynamoConfig dynamo = mock(PipelineOrchestratorConfig.DynamoConfig.class);
     when(config.dynamo()).thenReturn(dynamo);
+    lenient().when(dynamo.awaitCompletionLifecycleTable()).thenReturn(tablePrefix + "_completion_lifecycle");
     when(dynamo.awaitInteractionTable()).thenReturn(tablePrefix + "_interaction");
     if (lookupRequired) {
       when(dynamo.awaitInteractionKeyTable()).thenReturn(tablePrefix + "_interaction_key");

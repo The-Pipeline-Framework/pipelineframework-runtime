@@ -68,6 +68,10 @@ public final class AwsDurableCoordinatorHandler
         Objects.requireNonNull(input, "input");
         Objects.requireNonNull(context, "context");
 
+        String providerName = AwsDurableExecutionNames.durableExecutionName(input.tenantId(), input.idempotencyKey(), input.generation());
+        context.step("register-admission-recovery", Boolean.class, ignored ->
+            actions.invoke(AwsDurableActionRequest.registerAdmission(input, providerName, context.getExecutionArn())).bindingCreated());
+
         AwsDurableDriverCheckpoint checkpoint = input.resumeExecutionId()
             .map(executionId -> context.step(
                 "resume-tpf-execution",
@@ -86,6 +90,9 @@ public final class AwsDurableCoordinatorHandler
                 ignored -> new AwsDurableDriverCheckpoint(
                     requiredCheckpoint(actions.invoke(AwsDurableActionRequest.submit(input))),
                     input.generation())));
+
+        context.step("register-execution-recovery", Boolean.class, ignored ->
+            actions.invoke(AwsDurableActionRequest.registerExecution(checkpoint, providerName, context.getExecutionArn())).bindingCreated());
 
         int awaitIndex = 0;
         AwsDurableExecutionStatusPoll terminal = waitForBlockedOrTerminal(checkpoint, context, awaitIndex);
@@ -135,6 +142,14 @@ public final class AwsDurableCoordinatorHandler
             (callbackId, ignored) -> actions.invoke(AwsDurableActionRequest.register(
                 checkpoint, identity, providerExecutionName, context.getExecutionArn(), callbackId)));
         verifySignal(identity, signal);
+        context.step("record-await-first-resumed-action-" + awaitIndex, Boolean.class, ignored -> {
+            try {
+                actions.invoke(AwsDurableActionRequest.awaitResumed(identity, checkpoint, context.getExecutionArn()));
+            } catch (RuntimeException unavailable) {
+                // This bounded timing observation must never block semantic Await resume.
+            }
+            return true;
+        });
     }
 
     private AwsDurableExecutionStatusPoll waitForBlockedOrTerminal(
@@ -147,12 +162,15 @@ public final class AwsDurableCoordinatorHandler
             AwsDurableExecutionStatusPoll.class,
             (previous, ignored) -> {
                 actions.invoke(AwsDurableActionRequest.sweep(checkpoint));
-                AwsDurableActionResponse current = actions.invoke(AwsDurableActionRequest.status(checkpoint));
+                AwsDurableActionResponse current = actions.invoke(AwsDurableActionRequest.status(checkpoint)
+                    .withAwaitSelectionCursor(java.util.Optional.ofNullable(previous)
+                        .flatMap(AwsDurableExecutionStatusPoll::awaitSelectionCursor)));
                 AwsDurableExecutionStatusPoll poll = new AwsDurableExecutionStatusPoll(
                     current.executionStatus().orElseThrow(() ->
                         new IllegalStateException("TPF status action returned no status")),
                     current.awaitCheckpoint().map(semantic -> new AwsDurableAwaitIdentity(semantic.tenantId(),
-                        semantic.executionId(), semantic.interactionId(), semantic.correlationId(), checkpoint.generation())));
+                        semantic.executionId(), semantic.interactionId(), semantic.correlationId(), checkpoint.generation())),
+                    current.awaitSelectionCursor());
                 return poll.terminal() || ("WAITING_EXTERNAL".equals(poll.status()) && poll.awaitIdentity().isPresent())
                     ? WaitForConditionResult.stopPolling(poll)
                     : WaitForConditionResult.continuePolling(poll);

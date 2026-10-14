@@ -1,6 +1,9 @@
 package org.pipelineframework;
 
 import java.util.List;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import io.smallrye.mutiny.Uni;
 import org.junit.jupiter.api.BeforeEach;
@@ -28,6 +31,7 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
@@ -77,6 +81,27 @@ class QueueAsyncSweepFlowTest {
     order.verify(workDispatcher).enqueueNow(new ExecutionWorkItem("tenant-a", "exec-c"));
     order.verify(workDispatcher).enqueueNow(new ExecutionWorkItem("tenant-b", "exec-a"));
     order.verify(workDispatcher).enqueueNow(new ExecutionWorkItem("tenant-b", "exec-b"));
+  }
+
+  @Test
+  void overlappingSweepsRedispatchTheSameStableExecutionIdentity() throws Exception {
+    when(awaitTimeoutFlow.sweepTimedOut(1000L, 100)).thenReturn(Uni.createFrom().item(0));
+    var overlap = new CyclicBarrier(2);
+    when(executionStateStore.findDueExecutions(1000L, 100)).thenAnswer(invocation -> {
+      overlap.await(5, TimeUnit.SECONDS);
+      return Uni.createFrom().item(List.of(record("tenant-a", "exec-a")));
+    });
+    when(workDispatcher.enqueueNow(any())).thenReturn(Uni.createFrom().voidItem());
+
+    try (var executor = Executors.newFixedThreadPool(2)) {
+      var first = executor.submit(() -> flow.sweepOnce(1000L).await().atMost(java.time.Duration.ofSeconds(5)));
+      var second = executor.submit(() -> flow.sweepOnce(1000L).await().atMost(java.time.Duration.ofSeconds(5)));
+      assertEquals(new CoordinatorSweepResult(1000L, 100, 0, 1), first.get(10, TimeUnit.SECONDS));
+      assertEquals(new CoordinatorSweepResult(1000L, 100, 0, 1), second.get(10, TimeUnit.SECONDS));
+    }
+    // Overlapping discovery may redeliver work; worker admission uses this stable semantic identity.
+    verify(workDispatcher, times(2)).enqueueNow(new ExecutionWorkItem("tenant-a", "exec-a"));
+    verify(executionStateStore, times(2)).findDueExecutions(1000L, 100);
   }
 
   @Test

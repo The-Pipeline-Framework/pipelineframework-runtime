@@ -25,6 +25,48 @@ class AwsDurableAwaitStreamProcessorTest {
     private static final String BINDING_STREAM = "arn:aws:dynamodb:eu-west-1:123456789012:table/bindings/stream/2026-10-12T00:00:00.000";
 
     @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"CALLBACK_ACCEPTED", "DRIVER_RESUMED", "CALLBACK_LATENCY", "REPAIR_FIRST_OBSERVED"})
+    void mechanicalObservationFactsAreAcknowledgedWithoutEnteringSemanticAuthority(String recordType) {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var actions = mock(AwsDurableActionInvoker.class);
+        var wakeups = mock(AwsDurableWakeupService.class);
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, AWAIT_STREAM, BINDING_STREAM,
+            ignored -> { throw new AssertionError("timing facts are mechanical, not semantic rows"); });
+
+        assertThat(processor.process(record(BINDING_STREAM, Map.of("record_type", string(recordType)))))
+            .isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        org.mockito.Mockito.verifyNoInteractions(bindings, actions, wakeups);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"missing-callback", "invalid-generation", "missing-source-record"})
+    void malformedMechanicalEvidenceDoesNotRetireRequiredRegistrationRepair(String fault) {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var actions = mock(AwsDurableActionInvoker.class);
+        var wakeups = mock(AwsDurableWakeupService.class);
+        var image = new HashMap<>(registrationImage(registration()));
+        if ("missing-callback".equals(fault)) {
+            image.remove("provider_callback_id");
+        } else if ("invalid-generation".equals(fault)) {
+            image.put("generation", new AttributeValue().withN("not-a-number"));
+        } else {
+            image.clear();
+        }
+        var damaged = record(BINDING_STREAM, image);
+        damaged.getDynamodb().setSequenceNumber("retry-this-record");
+        var unrelated = record(BINDING_STREAM, Map.of("record_type", string("GENERATION_CLAIM")));
+        unrelated.getDynamodb().setSequenceNumber("already-classified");
+        var event = new DynamodbEvent();
+        event.setRecords(List.of(damaged, unrelated));
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, AWAIT_STREAM, BINDING_STREAM,
+            ignored -> { throw new AssertionError("mechanical rows cannot supply semantic authority"); });
+
+        assertThat(new AwsDurableAwaitStreamBatchAdapter().handle(event, processor::process).getBatchItemFailures())
+            .extracting(item -> item.getItemIdentifier()).containsExactly("retry-this-record");
+        org.mockito.Mockito.verifyNoInteractions(bindings, actions, wakeups);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     void registrationStreamRetainsCompletedAwaitRepairEvenWhenTheBindingIsFenced(boolean superseded) {
         AwsDurableCallbackBindingRepository bindings = mock(AwsDurableCallbackBindingRepository.class);

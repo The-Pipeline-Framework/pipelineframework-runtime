@@ -57,6 +57,7 @@ class SqsAwaitCompletionDynamoIT {
   @BeforeAll void setUp() {
     dynamo = DynamoDbClient.builder().endpointOverride(LOCALSTACK.getEndpoint()).region(Region.of(LOCALSTACK.getRegion())).credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(LOCALSTACK.getAccessKey(), LOCALSTACK.getSecretKey()))).build();
     table(PREFIX + "_interaction", "tenant_id", "interaction_id"); table(PREFIX + "_interaction_key", "lookup_key", null);
+    table(PREFIX + "_completion_lifecycle", "pk", "sk");
   }
 
   @AfterAll void tearDown() {

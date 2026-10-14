@@ -3,6 +3,7 @@ package org.pipelineframework.awaitable.store;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -20,6 +21,152 @@ import org.pipelineframework.awaitable.AwaitInteractionTerminalException;
 import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 
 class InMemoryAwaitInteractionStoreTest {
+    @Test
+    void legacyConfiguredKeyStillDeduplicatesActiveInteractionAcrossExecutions() {
+        var store = new InMemoryAwaitInteractionStore();
+        var first = store.createOrGet(createCommand("review:business-key", 10_000L, 70_000L)).await().indefinitely().record();
+        var duplicate = store.createOrGet(new AwaitCreateCommand("tenant", "execution-2", "review", 0,
+            String.class.getName(), "cause-2", first.idempotencyKey(), "corr-execution-2", "different request",
+            "alice", "finance", "local", "legacy-unit-2", null, 12_000L, 70_000L, Long.MAX_VALUE))
+            .await().indefinitely();
+        assertTrue(duplicate.duplicate());
+        assertEquals(first, duplicate.record());
+        assertTrue(store.findByCorrelation("tenant", "corr-execution-2").await().indefinitely().isEmpty());
+    }
+
+    @Test
+    void qualifiedTerminalRetryReturnsExactInteractionWhileNewCauseCreatesFreshInteraction() {
+        var store = new InMemoryAwaitInteractionStore();
+        var command = occurrenceCommand("initial", "idem-initial", "corr-initial", 0);
+        var first = store.createOrGet(command).await().indefinitely().record();
+        var completed = store.complete(new AwaitCompletionCommand("tenant", first.interactionId(), null,
+            "completion", "approved", "alice", 15_000L)).await().indefinitely().record();
+        var replay = store.createOrGet(command).await().indefinitely();
+        assertTrue(replay.duplicate());
+        assertEquals(completed, replay.record());
+        var fresh = store.createOrGet(occurrenceCommand("reissue", "idem-reissue", "corr-reissue", 0)).await().indefinitely();
+        assertFalse(fresh.duplicate());
+        assertNotEquals(completed.interactionId(), fresh.record().interactionId());
+        assertNotEquals(completed.unitId(), fresh.record().unitId());
+        assertEquals(completed, store.get("tenant", completed.interactionId()).await().indefinitely().orElseThrow());
+    }
+
+    @Test
+    void qualifiedImportConflictsCannotReplaceInteractionOrLookupOwner() {
+        var store = new InMemoryAwaitInteractionStore();
+        var first = store.createOrGet(occurrenceCommand("initial", "idem-initial", "corr-initial", 0)).await().indefinitely().record();
+        for (var conflict : java.util.List.of(
+            copyIdentity(first, first.interactionId(), occurrenceCommand("reissue", "idem-initial", "corr-initial", 0).unitId(), 0, first.idempotencyKey(), first.correlationId()),
+            copyIdentity(first, first.interactionId(), first.unitId(), 1, first.idempotencyKey(), first.correlationId()),
+            copyIdentity(first, first.interactionId(), first.unitId(), 0, "foreign-idem", first.correlationId()),
+            copyIdentity(first, first.interactionId(), first.unitId(), 0, first.idempotencyKey(), "foreign-corr"),
+            copyIdentity(first, "foreign-interaction", first.unitId(), 0, first.idempotencyKey(), "foreign-corr"),
+            copyIdentity(first, "foreign-interaction", first.unitId(), 0, "foreign-idem", first.correlationId()))) {
+            assertThrows(IllegalStateException.class, () -> store.importRecord(conflict).await().indefinitely());
+            assertEquals(first, store.get("tenant", first.interactionId()).await().indefinitely().orElseThrow());
+            assertEquals(first, store.findByCorrelation("tenant", first.correlationId()).await().indefinitely().orElseThrow());
+            assertTrue(store.get("tenant", "foreign-interaction").await().indefinitely().isEmpty());
+        }
+        assertThrows(IllegalStateException.class, () -> store.createOrGet(
+            occurrenceCommand("reissue", "idem-initial", "corr-other", 0)).await().indefinitely());
+        assertThrows(IllegalStateException.class, () -> store.createOrGet(
+            occurrenceCommand("reissue", "idem-other", "corr-initial", 0)).await().indefinitely());
+    }
+
+    private AwaitCreateCommand occurrenceCommand(String cause, String idem, String correlation, int itemIndex) {
+        String unit = new org.pipelineframework.awaitable.AwaitUnitOccurrence("tenant", "execution-1", "page", "review", 0, cause).unitId();
+        return new AwaitCreateCommand("tenant", "execution-1", "review", 0, String.class.getName(), "causation", idem,
+            correlation, "request", "alice", "finance", "local", unit, itemIndex, 10_000L, 70_000L, Long.MAX_VALUE);
+    }
+
+    private AwaitInteractionRecord copyIdentity(AwaitInteractionRecord original, String id, String unit, Integer index, String idem, String correlation) {
+        return new AwaitInteractionRecord(original.tenantId(), original.executionId(), original.stepId(), original.stepIndex(),
+            original.outputType(), id, correlation, original.causationId(), idem, original.version(), original.status(),
+            original.requestPayload(), original.responsePayload(), unit, index, original.actor(), original.assignee(), original.group(),
+            original.transportType(), original.transportMetadata(), original.deadlineEpochMs(), original.createdAtEpochMs(),
+            original.updatedAtEpochMs(), original.ttlEpochS(), original.transportOutputType());
+    }
+
+    @Test
+    void currentUnitPagingRetainsDistinctImportedMembersWhoseDelimitedKeysCollide() {
+        InMemoryAwaitInteractionStore store = new InMemoryAwaitInteractionStore();
+        store.importRecord(importedItem("c", "a#b")).await().indefinitely();
+        store.importRecord(importedItem("b#c", "a")).await().indefinitely();
+
+        assertEquals(2, store.findByUnit("tenant", "unit-1").await().indefinitely().size());
+        assertTrue(store.get("tenant", "c").await().indefinitely().isPresent());
+        assertTrue(store.get("tenant", "b#c").await().indefinitely().isPresent());
+        var ids = new java.util.ArrayList<String>();
+        java.util.Optional<org.pipelineframework.awaitable.AwaitInteractionCursor> cursor = java.util.Optional.empty();
+        for (int pageNumber = 0; pageNumber < 3; pageNumber++) {
+            var page = store.findByUnitPage("tenant", "unit-1", 1, cursor).await().indefinitely();
+            assertTrue(page.interactions().size() <= 1);
+            ids.addAll(page.interactions().stream().map(AwaitInteractionRecord::interactionId).toList());
+            cursor = page.nextCursor();
+            if (cursor.isEmpty()) {
+                break;
+            }
+        }
+        assertTrue(cursor.isEmpty(), "Stable finite unit traversal must terminate");
+        assertEquals(List.of("b#c", "c"), ids,
+            "Both retained unit members must be enumerated exactly once in tuple order");
+    }
+
+    @Test
+    void currentUnitPagingMatchesDeclaredTupleOrderAcrossCausationPrefixes() {
+        InMemoryAwaitInteractionStore store = new InMemoryAwaitInteractionStore();
+        String parentId = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+        String childId = "00000000-0000-0000-0000-000000000000";
+        store.importRecord(importedItem(parentId, "a")).await().indefinitely();
+        store.importRecord(importedItem(childId, "a#b")).await().indefinitely();
+
+        var first = store.findByUnitPage("tenant", "unit-1", 1, java.util.Optional.empty()).await().indefinitely();
+        var second = store.findByUnitPage("tenant", "unit-1", 1, first.nextCursor()).await().indefinitely();
+
+        assertEquals(List.of(parentId, childId), java.util.stream.Stream.concat(
+            first.interactions().stream(), second.interactions().stream())
+            .map(AwaitInteractionRecord::interactionId).toList());
+        assertTrue(first.nextCursor().isPresent());
+        assertTrue(second.nextCursor().isEmpty());
+    }
+
+    private AwaitInteractionRecord importedItem(String interactionId, String causationId) {
+        var template = new InMemoryAwaitInteractionStore().createOrGet(
+            itemCommand("template", "template-correlation", 0)).await().indefinitely().record();
+        return new AwaitInteractionRecord(template.tenantId(), template.executionId(), template.stepId(),
+            template.stepIndex(), template.outputType(), interactionId, "corr-" + interactionId,
+            causationId, "idem-" + interactionId, template.version(), template.status(),
+            template.requestPayload(), template.responsePayload(), template.unitId(), template.itemIndex(),
+            template.actor(), template.assignee(), template.group(), template.transportType(),
+            template.transportMetadata(), template.deadlineEpochMs(), template.createdAtEpochMs(),
+            template.updatedAtEpochMs(), template.ttlEpochS(), template.transportOutputType());
+    }
+
+    @Test
+    void currentUnitPagingFindsPendingAfterMoreThan100CompletedMembers() {
+        InMemoryAwaitInteractionStore store = new InMemoryAwaitInteractionStore();
+        for (int index = 0; index < 103; index++) {
+            var created = store.createOrGet(itemCommand("page-" + index, "corr-page-" + index, index))
+                .await().indefinitely().record();
+            if (index < 101) {
+                store.complete(new AwaitCompletionCommand("tenant", created.interactionId(), null,
+                    "completion-" + index, "approved", "provider", 12_000L)).await().indefinitely();
+            }
+        }
+        var first = store.findByUnitPage("tenant", "unit-1", 100, java.util.Optional.empty()).await().indefinitely();
+        assertEquals(100, first.interactions().size());
+        assertTrue(first.interactions().stream().allMatch(record -> record.status().terminal()));
+        assertTrue(first.nextCursor().isPresent());
+        var second = store.findByUnitPage("tenant", "unit-1", 100, first.nextCursor()).await().indefinitely();
+        assertEquals(3, second.interactions().size());
+        assertEquals(101, second.interactions().stream().filter(record -> !record.status().terminal())
+            .findFirst().orElseThrow().itemIndex());
+        assertTrue(second.nextCursor().isEmpty());
+        assertThrows(IllegalArgumentException.class, () -> store.findByUnitPage(
+            "tenant", "other-unit", 100, first.nextCursor()).await().indefinitely());
+        assertThrows(IllegalArgumentException.class, () -> store.findByUnitPage(
+            "tenant", "unit-1", 101, java.util.Optional.empty()).await().indefinitely());
+    }
 
     @Test
     void reconstructsCompletedInteractionsByExecutionIdentity() {
@@ -191,6 +338,7 @@ class InMemoryAwaitInteractionStoreTest {
 
         var stored = store.get("tenant", created.record().interactionId()).await().indefinitely().orElseThrow();
         assertEquals(AwaitInteractionStatus.TIMED_OUT, stored.status());
+        assertEquals(java.util.List.of(stored), store.findDueTimeoutConsequences(21_000L, 100).await().indefinitely());
     }
 
     @Test
@@ -335,6 +483,99 @@ class InMemoryAwaitInteractionStoreTest {
 
         assertTrue(timedOut.isPresent());
         assertEquals(AwaitInteractionStatus.TIMED_OUT, timedOut.get().status());
+    }
+
+    @Test
+    void timeoutAdmissionRetainsWorkUntilScopedVersionMatchingAcknowledgement() {
+        InMemoryAwaitInteractionStore store = new InMemoryAwaitInteractionStore();
+        var created = store.createOrGet(createCommand("retained-timeout", 10_000L, 70_000L)).await().indefinitely().record();
+        var timedOut = store.markTimedOut(created.tenantId(), created.interactionId(), created.version(), 71_000L)
+            .await().indefinitely().orElseThrow();
+        assertEquals(created.version() + 1, timedOut.version());
+        assertEquals(java.util.List.of(timedOut), store.findDueTimeoutConsequences(71_000L, 1).await().indefinitely());
+        assertTrue(store.findTimedOut(71_000L, 100).await().indefinitely().isEmpty());
+
+        for (var mismatched : java.util.List.of(
+            timeoutAcknowledgement(timedOut, "foreign-tenant", timedOut.version(), timedOut.executionId(), timedOut.unitId()),
+            timeoutAcknowledgement(timedOut, timedOut.tenantId(), timedOut.version() + 1, timedOut.executionId(), timedOut.unitId()),
+            timeoutAcknowledgement(timedOut, timedOut.tenantId(), timedOut.version(), "foreign-execution", timedOut.unitId()),
+            timeoutAcknowledgement(timedOut, timedOut.tenantId(), timedOut.version(), timedOut.executionId(), "foreign-unit"))) {
+            assertThrows(IllegalArgumentException.class, () -> store.completeTimeoutConsequences(mismatched).await().indefinitely());
+            assertEquals(java.util.List.of(timedOut), store.findDueTimeoutConsequences(71_000L, 1).await().indefinitely());
+        }
+        assertThrows(IllegalArgumentException.class, () -> store.completeTimeoutConsequences(created).await().indefinitely());
+        store.completeTimeoutConsequences(timedOut).await().indefinitely();
+        store.completeTimeoutConsequences(timedOut).await().indefinitely();
+        assertTrue(store.findDueTimeoutConsequences(71_000L, 1).await().indefinitely().isEmpty());
+        assertEquals(timedOut, store.get(created.tenantId(), created.interactionId()).await().indefinitely().orElseThrow());
+    }
+
+    @Test
+    void completionAndTimeoutHaveOneWinnerAndOnlyTimeoutWinnerRetainsWork() throws Exception {
+        InMemoryAwaitInteractionStore store = new InMemoryAwaitInteractionStore();
+        var created = store.createOrGet(createCommand("timeout-completion-race", 10_000L, 70_000L)).await().indefinitely().record();
+        var ready = new java.util.concurrent.CountDownLatch(2);
+        var start = new java.util.concurrent.CountDownLatch(1);
+        try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var completion = executor.submit(() -> {
+                ready.countDown();
+                assertTrue(start.await(5, java.util.concurrent.TimeUnit.SECONDS));
+                try {
+                    store.complete(new AwaitCompletionCommand(created.tenantId(), created.interactionId(), created.correlationId(),
+                        "completion-race", "approved", "provider", 15_000L)).await().indefinitely();
+                    return true;
+                } catch (AwaitInteractionTerminalException timeoutWon) {
+                    return false;
+                }
+            });
+            var timeout = executor.submit(() -> {
+                ready.countDown();
+                assertTrue(start.await(5, java.util.concurrent.TimeUnit.SECONDS));
+                return store.markTimedOut(created.tenantId(), created.interactionId(), created.version(), 71_000L)
+                    .await().indefinitely().isPresent();
+            });
+            assertTrue(ready.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            start.countDown();
+            boolean completionWon = completion.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            boolean timeoutWon = timeout.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            assertTrue(completionWon ^ timeoutWon);
+            var stored = store.get(created.tenantId(), created.interactionId()).await().indefinitely().orElseThrow();
+            assertEquals(timeoutWon ? AwaitInteractionStatus.TIMED_OUT : AwaitInteractionStatus.COMPLETED, stored.status());
+            var pending = store.findDueTimeoutConsequences(71_000L, 100).await().indefinitely();
+            assertEquals(timeoutWon ? java.util.List.of(stored) : java.util.List.of(), pending);
+        }
+    }
+
+    @Test
+    void expiredPendingPrefixCannotStarveRetainedTimeoutWorkAcrossBoundedCalls() {
+        InMemoryAwaitInteractionStore store = new InMemoryAwaitInteractionStore();
+        for (int index = 0; index < 101; index++) {
+            var created = store.createOrGet(createCommand("expired-timeout-" + index, 10_000L, 70_000L, 90L))
+                .await().indefinitely().record();
+            store.markTimedOut(created.tenantId(), created.interactionId(), created.version(), 71_000L)
+                .await().indefinitely();
+        }
+        var retained = store.createOrGet(createCommand("retained-last-timeout", 10_000L, 70_000L)).await().indefinitely().record();
+        var timedOut = store.markTimedOut(retained.tenantId(), retained.interactionId(), retained.version(), 72_000L)
+            .await().indefinitely().orElseThrow();
+        // Exactly one bounded page is consumed: expired entries are removed, but the caller owns repetition.
+        assertTrue(store.findDueTimeoutConsequences(100_000L, 100).await().indefinitely().isEmpty());
+        assertEquals(java.util.List.of(timedOut), store.findDueTimeoutConsequences(100_000L, 100).await().indefinitely());
+        for (int limit : new int[] {0, -1, 101, Integer.MAX_VALUE}) {
+            assertThrows(IllegalArgumentException.class, () -> store.findDueTimeoutConsequences(100_000L, limit));
+        }
+    }
+
+    private AwaitInteractionRecord timeoutAcknowledgement(AwaitInteractionRecord original, String tenant,
+        long version, String execution, String unit) {
+        var acknowledgement = org.mockito.Mockito.mock(AwaitInteractionRecord.class);
+        org.mockito.Mockito.when(acknowledgement.status()).thenReturn(AwaitInteractionStatus.TIMED_OUT);
+        org.mockito.Mockito.when(acknowledgement.tenantId()).thenReturn(tenant);
+        org.mockito.Mockito.when(acknowledgement.interactionId()).thenReturn(original.interactionId());
+        org.mockito.Mockito.when(acknowledgement.version()).thenReturn(version);
+        org.mockito.Mockito.when(acknowledgement.executionId()).thenReturn(execution);
+        org.mockito.Mockito.when(acknowledgement.unitId()).thenReturn(unit);
+        return acknowledgement;
     }
 
     @Test
@@ -517,6 +758,10 @@ class InMemoryAwaitInteractionStoreTest {
     }
 
     private AwaitCreateCommand createCommand(String idempotencyKey, long nowEpochMs, long deadlineEpochMs) {
+        return createCommand(idempotencyKey, nowEpochMs, deadlineEpochMs, Long.MAX_VALUE);
+    }
+
+    private AwaitCreateCommand createCommand(String idempotencyKey, long nowEpochMs, long deadlineEpochMs, long ttlEpochS) {
         return new AwaitCreateCommand(
             "tenant",
             "execution-1",
@@ -534,7 +779,7 @@ class InMemoryAwaitInteractionStoreTest {
             null,
             nowEpochMs,
             deadlineEpochMs,
-            Long.MAX_VALUE);
+            ttlEpochS);
     }
 
     private AwaitCreateCommand itemCommand(String idempotencyKey, String correlationId, int itemIndex) {

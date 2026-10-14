@@ -26,8 +26,17 @@ public record AwsDurableHostLimits(
         completedHistoryRetention = positive(completedHistoryRetention, "completedHistoryRetention");
         workerActionTimeout = positive(workerActionTimeout, "workerActionTimeout");
         sqsVisibilityTimeout = positive(sqsVisibilityTimeout, "sqsVisibilityTimeout");
-        if (sqsVisibilityTimeout.compareTo(workerActionTimeout) <= 0) {
-            throw new IllegalArgumentException("sqsVisibilityTimeout must exceed workerActionTimeout");
+        if (executionTimeout.compareTo(Duration.ofSeconds(31_622_400)) > 0) {
+            throw new IllegalArgumentException("executionTimeout must not exceed 31622400 seconds");
+        }
+        if (completedHistoryRetention.compareTo(Duration.ofDays(90)) > 0) {
+            throw new IllegalArgumentException("completedHistoryRetention must not exceed 90 days");
+        }
+        if (workerActionTimeout.compareTo(Duration.ofSeconds(900)) > 0) {
+            throw new IllegalArgumentException("workerActionTimeout must not exceed 900 seconds");
+        }
+        if (sqsVisibilityTimeout.compareTo(workerActionTimeout.multipliedBy(6)) < 0) {
+            throw new IllegalArgumentException("sqsVisibilityTimeout must allow six times workerActionTimeout");
         }
     }
 

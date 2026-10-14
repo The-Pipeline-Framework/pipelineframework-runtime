@@ -8,19 +8,26 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.UUID;
 import jakarta.enterprise.context.ApplicationScoped;
 
 import io.smallrye.mutiny.Uni;
 import org.pipelineframework.awaitable.AwaitCompletionCommand;
+import org.pipelineframework.awaitable.AwaitCompletionAdmission;
+import org.pipelineframework.awaitable.AwaitCompletionCursor;
+import org.pipelineframework.awaitable.AwaitCompletionPage;
 import org.pipelineframework.awaitable.AwaitCompletionResult;
 import org.pipelineframework.awaitable.AwaitCreateCommand;
 import org.pipelineframework.awaitable.AwaitCreateResult;
 import org.pipelineframework.awaitable.AwaitInteractionNotFoundException;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
+import org.pipelineframework.awaitable.AwaitInteractionCursor;
+import org.pipelineframework.awaitable.AwaitInteractionPage;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.AwaitInteractionTerminalException;
 import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
+import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 
 /**
@@ -39,9 +46,15 @@ public class InMemoryAwaitInteractionStore implements
 
     private final Object lock = new Object();
     private final Map<String, AwaitInteractionRecord> interactionsByScopedId = new HashMap<>();
+    private final Map<String, java.util.NavigableMap<UnitPosition, String>> interactionIdsByUnit = new HashMap<>();
+    private final Map<String, AwaitCompletionAdmission> completionAdmissions = new HashMap<>();
+    private final Map<String, java.util.NavigableMap<String, AwaitCompletionAdmission>> openCompletionsByTenant = new HashMap<>();
     private final Map<String, String> interactionIdByScopedIdempotencyKey = new HashMap<>();
     private final Map<String, String> interactionIdByScopedCorrelation = new HashMap<>();
     private final Map<String, AwaitItemContinuationCommand> itemContinuationWorkByInteraction = new HashMap<>();
+    private final java.util.NavigableSet<AwaitInteractionRecord> timeoutConsequences = new java.util.TreeSet<>(
+        Comparator.comparingLong(AwaitInteractionRecord::updatedAtEpochMs)
+            .thenComparing(AwaitInteractionRecord::tenantId).thenComparing(AwaitInteractionRecord::interactionId));
 
     @Override
     public String providerName() {
@@ -62,8 +75,18 @@ public class InMemoryAwaitInteractionStore implements
                 String existingId = interactionIdByScopedIdempotencyKey.get(scopedKey);
                 if (existingId != null) {
                     AwaitInteractionRecord existing = interactionsByScopedId.get(scopedInteractionId(command.tenantId(), existingId));
-                    if (existing != null && (!existing.status().terminal() || existing.commandCallback())) {
+                    if (existing != null && (!existing.status().terminal() || existing.commandCallback()
+                        || org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(existing.unitId()).isPresent())) {
+                        if (org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(existing.unitId()).isPresent()
+                            || org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(command.unitId()).isPresent()) {
+                            requireSameOwner(existing, command.tenantId(), command.unitId(), command.executionId(), command.stepId(),
+                                command.stepIndex(), command.itemIndex(), command.idempotencyKey(), command.correlationId());
+                        }
                         return new AwaitCreateResult(existing, true);
+                    }
+                    if (existing != null && org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(command.unitId()).isPresent()) {
+                        requireSameOwner(existing, command.tenantId(), command.unitId(), command.executionId(), command.stepId(),
+                            command.stepIndex(), command.itemIndex(), command.idempotencyKey(), command.correlationId());
                     }
                 }
                 String interactionId = UUID.randomUUID().toString();
@@ -93,7 +116,10 @@ public class InMemoryAwaitInteractionStore implements
                     command.nowEpochMs(),
                     command.ttlEpochS(),
                     command.transportOutputType());
+                requireAvailableLookup(interactionIdByScopedCorrelation.get(
+                    scopedCorrelation(created.tenantId(), created.correlationId())), created);
                 interactionsByScopedId.put(scopedInteractionId(created.tenantId(), created.interactionId()), created);
+                indexUnitInteraction(created);
                 interactionIdByScopedIdempotencyKey.put(scopedKey, interactionId);
                 interactionIdByScopedCorrelation.put(scopedCorrelation(command.tenantId(), command.correlationId()), interactionId);
                 return new AwaitCreateResult(created, false);
@@ -119,11 +145,19 @@ public class InMemoryAwaitInteractionStore implements
                 long now = System.currentTimeMillis();
                 purgeExpired(now);
                 String scopedId = scopedInteractionId(record.tenantId(), record.interactionId());
+                requireAvailableLookup(interactionIdByScopedIdempotencyKey.get(
+                    scopedIdempotencyKey(record.tenantId(), record.stepId(), record.idempotencyKey())), record);
+                requireAvailableLookup(interactionIdByScopedCorrelation.get(
+                    scopedCorrelation(record.tenantId(), record.correlationId())), record);
                 AwaitInteractionRecord existing = interactionsByScopedId.get(scopedId);
                 if (existing != null) {
+                    requireSameOwner(existing, record.tenantId(), record.unitId(), record.executionId(), record.stepId(),
+                        record.stepIndex(), record.itemIndex(), record.idempotencyKey(), record.correlationId());
                     return existing;
                 }
                 interactionsByScopedId.put(scopedId, record);
+                if (record.status() == AwaitInteractionStatus.TIMED_OUT) timeoutConsequences.add(record);
+                indexUnitInteraction(record);
                 interactionIdByScopedIdempotencyKey.put(
                     scopedIdempotencyKey(record.tenantId(), record.stepId(), record.idempotencyKey()),
                     record.interactionId());
@@ -133,6 +167,26 @@ public class InMemoryAwaitInteractionStore implements
                 return record;
             }
         });
+    }
+
+    private void requireSameOwner(AwaitInteractionRecord existing, String tenantId, String unitId,
+        String executionId, String stepId, int stepIndex, Integer itemIndex, String idempotencyKey, String correlationId) {
+        if (!existing.tenantId().equals(tenantId) || !Objects.equals(existing.unitId(), unitId)
+            || !existing.executionId().equals(executionId) || !existing.stepId().equals(stepId)
+            || existing.stepIndex() != stepIndex || !Objects.equals(existing.itemIndex(), itemIndex)
+            || !Objects.equals(existing.idempotencyKey(), idempotencyKey) || !Objects.equals(existing.correlationId(), correlationId)) {
+            throw new IllegalStateException("Await interaction identity conflicts with its immutable owner");
+        }
+    }
+
+    private void requireAvailableLookup(String indexedId, AwaitInteractionRecord record) {
+        if (indexedId != null && !indexedId.equals(record.interactionId())) {
+            AwaitInteractionRecord indexed = interactionsByScopedId.get(scopedInteractionId(record.tenantId(), indexedId));
+            if (org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(record.unitId()).isPresent()
+                || (indexed != null && org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(indexed.unitId()).isPresent())) {
+                throw new IllegalStateException("Qualified Await lookup belongs to a different interaction");
+            }
+        }
     }
 
     @Override
@@ -169,6 +223,93 @@ public class InMemoryAwaitInteractionStore implements
                     .toList();
             }
         });
+    }
+
+    @Override
+    public Uni<AwaitInteractionPage> findByUnitPage(
+        String tenantId, String unitId, int limit, Optional<AwaitInteractionCursor> cursor) {
+        return Uni.createFrom().item(() -> {
+            if (limit < 1 || limit > 100) {
+                throw new IllegalArgumentException("Await page limit must be between 1 and 100");
+            }
+            Objects.requireNonNull(cursor, "cursor").ifPresent(value -> value.requireScope(tenantId, unitId));
+            synchronized (lock) {
+                var index = interactionIdsByUnit.getOrDefault(scopedUnitId(tenantId, unitId), new java.util.TreeMap<>());
+                var remaining = cursor.map(value -> index.tailMap(UnitPosition.decode(value.position()), false)).orElse(index);
+                var entries = remaining.entrySet().iterator();
+                List<AwaitInteractionRecord> page = new ArrayList<>();
+                Optional<UnitPosition> lastPosition = Optional.empty();
+                long nowEpochS = Instant.now().getEpochSecond();
+                for (int evaluated = 0; evaluated < limit && entries.hasNext(); evaluated++) {
+                    var entry = entries.next();
+                    lastPosition = Optional.of(entry.getKey());
+                    var record = interactionsByScopedId.get(scopedInteractionId(tenantId, entry.getValue()));
+                    if (record != null && (record.ttlEpochS() <= 0 || record.ttlEpochS() > nowEpochS)) {
+                        page.add(record);
+                    }
+                }
+                Optional<AwaitInteractionCursor> next = entries.hasNext()
+                    ? lastPosition.map(position -> new AwaitInteractionCursor(tenantId, unitId, position.encode()))
+                    : Optional.empty();
+                return new AwaitInteractionPage(page, next);
+            }
+        });
+    }
+
+    private void indexUnitInteraction(AwaitInteractionRecord record) {
+        if (record.unitId() != null && !record.unitId().isBlank()) {
+            interactionIdsByUnit.computeIfAbsent(scopedUnitId(record.tenantId(), record.unitId()),
+                ignored -> new java.util.TreeMap<>()).put(unitPosition(record), record.interactionId());
+        }
+    }
+
+    private static String scopedUnitId(String tenantId, String unitId) {
+        return compositeScopedKey("tenantId", tenantId, "unitId", unitId);
+    }
+
+    private static UnitPosition unitPosition(AwaitInteractionRecord record) {
+        return new UnitPosition(record.itemIndex() == null ? Integer.MAX_VALUE : record.itemIndex(),
+            nullToEmpty(record.causationId()), record.interactionId());
+    }
+
+    /** Tuple identity must not alias when imported identifiers contain delimiters. */
+    private record UnitPosition(int itemIndex, String causationId, String interactionId)
+        implements Comparable<UnitPosition> {
+        private UnitPosition {
+            Objects.requireNonNull(causationId, "causationId");
+            Objects.requireNonNull(interactionId, "interactionId");
+        }
+
+        @Override
+        public int compareTo(UnitPosition other) {
+            int itemOrder = Integer.compare(itemIndex, other.itemIndex);
+            if (itemOrder != 0) return itemOrder;
+            int causeOrder = causationId.compareTo(other.causationId);
+            return causeOrder != 0 ? causeOrder : interactionId.compareTo(other.interactionId);
+        }
+
+        private String encode() {
+            try {
+                return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+                    PipelineJson.mapper().writeValueAsBytes(List.of(Integer.toString(itemIndex), causationId, interactionId)));
+            } catch (java.io.IOException failure) {
+                throw new IllegalArgumentException("Cannot encode Await unit cursor", failure);
+            }
+        }
+
+        private static UnitPosition decode(String encoded) {
+            try {
+                List<String> values = PipelineJson.mapper().readValue(
+                    java.util.Base64.getUrlDecoder().decode(encoded),
+                    new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {});
+                if (values.size() != 3 || values.stream().anyMatch(Objects::isNull)) {
+                    throw new IllegalArgumentException("Await unit cursor has invalid position");
+                }
+                return new UnitPosition(Integer.parseInt(values.get(0)), values.get(1), values.get(2));
+            } catch (java.io.IOException failure) {
+                throw new IllegalArgumentException("Cannot decode Await unit cursor", failure);
+            }
+        }
     }
 
     @Override
@@ -283,6 +424,7 @@ public class InMemoryAwaitInteractionStore implements
         }
         if (current.deadlineEpochMs() <= command.nowEpochMs()) {
             AwaitInteractionRecord timedOut = updateStatus(current, AwaitInteractionStatus.TIMED_OUT, command.nowEpochMs(), null, null);
+            timeoutConsequences.add(timedOut);
             interactionsByScopedId.put(scopedInteractionId(timedOut.tenantId(), timedOut.interactionId()), timedOut);
             throw new AwaitInteractionTerminalException("Await interaction timed out before completion");
         }
@@ -312,9 +454,125 @@ public class InMemoryAwaitInteractionStore implements
             command.nowEpochMs(),
             current.ttlEpochS(),
             current.transportOutputType());
-        interactionsByScopedId.put(scopedInteractionId(completed.tenantId(), completed.interactionId()), completed);
+        String scopedId = scopedInteractionId(completed.tenantId(), completed.interactionId());
+        // Construct and validate the fact before changing semantic state. The lock is the completion CAS boundary.
+        AwaitCompletionAdmission admission = new AwaitCompletionAdmission(
+            AwaitCompletionAdmission.CURRENT_SCHEMA_VERSION, completed.tenantId(), completed.executionId(),
+            completed.interactionId(), Optional.ofNullable(completed.unitId()), completed.stepId(), completed.stepIndex(),
+            completed.itemIndex() == null ? OptionalInt.empty() : OptionalInt.of(completed.itemIndex()),
+            Optional.ofNullable(completed.causationId()), command.nowEpochMs(), completed.ttlEpochS());
+        if (!completionAdmissions.containsKey(scopedId)) {
+            completionAdmissions.put(scopedId, admission);
+            openCompletionsByTenant.computeIfAbsent(admission.tenantId(), ignored -> new java.util.TreeMap<>())
+                .put(admission.interactionId(), admission);
+        }
+        interactionsByScopedId.put(scopedId, completed);
         projectItemContinuation(completed, command.nowEpochMs());
         return new AwaitCompletionResult(completed, false);
+    }
+
+    @Override
+    public Uni<Optional<AwaitCompletionAdmission>> getCompletionAdmission(String tenantId, String interactionId) {
+        requireCompletionIdentity(tenantId, "tenantId");
+        requireCompletionIdentity(interactionId, "interactionId");
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                String key = scopedInteractionId(tenantId, interactionId);
+                var admission = Optional.ofNullable(completionAdmissions.get(key));
+                if (admission.filter(value -> completionExpired(value, Instant.now().getEpochSecond())).isPresent()) {
+                    completionAdmissions.remove(key);
+                    var open = openCompletionsByTenant.get(tenantId);
+                    if (open != null) open.remove(interactionId);
+                    return Optional.empty();
+                }
+                return admission;
+            }
+        });
+    }
+
+    @Override
+    public Uni<AwaitCompletionPage> findOpenCompletions(
+        String tenantId, int pageLimit, Optional<AwaitCompletionCursor> cursor) {
+        requireCompletionIdentity(tenantId, "tenantId");
+        if (pageLimit < 1 || pageLimit > 100) {
+            throw new IllegalArgumentException("Completion page limit must be between 1 and 100");
+        }
+        Objects.requireNonNull(cursor, "cursor").ifPresent(value -> value.requireScope(tenantId));
+        Optional<String> after = cursor.map(value -> decodeCompletionPosition(tenantId, value.position()));
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                var index = openCompletionsByTenant.getOrDefault(tenantId, new java.util.TreeMap<>());
+                var remaining = after.map(value -> index.tailMap(value, false)).orElse(index);
+                var entries = remaining.entrySet().iterator();
+                var admissions = new ArrayList<AwaitCompletionAdmission>();
+                Optional<String> last = Optional.empty();
+                int evaluated = 0;
+                long nowEpochS = Instant.now().getEpochSecond();
+                while (evaluated < pageLimit && entries.hasNext()) {
+                    var entry = entries.next();
+                    evaluated++;
+                    last = Optional.of(entry.getKey());
+                    if (completionExpired(entry.getValue(), nowEpochS)) {
+                        completionAdmissions.remove(scopedInteractionId(tenantId, entry.getKey()), entry.getValue());
+                        entries.remove();
+                    } else {
+                        admissions.add(entry.getValue());
+                    }
+                }
+                Optional<AwaitCompletionCursor> next = entries.hasNext()
+                    ? last.map(value -> new AwaitCompletionCursor(tenantId, encodeCompletionPosition(tenantId, value)))
+                    : Optional.empty();
+                return new AwaitCompletionPage(admissions, next, evaluated);
+            }
+        });
+    }
+
+    @Override
+    public Uni<Void> retireCompletionAdmission(AwaitCompletionAdmission admission) {
+        Objects.requireNonNull(admission, "admission");
+        return Uni.createFrom().voidItem().invoke(() -> {
+            synchronized (lock) {
+                var retained = completionAdmissions.get(scopedInteractionId(admission.tenantId(), admission.interactionId()));
+                if (!admission.equals(retained)) {
+                    throw new IllegalArgumentException("Completion retirement does not match the retained admission");
+                }
+                var open = openCompletionsByTenant.get(admission.tenantId());
+                if (open != null) open.remove(admission.interactionId(), admission);
+            }
+        });
+    }
+
+    private static boolean completionExpired(AwaitCompletionAdmission admission, long nowEpochS) {
+        return admission.ttlEpochS() > 0 && admission.ttlEpochS() <= nowEpochS;
+    }
+
+    private static void requireCompletionIdentity(String value, String name) {
+        Objects.requireNonNull(value, name);
+        if (value.isBlank()) throw new IllegalArgumentException(name + " must not be blank");
+    }
+
+    private static String encodeCompletionPosition(String tenantId, String interactionId) {
+        try {
+            return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+                PipelineJson.mapper().writeValueAsBytes(List.of("memory-completion-v1", tenantId, interactionId)));
+        } catch (java.io.IOException failure) {
+            throw new IllegalArgumentException("Cannot encode completion cursor", failure);
+        }
+    }
+
+    private static String decodeCompletionPosition(String tenantId, String position) {
+        try {
+            List<String> values = PipelineJson.mapper().readValue(java.util.Base64.getUrlDecoder().decode(position),
+                new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {});
+            if (values.size() != 3 || !"memory-completion-v1".equals(values.get(0))
+                || !tenantId.equals(values.get(1))) {
+                throw new IllegalArgumentException("Completion cursor has invalid provider position or tenant");
+            }
+            requireCompletionIdentity(values.get(2), "cursor interactionId");
+            return values.get(2);
+        } catch (java.io.IOException failure) {
+            throw new IllegalArgumentException("Cannot decode completion cursor", failure);
+        }
     }
 
     @Override
@@ -435,6 +693,45 @@ public class InMemoryAwaitInteractionStore implements
     }
 
     @Override
+    public Uni<List<AwaitInteractionRecord>> findDueTimeoutConsequences(long nowEpochMs, int limit) {
+        if (limit < 1 || limit > 100) throw new IllegalArgumentException("Timeout page limit must be between 1 and 100");
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                var entries = timeoutConsequences.iterator();
+                var due = new ArrayList<AwaitInteractionRecord>();
+                for (int evaluated = 0; evaluated < limit && entries.hasNext(); evaluated++) {
+                    var record = entries.next();
+                    if (record.updatedAtEpochMs() > nowEpochMs) break;
+                    if (record.ttlEpochS() > 0 && record.ttlEpochS() <= Instant.ofEpochMilli(nowEpochMs).getEpochSecond()) {
+                        entries.remove();
+                    } else {
+                        due.add(record);
+                    }
+                }
+                return List.copyOf(due);
+            }
+        });
+    }
+
+    @Override
+    public Uni<Void> completeTimeoutConsequences(AwaitInteractionRecord interaction) {
+        Objects.requireNonNull(interaction, "interaction");
+        return Uni.createFrom().voidItem().invoke(() -> {
+            synchronized (lock) {
+                String scopedId = scopedInteractionId(interaction.tenantId(), interaction.interactionId());
+                var current = interactionsByScopedId.get(scopedId);
+                if (interaction.status() != AwaitInteractionStatus.TIMED_OUT || current == null
+                    || current.status() != AwaitInteractionStatus.TIMED_OUT || current.version() != interaction.version()
+                    || !Objects.equals(current.executionId(), interaction.executionId())
+                    || !Objects.equals(current.unitId(), interaction.unitId())) {
+                    throw new IllegalArgumentException("Timeout acknowledgement does not match the retained interaction");
+                }
+                timeoutConsequences.remove(current);
+            }
+        });
+    }
+
+    @Override
     public Uni<List<AwaitInteractionRecord>> queryPending(
         String tenantId,
         String assignee,
@@ -490,6 +787,9 @@ public class InMemoryAwaitInteractionStore implements
                 }
                 AwaitInteractionRecord updated = transition.apply(current);
                 interactionsByScopedId.put(scopedId, updated);
+                if (updated.status() == AwaitInteractionStatus.TIMED_OUT) {
+                    timeoutConsequences.add(updated);
+                }
                 return Optional.of(updated);
             }
         });
@@ -568,6 +868,16 @@ public class InMemoryAwaitInteractionStore implements
             AwaitInteractionRecord record = iterator.next().getValue();
             if (record.ttlEpochS() > 0 && record.ttlEpochS() <= nowEpochS) {
                 iterator.remove();
+                timeoutConsequences.remove(record);
+                if (record.unitId() != null && !record.unitId().isBlank()) {
+                    var unitIndex = interactionIdsByUnit.get(scopedUnitId(record.tenantId(), record.unitId()));
+                    if (unitIndex != null) {
+                        unitIndex.remove(unitPosition(record));
+                        if (unitIndex.isEmpty()) {
+                            interactionIdsByUnit.remove(scopedUnitId(record.tenantId(), record.unitId()));
+                        }
+                    }
+                }
                 itemContinuationWorkByInteraction.remove(scopedInteractionId(
                     record.tenantId(), record.interactionId()));
                 interactionIdByScopedIdempotencyKey.remove(scopedIdempotencyKey(

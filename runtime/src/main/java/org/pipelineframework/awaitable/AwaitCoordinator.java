@@ -106,7 +106,7 @@ public class AwaitCoordinator {
         String group,
         Map<String, Object> traceMetadata
     ) {
-        String unitId = deriveUnitId(tenantId, identityScope, descriptor.stepId(), stepIndex);
+        String unitId = unitIdFor(descriptor, tenantId, executionId, identityScope, stepIndex);
         return registerDescriptor(descriptor)
             .onItem().transformToUni(registered -> createOrGetUnit(
                 registered, tenantId, unitId, executionId, stepIndex)
@@ -128,7 +128,14 @@ public class AwaitCoordinator {
                         unit.unitId(),
                         created.record().interactionId(),
                         System.currentTimeMillis())
-                    .replaceWith(created))));
+                    .map(attached -> {
+                        if (AwaitUnitOccurrence.fromUnitId(unit.unitId()).isPresent()
+                            && (attached.isEmpty() || !created.record().interactionId().equals(
+                                attached.orElseThrow().primaryInteractionId()))) {
+                            throw new IllegalStateException("Await occurrence rejected primary attachment");
+                        }
+                        return created;
+                    }))));
     }
 
     public Uni<AwaitCreateResult> createOrGetItem(
@@ -503,6 +510,7 @@ public class AwaitCoordinator {
     }
 
     private static String itemCompletionKey(AwaitInteractionRecord record) {
+        if (AwaitUnitOccurrence.fromUnitId(record.unitId()).isPresent()) return "interaction:" + record.interactionId();
         return record.itemIndex() == null ? record.interactionId() : "item:" + record.itemIndex();
     }
 
@@ -577,6 +585,13 @@ public class AwaitCoordinator {
         return interactionStore().findByUnit(tenantId, unitId);
     }
 
+    /** Reads one bounded page of the current unit without walking execution history. */
+    public Uni<AwaitInteractionPage> findByUnitPage(
+        String tenantId, String unitId, int limit,
+        Optional<AwaitInteractionCursor> cursor) {
+        return interactionStore().findByUnitPage(tenantId, unitId, limit, cursor);
+    }
+
     /** Finds Await interactions by their provider-neutral TPF execution identity. */
     public Uni<List<AwaitInteractionRecord>> findByExecution(
         String tenantId,
@@ -613,6 +628,21 @@ public class AwaitCoordinator {
     /** Reads one interaction for a provider-neutral control-plane checkpoint projection. */
     public Uni<Optional<AwaitInteractionRecord>> getInteraction(String tenantId, String interactionId) {
         return interactionStore().get(tenantId, interactionId);
+    }
+
+    public Uni<Optional<AwaitCompletionAdmission>> getCompletionAdmission(String tenantId, String interactionId) {
+        return interactionStore().getCompletionAdmission(tenantId, interactionId);
+    }
+
+    public Uni<AwaitCompletionPage> findOpenCompletions(
+        String tenantId, int limit, Optional<AwaitCompletionCursor> cursor
+    ) {
+        return interactionStore().findOpenCompletions(tenantId, limit, cursor);
+    }
+
+    /** Caller must first verify the current unit convergence and retained parent-release acknowledgement. */
+    public Uni<Void> retireCompletionAdmission(AwaitCompletionAdmission admission) {
+        return interactionStore().retireCompletionAdmission(admission);
     }
 
     private AwaitItemContinuationWorkStore itemContinuationWorkStore() {
@@ -685,20 +715,67 @@ public class AwaitCoordinator {
         return interactionStore().findTimedOut(nowEpochMs, limit);
     }
 
+    public Uni<List<AwaitInteractionRecord>> findDueTimeoutConsequences(long nowEpochMs, int limit) {
+        return interactionStore().findDueTimeoutConsequences(nowEpochMs, limit);
+    }
+
+    public Uni<Void> completeTimeoutConsequences(AwaitInteractionRecord interaction) {
+        return interactionStore().completeTimeoutConsequences(interaction);
+    }
+
     public Uni<Optional<AwaitInteractionRecord>> markTimedOut(AwaitInteractionRecord record, long nowEpochMs) {
         return interactionStore().markTimedOut(record.tenantId(), record.interactionId(), record.version(), nowEpochMs)
-            .onItem().transformToUni(updated -> {
-                if (updated.isEmpty()) {
-                    return Uni.createFrom().item(Optional.empty());
+            .onItem().transformToUni(updated -> updated
+                .map(timedOut -> reconcileTimedOut(timedOut, nowEpochMs).replaceWith(updated))
+                .orElseGet(() -> Uni.createFrom().item(Optional.empty())));
+    }
+
+    /** Replays consequences of the authoritative timeout winner without changing interaction state. */
+    public Uni<Void> reconcileTimedOut(AwaitInteractionRecord record, long nowEpochMs) {
+        Objects.requireNonNull(record, "record must not be null");
+        if (record.status() != AwaitInteractionStatus.TIMED_OUT) {
+            return Uni.createFrom().failure(new IllegalArgumentException("Timeout recovery requires a timed-out interaction"));
+        }
+        return interactionStore().getMetadata(record.tenantId(), record.interactionId())
+            .onItem().transformToUni(current -> {
+                var retained = current.orElseThrow(() -> new IllegalStateException("Timed-out interaction is unavailable"));
+                if (retained.status() != AwaitInteractionStatus.TIMED_OUT || retained.version() != record.version()
+                    || !Objects.equals(retained.tenantId(), record.tenantId())
+                    || !Objects.equals(retained.interactionId(), record.interactionId())
+                    || !Objects.equals(retained.executionId(), record.executionId())
+                    || !Objects.equals(retained.unitId(), record.unitId())) {
+                    return Uni.createFrom().failure(new IllegalStateException("Timeout observation no longer matches authority"));
                 }
-                return unitStore().markTerminal(
-                        record.tenantId(),
-                        record.unitId(),
-                        AwaitUnitStatus.TIMED_OUT,
-                        nowEpochMs)
-                    .onItem().invoke(unit -> unit.ifPresent(value -> recordUnitTerminal(updated.get(), value)))
-                    .chain(() -> releaseAdmission(updated.get()).replaceWith(updated));
+                return getUnit(record.tenantId(), record.unitId())
+                    .onItem().transformToUni(unit -> {
+                        if (!Objects.equals(unit.tenantId(), record.tenantId())
+                            || !Objects.equals(unit.unitId(), record.unitId())
+                            || !Objects.equals(unit.executionId(), record.executionId())) {
+                            return Uni.createFrom().failure(new IllegalStateException("Timeout unit belongs to another execution"));
+                        }
+                        if (unit.status().terminal()) {
+                            return Uni.createFrom().voidItem();
+                        }
+                        return unitStore().markTerminal(record.tenantId(), record.unitId(), AwaitUnitStatus.TIMED_OUT, nowEpochMs)
+                            .invoke(updated -> {
+                                var terminal = updated.orElseThrow(() -> new IllegalStateException("Timeout unit is unavailable"));
+                                recordUnitTerminal(record, terminal);
+                            }).replaceWithVoid();
+                    })
+                    .chain(() -> releaseTimeoutAdmission(record));
             });
+    }
+
+    private Uni<Void> releaseTimeoutAdmission(AwaitInteractionRecord interaction) {
+        if (!admissionEnabled()) {
+            return Uni.createFrom().voidItem();
+        }
+        return awaitAdmissionCoordinator.release(interaction)
+            .invoke(released -> {
+                if (released) {
+                    recordAdmissionLifecycle(AwaitReplayLifecycleEvent.ADMISSION_RELEASED, interaction);
+                }
+            }).replaceWithVoid();
     }
 
     private void recordInteractionDispatched(AwaitInteractionRecord record) {
@@ -833,11 +910,36 @@ public class AwaitCoordinator {
         long now = System.currentTimeMillis();
         long deadline = now + descriptor.timeout().toMillis();
         long ttl = Instant.ofEpochMilli(deadline).plusSeconds(86_400).getEpochSecond();
+        String completionScope = AwaitUnitOccurrence.fromUnitId(unitId).isPresent() ? unitId : identityScope;
         String idempotencyKey = deriveIdempotencyKey(
-            descriptor, executionId, identityScope, canonicalRequestPayload)
+            descriptor, executionId, completionScope, canonicalRequestPayload)
             + (descriptor.callback().isPresent() ? ":step=" + stepIndex : "")
             + (itemIndex == null ? "" : ":item=" + itemIndex);
-        String correlationId = deriveCorrelationId(descriptor, tenantId, identityScope, idempotencyKey);
+        String correlationId = deriveCorrelationId(descriptor, tenantId, completionScope, idempotencyKey);
+        if (AwaitUnitOccurrence.fromUnitId(unitId).isPresent()) {
+            return getUnit(tenantId, unitId).onItem().transformToUni(unit -> {
+                if (unit.status().terminal() || unit.dispatchComplete()) {
+                    return interactionStore().findByCorrelation(tenantId, correlationId)
+                        .map(found -> found.filter(record -> unitId.equals(record.unitId())
+                            && idempotencyKey.equals(record.idempotencyKey()))
+                            .map(record -> new AwaitCreateResult(record, true))
+                            .orElseThrow(() -> new IllegalStateException("Await occurrence is sealed against new members")));
+                }
+                return createInteractionInOpenUnit(descriptor, unitId, tenantId, executionId, stepIndex,
+                    causationId, canonicalRequestPayload, itemIndex, assignee, group, traceMetadata,
+                    now, deadline, ttl, idempotencyKey, correlationId);
+            });
+        }
+        return createInteractionInOpenUnit(descriptor, unitId, tenantId, executionId, stepIndex,
+            causationId, canonicalRequestPayload, itemIndex, assignee, group, traceMetadata,
+            now, deadline, ttl, idempotencyKey, correlationId);
+    }
+
+    private Uni<AwaitCreateResult> createInteractionInOpenUnit(
+        AwaitCompletionDescriptor descriptor, String unitId, String tenantId, String executionId, int stepIndex,
+        String causationId, Object canonicalRequestPayload, Integer itemIndex, String assignee, String group,
+        Map<String, Object> traceMetadata, long now, long deadline, long ttl, String idempotencyKey, String correlationId
+    ) {
         return acquireAdmission(descriptor, tenantId, unitId, itemIndex, executionId, deadline)
             .onItem().transformToUni(lease -> interactionStore().createOrGet(new AwaitCreateCommand(
                 tenantId,
@@ -1016,6 +1118,11 @@ public class AwaitCoordinator {
         String executionId,
         int stepIndex
     ) {
+        AwaitExecutionContext context = AwaitExecutionContextHolder.get();
+        if (context != null && context.awaitOccurrenceCause().isPresent()
+            && !unitId.equals(unitIdFor(descriptor, tenantId, executionId, context.identityScope(), stepIndex))) {
+            return Uni.createFrom().failure(new IllegalStateException("Await unit differs from the execution occurrence"));
+        }
         long now = System.currentTimeMillis();
         long ttl = Instant.ofEpochMilli(now + descriptor.timeout().toMillis()).plusSeconds(86_400).getEpochSecond();
         return unitStore().createOrGet(new AwaitUnitCreateCommand(
@@ -1465,6 +1572,20 @@ public class AwaitCoordinator {
             return context.traceMetadata();
         }
         return awaitTelemetry.captureTraceMetadata();
+    }
+
+    static String unitIdFor(AwaitCompletionDescriptor descriptor, String tenantId, String executionId,
+        String identityScope, int stepIndex) {
+        AwaitExecutionContext context = AwaitExecutionContextHolder.get();
+        if (context != null && context.awaitOccurrenceCause().isPresent()) {
+            if (!tenantId.equals(context.tenantId()) || !executionId.equals(context.executionId())
+                || !identityScope.equals(context.identityScope())) {
+                throw new IllegalStateException("Await creation context differs from its semantic owner");
+            }
+            return new AwaitUnitOccurrence(tenantId, executionId, identityScope, descriptor.stepId(),
+                stepIndex, context.awaitOccurrenceCause().orElseThrow()).unitId();
+        }
+        return deriveUnitId(tenantId, identityScope, descriptor.stepId(), stepIndex);
     }
 
     private static String deriveUnitId(String tenantId, String executionId, String stepId, int stepIndex) {

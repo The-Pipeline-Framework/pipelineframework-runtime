@@ -5,6 +5,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
+import org.pipelineframework.awaitable.AwaitUnitOccurrence;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -132,6 +133,7 @@ class InMemoryExecutionStateStoreTest {
             .await().indefinitely().orElseThrow();
 
         assertEquals(ExecutionStatus.QUEUED, committed.status());
+        assertEquals(firstClaim.awaitOccurrenceCause(), committed.awaitOccurrenceCause());
         assertEquals(1, committed.pagingState().orElseThrow().pageIndex());
         assertEquals(Optional.of("cursor-1"), committed.pagingState().orElseThrow().startCheckpoint());
 
@@ -139,8 +141,15 @@ class InMemoryExecutionStateStoreTest {
                 "tenant-a", firstClaim.executionId(), "worker-2", now + 2, 1_000L)
             .await().indefinitely().orElseThrow();
         assertEquals(1, replacementClaim.pagingState().orElseThrow().pageIndex());
+        assertEquals(committed.awaitOccurrenceCause(), replacementClaim.awaitOccurrenceCause());
         assertEquals(Optional.of("cursor-1"),
             replacementClaim.pagingState().orElseThrow().startCheckpoint());
+        String priorPageAwait = new AwaitUnitOccurrence("tenant-a", firstClaim.executionId(),
+            firstClaim.executionId() + ":page:0", "AwaitApproval", 4,
+            replacementClaim.awaitOccurrenceCause().orElseThrow()).unitId();
+        assertTrue(store.markWaitingExternal("tenant-a", replacementClaim.executionId(),
+            replacementClaim.version(), "stale-page-await", priorPageAwait, 4, now + 3)
+            .await().indefinitely().isEmpty());
 
         assertTrue(store.advancePage(
                 "tenant-a", firstClaim.executionId(), firstClaim.version(), "stale-page-0",
@@ -386,13 +395,15 @@ class InMemoryExecutionStateStoreTest {
         ExecutionRecord<Object, Object> claimed = store.claimLease(
                 "tenant-a", created.record().executionId(), "worker-1", now, 1_000L)
             .await().indefinitely().orElseThrow();
+        String awaitUnit = unitId(claimed, "archive-await", 4);
         ExecutionRecord<Object, Object> waiting = store.markWaitingExternal(
-                "tenant-a", claimed.executionId(), claimed.version(), "await", "unit-reissue", 4, now + 1)
+                "tenant-a", claimed.executionId(), claimed.version(), "await", awaitUnit, 4, now + 1)
             .await().indefinitely().orElseThrow();
+        assertEquals(claimed.awaitOccurrenceCause(), waiting.awaitOccurrenceCause());
         ExecutionRecord<Object, Object> resumed = store.markAwaitItemContinuationsCompleted(
                 "tenant-a",
                 claimed.executionId(),
-                "unit-reissue",
+                awaitUnit,
                 5,
                 new ExecutionInputSnapshot(ExecutionInputShape.UNI, "continuation-input"),
                 now + 2)
@@ -421,6 +432,7 @@ class InMemoryExecutionStateStoreTest {
         assertEquals(ExecutionRedriveIntent.REISSUE_COMMAND, redriven.redriveIntent());
         assertEquals(Optional.of("archive:confirmation-7"), redriven.redriveTargetCommandId());
         assertEquals(Optional.of("customer approved a second archive"), redriven.redriveReason());
+        assertNotEquals(succeeded.awaitOccurrenceCause(), redriven.awaitOccurrenceCause());
         assertTrue(store.redriveTerminalExecution(
                 "tenant-a",
                 succeeded.executionId(),
@@ -436,6 +448,7 @@ class InMemoryExecutionStateStoreTest {
         ExecutionRecord<Object, Object> reclaimed = store.claimLease(
                 "tenant-a", succeeded.executionId(), "worker-2", now + 5, 1_000L)
             .await().indefinitely().orElseThrow();
+        assertEquals(redriven.awaitOccurrenceCause(), reclaimed.awaitOccurrenceCause());
         assertEquals(Optional.of("archive:confirmation-7"), reclaimed.redriveTargetCommandId());
         assertEquals(Optional.of("customer approved a second archive"), reclaimed.redriveReason());
 
@@ -576,7 +589,7 @@ class InMemoryExecutionStateStoreTest {
                 created.record().executionId(),
                 created.record().version(),
                 "transition-await",
-                "unit-1",
+                unitId(created.record(), "await", 2),
                 2,
                 now + 1)
             .await().indefinitely();
@@ -584,7 +597,7 @@ class InMemoryExecutionStateStoreTest {
         Optional<ExecutionRecord<Object, Object>> queued = store.markAwaitCompleted(
                 "tenant-a",
                 created.record().executionId(),
-                "unit-1",
+                waiting.orElseThrow().awaitUnitId(),
                 3,
                 now + 2)
             .await().indefinitely();
@@ -611,7 +624,7 @@ class InMemoryExecutionStateStoreTest {
             .await().indefinitely();
 
         assertTrue(redriven.isPresent());
-        assertEquals("unit-1", redriven.get().awaitUnitId());
+        assertEquals(waiting.orElseThrow().awaitUnitId(), redriven.get().awaitUnitId());
         assertEquals(3, redriven.get().currentStepIndex());
     }
 
@@ -634,7 +647,7 @@ class InMemoryExecutionStateStoreTest {
                 created.record().executionId(),
                 created.record().version(),
                 "transition-await",
-                "unit-1",
+                unitId(created.record(), "await", 5),
                 5,
                 now + 1)
             .await().indefinitely();
@@ -643,7 +656,7 @@ class InMemoryExecutionStateStoreTest {
         Optional<ExecutionRecord<Object, Object>> queued = store.markAwaitCompleted(
                 "tenant-a",
                 created.record().executionId(),
-                "unit-1",
+                waiting.orElseThrow().awaitUnitId(),
                 6,
                 now + 2)
             .await().indefinitely();
@@ -671,7 +684,7 @@ class InMemoryExecutionStateStoreTest {
             .await().indefinitely();
 
         assertTrue(retried.isPresent());
-        assertEquals("unit-1", retried.get().awaitUnitId());
+        assertEquals(waiting.orElseThrow().awaitUnitId(), retried.get().awaitUnitId());
     }
 
     @Test
@@ -692,7 +705,7 @@ class InMemoryExecutionStateStoreTest {
                 created.record().executionId(),
                 created.record().version(),
                 "transition-await",
-                "unit-1",
+                unitId(created.record(), "await-items", 5),
                 5,
                 now + 1)
             .await().indefinitely();
@@ -704,7 +717,7 @@ class InMemoryExecutionStateStoreTest {
         Optional<ExecutionRecord<Object, Object>> queued = store.markAwaitItemContinuationsCompleted(
                 "tenant-a",
                 created.record().executionId(),
-                "unit-1",
+                waiting.orElseThrow().awaitUnitId(),
                 6,
                 resumeInput,
                 now + 2)
@@ -828,5 +841,31 @@ class InMemoryExecutionStateStoreTest {
         assertEquals(ExecutionStatus.FAILED, firstRead.get().status());
         assertTrue(firstRead.get().status().terminal());
         assertFalse(secondRead.get().status().terminal());
+    }
+    private static String unitId(ExecutionRecord<Object, Object> record, String stepId, int stepIndex) {
+        return new AwaitUnitOccurrence(record.tenantId(), record.executionId(), record.executionId(),
+            stepId, stepIndex, record.awaitOccurrenceCause().orElseThrow()).unitId();
+    }
+
+    @Test
+    void waitingCasRejectsLegacyAndMismatchedOccurrenceIdsForNewExecutions() {
+        InMemoryExecutionStateStore store = new InMemoryExecutionStateStore();
+        long now = System.currentTimeMillis();
+        ExecutionRecord<Object, Object> created = store.createOrGetExecution(new ExecutionCreateCommand(
+            "tenant-a", "key-await-cause", "payload", ExecutionResultShape.SINGLE, now, now / 1000 + 60))
+            .await().indefinitely().record();
+
+        assertTrue(store.markWaitingExternal("tenant-a", created.executionId(), created.version(), "legacy", "unit", 2,
+            now + 1).await().indefinitely().isEmpty());
+        String wrongCause = new AwaitUnitOccurrence("tenant-a", created.executionId(), created.executionId(),
+            "await", 2, "stale-cycle").unitId();
+        assertTrue(store.markWaitingExternal("tenant-a", created.executionId(), created.version(), "stale", wrongCause, 2,
+            now + 1).await().indefinitely().isEmpty());
+        String wrongScope = new AwaitUnitOccurrence("other-tenant", created.executionId(), created.executionId(),
+            "await", 2, created.awaitOccurrenceCause().orElseThrow()).unitId();
+        assertTrue(store.markWaitingExternal("tenant-a", created.executionId(), created.version(), "foreign", wrongScope, 2,
+            now + 1).await().indefinitely().isEmpty());
+        assertTrue(store.markWaitingExternal("tenant-a", created.executionId(), created.version(), "valid",
+            unitId(created, "await", 2), 2, now + 1).await().indefinitely().isPresent());
     }
 }

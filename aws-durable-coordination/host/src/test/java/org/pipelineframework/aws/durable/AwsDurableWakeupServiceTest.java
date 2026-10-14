@@ -3,6 +3,8 @@ package org.pipelineframework.aws.durable;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -26,7 +28,7 @@ class AwsDurableWakeupServiceTest {
 
         assertThat(service.wake(IDENTITY)).isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
 
-        verify(callbacks, never()).sendSuccess(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+        verify(callbacks, never()).sendSuccessObserved(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
     }
 
     @Test
@@ -41,7 +43,7 @@ class AwsDurableWakeupServiceTest {
 
         assertThat(service.wake(IDENTITY)).isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
 
-        verify(callbacks, never()).sendSuccess(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+        verify(callbacks, never()).sendSuccessObserved(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
     }
 
     @Test
@@ -53,11 +55,13 @@ class AwsDurableWakeupServiceTest {
         when(bindings.findLatest(IDENTITY.tenantId(), IDENTITY.interactionId()))
             .thenReturn(Optional.of(current));
         when(bindings.delivered(current)).thenReturn(false);
+        when(callbacks.sendSuccessObserved(eq(current), any())).thenReturn(1_234L);
         AwsDurableWakeupService service = service(bindings, callbacks, "COMPLETED", current);
 
         assertThat(service.wake(IDENTITY)).isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
 
-        verify(callbacks).sendSuccess(org.mockito.ArgumentMatchers.eq(current), org.mockito.ArgumentMatchers.any());
+        verify(callbacks).sendSuccessObserved(org.mockito.ArgumentMatchers.eq(current), org.mockito.ArgumentMatchers.any());
+        verify(bindings).recordCallbackAccepted(current, 1_234L);
         verify(bindings).recordDelivered(current, "CALLBACK_ACCEPTED");
     }
 

@@ -1,6 +1,7 @@
 package org.pipelineframework.orchestrator;
 
 import java.time.Instant;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -14,6 +15,9 @@ import java.util.UUID;
 import jakarta.enterprise.context.ApplicationScoped;
 
 import io.smallrye.mutiny.Uni;
+import org.pipelineframework.awaitable.AwaitReleaseDisposition;
+import org.pipelineframework.awaitable.AwaitUnitOccurrence;
+import org.pipelineframework.awaitable.AwaitUnitReleaseAcknowledgement;
 
 /**
  * In-memory execution state store intended for development and tests.
@@ -26,6 +30,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
     private final Map<String, String> executionIdByScopedKey = new HashMap<>();
     private final Map<String, Object> initialInputByScopedId = new HashMap<>();
     private final Map<String, NativeExecutionAdmission> admissions = new HashMap<>();
+    private final Map<AwaitReleaseKey, AwaitUnitReleaseAcknowledgement> awaitReleaseAcknowledgements = new HashMap<>();
 
     @Override
     public Uni<Optional<ExecutionAdmissionResult>> inspectExistingAdmission(ExecutionAdmissionIntent intent) {
@@ -145,7 +150,16 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     command.nowEpochMs(),
                     command.nowEpochMs(),
                     command.ttlEpochS(),
-                    command.pagingState());
+                    0L,
+                    0,
+                    "",
+                    ExecutionRedriveIntent.REPLAY,
+                    -1,
+                    Optional.empty(),
+                    Optional.empty(),
+                    Optional.empty(),
+                    command.pagingState(),
+                    Optional.of("initial-v1"));
 
                 executionIdByScopedKey.put(scopedKey, executionId);
                 String scopedId = scopedExecutionId(command.tenantId(), executionId);
@@ -257,7 +271,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.failedStepIndex(),
                     current.failedCommandId(),
                     current.redriveTargetCommandId(),
-                    current.redriveReason(), current.pagingState());
+                    current.redriveReason(), current.pagingState(), current.awaitOccurrenceCause());
                 executionsByScopedId.put(scopedId, claimed);
                 return Optional.of(claimed);
             }
@@ -317,7 +331,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.failedStepIndex(),
                     current.failedCommandId(),
                     current.redriveTargetCommandId(),
-                    current.redriveReason(), current.pagingState());
+                    current.redriveReason(), current.pagingState(), current.awaitOccurrenceCause());
                 executionsByScopedId.put(scopedId, renewed);
                 return Optional.of(renewed);
             }
@@ -366,7 +380,8 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
+                    current.awaitOccurrenceCause());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -405,7 +420,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.createdAtEpochMs(), nowEpochMs, current.ttlEpochS(),
                     current.firstCircuitDeferredAtEpochMs(), current.circuitDeferralCount(),
                     current.circuitIdentity(), ExecutionRedriveIntent.REPLAY, -1, Optional.empty(),
-                    Optional.empty(), Optional.empty(), Optional.of(nextPage));
+                    Optional.empty(), Optional.empty(), Optional.of(nextPage), current.awaitOccurrenceCause());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -444,6 +459,9 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                 if (current == null || current.version() != expectedVersion) {
                     return Optional.empty();
                 }
+                if (!awaitOccurrenceMatches(current, awaitUnitId, awaitStepIndex)) {
+                    return Optional.empty();
+                }
                 ExecutionRecord<Object, Object> updated = new ExecutionRecord<>(
                     current.tenantId(),
                     current.executionId(),
@@ -474,7 +492,8 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(),
                     pageCompletion.map(completion -> current.pagingState().orElseThrow(() ->
                         new IllegalStateException("page completion requires durable paging state"))
-                        .withSuspendedCompletion(completion)).or(() -> current.pagingState()));
+                        .withSuspendedCompletion(completion)).or(() -> current.pagingState()),
+                    current.awaitOccurrenceCause());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -525,7 +544,9 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
+                    current.awaitOccurrenceCause());
+                retainAwaitRelease(current, updated, awaitUnitId, AwaitReleaseDisposition.CONTINUATION_QUEUED, nowEpochMs);
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -582,11 +603,55 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
+                    current.awaitOccurrenceCause());
+                retainAwaitRelease(current, updated, awaitUnitId, AwaitReleaseDisposition.CONTINUATION_QUEUED, nowEpochMs);
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
         });
+    }
+
+    @Override
+    public Uni<Optional<AwaitUnitReleaseAcknowledgement>> getAwaitUnitReleaseAcknowledgement(
+        String tenantId, String executionId, String unitId) {
+        var key = new AwaitReleaseKey(tenantId, executionId, unitId);
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                var acknowledgement = Optional.ofNullable(awaitReleaseAcknowledgements.get(key));
+                long nowEpochS = Instant.now().getEpochSecond();
+                if (acknowledgement.filter(value -> value.ttlEpochS() > 0 && value.ttlEpochS() <= nowEpochS).isPresent()) {
+                    awaitReleaseAcknowledgements.remove(key);
+                    return Optional.empty();
+                }
+                return acknowledgement;
+            }
+        });
+    }
+
+    /** Called only under the parent CAS lock, before making the updated parent visible. */
+    private void retainAwaitRelease(ExecutionRecord<Object, Object> current, ExecutionRecord<Object, Object> updated,
+        String unitId, AwaitReleaseDisposition disposition, long nowEpochMs) {
+        var key = new AwaitReleaseKey(current.tenantId(), current.executionId(), unitId);
+        // Legitimate redrive can release the same unit again. Retain its first disposition without rejecting that CAS.
+        if (!awaitReleaseAcknowledgements.containsKey(key)) {
+            var acknowledgement = new AwaitUnitReleaseAcknowledgement(
+                AwaitUnitReleaseAcknowledgement.CURRENT_SCHEMA_VERSION, current.tenantId(), current.executionId(), unitId,
+                current.pipelineId(), current.contractVersion(), current.releaseVersion(), current.currentStepIndex(),
+                updated.version(), disposition, nowEpochMs, current.ttlEpochS());
+            awaitReleaseAcknowledgements.put(key, acknowledgement);
+        }
+    }
+
+    private record AwaitReleaseKey(String tenantId, String executionId, String unitId) {
+        private AwaitReleaseKey {
+            Objects.requireNonNull(tenantId, "tenantId");
+            Objects.requireNonNull(executionId, "executionId");
+            Objects.requireNonNull(unitId, "unitId");
+            if (tenantId.isBlank() || executionId.isBlank() || unitId.isBlank()) {
+                throw new IllegalArgumentException("Await acknowledgement requires tenant, execution and unit identities");
+            }
+        }
     }
 
     private static ExecutionInputSnapshot normalizeExecutionInputPayload(Object inputPayload) {
@@ -663,7 +728,8 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
+                    current.awaitOccurrenceCause());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -713,7 +779,8 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.firstCircuitDeferredAtEpochMs(),
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
+                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
+                    current.awaitOccurrenceCause());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -749,7 +816,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.createdAtEpochMs(), nowEpochMs, current.ttlEpochS(), firstCircuitDeferredAtEpochMs,
                     circuitDeferralCount, circuitIdentity == null ? "" : circuitIdentity,
                     current.redriveIntent(), current.failedStepIndex(), current.failedCommandId(),
-                    current.redriveTargetCommandId(), current.redriveReason(), current.pagingState());
+                    current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(), current.awaitOccurrenceCause());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -841,7 +908,11 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     failedCommandId,
                     Optional.empty(),
                     Optional.empty(),
-                    current.pagingState());
+                    current.pagingState(), current.awaitOccurrenceCause());
+                if (current.status() == ExecutionStatus.WAITING_EXTERNAL
+                    && current.awaitUnitId() != null && !current.awaitUnitId().isBlank()) {
+                    retainAwaitRelease(current, updated, current.awaitUnitId(), AwaitReleaseDisposition.TERMINAL_FAILED, nowEpochMs);
+                }
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -964,7 +1035,10 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.failedCommandId(),
                     retainedTarget,
                     retainedReason,
-                    current.pagingState());
+                    current.pagingState(), reissue
+                        ? Optional.of(reissueOccurrenceCause(current.tenantId(), current.executionId(), current.version() + 1,
+                            retainedTarget.orElseThrow()))
+                        : current.awaitOccurrenceCause());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -1042,6 +1116,30 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
         initialInputByScopedId.remove(scopedId);
         executionIdByScopedKey.remove(scopedExecutionKey(current.tenantId(), current.executionKey()));
         return null;
+    }
+
+    private static boolean awaitOccurrenceMatches(
+        ExecutionRecord<Object, Object> current, String unitId, int stepIndex) {
+        if (unitId == null || unitId.isBlank()) return false;
+        try {
+            Optional<AwaitUnitOccurrence> occurrence = AwaitUnitOccurrence.fromUnitId(unitId);
+            if (current.awaitOccurrenceCause().isEmpty()) return occurrence.isEmpty();
+            if (occurrence.isEmpty()) return false;
+            AwaitUnitOccurrence value = occurrence.orElseThrow();
+            String identityScope = current.executionId() + current.pagingState()
+                .map(page -> ":page:" + page.pageIndex()).orElse("");
+            return value.matches(current.tenantId(), current.executionId(), value.stepId(), stepIndex)
+                && value.identityScope().equals(identityScope)
+                && value.occurrenceCause().equals(current.awaitOccurrenceCause().orElseThrow());
+        } catch (IllegalArgumentException malformed) {
+            return false;
+        }
+    }
+
+    private static String reissueOccurrenceCause(String tenantId, String executionId, long admittedVersion,
+        String targetCommandId) {
+        String material = tenantId + "\u0000" + executionId + "\u0000" + admittedVersion + "\u0000" + targetCommandId;
+        return "reissue-v" + admittedVersion + "-" + UUID.nameUUIDFromBytes(material.getBytes(StandardCharsets.UTF_8));
     }
 
     private static String scopedExecutionId(String tenantId, String executionId) {

@@ -149,9 +149,11 @@ class RegisteredTargetCoordinatorPathsTest {
     @Test void unknownCompiledContractFailsBeforeTerminalShortcutOrWorkerInvocation() {
         var record = create("terminal-guard", ExecutionResultShape.SINGLE);
         long now = System.currentTimeMillis();
-        executions.markWaitingExternal("tenant", record.executionId(), record.version(), "await", "unit", 99, now)
-            .await().indefinitely();
-        executions.markAwaitCompleted("tenant", record.executionId(), "unit", 99, now).await().indefinitely().orElseThrow();
+        String unit = new AwaitUnitOccurrence("tenant", record.executionId(), record.executionId(),
+            "unknown-await", 99, record.awaitOccurrenceCause().orElseThrow()).unitId();
+        executions.markWaitingExternal("tenant", record.executionId(), record.version(), "await", unit, 99, now)
+            .await().indefinitely().orElseThrow();
+        executions.markAwaitCompleted("tenant", record.executionId(), unit, 99, now).await().indefinitely().orElseThrow();
         fixture.forgetCompiledContractForTest();
         assertThrows(IllegalStateException.class, () -> process(record));
         assertEquals(ExecutionStatus.QUEUED, current(record).status());
@@ -159,9 +161,11 @@ class RegisteredTargetCoordinatorPathsTest {
     }
 
     private AwaitInteractionRecord seedAwait(ExecutionRecord<Object,Object> parent, boolean itemized) {
-        long now = System.currentTimeMillis(); String unit = "unit-" + parent.executionId();
+        long now = System.currentTimeMillis();
+        String unit = new AwaitUnitOccurrence("tenant", parent.executionId(), parent.executionId(),
+            "AwaitApproval", 0, parent.awaitOccurrenceCause().orElseThrow()).unitId();
         executions.markWaitingExternal("tenant", parent.executionId(), parent.version(), "await", unit, 0, now)
-            .await().indefinitely();
+            .await().indefinitely().orElseThrow();
         units.createOrGet(new AwaitUnitCreateCommand("tenant", unit, parent.executionId(), "AwaitApproval", 0,
             "ONE_TO_ONE", now, now / 1000 + 3600)).await().indefinitely();
         units.markDispatchComplete("tenant", unit, 1, now).await().indefinitely();

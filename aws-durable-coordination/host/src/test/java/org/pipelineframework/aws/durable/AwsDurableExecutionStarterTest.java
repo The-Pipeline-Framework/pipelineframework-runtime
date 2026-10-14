@@ -19,6 +19,21 @@ import software.amazon.awssdk.services.lambda.model.InvokeResponse;
 class AwsDurableExecutionStarterTest {
 
     @Test
+    void recoveryIgnoresMovedAliasAndInvokesOriginalNumericVersion() {
+        var lambda = mock(LambdaClient.class);
+        when(lambda.invoke(any(InvokeRequest.class))).thenReturn(InvokeResponse.builder().statusCode(202).build());
+        var starter = new AwsDurableExecutionStarter(lambda, new ObjectMapper(), "wrong-new-function", "moved-alias");
+        var input = new AwsDurableExecutionInput("tenant", "execution", "pipeline", "contract", "release", "{}", Optional.of("execution"), 2);
+        starter.pinnedToExecution("arn:aws:lambda:eu-west-1:123456789012:function:original:7/durable-execution/name/id").start(input);
+        var request = ArgumentCaptor.forClass(InvokeRequest.class); verify(lambda).invoke(request.capture());
+        assertThat(request.getValue().functionName()).isEqualTo("arn:aws:lambda:eu-west-1:123456789012:function:original");
+        assertThat(request.getValue().qualifier()).isEqualTo("7");
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> starter.pinnedToExecution(
+            "arn:aws:lambda:eu-west-1:123456789012:function:original:live/durable-execution/name/id"))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void invokesNumberedAliasWithStableDurableExecutionName() {
         LambdaClient lambda = mock(LambdaClient.class);
         when(lambda.invoke(any(InvokeRequest.class))).thenReturn(InvokeResponse.builder().statusCode(202).build());

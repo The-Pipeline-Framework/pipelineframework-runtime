@@ -4,6 +4,7 @@ import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
 import java.net.URI;
 import java.lang.reflect.Method;
 import java.time.Instant;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -29,6 +30,10 @@ import org.jboss.logging.Logger;
 import org.pipelineframework.cache.ProtobufMessageParser;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.context.PipelineContext;
+import org.pipelineframework.awaitable.AwaitUnitReleaseAcknowledgement;
+import org.pipelineframework.awaitable.AwaitReleaseDisposition;
+import org.pipelineframework.awaitable.AwaitUnitOccurrence;
+import org.pipelineframework.awaitable.store.DynamoAwaitCompletionLifecycleRepository;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -56,8 +61,8 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
 public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExecutionAdmissionStore {
     private static final Logger LOG = Logger.getLogger(DynamoExecutionStateStore.class);
 
-    private static final String TENANT_ID = "tenant_id";
-    private static final String EXECUTION_ID = "execution_id";
+    static final String TENANT_ID = "tenant_id";
+    static final String EXECUTION_ID = "execution_id";
     private static final String EXECUTION_KEY = "execution_key";
     private static final String PIPELINE_ID = "pipeline_id";
     private static final String CONTRACT_VERSION = "contract_version";
@@ -117,6 +122,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
     private static final String FAILED_COMMAND_ID = "failed_command_id";
     private static final String REDRIVE_TARGET_COMMAND_ID = "redrive_target_command_id";
     private static final String REDRIVE_REASON = "redrive_reason";
+    private static final String AWAIT_OCCURRENCE_CAUSE = "await_occurrence_cause";
     private static final String ENCODED_TYPE = "_tpf_type";
     private static final String ENCODED_MESSAGE_CLASS = "protobuf";
     private static final String ENCODED_MESSAGE_NAME = "_tpf_message";
@@ -189,7 +195,64 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         if (payloadTable == null || payloadTable.isBlank()) {
             return Optional.of("pipeline.orchestrator.dynamo.execution-payload-table must not be blank.");
         }
+        String lifecycleTable = orchestratorConfig.dynamo().awaitCompletionLifecycleTable();
+        if (lifecycleTable == null || lifecycleTable.isBlank()) {
+            return Optional.of("pipeline.orchestrator.dynamo.await-completion-lifecycle-table must not be blank.");
+        }
         return Optional.empty();
+    }
+
+    @Override
+    public Uni<Optional<AwaitUnitReleaseAcknowledgement>> getAwaitUnitReleaseAcknowledgement(
+        String tenantId, String executionId, String unitId
+    ) {
+        return blocking(() -> completionLifecycle().readRelease(tenantId, executionId, unitId));
+    }
+
+    private DynamoAwaitCompletionLifecycleRepository completionLifecycle() {
+        return new DynamoAwaitCompletionLifecycleRepository(dynamoClient(),
+            orchestratorConfig.dynamo().awaitCompletionLifecycleTable(), Clock.systemUTC());
+    }
+
+    private Optional<ExecutionRecord<Object, Object>> commitAwaitRelease(
+        UpdateItemRequest mutation, ExecutionRecord<Object, Object> waiting, String unitId,
+        AwaitReleaseDisposition disposition, long nowEpochMs
+    ) {
+        DynamoAwaitCompletionLifecycleRepository lifecycle = completionLifecycle();
+        AwaitUnitReleaseAcknowledgement first = new AwaitUnitReleaseAcknowledgement(
+            AwaitUnitReleaseAcknowledgement.CURRENT_SCHEMA_VERSION, waiting.tenantId(), waiting.executionId(), unitId,
+            waiting.pipelineId(), waiting.contractVersion(), waiting.releaseVersion(), waiting.currentStepIndex(),
+            waiting.version() + 1, disposition, nowEpochMs, waiting.ttlEpochS());
+        Optional<AwaitUnitReleaseAcknowledgement> existing = lifecycle.readRelease(
+            waiting.tenantId(), waiting.executionId(), unitId);
+        existing.ifPresent(value -> {
+            if (!value.pipelineId().equals(first.pipelineId()) || !value.contractVersion().equals(first.contractVersion())
+                || !value.releaseVersion().equals(first.releaseVersion()) || value.stepIndex() != first.stepIndex()) {
+                throw new IllegalStateException("Await unit release identity conflicts with retained acknowledgement");
+            }
+        });
+        TransactWriteItem fact = existing.map(lifecycle::releaseObservationCondition)
+            .orElseGet(() -> lifecycle.releaseWrite(first));
+        Map<String, String> names = new HashMap<>(mutation.expressionAttributeNames());
+        names.put("#releaseExpected", VERSION);
+        Map<String, AttributeValue> values = new HashMap<>(mutation.expressionAttributeValues());
+        values.put(":releaseExpected", avN(waiting.version()));
+        var update = software.amazon.awssdk.services.dynamodb.model.Update.builder()
+            .tableName(mutation.tableName()).key(mutation.key()).updateExpression(mutation.updateExpression())
+            .conditionExpression("(" + mutation.conditionExpression() + ") AND #releaseExpected = :releaseExpected")
+            .expressionAttributeNames(names).expressionAttributeValues(values).build();
+        try {
+            dynamoClient().transactWriteItems(TransactWriteItemsRequest.builder()
+                .transactItems(TransactWriteItem.builder().update(update).build(), fact).build());
+            return getExecutionBlocking(waiting.tenantId(), waiting.executionId(), nowEpochMs);
+        } catch (TransactionCanceledException failure) {
+            var reasons = failure.cancellationReasons();
+            if (reasons.stream().anyMatch(reason -> "ConditionalCheckFailed".equals(reason.code()))
+                && reasons.stream().allMatch(reason -> "ConditionalCheckFailed".equals(reason.code()) || "None".equals(reason.code()))) {
+                return Optional.empty();
+            }
+            throw failure;
+        }
     }
 
     @Override
@@ -283,11 +346,13 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
     }
 
     private static ExecutionRecord<Object, Object> newQueuedExecution(ExecutionCreateCommand command) {
-        return new ExecutionRecord<>(command.tenantId(), UUID.randomUUID().toString(), command.executionKey(),
+        String executionId = UUID.randomUUID().toString();
+        return new ExecutionRecord<>(command.tenantId(), executionId, command.executionKey(),
             command.pipelineId(), command.contractVersion(), command.releaseVersion(), command.resultShape(),
             ExecutionStatus.QUEUED, 0L, command.initialStepIndex(), 0, null, 0L, command.nowEpochMs(), null,
             command.inputPayload(), null, null, null, null, command.nowEpochMs(), command.nowEpochMs(),
-            command.ttlEpochS(), command.pagingState());
+            command.ttlEpochS(), 0L, 0, "", ExecutionRedriveIntent.REPLAY, -1, Optional.empty(),
+            Optional.empty(), Optional.empty(), command.pagingState(), Optional.of("initial-v1"));
     }
 
     private static void requireAdmissionKeyBytes(String value, int limit, String role) {
@@ -639,7 +704,16 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             command.nowEpochMs(),
             command.nowEpochMs(),
             command.ttlEpochS(),
-            command.pagingState());
+            0L,
+            0,
+            "",
+            ExecutionRedriveIntent.REPLAY,
+            -1,
+            Optional.empty(),
+            Optional.empty(),
+            Optional.empty(),
+            command.pagingState(),
+            Optional.of("initial-v1"));
 
         try {
             writeNewExecution(scopedExecutionKey, created, command.inputCanonicalTypeId(), command.nowEpochMs(), command.ttlEpochS());
@@ -1134,6 +1208,39 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         Optional<PagedTransitionCompletion> pageCompletion,
         long nowEpochMs
     ) {
+        if (awaitUnitId == null || awaitUnitId.isBlank()) {
+            return Optional.empty();
+        }
+        Optional<AwaitUnitOccurrence> occurrence;
+        try {
+            occurrence = AwaitUnitOccurrence.fromUnitId(awaitUnitId);
+        } catch (IllegalArgumentException malformed) {
+            return Optional.empty();
+        }
+        String causeCondition = "attribute_not_exists(#awaitCause)";
+        String pageCondition = "";
+        Integer occurrencePage = null;
+        if (occurrence.isPresent()) {
+            AwaitUnitOccurrence value = occurrence.orElseThrow();
+            if (!value.matches(tenantId, executionId, value.stepId(), awaitStepIndex)) return Optional.empty();
+            causeCondition = "#awaitCause = :awaitCause";
+            if (value.identityScope().equals(executionId)) {
+                pageCondition = " AND attribute_not_exists(#pageIndex)";
+            } else if (value.identityScope().startsWith(executionId + ":page:")) {
+                try {
+                    occurrencePage = Integer.parseInt(value.identityScope().substring((executionId + ":page:").length()));
+                    if (occurrencePage < 0
+                        || !value.identityScope().equals(executionId + ":page:" + occurrencePage)) {
+                        return Optional.empty();
+                    }
+                } catch (NumberFormatException malformedPage) {
+                    return Optional.empty();
+                }
+                pageCondition = " AND #pageIndex = :occurrencePage";
+            } else {
+                return Optional.empty();
+            }
+        }
         Map<String, String> names = new HashMap<>(Map.ofEntries(
             Map.entry("#status", STATUS),
             Map.entry("#version", VERSION),
@@ -1148,8 +1255,10 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             Map.entry("#leaseOwner", LEASE_OWNER),
             Map.entry("#leaseExpires", LEASE_EXPIRES_EPOCH_MS),
             Map.entry("#redriveIntent", REDRIVE_INTENT),
+            Map.entry("#awaitCause", AWAIT_OCCURRENCE_CAUSE),
             Map.entry("#updated", UPDATED_AT_EPOCH_MS),
             Map.entry("#ttl", TTL_EPOCH_S)));
+        if (!pageCondition.isEmpty()) names.put("#pageIndex", PAGE_INDEX);
         Map<String, AttributeValue> values = new HashMap<>(Map.ofEntries(
             Map.entry(":expected", avN(expectedVersion)),
             Map.entry(":waiting", avS(ExecutionStatus.WAITING_EXTERNAL.name())),
@@ -1161,6 +1270,8 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             Map.entry(":now", avN(nowEpochMs)),
             Map.entry(":one", avN(1)),
             Map.entry(":nowSec", avN(Instant.ofEpochMilli(nowEpochMs).getEpochSecond()))));
+        occurrence.ifPresent(value -> values.put(":awaitCause", avS(value.occurrenceCause())));
+        if (occurrencePage != null) values.put(":occurrencePage", avN(occurrencePage));
         pageCompletion.ifPresent(completion -> {
             names.put("#pageIdentity", PAGE_SOURCE_IDENTITY);
             names.put("#pageCompletionConsumed", PAGE_COMPLETION_CONSUMED_RECORDS);
@@ -1191,7 +1302,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             .tableName(executionTable())
             .key(executionPrimaryKey(tenantId, executionId))
             .conditionExpression("#version = :expected AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)"
-                + pageCompletionCondition)
+                + pageCompletionCondition + " AND " + causeCondition + pageCondition)
             .updateExpression(
                 "SET #status = :waiting, #version = #version + :one, #step = :step, #nextDue = :nextDue, " +
                     "#transition = :transition, #awaitUnit = :awaitUnit, #leaseExpires = :zero, " +
@@ -1220,6 +1331,11 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         int nextStepIndex,
         long nowEpochMs
     ) {
+        Optional<ExecutionRecord<Object, Object>> current = getExecutionBlocking(tenantId, executionId, nowEpochMs);
+        if (current.isEmpty() || current.orElseThrow().status() != ExecutionStatus.WAITING_EXTERNAL
+            || (current.orElseThrow().awaitUnitId() != null && !current.orElseThrow().awaitUnitId().equals(awaitUnitId))) {
+            return Optional.empty();
+        }
         Map<String, String> names = new HashMap<>(Map.ofEntries(
             Map.entry("#status", STATUS),
             Map.entry("#version", VERSION),
@@ -1260,15 +1376,8 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             .expressionAttributeValues(values)
             .returnValues(ReturnValue.ALL_NEW)
             .build();
-        try {
-            Map<String, AttributeValue> attributes = dynamoClient().updateItem(request).attributes();
-            if (attributes == null || attributes.isEmpty()) {
-                return Optional.empty();
-            }
-            return Optional.of(toRecord(attributes));
-        } catch (ConditionalCheckFailedException ignored) {
-            return Optional.empty();
-        }
+        return commitAwaitRelease(request, current.orElseThrow(), awaitUnitId,
+            AwaitReleaseDisposition.CONTINUATION_QUEUED, nowEpochMs);
     }
 
     private Optional<ExecutionRecord<Object, Object>> markAwaitItemContinuationsCompletedBlocking(
@@ -1306,6 +1415,10 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         values.put(":awaitUnit", avS(awaitUnitId));
         ExecutionRecord<Object, Object> execution = getExecutionBlocking(tenantId, executionId, nowEpochMs)
             .orElseThrow(() -> new IllegalStateException("Execution is unavailable while persisting await continuation: " + executionId));
+        if (execution.status() != ExecutionStatus.WAITING_EXTERNAL
+            || Optional.ofNullable(execution.awaitUnitId()).filter(awaitUnitId::equals).isEmpty()) {
+            return Optional.empty();
+        }
         ExecutionRecord<Object, Object> continuation = withCurrentStepIndex(execution, nextStepIndex);
         Object canonicalInput = inputPayload instanceof ExecutionInputSnapshot snapshot ? snapshot.payload() : inputPayload;
         boolean typed = writesTypedDurablePayloads(continuation);
@@ -1361,15 +1474,8 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             .expressionAttributeValues(values)
             .returnValues(ReturnValue.ALL_NEW)
             .build();
-        try {
-            Map<String, AttributeValue> attributes = dynamoClient().updateItem(request).attributes();
-            if (attributes == null || attributes.isEmpty()) {
-                return Optional.empty();
-            }
-            return Optional.of(toRecord(attributes));
-        } catch (ConditionalCheckFailedException ignored) {
-            return Optional.empty();
-        }
+        return commitAwaitRelease(request, execution, awaitUnitId,
+            AwaitReleaseDisposition.CONTINUATION_QUEUED, nowEpochMs);
     }
 
     private Optional<ExecutionRecord<Object, Object>> scheduleRetryBlocking(
@@ -1550,6 +1656,8 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         Optional<String> failedCommandId,
         long nowEpochMs
     ) {
+        Optional<ExecutionRecord<Object, Object>> current = getExecutionBlocking(tenantId, executionId, nowEpochMs);
+        if (current.isEmpty() || current.orElseThrow().version() != expectedVersion) return Optional.empty();
         Map<String, String> names = Map.ofEntries(
             Map.entry("#status", STATUS),
             Map.entry("#version", VERSION),
@@ -1595,6 +1703,12 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             .expressionAttributeValues(values)
             .returnValues(ReturnValue.ALL_NEW)
             .build();
+        ExecutionRecord<Object, Object> execution = current.orElseThrow();
+        if (execution.status() == ExecutionStatus.WAITING_EXTERNAL
+            && execution.awaitUnitId() != null && !execution.awaitUnitId().isBlank()) {
+            return commitAwaitRelease(request, execution, execution.awaitUnitId(),
+                AwaitReleaseDisposition.TERMINAL_FAILED, nowEpochMs);
+        }
         try {
             Map<String, AttributeValue> attributes = dynamoClient().updateItem(request).attributes();
             if (attributes == null || attributes.isEmpty()) {
@@ -1632,13 +1746,13 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             Map.entry("#redriveIntent", REDRIVE_INTENT),
             Map.entry("#redriveTarget", REDRIVE_TARGET_COMMAND_ID),
             Map.entry("#redriveReason", REDRIVE_REASON),
+            Map.entry("#awaitCause", AWAIT_OCCURRENCE_CAUSE),
             Map.entry("#currentStep", CURRENT_STEP_INDEX),
             Map.entry("#updated", UPDATED_AT_EPOCH_MS),
             Map.entry("#ttl", TTL_EPOCH_S)));
         Map<String, AttributeValue> values = new HashMap<>();
         values.put(":expected", avN(expectedVersion));
         values.put(":queued", avS(ExecutionStatus.QUEUED.name()));
-        values.put(":dlq", avS(ExecutionStatus.DLQ.name()));
         values.put(":transition", avS(transitionKey == null ? "" : transitionKey));
         values.put(":redriveIntent", avS(intent.name()));
         values.put(":zero", avN(0));
@@ -1657,8 +1771,12 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             values.put(":succeeded", avS(ExecutionStatus.SUCCEEDED.name()));
             values.put(":redriveTarget", avS(target));
             values.put(":redriveReason", avS(auditReason));
+            values.put(":awaitCause", avS(reissueOccurrenceCause(tenantId, executionId,
+                expectedVersion + 1, target)));
         } else {
+            values.put(":dlq", avS(ExecutionStatus.DLQ.name()));
             names.remove("#currentStep");
+            names.remove("#awaitCause");
         }
         if (allowFailed) {
             values.put(":failed", avS(ExecutionStatus.FAILED.name()));
@@ -1677,7 +1795,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             Map<String, AttributeValue> persisted = readExecutionItem(tenantId, executionId);
             InitialInputRestore restore = initialInputRestore(persisted, names, values);
             reissueSet = "#currentStep = :zero, #redriveTarget = :redriveTarget, "
-                + "#redriveReason = :redriveReason, " + restore.setClause();
+                + "#redriveReason = :redriveReason, #awaitCause = :awaitCause, " + restore.setClause();
             removeAttributes.addAll(restore.removeNames());
         } else {
             removeAttributes.add("#redriveTarget");
@@ -1933,6 +2051,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         record.failedCommandId().ifPresent(value -> putIfPresent(item, FAILED_COMMAND_ID, value));
         record.redriveTargetCommandId().ifPresent(value -> putIfPresent(item, REDRIVE_TARGET_COMMAND_ID, value));
         record.redriveReason().ifPresent(value -> putIfPresent(item, REDRIVE_REASON, value));
+        record.awaitOccurrenceCause().ifPresent(value -> putIfPresent(item, AWAIT_OCCURRENCE_CAUSE, value));
         record.pagingState().ifPresent(page -> {
             item.put(PAGE_INDEX, avN(page.pageIndex()));
             item.put(PAGE_SOURCE_IDENTITY, avS(page.sourceIdentity()));
@@ -2293,6 +2412,8 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             .filter(value -> !value.isBlank());
         Optional<String> redriveReason = Optional.ofNullable(readString(item, REDRIVE_REASON))
             .filter(value -> !value.isBlank());
+        Optional<String> awaitOccurrenceCause = Optional.ofNullable(readString(item, AWAIT_OCCURRENCE_CAUSE))
+            .filter(value -> !value.isBlank());
         Optional<PagedExecutionState> pagingState = Optional.ofNullable(readString(item, PAGE_SOURCE_IDENTITY))
             .filter(value -> !value.isBlank())
             .map(identity -> new PagedExecutionState(
@@ -2345,7 +2466,8 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             failedCommandId,
             redriveTargetCommandId,
             redriveReason,
-            pagingState);
+            pagingState,
+            awaitOccurrenceCause);
         return withPayloads(stored, readInputPayload(stored, item), readResultPayload(stored, item));
     }
 
@@ -2356,7 +2478,8 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             stored.lastTransitionKey(), inputPayload, stored.awaitUnitId(), resultPayload, stored.errorCode(), stored.errorMessage(),
             stored.createdAtEpochMs(), stored.updatedAtEpochMs(), stored.ttlEpochS(), stored.firstCircuitDeferredAtEpochMs(),
             stored.circuitDeferralCount(), stored.circuitIdentity(), stored.redriveIntent(), stored.failedStepIndex(),
-            stored.failedCommandId(), stored.redriveTargetCommandId(), stored.redriveReason(), stored.pagingState());
+            stored.failedCommandId(), stored.redriveTargetCommandId(), stored.redriveReason(), stored.pagingState(),
+            stored.awaitOccurrenceCause());
     }
 
     private ExecutionRecord<Object, Object> withCurrentStepIndex(ExecutionRecord<Object, Object> stored, int currentStepIndex) {
@@ -2367,7 +2490,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             stored.errorMessage(), stored.createdAtEpochMs(), stored.updatedAtEpochMs(), stored.ttlEpochS(),
             stored.firstCircuitDeferredAtEpochMs(), stored.circuitDeferralCount(), stored.circuitIdentity(),
             stored.redriveIntent(), stored.failedStepIndex(), stored.failedCommandId(),
-            stored.redriveTargetCommandId(), stored.redriveReason(), stored.pagingState());
+            stored.redriveTargetCommandId(), stored.redriveReason(), stored.pagingState(), stored.awaitOccurrenceCause());
     }
 
     private ExecutionRedriveIntent readRedriveIntent(Map<String, AttributeValue> item) {
@@ -2602,6 +2725,13 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
     private static boolean readBoolean(Map<String, AttributeValue> item, String key) {
         AttributeValue value = item.get(key);
         return value != null && Boolean.TRUE.equals(value.bool());
+    }
+
+    private static String reissueOccurrenceCause(String tenantId, String executionId, long admittedVersion,
+        String targetCommandId) {
+        String material = tenantId + "\u0000" + executionId + "\u0000" + admittedVersion + "\u0000" + targetCommandId;
+        return "reissue-v" + admittedVersion + "-" + UUID.nameUUIDFromBytes(
+            material.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
     private static String scopedExecutionKey(String tenantId, String executionKey) {

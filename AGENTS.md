@@ -20,7 +20,8 @@ integration tests. It consumes compiler and framework-neutral contracts as relea
 - Keep compiler phases and source renderers in `pipelineframework-compiler`.
 - Keep Connectors, representation-provider implementations, Blocks, Expansions, examples, and applications outside
   this repository.
-- Keep Spring smoke tests here and internal. Do not place them in the ecosystem catalogue.
+- Generated Spring application smoke tests and AWS Durable application proofs live in `pipelineframework-examples`
+  and consume released artifacts. Runtime-owned unit/provider/deployment integration tests stay here.
 - Preserve equivalent cardinality, failure, lineage, replay, and generated-boundary behavior across supported
   runtime adapters unless a difference is explicit and tested.
 

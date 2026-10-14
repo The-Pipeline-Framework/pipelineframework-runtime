@@ -36,6 +36,17 @@ public final class AwsDurableExecutionStarter {
         this.qualifier = required(qualifier, "qualifier");
     }
 
+    public AwsDurableExecutionStarter pinnedToExecution(String providerExecutionArn) {
+        String arn = required(providerExecutionArn, "providerExecutionArn");
+        int execution = arn.indexOf("/durable-execution/");
+        if (execution < 0) throw new IllegalArgumentException("provider execution ARN has no qualified function");
+        String qualifiedFunction = arn.substring(0, execution);
+        int versionSeparator = qualifiedFunction.lastIndexOf(':');
+        String version = qualifiedFunction.substring(versionSeparator + 1);
+        if (!version.matches("[1-9][0-9]*")) throw new IllegalArgumentException("recovery requires a numbered coordinator version");
+        return new AwsDurableExecutionStarter(lambda, mapper, qualifiedFunction.substring(0, versionSeparator), version);
+    }
+
     public AwsDurableStartResponse start(AwsDurableExecutionInput input) {
         Objects.requireNonNull(input, "input");
         String executionName = AwsDurableExecutionNames.durableExecutionName(

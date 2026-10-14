@@ -323,7 +323,13 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
             ExecutionResultShape.MATERIALIZED_MULTI,
             parent.get().version(),
             transitionKey,
-            continuationInput);
+            continuationInput,
+            org.pipelineframework.orchestrator.ExecutionRedriveIntent.REPLAY,
+            -1,
+            java.util.Optional.empty(),
+            java.util.Optional.empty(),
+            parent.get().pagingState().map(org.pipelineframework.orchestrator.PagedExecutionState::toTransitionContext),
+            parent.get().awaitOccurrenceCause());
         TransitionCommandEnvelope envelope = TransitionCommandEnvelope.from(
             workerCommand,
             parent.get().pipelineId(),
@@ -686,7 +692,8 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
               continuationMode,
               terminalOutputOwnership,
               java.util.Map.of(),
-              command.pageContext()));
+              command.pageContext(),
+              command.awaitOccurrenceCause()));
           PipelineExecutionContextHolder.set(executionContext);
           rehydratedInput.pipelineContext().ifPresentOrElse(
               PipelineContextHolder::set,

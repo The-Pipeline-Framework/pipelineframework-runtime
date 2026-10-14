@@ -1,5 +1,7 @@
 package org.pipelineframework.orchestrator;
 
+import org.pipelineframework.awaitable.AwaitInteractionCursor;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -35,6 +37,12 @@ public interface PipelineControlPlane {
         String pipelineId,
         String contractVersion,
         String releaseVersion);
+
+    /** Reads the provider-neutral state and release identity of an admitted execution. */
+    Uni<ExecutionSemanticCheckpoint> getExecutionSemanticCheckpoint(String tenantId, String executionId);
+
+    /** Looks up admission by client key. Absence never establishes execution completion. */
+    Uni<Optional<ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(String tenantId, String clientKey);
 
     Uni<ExecutionStatusDto> getExecutionStatus(String tenantId, String executionId);
 
@@ -100,18 +108,35 @@ public interface PipelineControlPlane {
         String stepId,
         int limit);
 
+    /** First native admission/parent-release evidence; absent legacy facts remain UNKNOWN. */
+    Uni<AwaitCompletionObservation> getAwaitCompletionObservation(String tenantId, String interactionId);
+
+    /** One bounded OPEN page. No cross-page snapshot or completeness over pre-protocol data is implied. */
+    Uni<AwaitCompletionObservationPage> queryAwaitCompletionObservations(
+        String tenantId, int limit, Optional<org.pipelineframework.awaitable.AwaitCompletionCursor> cursor);
+
     /** Reads one provider-neutral Await checkpoint without exposing the backing store schema. */
     Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(
         String tenantId,
         String interactionId);
 
     /**
-     * Observes the primary interaction of the Await unit currently parking an execution.
+     * Observes the primary interaction or the first bounded page of an itemised current Await unit.
+     * Use the cursor overload for itemised units that may span multiple pages.
      * Completion status is preserved: a completed interaction may still have pending consequences.
      * This bounded semantic observation contains no hosting or callback identity.
      */
     Uni<Optional<AwaitSemanticCheckpoint>> getCurrentAwaitSemanticCheckpoint(
         String tenantId, String executionId);
+
+    /**
+     * Reads one bounded current-unit page. Carry the returned cursor into the next observation.
+     * An empty checkpoint does not imply unit completion, even after cursor exhaustion.
+     * When this execution advanced to another unit, a validated prior-unit cursor produces
+     * an explicit reset observation. Cross-tenant or unrelated-unit cursors are rejected.
+     */
+    Uni<AwaitSemanticSelection> getCurrentAwaitSemanticCheckpoint(
+        String tenantId, String executionId, Optional<AwaitInteractionCursor> cursor);
 
     /** Reads bounded provider-neutral Await checkpoints for one TPF execution. */
     Uni<List<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoints(

@@ -103,6 +103,7 @@ class NativeExecutionAdmissionSweepIT {
             assertTrue(sqs.receiveMessage(request -> request.queueUrl(queue).waitTimeSeconds(0)).messages().isEmpty());
             var dispatcher = AwsShapedCoordinatorTestComponents.workDispatcher(sqs, config);
             var awaits = mock(AwaitCoordinator.class);
+            when(awaits.findDueTimeoutConsequences(anyLong(), anyInt())).thenReturn(io.smallrye.mutiny.Uni.createFrom().item(List.of()));
             when(awaits.findTimedOut(anyLong(), anyInt())).thenReturn(io.smallrye.mutiny.Uni.createFrom().item(List.of()));
             var nativeSweep = new QueueAsyncSweepFlow(config, replacement, dispatcher, new AwaitTimeoutFlow(awaits, replacement, () -> ledger));
             long now = System.currentTimeMillis();

@@ -23,6 +23,7 @@ public final class AwsDurableAwaitStreamProcessor {
     private final String awaitStreamArn;
     private final String bindingStreamArn;
     private final Function<DynamodbEvent.DynamodbStreamRecord, Optional<AwsDurableAwaitCheckpoint>> observations;
+    private final Function<AwsDurableCallbackRegistration, Optional<AwsDurableWakeupDisposition>> terminalSettlements;
 
     public AwsDurableAwaitStreamProcessor(
         AwsDurableCallbackBindingRepository bindings,
@@ -32,6 +33,13 @@ public final class AwsDurableAwaitStreamProcessor {
         String bindingStreamArn,
         Function<DynamodbEvent.DynamodbStreamRecord, Optional<AwsDurableAwaitCheckpoint>> observations
     ) {
+        this(bindings, actions, wakeups, awaitStreamArn, bindingStreamArn, observations, ignored -> Optional.empty());
+    }
+
+    public AwsDurableAwaitStreamProcessor(AwsDurableCallbackBindingRepository bindings, AwsDurableActionInvoker actions,
+        AwsDurableWakeupService wakeups, String awaitStreamArn, String bindingStreamArn,
+        Function<DynamodbEvent.DynamodbStreamRecord, Optional<AwsDurableAwaitCheckpoint>> observations,
+        Function<AwsDurableCallbackRegistration, Optional<AwsDurableWakeupDisposition>> terminalSettlements) {
         this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.actions = Objects.requireNonNull(actions, "actions");
         this.wakeups = Objects.requireNonNull(wakeups, "wakeups");
@@ -41,6 +49,7 @@ public final class AwsDurableAwaitStreamProcessor {
             throw new IllegalArgumentException("semantic and mechanical streams must be distinct");
         }
         this.observations = Objects.requireNonNull(observations, "observations");
+        this.terminalSettlements = Objects.requireNonNull(terminalSettlements, "terminalSettlements");
     }
 
     public AwsDurableWakeupDisposition process(DynamodbEvent.DynamodbStreamRecord record) {
@@ -61,9 +70,17 @@ public final class AwsDurableAwaitStreamProcessor {
         Map<String, AttributeValue> image = Optional.ofNullable(record.getDynamodb())
             .map(com.amazonaws.services.lambda.runtime.events.models.dynamodb.StreamRecord::getNewImage)
             .orElse(Map.of());
-        return AwsDurableCallbackBindingRepository.REGISTRATION.equals(text(image, "record_type").orElse(""))
-            ? processRegistration(image)
-            : AwsDurableWakeupDisposition.ACKNOWLEDGE;
+        return switch (required(image, AwsDurableCallbackBindingRepository.RECORD_TYPE)) {
+            case AwsDurableCallbackBindingRepository.REGISTRATION -> processRegistration(image);
+            case AwsDurableCallbackBindingRepository.BINDING,
+                 AwsDurableCallbackBindingRepository.DELIVERY,
+                 AwsDurableCallbackBindingRepository.CALLBACK_ACCEPTED,
+                 AwsDurableCallbackBindingRepository.DRIVER_RESUMED,
+                 AwsDurableCallbackBindingRepository.CALLBACK_LATENCY,
+                 AwsDurableCallbackBindingRepository.REPAIR_FIRST_OBSERVED,
+                 "GENERATION_CLAIM", "GENERATION_SUCCESSOR", "RECOVERY", "ADMISSION" -> AwsDurableWakeupDisposition.ACKNOWLEDGE;
+            default -> throw new IllegalStateException("unrecognised mechanical evidence; retry with a compatible host");
+        };
     }
 
     private AwsDurableWakeupDisposition processAwait(AwsDurableAwaitCheckpoint semantic) {
@@ -99,11 +116,10 @@ public final class AwsDurableAwaitStreamProcessor {
     }
 
     private AwsDurableWakeupDisposition processRegistration(Map<String, AttributeValue> image) {
-        Optional<AwsDurableCallbackRegistration> decoded = decodeRegistration(image);
-        if (decoded.isEmpty()) {
-            return AwsDurableWakeupDisposition.ACKNOWLEDGE;
-        }
-        AwsDurableCallbackRegistration registration = decoded.orElseThrow();
+        AwsDurableCallbackRegistration registration = decodeRegistration(image)
+            .orElseThrow(() -> new IllegalStateException("malformed callback registration; retry repair"));
+        var terminal = terminalSettlements.apply(registration);
+        if (terminal.isPresent()) return terminal.orElseThrow();
         AwsDurableAwaitIdentity pinned = registration.awaitIdentity()
             .orElseThrow(() -> new IllegalStateException("legacy registration requires a validated protocol upgrade"));
         Optional<AwsDurableAwaitCheckpoint> latest = actions.invoke(AwsDurableActionRequest.awaitCheckpoint(pinned))

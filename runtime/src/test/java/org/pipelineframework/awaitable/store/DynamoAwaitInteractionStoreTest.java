@@ -22,6 +22,7 @@ import org.pipelineframework.awaitable.AwaitCompletionCommand;
 import org.pipelineframework.awaitable.AwaitCreateCommand;
 import org.pipelineframework.awaitable.AwaitDurablePayloadResolver;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
+import org.pipelineframework.awaitable.AwaitInteractionCursor;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -38,6 +39,46 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.UpdateItemResponse;
 
 class DynamoAwaitInteractionStoreTest {
+
+    @Test
+    void boundedUnitPagePreservesEmptyFilteredContinuationWithoutFetchingNextPage() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
+        Map<String, AttributeValue> key = Map.of(
+            "tenant_id", avS("tenant-a"), "interaction_id", avS("interaction-100"),
+            "query_unit_key", avS(scoped("tenant-a", "unit-1")), "query_unit_sort", avS("0000000100#cause#interaction-100"));
+        when(client.query(any(QueryRequest.class))).thenReturn(
+            QueryResponse.builder().lastEvaluatedKey(key).build(),
+            QueryResponse.builder().items(item("tenant-a", "interaction-101", "unit-1", 101,
+                AwaitInteractionStatus.DISPATCHED, 20_000L, "alice", "finance")).build());
+
+        var first = store.findByUnitPage("tenant-a", "unit-1", 100, Optional.empty()).await().indefinitely();
+        assertTrue(first.interactions().isEmpty());
+        assertTrue(first.nextCursor().isPresent());
+        verify(client, times(1)).query(any(QueryRequest.class));
+        var second = store.findByUnitPage("tenant-a", "unit-1", 100, first.nextCursor()).await().indefinitely();
+        assertEquals("interaction-101", second.interactions().getFirst().interactionId());
+        assertTrue(second.nextCursor().isEmpty());
+        ArgumentCaptor<QueryRequest> queries = ArgumentCaptor.forClass(QueryRequest.class);
+        verify(client, times(2)).query(queries.capture());
+        assertEquals(100, queries.getAllValues().getFirst().limit());
+        assertEquals(key, queries.getAllValues().getLast().exclusiveStartKey());
+        verify(client, never()).scan(any(ScanRequest.class));
+    }
+
+    @Test
+    void unitPageRejectsForeignCursorAndUnboundedLimitsBeforeStorage() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, () -> store.findByUnitPage(
+            "tenant-a", "unit-1", 100, Optional.of(new AwaitInteractionCursor("tenant-b", "unit-1", "opaque")))
+            .await().indefinitely());
+        for (int limit : new int[] {0, -1, 101, Integer.MAX_VALUE}) {
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, () -> store.findByUnitPage(
+                "tenant-a", "unit-1", limit, Optional.empty()).await().indefinitely());
+        }
+        verifyNoInteractions(client);
+    }
 
     @Test
     void reconstructsAwaitInteractionsThroughExecutionIndex() {
@@ -117,23 +158,36 @@ class DynamoAwaitInteractionStoreTest {
         DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
         var dispatching = new java.util.HashMap<>(item("tenant-a", "interaction-1", "unit-1", 0,
             AwaitInteractionStatus.DISPATCHING, 20_000L, "alice", "finance"));
+        dispatching.put("ttl_epoch_s", avN(0));
         dispatching.put("transport_metadata_json", avS("{\"completionMode\":\"CONNECTOR_CALLBACK\"}"));
         var observed = new java.util.HashMap<>(dispatching);
         observed.put("status", avS("COMPLETION_OBSERVED"));
         observed.put("response_payload_json", avS("\"done\""));
         when(client.getItem(any(GetItemRequest.class)))
-            .thenReturn(GetItemResponse.builder().item(dispatching).build());
-        when(client.updateItem(any(UpdateItemRequest.class)))
-            .thenReturn(UpdateItemResponse.builder().attributes(observed).build());
+            .thenReturn(GetItemResponse.builder().item(dispatching).build(),
+                GetItemResponse.builder().item(observed).build());
+        when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
+            .thenReturn(TransactWriteItemsResponse.builder().build());
 
         var completion = store.complete(new AwaitCompletionCommand("tenant-a", "interaction-1", "",
             "completion-1", "done", "provider", 2_000L)).await().indefinitely();
         assertEquals(AwaitInteractionStatus.COMPLETION_OBSERVED, completion.record().status());
-        ArgumentCaptor<UpdateItemRequest> updates = ArgumentCaptor.forClass(UpdateItemRequest.class);
-        verify(client).updateItem(updates.capture());
-        assertFalse(updates.getValue().updateExpression().contains("REMOVE"));
-        assertTrue(updates.getValue().conditionExpression().contains("#version = :expected"));
-        assertEquals("COMPLETION_OBSERVED", updates.getValue().expressionAttributeValues().get(":status").s());
+        ArgumentCaptor<TransactWriteItemsRequest> completionWrites = ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+        verify(client).transactWriteItems(completionWrites.capture());
+        assertEquals(3, completionWrites.getValue().transactItems().size());
+        var parentMutation = completionWrites.getValue().transactItems().getFirst().update();
+        assertFalse(parentMutation.updateExpression().contains("REMOVE"));
+        assertTrue(parentMutation.conditionExpression().contains("#version = :expected"));
+        assertTrue(parentMutation.conditionExpression().contains("#ttl = :noExpiry"));
+        assertEquals("0", parentMutation.expressionAttributeValues().get(":noExpiry").n());
+        assertEquals("COMPLETION_OBSERVED", parentMutation.expressionAttributeValues().get(":status").s());
+        assertTrue(completionWrites.getValue().transactItems().subList(1, 3).stream()
+            .allMatch(write -> write.put().conditionExpression().contains("attribute_not_exists")));
+        ArgumentCaptor<GetItemRequest> completionReads = ArgumentCaptor.forClass(GetItemRequest.class);
+        verify(client, times(2)).getItem(completionReads.capture());
+        assertTrue(completionReads.getAllValues().stream().allMatch(GetItemRequest::consistentRead));
+        assertTrue(completionReads.getAllValues().stream().allMatch(request ->
+            "interaction-1".equals(request.key().get("interaction_id").s())));
 
         var completed = new java.util.HashMap<>(observed);
         completed.put("status", avS("COMPLETED"));
@@ -142,9 +196,12 @@ class DynamoAwaitInteractionStoreTest {
         var settled = store.settleCommandDispatch(completion.record(),
             org.pipelineframework.awaitable.CommandDispatchSettlement.AMBIGUOUS, 3_000L).await().indefinitely();
         assertEquals(AwaitInteractionStatus.COMPLETED, settled.orElseThrow().status());
-        verify(client, times(2)).updateItem(updates.capture());
+        ArgumentCaptor<UpdateItemRequest> updates = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        verify(client).updateItem(updates.capture());
         var settlement = updates.getValue();
         assertTrue(settlement.updateExpression().contains("REMOVE"));
+        assertTrue(settlement.conditionExpression().contains("#ttl = :noExpiry"));
+        assertEquals("0", settlement.expressionAttributeValues().get(":noExpiry").n());
         assertEquals("COMPLETION_OBSERVED", settlement.expressionAttributeValues().get(":requiredStatus").s());
         assertEquals("\"done\"", settlement.expressionAttributeValues().get(":response").s());
     }
@@ -161,6 +218,32 @@ class DynamoAwaitInteractionStoreTest {
 
         verify(client).transactWriteItems(any(TransactWriteItemsRequest.class));
         verify(client, never()).getItem(any(GetItemRequest.class));
+    }
+
+    @Test
+    void importWithoutExpiryOmitsTtlFromInteractionAndLookupRecordsAndReadsAsZero() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
+        AwaitInteractionRecord imported = new AwaitInteractionRecord("tenant-a", "execution-a", "review", 0,
+            String.class.getName(), "interaction-imported", "correlation-imported", null, "idempotency-imported", 0,
+            AwaitInteractionStatus.WAITING, Map.of("request", "value"), null, "unit-a", null, null,
+            "alice", "finance", "local", Map.of(), 20_000L, 1_000L, 1_000L, 0L, String.class.getName());
+        when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
+            .thenReturn(TransactWriteItemsResponse.builder().build());
+
+        store.importRecord(imported).await().indefinitely();
+
+        ArgumentCaptor<TransactWriteItemsRequest> writes = ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+        verify(client).transactWriteItems(writes.capture());
+        assertEquals(3, writes.getValue().transactItems().size());
+        assertTrue(writes.getValue().transactItems().stream().allMatch(write ->
+            !write.put().item().containsKey("ttl_epoch_s")));
+
+        Map<String, AttributeValue> readable = item("tenant-a", "interaction-imported", "unit-a", null,
+            AwaitInteractionStatus.WAITING, 20_000L, "alice", "finance");
+        readable.remove("ttl_epoch_s");
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(readable).build());
+        assertEquals(0L, store.get("tenant-a", "interaction-imported").await().indefinitely().orElseThrow().ttlEpochS());
     }
 
     @Test
@@ -187,19 +270,25 @@ class DynamoAwaitInteractionStoreTest {
         Map<String, AttributeValue> completed = new java.util.HashMap<>(waiting);
         completed.put("status", avS(AwaitInteractionStatus.COMPLETED.name()));
         completed.put("response_payload_json", avS(typedResponse));
-        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(waiting).build());
-        when(client.updateItem(any(UpdateItemRequest.class))).thenReturn(UpdateItemResponse.builder().attributes(completed).build());
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(waiting).build(),
+            GetItemResponse.builder().item(completed).build());
+        when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
+            .thenReturn(TransactWriteItemsResponse.builder().build());
         when(payloads.encode(any(), eq(AwaitDurablePayloadResolver.Slot.RESPONSE), any())).thenReturn(typedResponse);
         when(payloads.decode(any(), eq(AwaitDurablePayloadResolver.Slot.RESPONSE), eq(typedResponse))).thenReturn(decision);
 
         var completion = store.complete(new AwaitCompletionCommand(
             "tenant-a", "interaction-1", null, "completion-1", decision, "provider", 2_000L)).await().indefinitely();
 
-        ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
-        verify(client).updateItem(update.capture());
-        assertEquals(typedResponse, update.getValue().expressionAttributeValues().get(":response").s());
-        assertEquals("ready", update.getValue().expressionAttributeValues().get(":continuationKey").s());
-        assertTrue(update.getValue().updateExpression().contains("#continuationDue = :continuationDue"));
+        ArgumentCaptor<TransactWriteItemsRequest> updates = ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+        verify(client, times(2)).transactWriteItems(updates.capture());
+        var completionWrite = updates.getAllValues().getLast();
+        assertEquals(3, completionWrite.transactItems().size());
+        var parentMutation = completionWrite.transactItems().getFirst().update();
+        assertTrue(completionWrite.transactItems().get(1).put().conditionExpression().contains("attribute_not_exists"));
+        assertEquals(typedResponse, parentMutation.expressionAttributeValues().get(":response").s());
+        assertEquals("ready", parentMutation.expressionAttributeValues().get(":continuationKey").s());
+        assertTrue(parentMutation.updateExpression().contains("#continuationDue = :continuationDue"));
         assertEquals(decision, completion.record().responsePayload());
         verify(payloads).encode(any(), eq(AwaitDurablePayloadResolver.Slot.REQUEST), any());
         verify(payloads).encode(any(), eq(AwaitDurablePayloadResolver.Slot.RESPONSE), eq(decision));
@@ -347,6 +436,25 @@ class DynamoAwaitInteractionStoreTest {
     }
 
     @Test
+    void activeTimeoutAdmissionConsumesOneBoundedPageEvenWhenNoLiveInteractionIsReturned() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
+        when(client.query(any(QueryRequest.class))).thenReturn(
+            QueryResponse.builder().lastEvaluatedKey(Map.of("tenant_id", avS("tenant-a"),
+                "interaction_id", avS("expired-page-boundary"))).build(),
+            QueryResponse.builder().items(item("tenant-a", "retained-active", "unit-a", 0,
+                AwaitInteractionStatus.WAITING, 70_000L, "alice", "finance")).build());
+        assertTrue(store.findTimedOut(100_000L, 100).await().indefinitely().isEmpty());
+        verify(client, times(1)).query(any(QueryRequest.class));
+        assertEquals("retained-active", store.findTimedOut(100_000L, 100).await().indefinitely().getFirst().interactionId());
+        ArgumentCaptor<QueryRequest> queries = ArgumentCaptor.forClass(QueryRequest.class);
+        verify(client, times(2)).query(queries.capture());
+        assertTrue(queries.getAllValues().stream().allMatch(query -> query.limit() <= 100));
+        assertTrue(queries.getAllValues().getLast().exclusiveStartKey().isEmpty());
+        verify(client, never()).scan(any(ScanRequest.class));
+    }
+
+    @Test
     void findTimedOutUsesMetadataOnlyViewWithoutTypedPayloadResolution() {
         DynamoDbClient client = mock(DynamoDbClient.class);
         AwaitDurablePayloadResolver payloads = mock(AwaitDurablePayloadResolver.class);
@@ -371,9 +479,11 @@ class DynamoAwaitInteractionStoreTest {
     void terminalTransitionRemovesActivePendingAndDeadlineQueryKeys() {
         DynamoDbClient client = mock(DynamoDbClient.class);
         DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
-        when(client.updateItem(any(UpdateItemRequest.class))).thenReturn(UpdateItemResponse.builder()
-            .attributes(item("tenant-a", "interaction-1", "unit-1", null, AwaitInteractionStatus.TIMED_OUT, 10_000L, "alice", "finance"))
-            .build());
+        Map<String, AttributeValue> timedOut = item("tenant-a", "interaction-1", "unit-1", null,
+            AwaitInteractionStatus.TIMED_OUT, 10_000L, "alice", "finance");
+        timedOut.put("ttl_epoch_s", avN(0));
+        when(client.updateItem(any(UpdateItemRequest.class)))
+            .thenReturn(UpdateItemResponse.builder().attributes(timedOut).build());
 
         var updated = store.markTimedOut("tenant-a", "interaction-1", 0L, 11_000L).await().indefinitely();
 
@@ -388,8 +498,106 @@ class DynamoAwaitInteractionStoreTest {
         assertTrue(updateExpression.contains("#pendingStepKey"));
         assertTrue(updateExpression.contains("#pendingDeadlineSort"));
         assertTrue(updateExpression.contains("#deadlineKey"));
-        assertTrue(updateExpression.contains("#deadlineSort"));
+        assertTrue(captor.getValue().conditionExpression().contains("#ttl = :noExpiry"));
+        assertEquals("0", captor.getValue().expressionAttributeValues().get(":noExpiry").n());
+        assertTrue(updateExpression.substring(0, updateExpression.indexOf(" REMOVE ")).contains("#deadlineKey = :timeoutWork"));
+        assertEquals("TIMEOUT_CONSEQUENCES", captor.getValue().expressionAttributeValues().get(":timeoutWork").s());
+        assertFalse(updateExpression.substring(updateExpression.indexOf(" REMOVE ")).contains("#deadlineKey"));
+        assertFalse(updateExpression.substring(updateExpression.indexOf(" REMOVE ")).contains("#deadlineSort"));
         verify(client, never()).scan(any(ScanRequest.class));
+    }
+
+    @Test
+    void timeoutAndPendingConsequencesArePublishedByOneConditionalMutation() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        AwaitDurablePayloadResolver payloads = mock(AwaitDurablePayloadResolver.class);
+        DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig(), payloads);
+        var retained = item("tenant-a", "atomic-timeout", "unit-a", 7, AwaitInteractionStatus.TIMED_OUT, 70_000L, "alice", "finance");
+        retained.put("version", avN(1));
+        when(client.updateItem(any(UpdateItemRequest.class))).thenReturn(UpdateItemResponse.builder().attributes(retained).build());
+        var timedOut = store.markTimedOut("tenant-a", "atomic-timeout", 0L, 71_000L).await().indefinitely().orElseThrow();
+        assertEquals(AwaitInteractionStatus.TIMED_OUT, timedOut.status());
+        assertEquals(1L, timedOut.version());
+        ArgumentCaptor<UpdateItemRequest> updates = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        verify(client).updateItem(updates.capture());
+        var update = updates.getValue();
+        assertTrue(update.updateExpression().contains("#status = :status"));
+        assertTrue(update.updateExpression().contains("#timeoutPending = :timeoutPending"));
+        assertTrue(update.updateExpression().contains("#deadlineKey = :timeoutWork"));
+        assertTrue(update.updateExpression().contains("#deadlineSort = :timeoutSort"));
+        assertEquals("timeout_consequences_pending", update.expressionAttributeNames().get("#timeoutPending"));
+        assertEquals(Boolean.TRUE, update.expressionAttributeValues().get(":timeoutPending").bool());
+        assertEquals("TIMEOUT_CONSEQUENCES", update.expressionAttributeValues().get(":timeoutWork").s());
+        assertTrue(update.conditionExpression().contains("#version = :expected"));
+        assertTrue(update.conditionExpression().contains("#status <> :terminalCOMPLETED"));
+        assertTrue(update.conditionExpression().contains("#status <> :terminalTIMED_OUT"));
+        verifyNoInteractions(payloads);
+    }
+
+    @Test
+    void boundedExpiredTimeoutPageIsCleanedWithoutFetchingASecondPageOrDecodingPayloads() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        AwaitDurablePayloadResolver payloads = mock(AwaitDurablePayloadResolver.class);
+        DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig(), payloads);
+        var expired = item("tenant-a", "expired-timeout", "unit-a", 0, AwaitInteractionStatus.TIMED_OUT, 70_000L, "alice", "finance");
+        expired.put("ttl_epoch_s", avN(90L));
+        var retained = item("tenant-a", "retained-timeout", "unit-a", 1, AwaitInteractionStatus.TIMED_OUT, 70_000L, "alice", "finance");
+        when(client.query(any(QueryRequest.class))).thenReturn(
+            QueryResponse.builder().items(expired).lastEvaluatedKey(Map.of("tenant_id", avS("tenant-a"),
+                "interaction_id", avS("expired-timeout"))).build(),
+            QueryResponse.builder().items(retained).build());
+        when(client.updateItem(any(UpdateItemRequest.class))).thenReturn(UpdateItemResponse.builder().build());
+        assertTrue(store.findDueTimeoutConsequences(100_000L, 100).await().indefinitely().isEmpty());
+        verify(client, times(1)).query(any(QueryRequest.class));
+        var next = store.findDueTimeoutConsequences(100_000L, 100).await().indefinitely();
+        assertEquals("retained-timeout", next.getFirst().interactionId());
+        ArgumentCaptor<QueryRequest> queries = ArgumentCaptor.forClass(QueryRequest.class);
+        verify(client, times(2)).query(queries.capture());
+        assertTrue(queries.getAllValues().stream().allMatch(query -> query.limit() == 100
+            && query.indexName().equals("await-interaction-pending-by-deadline")));
+        assertTrue(queries.getAllValues().getLast().exclusiveStartKey().isEmpty());
+        ArgumentCaptor<UpdateItemRequest> cleanup = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        verify(client).updateItem(cleanup.capture());
+        assertEquals("expired-timeout", cleanup.getValue().key().get("interaction_id").s());
+        assertTrue(cleanup.getValue().conditionExpression().contains("#ttl <= :expired"));
+        assertEquals("REMOVE #pending, #deadlineKey, #deadlineSort", cleanup.getValue().updateExpression());
+        verify(client, never()).scan(any(ScanRequest.class));
+        verifyNoInteractions(payloads);
+        for (int limit : new int[] {0, -1, 101, Integer.MAX_VALUE}) {
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> store.findDueTimeoutConsequences(100_000L, limit));
+        }
+        verify(client, times(2)).query(any(QueryRequest.class));
+    }
+
+    @Test
+    void acknowledgementConditionsScopeAndVersionAndRemovesOnlyTheProjection() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
+        var retained = item("tenant-a", "ack-timeout", "unit-a", 0, AwaitInteractionStatus.TIMED_OUT, 70_000L, "alice", "finance");
+        retained.put("version", avN(3));
+        when(client.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder().items(retained).build());
+        when(client.updateItem(any(UpdateItemRequest.class))).thenReturn(UpdateItemResponse.builder().build());
+        var timedOut = store.findDueTimeoutConsequences(100_000L, 1).await().indefinitely().getFirst();
+        store.completeTimeoutConsequences(timedOut).await().indefinitely();
+        store.completeTimeoutConsequences(timedOut).await().indefinitely();
+        ArgumentCaptor<UpdateItemRequest> acknowledgements = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        verify(client, times(2)).updateItem(acknowledgements.capture());
+        assertEquals(acknowledgements.getAllValues().getFirst(), acknowledgements.getAllValues().getLast());
+        var acknowledgement = acknowledgements.getValue();
+        assertEquals("tenant-a", acknowledgement.key().get("tenant_id").s());
+        assertEquals("ack-timeout", acknowledgement.key().get("interaction_id").s());
+        assertEquals("3", acknowledgement.expressionAttributeValues().get(":version").n());
+        assertEquals("execution-ack-timeout", acknowledgement.expressionAttributeValues().get(":execution").s());
+        assertEquals("unit-a", acknowledgement.expressionAttributeValues().get(":unit").s());
+        assertEquals("TIMED_OUT", acknowledgement.expressionAttributeValues().get(":status").s());
+        assertEquals("#version = :version AND #status = :status AND #execution = :execution AND #unit = :unit",
+            acknowledgement.conditionExpression());
+        assertEquals("REMOVE #pending, #deadlineKey, #deadlineSort", acknowledgement.updateExpression());
+        when(client.updateItem(any(UpdateItemRequest.class)))
+            .thenThrow(ConditionalCheckFailedException.builder().message("mismatched identity/version").build());
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+            () -> store.completeTimeoutConsequences(timedOut).await().indefinitely());
     }
 
     @Test
@@ -422,9 +630,10 @@ class DynamoAwaitInteractionStoreTest {
                 .build(),
             GetItemResponse.builder()
                 .item(item("tenant-a", "interaction-1", "unit-1", null, AwaitInteractionStatus.COMPLETED, 10_000L, "alice", "finance"))
-                .build());
-        when(client.updateItem(any(UpdateItemRequest.class)))
-            .thenThrow(ConditionalCheckFailedException.builder().message("conditional update failed").build());
+                .build(),
+            GetItemResponse.builder().build());
+        when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
+            .thenThrow(ConditionalCheckFailedException.builder().message("conditional transaction failed").build());
 
         var result = store.complete(new AwaitCompletionCommand(
                 "tenant-a",
@@ -438,8 +647,8 @@ class DynamoAwaitInteractionStoreTest {
 
         assertTrue(result.duplicate());
         assertEquals(AwaitInteractionStatus.COMPLETED, result.record().status());
-        verify(client).updateItem(any(UpdateItemRequest.class));
-        verify(client, times(2)).getItem(any(GetItemRequest.class));
+        verify(client).transactWriteItems(any(TransactWriteItemsRequest.class));
+        verify(client, times(3)).getItem(any(GetItemRequest.class));
     }
 
     @Test
@@ -449,8 +658,12 @@ class DynamoAwaitInteractionStoreTest {
         Map<String, AttributeValue> completed = item(
             "tenant-a", "interaction-1", "unit-1", 0,
             AwaitInteractionStatus.COMPLETED, 10_000L, "alice", "finance");
-        when(client.getItem(any(GetItemRequest.class)))
-            .thenReturn(GetItemResponse.builder().item(completed).build());
+        when(client.getItem(any(GetItemRequest.class))).thenAnswer(invocation -> {
+            GetItemRequest request = invocation.getArgument(0);
+            return "tpf_await_completion_lifecycle".equals(request.tableName())
+                ? GetItemResponse.builder().build()
+                : GetItemResponse.builder().item(completed).build();
+        });
         when(client.updateItem(any(UpdateItemRequest.class)))
             .thenReturn(UpdateItemResponse.builder().build());
 
@@ -554,6 +767,7 @@ class DynamoAwaitInteractionStoreTest {
         PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
         PipelineOrchestratorConfig.DynamoConfig dynamo = mock(PipelineOrchestratorConfig.DynamoConfig.class);
         when(config.dynamo()).thenReturn(dynamo);
+        when(dynamo.awaitCompletionLifecycleTable()).thenReturn("tpf_await_completion_lifecycle");
         when(dynamo.awaitInteractionTable()).thenReturn("tpf_await_interaction");
         when(dynamo.awaitInteractionKeyTable()).thenReturn("tpf_await_interaction_key");
         when(dynamo.region()).thenReturn(Optional.empty());

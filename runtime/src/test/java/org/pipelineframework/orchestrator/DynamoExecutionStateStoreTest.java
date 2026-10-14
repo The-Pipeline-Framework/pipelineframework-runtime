@@ -21,6 +21,7 @@ import org.mockito.ArgumentCaptor;
 import org.pipelineframework.cache.ProtobufMessageParser;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.context.PipelineContext;
+import org.pipelineframework.awaitable.AwaitUnitOccurrence;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.BatchGetItemRequest;
@@ -30,6 +31,7 @@ import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.GetItemResponse;
 import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.TransactWriteItemsRequest;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItemsResponse;
 import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.UpdateItemResponse;
 
@@ -283,9 +285,16 @@ class DynamoExecutionStateStoreTest {
         waiting.put("input_shape", AttributeValue.builder().s(ExecutionInputShape.RAW.name()).build());
         waiting.put("input_payload_type_id", AttributeValue.builder().s(String.class.getName()).build());
         waiting.put("input_payload_encoding", AttributeValue.builder().s(JsonTransitionPayloadCodec.ENCODING).build());
-        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(waiting).build());
-        when(client.updateItem(any(UpdateItemRequest.class))).thenAnswer(invocation -> {
-            UpdateItemRequest request = invocation.getArgument(0);
+        var current = new java.util.concurrent.atomic.AtomicReference<Map<String, AttributeValue>>(waiting);
+        when(client.getItem(any(GetItemRequest.class))).thenAnswer(invocation -> {
+            GetItemRequest request = invocation.getArgument(0);
+            return "tpf_await_completion_lifecycle".equals(request.tableName())
+                ? GetItemResponse.builder().build()
+                : GetItemResponse.builder().item(current.get()).build();
+        });
+        when(client.transactWriteItems(any(TransactWriteItemsRequest.class))).thenAnswer(invocation -> {
+            TransactWriteItemsRequest transaction = invocation.getArgument(0);
+            var request = transaction.transactItems().getFirst().update();
             Map<String, AttributeValue> values = request.expressionAttributeValues();
             Map<String, AttributeValue> updated = new HashMap<>(waiting);
             updated.put("status", values.get(":queued"));
@@ -296,7 +305,8 @@ class DynamoExecutionStateStoreTest {
             updated.put("input_payload_encoding", values.get(":inputPayloadEncoding"));
             updated.put("input_shape", values.get(":inputShape"));
             updated.remove("await_unit_id");
-            return UpdateItemResponse.builder().attributes(updated).build();
+            current.set(updated);
+            return TransactWriteItemsResponse.builder().build();
         });
 
         Optional<ExecutionRecord<Object, Object>> released = store.markAwaitItemContinuationsCompleted(
@@ -310,11 +320,17 @@ class DynamoExecutionStateStoreTest {
         ExecutionRecord<Object, Object> record = released.orElseThrow();
         ExecutionInputSnapshot restored = assertInstanceOf(ExecutionInputSnapshot.class, record.inputPayload());
         assertEquals(continuation, restored.payload());
-        ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
-        verify(client).updateItem(update.capture());
-        assertEquals(PaymentStatus.class.getName(), update.getValue().expressionAttributeValues().get(":inputPayloadTypeId").s());
+        ArgumentCaptor<TransactWriteItemsRequest> transactions = ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+        verify(client).transactWriteItems(transactions.capture());
+        var transaction = transactions.getValue();
+        assertEquals(2, transaction.transactItems().size());
+        var update = transaction.transactItems().getFirst().update();
+        assertEquals(PaymentStatus.class.getName(), update.expressionAttributeValues().get(":inputPayloadTypeId").s());
         assertEquals(JsonTransitionPayloadCodec.ENCODING,
-            update.getValue().expressionAttributeValues().get(":inputPayloadEncoding").s());
+            update.expressionAttributeValues().get(":inputPayloadEncoding").s());
+        var acknowledgement = transaction.transactItems().get(1).put();
+        assertEquals("await-unit", acknowledgement.item().get("unit_id").s());
+        assertEquals("CONTINUATION_QUEUED", acknowledgement.item().get("disposition").s());
     }
 
     @Test
@@ -322,17 +338,58 @@ class DynamoExecutionStateStoreTest {
         DynamoDbClient client = mock(DynamoDbClient.class);
         DynamoExecutionStateStore store = new DynamoExecutionStateStore(
             client, mockConfig("tpf_execution", "tpf_execution_key"));
-        when(client.updateItem(any(UpdateItemRequest.class)))
-            .thenReturn(UpdateItemResponse.builder().attributes(Map.of()).build());
+        long now = System.currentTimeMillis();
+        Map<String, AttributeValue> waiting = new HashMap<>(executionItem(
+            "tenant-a", "execution-a", "execution-key", now / 1000 + 3600, ExecutionStatus.WAITING_EXTERNAL));
+        waiting.put("await_unit_id", AttributeValue.builder().s("await-unit").build());
+        Map<String, AttributeValue> queued = new HashMap<>(waiting);
+        queued.put("status", AttributeValue.builder().s(ExecutionStatus.QUEUED.name()).build());
+        queued.put("version", AttributeValue.builder().n("1").build());
+        queued.put("current_step_index", AttributeValue.builder().n("3").build());
+        queued.put("next_due_epoch_ms", AttributeValue.builder().n(Long.toString(now)).build());
+        AtomicInteger executionReads = new AtomicInteger();
+        when(client.getItem(any(GetItemRequest.class))).thenAnswer(invocation -> {
+            GetItemRequest request = invocation.getArgument(0);
+            if ("tpf_execution".equals(request.tableName())) {
+                return GetItemResponse.builder().item(executionReads.getAndIncrement() == 0 ? waiting : queued).build();
+            }
+            return GetItemResponse.builder().build();
+        });
+        when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
+            .thenReturn(TransactWriteItemsResponse.builder().build());
 
-        store.markAwaitCompleted(
-            "tenant-a", "execution-a", "await-unit", 3, System.currentTimeMillis())
-            .await().indefinitely();
+        var released = store.markAwaitCompleted(
+            "tenant-a", "execution-a", "await-unit", 3, now)
+            .await().indefinitely().orElseThrow();
+        assertEquals(ExecutionStatus.QUEUED, released.status());
+        assertEquals(1L, released.version());
 
-        verify(client).updateItem(argThat((UpdateItemRequest request) ->
-            request.updateExpression().contains("#redriveIntent")
-                && "redrive_intent".equals(
-                    request.expressionAttributeNames().get("#redriveIntent"))));
+        ArgumentCaptor<TransactWriteItemsRequest> transactions = ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+        verify(client).transactWriteItems(transactions.capture());
+        var transaction = transactions.getValue();
+        assertEquals(2, transaction.transactItems().size());
+        var update = transaction.transactItems().getFirst().update();
+        assertTrue(update.updateExpression().contains("#redriveIntent"));
+        assertEquals("redrive_intent", update.expressionAttributeNames().get("#redriveIntent"));
+        assertTrue(update.conditionExpression().contains("#releaseExpected = :releaseExpected"));
+        assertEquals("0", update.expressionAttributeValues().get(":releaseExpected").n());
+        var acknowledgement = transaction.transactItems().get(1).put();
+        assertEquals("AWAIT_UNIT_RELEASE_ACKNOWLEDGEMENT", acknowledgement.item().get("record_type").s());
+        assertEquals("tenant-a", acknowledgement.item().get("tenant_id").s());
+        assertEquals("execution-a", acknowledgement.item().get("execution_id").s());
+        assertEquals("await-unit", acknowledgement.item().get("unit_id").s());
+        assertEquals("CONTINUATION_QUEUED", acknowledgement.item().get("disposition").s());
+        assertEquals("1", acknowledgement.item().get("parent_version").n());
+        assertEquals(Long.toString(now), acknowledgement.item().get("acknowledged_at_epoch_ms").n());
+        assertTrue(acknowledgement.conditionExpression().contains("attribute_not_exists"));
+        ArgumentCaptor<GetItemRequest> reads = ArgumentCaptor.forClass(GetItemRequest.class);
+        verify(client, times(3)).getItem(reads.capture());
+        var executionReadRequests = reads.getAllValues().stream()
+            .filter(request -> "tpf_execution".equals(request.tableName())).toList();
+        assertEquals(2, executionReadRequests.size());
+        assertTrue(executionReadRequests.stream().allMatch(GetItemRequest::consistentRead));
+        assertTrue(executionReadRequests.stream().allMatch(request ->
+            "execution-a".equals(request.key().get("execution_id").s())));
     }
 
     @Test
@@ -687,6 +744,29 @@ class DynamoExecutionStateStoreTest {
     }
 
     @Test
+    void parentAwaitCasFencesTheRetainedOccurrenceAndPageAtomically() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoExecutionStateStore store = new DynamoExecutionStateStore(client,
+            mockConfig("tpf_execution", "tpf_execution_key"));
+        String unitId = new AwaitUnitOccurrence("tenant-a", "exec-1", "exec-1:page:3",
+            "AwaitApproval", 4, "reissue-v8-target").unitId();
+        when(client.updateItem(any(UpdateItemRequest.class))).thenReturn(UpdateItemResponse.builder().build());
+
+        store.markWaitingExternal("tenant-a", "exec-1", 8, "await-transition", unitId, 4,
+            Optional.empty(), 1234L).await().indefinitely();
+
+        ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        verify(client).updateItem(update.capture());
+        UpdateItemRequest request = update.getValue();
+        assertTrue(request.conditionExpression().contains("#awaitCause = :awaitCause"));
+        assertTrue(request.conditionExpression().contains("#pageIndex = :occurrencePage"));
+        assertEquals("await_occurrence_cause", request.expressionAttributeNames().get("#awaitCause"));
+        assertEquals("page_index", request.expressionAttributeNames().get("#pageIndex"));
+        assertEquals("reissue-v8-target", request.expressionAttributeValues().get(":awaitCause").s());
+        assertEquals("3", request.expressionAttributeValues().get(":occurrencePage").n());
+    }
+
+    @Test
     void claimLeaseRejectsNonPositiveLeaseDuration() {
         DynamoDbClient client = mock(DynamoDbClient.class);
         PipelineOrchestratorConfig config = mockConfig("tpf_execution", "tpf_execution_key");
@@ -841,6 +921,7 @@ class DynamoExecutionStateStoreTest {
         PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
         PipelineOrchestratorConfig.DynamoConfig dynamo = mock(PipelineOrchestratorConfig.DynamoConfig.class);
         when(config.dynamo()).thenReturn(dynamo);
+        when(dynamo.awaitCompletionLifecycleTable()).thenReturn("tpf_await_completion_lifecycle");
         when(dynamo.executionTable()).thenReturn(executionTable);
         when(dynamo.executionKeyTable()).thenReturn(keyTable);
         when(dynamo.executionPayloadTable()).thenReturn("tpf_execution_payload");
@@ -959,7 +1040,9 @@ class DynamoExecutionStateStoreTest {
         long now = System.currentTimeMillis();
         long ttl = now / 1000 + 3600;
         Map<String, AttributeValue> dlqItem = executionItem("tenant-a", "exec-1", "key-1", ttl, ExecutionStatus.DLQ);
+        Map<String, AttributeValue> running = executionItem("tenant-a", "exec-1", "key-1", ttl, ExecutionStatus.RUNNING);
 
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(running).build());
         when(client.updateItem(any(UpdateItemRequest.class)))
             .thenReturn(UpdateItemResponse.builder().attributes(dlqItem).build());
 
@@ -989,7 +1072,9 @@ class DynamoExecutionStateStoreTest {
             executionItem("tenant-a", "exec-1", "key-1", ttl, ExecutionStatus.FAILED));
         failedItem.put("failed_step_index", AttributeValue.builder().n("13").build());
         failedItem.put("failed_command_id", AttributeValue.builder().s("archive:confirmation-7").build());
+        Map<String, AttributeValue> running = executionItem("tenant-a", "exec-1", "key-1", ttl, ExecutionStatus.RUNNING);
 
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(running).build());
         when(client.updateItem(any(UpdateItemRequest.class)))
             .thenReturn(UpdateItemResponse.builder().attributes(failedItem).build());
 

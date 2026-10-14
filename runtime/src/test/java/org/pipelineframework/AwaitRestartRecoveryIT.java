@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -43,6 +44,7 @@ import org.pipelineframework.awaitable.AwaitInteractionTerminalException;
 import org.pipelineframework.awaitable.AwaitLifecycleCoverageRegistry;
 import org.pipelineframework.awaitable.AwaitUnitCreateCommand;
 import org.pipelineframework.awaitable.AwaitUnitRecord;
+import org.pipelineframework.awaitable.AwaitUnitOccurrence;
 import org.pipelineframework.awaitable.AwaitUnitStatus;
 import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
 import org.pipelineframework.awaitable.spi.AwaitUnitStore;
@@ -116,6 +118,7 @@ class AwaitRestartRecoveryIT {
     createTable(TABLE_PREFIX + "_unit", "tenant_id", "unit_id");
     createTable(TABLE_PREFIX + "_interaction", "tenant_id", "interaction_id");
     createTable(TABLE_PREFIX + "_interaction_key", "lookup_key", null);
+    createTable(TABLE_PREFIX + "_completion_lifecycle", "pk", "sk");
   }
 
   @AfterEach
@@ -162,6 +165,48 @@ class AwaitRestartRecoveryIT {
             AwaitLifecycleCoverageRegistry.journeyNamed("sequential_durable_shape_after_restart"),
             AwaitLifecycleCoverageRegistry.journeyNamed("terminal_cleanup_durable_state"))
         .map(journey -> DynamicTest.dynamicTest(journey.name(), () -> executeDynamoJourney(journey)));
+  }
+
+  @Test
+  void timeoutProjectionSurvivesFreshProviderAndOnlyScopedVersionMatchingAcknowledgementRetiresIt() {
+    long now = System.currentTimeMillis();
+    var creator = newInteractionStore();
+    var created = createInteraction(creator, "tenant-retained-timeout", "retained-timeout", now);
+    long dueAt = now + 61_000L;
+    var timedOut = creator.markTimedOut(created.tenantId(), created.interactionId(), created.version(), dueAt)
+        .await().indefinitely().orElseThrow();
+    assertEquals(AwaitInteractionStatus.TIMED_OUT, timedOut.status());
+    assertEquals(created.version() + 1, timedOut.version());
+
+    var fresh = org.pipelineframework.awaitable.store.DynamoAwaitLifecycleTestStores
+        .interactionStoreForCompletion(dynamo, TABLE_PREFIX);
+    var pending = fresh.findDueTimeoutConsequences(dueAt, 100).await().indefinitely().stream()
+        .filter(record -> record.interactionId().equals(timedOut.interactionId())).toList();
+    assertEquals(List.of(timedOut), pending);
+    for (String mismatch : List.of("tenant", "version", "execution", "unit")) {
+      var forged = org.mockito.Mockito.spy(timedOut);
+      switch (mismatch) {
+        case "tenant" -> when(forged.tenantId()).thenReturn("foreign-tenant");
+        case "version" -> when(forged.version()).thenReturn(timedOut.version() + 1);
+        case "execution" -> when(forged.executionId()).thenReturn("foreign-execution");
+        case "unit" -> when(forged.unitId()).thenReturn("foreign-unit");
+        default -> throw new AssertionError("Unknown acknowledgement mismatch");
+      }
+      assertThrows(IllegalStateException.class, () -> fresh.completeTimeoutConsequences(forged).await().indefinitely());
+    }
+    assertEquals(List.of(timedOut), fresh.findDueTimeoutConsequences(dueAt, 100).await().indefinitely().stream()
+        .filter(record -> record.interactionId().equals(timedOut.interactionId())).toList());
+    var semanticBeforeAcknowledgement = fresh.getMetadata(timedOut.tenantId(), timedOut.interactionId())
+        .await().indefinitely().orElseThrow();
+    fresh.completeTimeoutConsequences(timedOut).await().indefinitely();
+    fresh.completeTimeoutConsequences(timedOut).await().indefinitely();
+    var afterAcknowledgement = org.pipelineframework.awaitable.store.DynamoAwaitLifecycleTestStores
+        .interactionStoreForCompletion(dynamo, TABLE_PREFIX);
+    assertTrue(afterAcknowledgement.findDueTimeoutConsequences(dueAt, 100).await().indefinitely().stream()
+        .noneMatch(record -> record.interactionId().equals(timedOut.interactionId())));
+    assertEquals(semanticBeforeAcknowledgement, afterAcknowledgement.getMetadata(timedOut.tenantId(), timedOut.interactionId())
+        .await().indefinitely().orElseThrow());
+    assertThrows(IllegalArgumentException.class, () -> fresh.completeTimeoutConsequences(created).await().indefinitely());
   }
 
   private void executeDynamoJourney(AwaitLifecycleCoverageRegistry.Journey journey) {
@@ -442,6 +487,16 @@ class AwaitRestartRecoveryIT {
             .await().indefinitely().map(AwaitInteractionRecord::status)
             .orElseGet(() -> persistedInteractionStatus(interaction)));
     assertTerminalRaceConverges(interaction, attempts, Set.of(AwaitInteractionStatus.COMPLETED, AwaitInteractionStatus.TIMED_OUT));
+    var fresh = org.pipelineframework.awaitable.store.DynamoAwaitLifecycleTestStores
+        .interactionStoreForCompletion(dynamo, TABLE_PREFIX);
+    var persisted = fresh.getMetadata(interaction.tenantId(), interaction.interactionId()).await().indefinitely().orElseThrow();
+    var pending = fresh.findDueTimeoutConsequences(now + 61_000L, 100).await().indefinitely().stream()
+        .filter(record -> record.interactionId().equals(interaction.interactionId())).toList();
+    assertEquals(persisted.status() == AwaitInteractionStatus.TIMED_OUT ? List.of(persisted) : List.of(), pending);
+    if (persisted.status() == AwaitInteractionStatus.TIMED_OUT) {
+      fresh.completeTimeoutConsequences(persisted).await().indefinitely();
+      assertEquals(persisted, fresh.getMetadata(interaction.tenantId(), interaction.interactionId()).await().indefinitely().orElseThrow());
+    }
   }
 
   private void concurrentCancellationAndCompletionConverge(AwaitInteractionStore creator, long now) {
@@ -589,12 +644,13 @@ class AwaitRestartRecoveryIT {
             "tenant-empty", "parent-empty", new ExecutionInputSnapshot(ExecutionInputShape.UNI, "input"),
             ExecutionResultShape.MATERIALIZED_MULTI, now, ttl))
         .await().indefinitely();
+    String unitId = awaitUnitId(parent.record(), "tenant-empty", "AwaitPaymentProvider", 2);
     workerAStore.markWaitingExternal(
-            "tenant-empty", parent.record().executionId(), parent.record().version(), "await", "unit-empty", 2, now)
-        .await().indefinitely();
+            "tenant-empty", parent.record().executionId(), parent.record().version(), "await", unitId, 2, now)
+        .await().indefinitely().orElseThrow();
     ExecutionRecord<Object, Object> waitingParent = workerAStore.getExecution("tenant-empty", parent.record().executionId())
         .await().indefinitely().orElseThrow();
-    AwaitUnitRecord emptyUnit = emptyUnit(waitingParent.executionId(), ttl);
+    AwaitUnitRecord emptyUnit = emptyUnit(waitingParent.executionId(), ttl, unitId);
     persistUnit(emptyUnit);
 
     replaceScheduler();
@@ -634,16 +690,17 @@ class AwaitRestartRecoveryIT {
             tenantId, "terminal-cleanup-parent", new ExecutionInputSnapshot(ExecutionInputShape.UNI, "input"),
             ExecutionResultShape.MATERIALIZED_MULTI, now, ttl))
         .await().indefinitely();
+    String unitId = awaitUnitId(created.record(), tenantId, "AwaitPaymentProvider", 2);
     executionStore.markWaitingExternal(
-            tenantId, created.record().executionId(), created.record().version(), "await", "unit-terminal-cleanup", 2, now)
-        .await().indefinitely();
+            tenantId, created.record().executionId(), created.record().version(), "await", unitId, 2, now)
+        .await().indefinitely().orElseThrow();
     ExecutionRecord<Object, Object> waiting = executionStore
         .getExecution(tenantId, created.record().executionId()).await().indefinitely().orElseThrow();
 
     AwaitUnitStore unitStore = org.pipelineframework.awaitable.store.DynamoAwaitLifecycleTestStores
         .unitStore(dynamo, TABLE_PREFIX);
     AwaitUnitRecord createdUnit = unitStore.createOrGet(new AwaitUnitCreateCommand(
-            tenantId, "unit-terminal-cleanup", waiting.executionId(), "AwaitPaymentProvider", 2,
+            tenantId, unitId, waiting.executionId(), "AwaitPaymentProvider", 2,
             "ONE_TO_ONE", now, ttl))
         .await().indefinitely();
     AwaitUnitRecord completedUnit = unitStore.markDispatchComplete(
@@ -718,13 +775,14 @@ class AwaitRestartRecoveryIT {
             now,
             ttl))
         .await().indefinitely();
+    String unitId = awaitUnitId(parent.record(), "tenant-restart", "AwaitPaymentProvider", 2);
     workerAStore.markWaitingExternal(
             "tenant-restart", parent.record().executionId(), parent.record().version(),
-            "await", "unit-1", 2, now)
-        .await().indefinitely();
+            "await", unitId, 2, now)
+        .await().indefinitely().orElseThrow();
     ExecutionRecord<Object, Object> waitingParent = workerAStore.getExecution("tenant-restart", parent.record().executionId())
         .await().indefinitely().orElseThrow();
-    AwaitUnitRecord unit = unit(waitingParent.executionId(), ttl);
+    AwaitUnitRecord unit = unit(waitingParent.executionId(), ttl, "tenant-restart", unitId);
     persistUnit(unit);
 
     CreateExecutionResult firstChild = workerAStore.createOrGetExecution(new ExecutionCreateCommand(
@@ -756,7 +814,7 @@ class AwaitRestartRecoveryIT {
         new ItemContinuationClaims());
 
     workerB.captureOutput(
-            interaction(waitingParent.executionId(), 1),
+            interaction(waitingParent.executionId(), 1, "tenant-restart", unitId),
             unit,
             4,
             new ExecutionInputSnapshot(ExecutionInputShape.UNI, "second"),
@@ -776,7 +834,7 @@ class AwaitRestartRecoveryIT {
     // rather than either worker's local claim set, decides whether a semantic release is still due.
     ItemizedAwaitContinuationFlow workerC = flow(workerBStore, dispatcher);
     workerC.captureOutput(
-            interaction(waitingParent.executionId(), 1),
+            interaction(waitingParent.executionId(), 1, "tenant-restart", unitId),
             unit,
             4,
             new ExecutionInputSnapshot(ExecutionInputShape.UNI, "second"),
@@ -803,21 +861,22 @@ class AwaitRestartRecoveryIT {
             "tenant-admission", "parent-admission", new ExecutionInputSnapshot(ExecutionInputShape.UNI, "input"),
             ExecutionResultShape.MATERIALIZED_MULTI, now, ttl))
         .await().indefinitely();
+    String unitId = awaitUnitId(parent.record(), "tenant-admission", "AwaitPaymentProvider", 2);
     workerAStore.markWaitingExternal(
-            "tenant-admission", parent.record().executionId(), parent.record().version(), "await", "unit-admission", 2, now)
-        .await().indefinitely();
+            "tenant-admission", parent.record().executionId(), parent.record().version(), "await", unitId, 2, now)
+        .await().indefinitely().orElseThrow();
     ExecutionRecord<Object, Object> waitingParent = workerAStore.getExecution("tenant-admission", parent.record().executionId())
         .await().indefinitely().orElseThrow();
     AwaitUnitRecord unit = new AwaitUnitRecord(
-        "tenant-admission", "unit-admission", waitingParent.executionId(), "AwaitPaymentProvider", 2, "ONE_TO_ONE", 1L,
+        "tenant-admission", unitId, waitingParent.executionId(), "AwaitPaymentProvider", 2, "ONE_TO_ONE", 1L,
         AwaitUnitStatus.COMPLETED, null, 1, 1, Set.of("item:0"), true, 1L, 2L, ttl);
-    AwaitInteractionRecord interaction = interaction(waitingParent.executionId(), 0, "tenant-admission");
+    AwaitInteractionRecord interaction = interaction(waitingParent.executionId(), 0, "tenant-admission", unitId);
     AwaitCoordinator coordinator = mock(AwaitCoordinator.class);
-    when(coordinator.getUnit("tenant-admission", "unit-admission"))
+    when(coordinator.getUnit("tenant-admission", unitId))
         .thenReturn(Uni.createFrom().item(unit));
     when(coordinator.recordCompletion(any(), any(Long.class)))
         .thenReturn(Uni.createFrom().item(unit));
-    when(coordinator.findByUnit("tenant-admission", "unit-admission"))
+    when(coordinator.findByUnit("tenant-admission", unitId))
         .thenReturn(Uni.createFrom().item(List.of(interaction)));
     when(coordinator.completeItemContinuation(any()))
         .thenReturn(Uni.createFrom().voidItem());
@@ -903,19 +962,20 @@ class AwaitRestartRecoveryIT {
             now,
             ttl))
         .await().indefinitely();
+    String unitId = awaitUnitId(parent.record(), "tenant-premature", "AwaitPaymentProvider", 2);
     store.markWaitingExternal(
             "tenant-premature", parent.record().executionId(), parent.record().version(),
-            "await", "unit-1", 2, now)
-        .await().indefinitely();
+            "await", unitId, 2, now)
+        .await().indefinitely().orElseThrow();
     ExecutionRecord<Object, Object> waitingParent = store.getExecution("tenant-premature", parent.record().executionId())
         .await().indefinitely().orElseThrow();
-    AwaitUnitRecord unit = unit(waitingParent.executionId(), ttl, "tenant-premature");
+    AwaitUnitRecord unit = unit(waitingParent.executionId(), ttl, "tenant-premature", unitId);
     persistUnit(unit);
 
     replaceScheduler();
     ItemizedAwaitContinuationFlow flow = flow(store, dispatcher);
     flow.captureOutput(
-            interaction(waitingParent.executionId(), 0, "tenant-premature"),
+            interaction(waitingParent.executionId(), 0, "tenant-premature", unitId),
             unit,
             4,
             new ExecutionInputSnapshot(ExecutionInputShape.UNI, "first"),
@@ -926,7 +986,7 @@ class AwaitRestartRecoveryIT {
     ExecutionRecord<Object, Object> held = store.getExecution("tenant-premature", waitingParent.executionId())
         .await().indefinitely().orElseThrow();
     assertEquals(ExecutionStatus.WAITING_EXTERNAL, held.status());
-    assertEquals("unit-1", held.awaitUnitId());
+    assertEquals(unitId, held.awaitUnitId());
     verify(dispatcher, org.mockito.Mockito.never()).enqueueNow(any());
     assertTrue(store.getExecutionByKey(
             "tenant-premature", ItemContinuationKey.from(waitingParent, unit, 1).childExecutionKey())
@@ -947,6 +1007,21 @@ class AwaitRestartRecoveryIT {
                 KeySchemaElement.builder().attributeName(hash).keyType(KeyType.HASH).build(),
                 KeySchemaElement.builder().attributeName(range).keyType(KeyType.RANGE).build()))
         .provisionedThroughput(ProvisionedThroughput.builder().readCapacityUnits(10L).writeCapacityUnits(10L).build());
+    if (name.equals(TABLE_PREFIX + "_interaction")) {
+      table.attributeDefinitions(
+          AttributeDefinition.builder().attributeName(hash).attributeType(ScalarAttributeType.S).build(),
+          AttributeDefinition.builder().attributeName(range).attributeType(ScalarAttributeType.S).build(),
+          AttributeDefinition.builder().attributeName("query_deadline_key").attributeType(ScalarAttributeType.S).build(),
+          AttributeDefinition.builder().attributeName("query_deadline_sort").attributeType(ScalarAttributeType.S).build())
+          .globalSecondaryIndexes(software.amazon.awssdk.services.dynamodb.model.GlobalSecondaryIndex.builder()
+              .indexName("await-interaction-pending-by-deadline")
+              .keySchema(KeySchemaElement.builder().attributeName("query_deadline_key").keyType(KeyType.HASH).build(),
+                  KeySchemaElement.builder().attributeName("query_deadline_sort").keyType(KeyType.RANGE).build())
+              .projection(software.amazon.awssdk.services.dynamodb.model.Projection.builder()
+                  .projectionType(software.amazon.awssdk.services.dynamodb.model.ProjectionType.ALL).build())
+              .provisionedThroughput(ProvisionedThroughput.builder().readCapacityUnits(10L).writeCapacityUnits(10L).build())
+              .build());
+    }
     dynamo.createTable(table.build());
     dynamo.waiter().waitUntilTableExists(request -> request.tableName(name));
   }
@@ -997,14 +1072,22 @@ class AwaitRestartRecoveryIT {
   }
 
   private static AwaitUnitRecord unit(String executionId, long ttl, String tenantId) {
+    return unit(executionId, ttl, tenantId, "unit-1");
+  }
+
+  private static AwaitUnitRecord unit(String executionId, long ttl, String tenantId, String unitId) {
     return new AwaitUnitRecord(
-        tenantId, "unit-1", executionId, "AwaitPaymentProvider", 2, "ONE_TO_ONE", 1L,
+        tenantId, unitId, executionId, "AwaitPaymentProvider", 2, "ONE_TO_ONE", 1L,
         AwaitUnitStatus.COMPLETED, null, 2, 2, Set.of("item:0", "item:1"), true, 1L, 2L, ttl);
   }
 
   private static AwaitUnitRecord emptyUnit(String executionId, long ttl) {
+    return emptyUnit(executionId, ttl, "unit-empty");
+  }
+
+  private static AwaitUnitRecord emptyUnit(String executionId, long ttl, String unitId) {
     return new AwaitUnitRecord(
-        "tenant-empty", "unit-empty", executionId, "AwaitPaymentProvider", 2, "ONE_TO_ONE", 1L,
+        "tenant-empty", unitId, executionId, "AwaitPaymentProvider", 2, "ONE_TO_ONE", 1L,
         AwaitUnitStatus.COMPLETED, null, 0, 0, Set.of(), true, 1L, 2L, ttl);
   }
 
@@ -1013,10 +1096,19 @@ class AwaitRestartRecoveryIT {
   }
 
   private static AwaitInteractionRecord interaction(String executionId, int index, String tenantId) {
+    return interaction(executionId, index, tenantId, "unit-1");
+  }
+
+  private static AwaitInteractionRecord interaction(String executionId, int index, String tenantId, String unitId) {
     return new AwaitInteractionRecord(
         tenantId, executionId, "AwaitPaymentProvider", 2, String.class.getName(),
         "interaction-" + index, "correlation-" + index, "cause", "idempotency-" + index, 1L,
         AwaitInteractionStatus.COMPLETED, Map.of("value", "request"), Map.of("value", "response"),
-        "unit-1", index, "user", null, null, "kafka", Map.of(), 10_000L, 1L, 2L, 9_999_999L);
+        unitId, index, "user", null, null, "kafka", Map.of(), 10_000L, 1L, 2L, 9_999_999L);
+  }
+
+  private static String awaitUnitId(ExecutionRecord<?, ?> record, String tenantId, String stepId, int stepIndex) {
+    return new AwaitUnitOccurrence(tenantId, record.executionId(), record.executionId(), stepId, stepIndex,
+        record.awaitOccurrenceCause().orElseThrow()).unitId();
   }
 }

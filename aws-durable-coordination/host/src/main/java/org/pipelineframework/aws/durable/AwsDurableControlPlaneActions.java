@@ -26,6 +26,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
     private final ObjectMapper mapper;
     private final Duration actionTimeout;
     private final Duration callbackRetention;
+    private final AwsDurableHostTelemetry telemetry;
 
     public AwsDurableControlPlaneActions(
         PipelineControlPlane controlPlane,
@@ -35,12 +36,25 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         Duration actionTimeout,
         Duration callbackRetention
     ) {
+        this(controlPlane, bindings, inputDecoder, mapper, actionTimeout, callbackRetention, new AwsDurableHostTelemetry());
+    }
+
+    AwsDurableControlPlaneActions(
+        PipelineControlPlane controlPlane,
+        AwsDurableCallbackBindingRepository bindings,
+        AwsDurableInputDecoder inputDecoder,
+        ObjectMapper mapper,
+        Duration actionTimeout,
+        Duration callbackRetention,
+        AwsDurableHostTelemetry telemetry
+    ) {
         this.controlPlane = Objects.requireNonNull(controlPlane, "controlPlane");
         this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.inputDecoder = Objects.requireNonNull(inputDecoder, "inputDecoder");
         this.mapper = Objects.requireNonNull(mapper, "mapper");
         this.actionTimeout = positive(actionTimeout, "actionTimeout");
         this.callbackRetention = positive(callbackRetention, "callbackRetention");
+        this.telemetry = Objects.requireNonNull(telemetry, "telemetry");
     }
 
     @Override
@@ -63,9 +77,92 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             case QUERY_PENDING_AWAIT -> pendingAwait(request);
             case READ_AWAIT_CHECKPOINT -> awaitCheckpoint(request);
             case READ_EXECUTION_AWAITS -> executionAwaits(request);
+            case READ_AWAIT_COMPLETION -> completionObservation(request);
+            case QUERY_AWAIT_COMPLETIONS -> completionObservations(request);
+            case RECORD_AWAIT_RESUMED -> recordAwaitResumed(request);
+            case REGISTER_EXECUTION -> registerExecution(request);
             case REGISTER_CALLBACK -> register(request);
             case BIND_CALLBACK -> bind(request);
         };
+    }
+
+    private AwsDurableActionResponse completionObservation(AwsDurableActionRequest request) {
+        var identity = request.awaitIdentity().orElseThrow(
+            () -> new IllegalArgumentException("awaitIdentity is required"));
+        var observation = controlPlane.getAwaitCompletionObservation(request.tenantId(), identity.interactionId())
+            .await().atMost(actionTimeout);
+        telemetry.recordCompletion(observation);
+        return AwsDurableActionResponse.result(json(observation));
+    }
+
+    private AwsDurableActionResponse completionObservations(AwsDurableActionRequest request) {
+        var page = controlPlane.queryAwaitCompletionObservations(
+            request.tenantId(), request.completionPageLimit().orElse(100), request.completionCursor())
+            .await().atMost(actionTimeout);
+        telemetry.recordCompletionPage(request.tenantId(), page);
+        return AwsDurableActionResponse.result(json(page));
+    }
+
+    private AwsDurableActionResponse recordAwaitResumed(AwsDurableActionRequest request) {
+        var identity = request.awaitIdentity().orElseThrow(
+            () -> new IllegalArgumentException("awaitIdentity is required"));
+        if (!request.tenantId().equals(identity.tenantId())
+            || !request.executionId().filter(identity.executionId()::equals).isPresent()
+            || request.generation() != identity.generation()) {
+            throw new IllegalArgumentException("resume observation does not match its Await identity");
+        }
+        var checkpoint = driverCheckpoint(request);
+        String providerExecutionArn = required(request.providerExecutionArn(), "providerExecutionArn");
+        var registration = bindings.findRegistration(identity.tenantId(), identity.executionId(),
+            identity.generation(), identity.occurrence());
+        if (registration.filter(value -> value.checkpoint().equals(checkpoint)
+                && value.providerExecutionArn().equals(providerExecutionArn)
+                && value.awaitIdentity().filter(identity::equals).isPresent()).isEmpty()) {
+            return AwsDurableActionResponse.bound(false);
+        }
+        // A superseded driver's authentic historical observation is useful telemetry;
+        // it confers no current-generation authority or semantic consequence.
+        bindings.recordDriverResumed(identity);
+        return AwsDurableActionResponse.bound(true);
+    }
+
+    private AwsDurableActionResponse registerExecution(AwsDurableActionRequest request) {
+        if (request.idempotencyKey().isPresent()) {
+            // Validate the semantic owner's key policy and any existing admission before retaining correlation.
+            var existing = request.executionId().isPresent()
+                ? Optional.of(controlPlane.getExecutionSemanticCheckpoint(request.tenantId(), request.executionId().orElseThrow())
+                    .await().atMost(actionTimeout))
+                : controlPlane.getExecutionSemanticCheckpointByClientKey(request.tenantId(), request.idempotencyKey().orElseThrow())
+                    .await().atMost(actionTimeout);
+            existing.ifPresent(semantic -> requireRecoveryRelease(request, semantic));
+            return AwsDurableActionResponse.bound(bindings.registerAdmission(
+                new org.pipelineframework.aws.durable.model.AwsDurableAdmissionLocator(request.tenantId(),
+                    request.idempotencyKey().orElseThrow(), required(request.pipelineId(), "pipelineId"),
+                    required(request.contractVersion(), "contractVersion"), required(request.releaseVersion(), "releaseVersion"),
+                    request.executionId(), request.generation(), required(request.providerExecutionName(), "providerExecutionName"),
+                    required(request.providerExecutionArn(), "providerExecutionArn"))));
+        }
+        var semantic = controlPlane.getExecutionSemanticCheckpoint(request.tenantId(), required(request.executionId(), "executionId"))
+            .await().atMost(actionTimeout);
+        requireRecoveryRelease(request, semantic);
+        if (!required(request.executionId(), "executionId").equals(semantic.executionId())) {
+            throw new IllegalStateException("Recovery locator does not match semantic execution");
+        }
+        return AwsDurableActionResponse.bound(bindings.registerRecovery(
+            new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(
+                new org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint(
+                    new AwsDurableExecutionCheckpoint(semantic.tenantId(), semantic.executionId(), semantic.pipelineId(),
+                        semantic.contractVersion(), semantic.releaseVersion()), request.generation()),
+                required(request.providerExecutionName(), "providerExecutionName"), required(request.providerExecutionArn(), "providerExecutionArn"))));
+    }
+
+    private void requireRecoveryRelease(AwsDurableActionRequest request,
+        org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint semantic) {
+        if (!required(request.pipelineId(), "pipelineId").equals(semantic.pipelineId())
+            || !required(request.contractVersion(), "contractVersion").equals(semantic.contractVersion())
+            || !required(request.releaseVersion(), "releaseVersion").equals(semantic.releaseVersion())) {
+            throw new IllegalStateException("Recovery locator does not match semantic pipeline and release");
+        }
     }
 
     private AwsDurableActionResponse submit(AwsDurableActionRequest request) {
@@ -86,22 +183,27 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
 
     private AwsDurableActionResponse pendingAwait(AwsDurableActionRequest request) {
         String executionId = required(request.executionId(), "executionId");
-        return controlPlane.getCurrentAwaitSemanticCheckpoint(request.tenantId(), executionId)
-            .await().atMost(actionTimeout)
+        var selected = controlPlane.getCurrentAwaitSemanticCheckpoint(request.tenantId(), executionId,
+            request.awaitSelectionCursor()).await().atMost(actionTimeout);
+        return selected.checkpoint()
             .map(checkpoint -> AwsDurableActionResponse.pendingAwait(new AwsDurableAwaitIdentity(
                 checkpoint.tenantId(), checkpoint.executionId(), checkpoint.interactionId(), checkpoint.correlationId(),
                 request.generation())))
-            .orElseGet(AwsDurableControlPlaneActions::emptyResponse);
+            .orElseGet(AwsDurableControlPlaneActions::emptyResponse)
+            .withAwaitSelectionCursor(selected.nextCursor());
     }
 
     private AwsDurableActionResponse status(AwsDurableActionRequest request) {
         String executionId = required(request.executionId(), "executionId");
         String status = controlPlane.getExecutionStatus(request.tenantId(), executionId)
             .await().atMost(actionTimeout).status().name();
-        return AwsDurableActionResponse.observation(status, "WAITING_EXTERNAL".equals(status)
-            ? controlPlane.getCurrentAwaitSemanticCheckpoint(request.tenantId(), executionId)
-                .await().atMost(actionTimeout).map(this::providerCheckpoint)
-            : java.util.Optional.empty());
+        if (!"WAITING_EXTERNAL".equals(status)) {
+            return AwsDurableActionResponse.observation(status, Optional.empty());
+        }
+        var selected = controlPlane.getCurrentAwaitSemanticCheckpoint(request.tenantId(), executionId,
+            request.awaitSelectionCursor()).await().atMost(actionTimeout);
+        return AwsDurableActionResponse.observation(status, selected.checkpoint().map(this::providerCheckpoint))
+            .withAwaitSelectionCursor(selected.nextCursor());
     }
 
     private AwsDurableAwaitCheckpoint providerCheckpoint(AwaitSemanticCheckpoint checkpoint) {

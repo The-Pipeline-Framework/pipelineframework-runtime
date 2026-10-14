@@ -1,5 +1,9 @@
 package org.pipelineframework;
 
+import org.pipelineframework.orchestrator.AwaitSemanticSelection;
+
+import org.pipelineframework.awaitable.AwaitInteractionCursor;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -85,6 +89,18 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     }
 
     @Override
+    public Uni<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint> getExecutionSemanticCheckpoint(
+        String tenantId, String executionId) {
+        return queueAsyncCoordinator.getExecutionSemanticCheckpoint(tenantId, executionId);
+    }
+
+    @Override
+    public Uni<Optional<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(
+        String tenantId, String clientKey) {
+        return queueAsyncCoordinator.getExecutionSemanticCheckpointByClientKey(tenantId, clientKey);
+    }
+
+    @Override
     public Uni<ExecutionStatusDto> getExecutionStatus(String tenantId, String executionId) {
         return queueAsyncCoordinator.getExecutionStatus(tenantId, executionId);
     }
@@ -164,6 +180,18 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     }
 
     @Override
+    public Uni<org.pipelineframework.orchestrator.AwaitCompletionObservation> getAwaitCompletionObservation(
+        String tenantId, String interactionId) {
+        return queueAsyncCoordinator.getAwaitCompletionObservation(tenantId, interactionId);
+    }
+
+    @Override
+    public Uni<org.pipelineframework.orchestrator.AwaitCompletionObservationPage> queryAwaitCompletionObservations(
+        String tenantId, int limit, Optional<org.pipelineframework.awaitable.AwaitCompletionCursor> cursor) {
+        return queueAsyncCoordinator.queryAwaitCompletionObservations(tenantId, limit, cursor);
+    }
+
+    @Override
     public Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(
         String tenantId,
         String interactionId) {
@@ -174,6 +202,12 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     public Uni<Optional<AwaitSemanticCheckpoint>> getCurrentAwaitSemanticCheckpoint(
         String tenantId, String executionId) {
         return queueAsyncCoordinator.getCurrentAwaitSemanticCheckpoint(tenantId, executionId);
+    }
+
+    @Override
+    public Uni<AwaitSemanticSelection> getCurrentAwaitSemanticCheckpoint(
+        String tenantId, String executionId, Optional<AwaitInteractionCursor> cursor) {
+        return queueAsyncCoordinator.getCurrentAwaitSemanticCheckpoint(tenantId, executionId, cursor);
     }
 
     @Override

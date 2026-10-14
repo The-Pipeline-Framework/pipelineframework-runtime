@@ -102,6 +102,34 @@ class SegmentCommitPlanTest {
     assertEquals(List.of("one"), completed.outputItems());
   }
 
+  @Test
+  void importedSuspensionMustCarryTheStoredCauseAndExactPageScope() {
+    long now = System.currentTimeMillis();
+    var store = new org.pipelineframework.orchestrator.InMemoryExecutionStateStore();
+    var owner = store.createOrGetExecution(new org.pipelineframework.orchestrator.ExecutionCreateCommand(
+        "tenant-1", "causal", "pipeline-a", "contract-a", "release-a",
+        new ExecutionInputSnapshot(ExecutionInputShape.UNI, "input"), ExecutionResultShape.SINGLE,
+        now, now / 1000 + 3600)).await().indefinitely().record();
+    var segment = ClaimedSegment.from(owner);
+    String cause = owner.awaitOccurrenceCause().orElseThrow();
+    String current = new org.pipelineframework.awaitable.AwaitUnitOccurrence("tenant-1", owner.executionId(),
+        owner.executionId(), "Await", 2, cause).unitId();
+    assertInstanceOf(SuspendedSegment.class, SegmentCommitPlan.from(segment,
+        TransitionResultEnvelope.waiting(new TransitionAwaitSuspension("tenant-1", owner.executionId(), current, 2))));
+    for (String invalid : List.of("legacy-unit",
+        new org.pipelineframework.awaitable.AwaitUnitOccurrence("tenant-1", owner.executionId(), owner.executionId(),
+            "Await", 2, "previous-cause").unitId(),
+        new org.pipelineframework.awaitable.AwaitUnitOccurrence("tenant-1", owner.executionId(), owner.executionId() + ":page:1",
+            "Await", 2, cause).unitId())) {
+      assertThrows(IllegalStateException.class, () -> SegmentCommitPlan.from(segment,
+          TransitionResultEnvelope.waiting(new TransitionAwaitSuspension("tenant-1", owner.executionId(), invalid, 2))));
+    }
+    assertThrows(IllegalStateException.class, () -> SegmentCommitPlan.from(segment,
+        TransitionResultEnvelope.waiting(new TransitionAwaitSuspension("other", owner.executionId(), "legacy", 2))));
+    assertEquals(owner, store.getExecution("tenant-1", owner.executionId()).await().indefinitely().orElseThrow(),
+        "invalid worker results must be rejected before any parent projection mutation");
+  }
+
   private static ExecutionRecord<Object, Object> record(String executionId, ExecutionResultShape resultShape) {
     return record(executionId, resultShape, "input");
   }

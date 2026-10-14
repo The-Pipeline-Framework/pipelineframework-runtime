@@ -1,6 +1,9 @@
 package org.pipelineframework.awaitable;
 
 import org.junit.jupiter.api.Test;
+import java.util.Map;
+import java.util.Optional;
+import org.pipelineframework.orchestrator.PagedTransitionContext;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -84,5 +87,17 @@ class AwaitExecutionContextTest {
         context.currentStepIndex(10);
 
         assertEquals(10, context.currentStepIndex());
+    }
+
+    @Test
+    void retainsAwaitCauseSeparatelyFromCommandIdentity() {
+        var page = new PagedTransitionContext(2, "snapshot", Optional.empty(), 20);
+        AwaitExecutionContext context = new AwaitExecutionContext("tenant", "exec", 4,
+            AwaitContinuationMode.DURABLE_HANDOFF, TerminalOutputOwnership.TRANSITION_WORKER,
+            Map.of(), Optional.of(page), Optional.of("reissue-v7-command"));
+
+        assertEquals("exec:page:2", context.identityScope());
+        assertEquals(Optional.of("reissue-v7-command"), context.awaitOccurrenceCause());
+        assertEquals(Optional.empty(), new AwaitExecutionContext("tenant", "exec", 0).awaitOccurrenceCause());
     }
 }

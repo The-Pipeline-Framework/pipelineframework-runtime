@@ -20,6 +20,7 @@ import org.pipelineframework.awaitable.AwaitCoordinator;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.AwaitUnitRecord;
+import org.pipelineframework.awaitable.AwaitUnitOccurrence;
 import org.pipelineframework.awaitable.AwaitUnitStatus;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
 import org.pipelineframework.orchestrator.CreateExecutionResult;
@@ -190,19 +191,20 @@ class AwaitContinuationsTest {
             now,
             9_999_999_999L))
         .await().indefinitely();
+    String unitId = awaitUnitId(parent.record());
     store.markWaitingExternal(
             "tenant-1",
             parent.record().executionId(),
             parent.record().version(),
             "transition",
-            "unit-1",
+            unitId,
             2,
             now)
-        .await().indefinitely();
-    AwaitUnitRecord unit = awaitUnit(AwaitUnitStatus.COMPLETED, 2, 2, true, null);
+        .await().indefinitely().orElseThrow();
+    AwaitUnitRecord unit = awaitUnit(parent.record().executionId(), unitId, AwaitUnitStatus.COMPLETED, 2, 2, true, null);
 
     continuations.captureItemContinuationOutput(
-            itemAwaitRecord(parent.record().executionId(), 1, AwaitInteractionStatus.COMPLETED, "second"),
+            itemAwaitRecord(parent.record().executionId(), 1, AwaitInteractionStatus.COMPLETED, "second", unitId),
             unit,
             4,
             new ExecutionInputSnapshot(ExecutionInputShape.UNI, "second-normalized"),
@@ -212,7 +214,7 @@ class AwaitContinuationsTest {
     verify(workDispatcher, never()).enqueueNow(any());
 
     continuations.captureItemContinuationOutput(
-            itemAwaitRecord(parent.record().executionId(), 0, AwaitInteractionStatus.COMPLETED, "first"),
+            itemAwaitRecord(parent.record().executionId(), 0, AwaitInteractionStatus.COMPLETED, "first", unitId),
             unit,
             4,
             new ExecutionInputSnapshot(ExecutionInputShape.UNI, "first-normalized"),
@@ -234,9 +236,9 @@ class AwaitContinuationsTest {
     ControlPlaneProjection projection = journal.projection("tenant-1", parent.record().executionId())
         .await().indefinitely();
     assertTrue(projection.factKeys().contains("continuation-segment-created:"
-        + parent.record().executionId() + ":segment:await-item:unit-1:0"));
+        + parent.record().executionId() + ":segment:await-item:" + unitId + ":0"));
     assertTrue(projection.factKeys().contains("continuation-segment-created:"
-        + parent.record().executionId() + ":segment:await-item:unit-1:1"));
+        + parent.record().executionId() + ":segment:await-item:" + unitId + ":1"));
     assertTrue(projection.factKeys().contains("continuation-segment-created:"
         + parent.record().executionId() + ":segment:4"));
   }
@@ -255,17 +257,18 @@ class AwaitContinuationsTest {
             now,
             9_999_999_999L))
         .await().indefinitely();
+    String unitId = awaitUnitId(parent.record());
     store.markWaitingExternal(
             "tenant-1",
             parent.record().executionId(),
             parent.record().version(),
             "transition",
-            "unit-1",
+            unitId,
             2,
             now)
-        .await().indefinitely();
-    AwaitUnitRecord unit = awaitUnit(parent.record().executionId(), AwaitUnitStatus.COMPLETED, 1, 1, true, null);
-    String childKey = "parent-key:await-item:unit-1:0";
+        .await().indefinitely().orElseThrow();
+    AwaitUnitRecord unit = awaitUnit(parent.record().executionId(), unitId, AwaitUnitStatus.COMPLETED, 1, 1, true, null);
+    String childKey = "parent-key:await-item:" + unitId + ":0";
     CreateExecutionResult child = store.createOrGetExecution(new ExecutionCreateCommand(
             "tenant-1",
             childKey,
@@ -284,7 +287,7 @@ class AwaitContinuationsTest {
         .await().indefinitely();
 
     continuations.captureItemContinuationOutput(
-            itemAwaitRecord(parent.record().executionId(), 0, AwaitInteractionStatus.COMPLETED, "first"),
+            itemAwaitRecord(parent.record().executionId(), 0, AwaitInteractionStatus.COMPLETED, "first", unitId),
             unit,
             4,
             new ExecutionInputSnapshot(ExecutionInputShape.UNI, "normalized"),
@@ -295,7 +298,7 @@ class AwaitContinuationsTest {
     ControlPlaneProjection projection = journal.projection("tenant-1", parent.record().executionId())
         .await().indefinitely();
     assertTrue(projection.factKeys().contains("continuation-segment-created:"
-        + parent.record().executionId() + ":segment:await-item:unit-1:0"));
+        + parent.record().executionId() + ":segment:await-item:" + unitId + ":0"));
     assertTrue(projection.factKeys().contains("continuation-segment-created:"
         + parent.record().executionId() + ":segment:4"));
     verify(workDispatcher).enqueueNow(new ExecutionWorkItem("tenant-1", parent.record().executionId()));
@@ -315,17 +318,18 @@ class AwaitContinuationsTest {
             now,
             9_999_999_999L))
         .await().indefinitely();
+    String unitId = awaitUnitId(parent.record());
     store.markWaitingExternal(
             "tenant-1",
             parent.record().executionId(),
             parent.record().version(),
             "transition",
-            "unit-1",
+            unitId,
             2,
             now)
-        .await().indefinitely();
-    AwaitUnitRecord unit = awaitUnit(parent.record().executionId(), AwaitUnitStatus.COMPLETED, 1, 1, true, null);
-    String childKey = "parent-key:await-item:unit-1:0";
+        .await().indefinitely().orElseThrow();
+    AwaitUnitRecord unit = awaitUnit(parent.record().executionId(), unitId, AwaitUnitStatus.COMPLETED, 1, 1, true, null);
+    String childKey = "parent-key:await-item:" + unitId + ":0";
     CreateExecutionResult child = store.createOrGetExecution(new ExecutionCreateCommand(
             "tenant-1",
             childKey,
@@ -345,7 +349,7 @@ class AwaitContinuationsTest {
     store.markAwaitItemContinuationsCompleted(
             "tenant-1",
             parent.record().executionId(),
-            "unit-1",
+            unitId,
             4,
             new ExecutionInputSnapshot(ExecutionInputShape.MULTI, List.of("out-0")),
             now)
@@ -460,6 +464,15 @@ class AwaitContinuationsTest {
       int itemIndex,
       AwaitInteractionStatus status,
       String response) {
+    return itemAwaitRecord(executionId, itemIndex, status, response, "unit-1");
+  }
+
+  private static AwaitInteractionRecord itemAwaitRecord(
+      String executionId,
+      int itemIndex,
+      AwaitInteractionStatus status,
+      String response,
+      String unitId) {
     return new AwaitInteractionRecord(
         "tenant-1",
         executionId,
@@ -474,7 +487,7 @@ class AwaitContinuationsTest {
         status,
         Map.of("value", "request-" + itemIndex),
         Map.of("value", response),
-        "unit-1",
+        unitId,
         itemIndex,
         "user-1",
         null,
@@ -503,9 +516,21 @@ class AwaitContinuationsTest {
         int completedItemCount,
         boolean dispatchComplete,
         String primaryInteractionId) {
+      return awaitUnit(executionId, "unit-1", status, expectedItemCount, completedItemCount,
+          dispatchComplete, primaryInteractionId);
+    }
+
+    private AwaitUnitRecord awaitUnit(
+        String executionId,
+        String unitId,
+        AwaitUnitStatus status,
+        Integer expectedItemCount,
+        int completedItemCount,
+        boolean dispatchComplete,
+        String primaryInteractionId) {
       AwaitUnitRecord unit = new AwaitUnitRecord(
           "tenant-1",
-          "unit-1",
+          unitId,
           executionId,
           "AwaitPaymentProvider",
         2,
@@ -524,6 +549,11 @@ class AwaitContinuationsTest {
           999_999L);
       durableUnitsById.put(unit.unitId(), unit);
       return unit;
+  }
+
+  private static String awaitUnitId(ExecutionRecord<?, ?> record) {
+    return new AwaitUnitOccurrence("tenant-1", record.executionId(), record.executionId(),
+        "AwaitPaymentProvider", 2, record.awaitOccurrenceCause().orElseThrow()).unitId();
   }
 
   private static ExecutionRecord<Object, Object> record(
