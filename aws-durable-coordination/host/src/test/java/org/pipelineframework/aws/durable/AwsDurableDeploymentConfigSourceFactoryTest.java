@@ -31,6 +31,20 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
         assertThat(requests).isEmpty();
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {
+        "tpf.aws.durable.resume-token-secret-arn", "tpf.aws.durable.worker-secret-arn",
+        "tpf.aws.durable.resume-token-secret-version", "tpf.aws.durable.worker-secret-version",
+        "pipeline.orchestrator.resume-token-secret", "pipeline.orchestrator.worker.sqs.shared-secret",
+        "pipeline.orchestrator.worker.sqs.shared-secret-ref", "tpf.aws.durable.configuration"})
+    void partialSecretConfigurationRequiresPreflightBeforeAnyRead(String property) {
+        var requests = new ArrayList<GetSecretValueRequest>();
+        var values = Map.of(property, property.endsWith("configuration") ? "{}" : SECRET);
+        assertThatThrownBy(() -> build(values, requests)).isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("requires preflight validation").hasMessageNotContaining(SECRET);
+        assertThat(requests).isEmpty();
+    }
+
     @Test
     void resolvesBothExactVersionsOnceIntoExistingRuntimeConfiguration() {
         var requests = new ArrayList<GetSecretValueRequest>();

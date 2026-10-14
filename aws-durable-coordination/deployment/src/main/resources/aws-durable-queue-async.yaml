@@ -564,9 +564,9 @@ Resources:
     UpdateReplacePolicy: Retain
     Metadata:
       cfn-lint: {config: {ignore_checks: [E3002]}}
-    DependsOn: DurableFunctionLogs
     Properties:
       FunctionName: !Sub '${AWS::StackName}-durable'
+      LoggingConfig: {LogGroup: !Ref DurableFunctionLogs}
       Code: {S3Bucket: !Ref DurableArtifactBucket, S3Key: !Ref DurableArtifactKey}
       Handler: org.pipelineframework.aws.durable.AwsDurableCoordinatorHandler::handleRequest
       Runtime: java21
@@ -606,9 +606,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::Serverless::Function
-    DependsOn: ActionFunctionLogs
     Properties: &ActionProperties
       FunctionName: !Sub '${AWS::StackName}-action'
+      LoggingConfig: {LogGroup: !Ref ActionFunctionLogs}
       CodeUri: !Ref ActionArtifactUri
       Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
       Role: !GetAtt ActionRole.Arn
@@ -654,10 +654,10 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::Lambda::Function
-    DependsOn: IngressFunctionLogs
     Properties:
       Code: {S3Bucket: !Ref DurableArtifactBucket, S3Key: !Ref DurableArtifactKey}
       FunctionName: !Sub '${AWS::StackName}-ingress'
+      LoggingConfig: {LogGroup: !Ref IngressFunctionLogs}
       KmsKeyArn: !Ref HostKmsKeyArn
       ReservedConcurrentExecutions: 16
       Handler: org.pipelineframework.aws.durable.AwsDurableIngressHandler::handleRequest
@@ -684,10 +684,10 @@ Resources:
 
   WorkFunction:
     <<: *ActionFunction
-    DependsOn: WorkFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-work'
+      LoggingConfig: {LogGroup: !Ref WorkFunctionLogs}
       Role: !GetAtt WorkerRole.Arn
       Timeout: 900
       Environment:
@@ -695,10 +695,10 @@ Resources:
 
   AwaitCompletionFunction:
     <<: *ActionFunction
-    DependsOn: AwaitCompletionFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-await-completion'
+      LoggingConfig: {LogGroup: !Ref AwaitCompletionFunctionLogs}
       Role: !GetAtt WorkerRole.Arn
       Environment:
         Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref AwaitCompletionHandler}
@@ -706,10 +706,10 @@ Resources:
   TransitionWorkerFunction:
     Condition: FunctionTransitionConsumer
     <<: *ActionFunction
-    DependsOn: TransitionWorkerFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-transition-worker'
+      LoggingConfig: {LogGroup: !Ref TransitionWorkerFunctionLogs}
       Role: !GetAtt WorkerRole.Arn
       Timeout: 900
       Environment:
@@ -717,10 +717,10 @@ Resources:
 
   AwaitWakeupFunction:
     <<: *ActionFunction
-    DependsOn: AwaitWakeupFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-await-wakeup'
+      LoggingConfig: {LogGroup: !Ref AwaitWakeupFunctionLogs}
       Role: !GetAtt WakeupRole.Arn
       Environment:
         Variables:
@@ -731,10 +731,10 @@ Resources:
 
   ExecutionWakeupFunction:
     <<: *ActionFunction
-    DependsOn: ExecutionWakeupFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-execution-wakeup'
+      LoggingConfig: {LogGroup: !Ref ExecutionWakeupFunctionLogs}
       Role: !GetAtt WakeupRole.Arn
       Environment:
         Variables:
@@ -744,10 +744,10 @@ Resources:
 
   DueWorkFunction:
     <<: *ActionFunction
-    DependsOn: DueWorkFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-due-work'
+      LoggingConfig: {LogGroup: !Ref DueWorkFunctionLogs}
       Role: !GetAtt DueWorkRole.Arn
       ReservedConcurrentExecutions: 2
       Environment:
@@ -933,10 +933,10 @@ Resources:
 
   ReconciliationFunction:
     <<: *ActionFunction
-    DependsOn: ReconciliationFunctionLogs
     Properties:
       <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-reconcile'
+      LoggingConfig: {LogGroup: !Ref ReconciliationFunctionLogs}
       Role: !GetAtt WakeupRole.Arn
       ReservedConcurrentExecutions: 2
       Environment:
@@ -1043,7 +1043,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-durable'
+      LogGroupName: !Sub
+        - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/durable'
+        - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       KmsKeyId: !Ref HostKmsKeyArn
       RetentionInDays: !Ref LogRetentionDays
   ExecutionWakeupFunctionLogs:
@@ -1051,7 +1053,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-execution-wakeup'
+      LogGroupName: !Sub
+        - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/execution-wakeup'
+        - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       RetentionInDays: !Ref LogRetentionDays
       KmsKeyId: !Ref HostKmsKeyArn
   DueWorkFunctionLogs:
@@ -1059,7 +1063,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-due-work'
+      LogGroupName: !Sub
+        - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/due-work'
+        - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       RetentionInDays: !Ref LogRetentionDays
       KmsKeyId: !Ref HostKmsKeyArn
   DurableFunctionErrorsAlarm:
@@ -1103,7 +1109,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-action'
+      LogGroupName: !Sub
+        - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/action'
+        - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       KmsKeyId: !Ref HostKmsKeyArn
       RetentionInDays: !Ref LogRetentionDays
   ActionFunctionErrorsAlarm:
@@ -1130,7 +1138,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-ingress'
+      LogGroupName: !Sub
+        - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/ingress'
+        - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       KmsKeyId: !Ref HostKmsKeyArn
       RetentionInDays: !Ref LogRetentionDays
   IngressFunctionErrorsAlarm:
@@ -1157,7 +1167,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-work'
+      LogGroupName: !Sub
+        - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/work'
+        - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       KmsKeyId: !Ref HostKmsKeyArn
       RetentionInDays: !Ref LogRetentionDays
   WorkFunctionErrorsAlarm:
@@ -1184,7 +1196,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-await-completion'
+      LogGroupName: !Sub
+        - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/await-completion'
+        - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       KmsKeyId: !Ref HostKmsKeyArn
       RetentionInDays: !Ref LogRetentionDays
   AwaitCompletionFunctionErrorsAlarm:
@@ -1212,7 +1226,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-transition-worker'
+      LogGroupName: !Sub
+        - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/transition-worker'
+        - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       KmsKeyId: !Ref HostKmsKeyArn
       RetentionInDays: !Ref LogRetentionDays
   TransitionWorkerFunctionErrorsAlarm:
@@ -1241,7 +1257,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-await-wakeup'
+      LogGroupName: !Sub
+        - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/await-wakeup'
+        - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       KmsKeyId: !Ref HostKmsKeyArn
       RetentionInDays: !Ref LogRetentionDays
   AwaitWakeupFunctionErrorsAlarm:
@@ -1268,7 +1286,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-reconcile'
+      LogGroupName: !Sub
+        - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/reconcile'
+        - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       KmsKeyId: !Ref HostKmsKeyArn
       RetentionInDays: !Ref LogRetentionDays
   ReconciliationFunctionErrorsAlarm:

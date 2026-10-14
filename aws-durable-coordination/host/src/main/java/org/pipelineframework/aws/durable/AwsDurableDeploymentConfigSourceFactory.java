@@ -51,8 +51,12 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             @Override public java.util.Iterator<String> iterateNames() { return originalContext.iterateNames(); }
         };
         if (value(context, PREFIX + "deployment-validation").isEmpty()) {
-            if (!settings.isEmpty() || value(context, PREFIX + "resume-token-secret-arn").isPresent()
-                || value(context, PREFIX + "worker-secret-arn").isPresent()) {
+            if (!settings.isEmpty() || List.of(PREFIX + "configuration",
+                PREFIX + "resume-token-secret-arn", PREFIX + "worker-secret-arn",
+                PREFIX + "resume-token-secret-version", PREFIX + "worker-secret-version",
+                "pipeline.orchestrator.resume-token-secret", "pipeline.orchestrator.worker.sqs.shared-secret",
+                "pipeline.orchestrator.worker.sqs.shared-secret-ref")
+                .stream().anyMatch(property -> value(context, property).isPresent())) {
                 throw new IllegalArgumentException("AWS Durable deployment requires preflight validation");
             }
             return List.of(); // Plain coordinator packages and ordinary builds do not load application secrets.

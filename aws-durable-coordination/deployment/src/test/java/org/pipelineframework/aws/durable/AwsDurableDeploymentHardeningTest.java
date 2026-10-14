@@ -19,6 +19,33 @@ class AwsDurableDeploymentHardeningTest {
     }
 
     @Test
+    void eachHostRoutesToItsOwnStackScopedTpfLogGroup() throws Exception {
+        var resources = template().path("Resources");
+        var names = new java.util.HashSet<String>();
+        int hosts = 0;
+        var entries = resources.fields();
+        while (entries.hasNext()) {
+            var entry = entries.next();
+            if (!entry.getKey().endsWith("Function")) continue;
+            hosts++;
+            String logs = entry.getKey() + "Logs";
+            assertEquals(logs, entry.getValue().path("Properties").path("LoggingConfig").path("LogGroup").asText(),
+                entry.getKey());
+            var name = resources.path(logs).path("Properties").path("LogGroupName");
+            assertTrue(name.isArray(), "Explicit stack-instance substitution required: " + logs);
+            String format = name.get(0).asText();
+            assertTrue(format.startsWith("/tpf/aws-durable/${AWS::StackName}/${StackInstance}/"), logs);
+            assertTrue(names.add(format), "Each host needs a distinct log group");
+            // A stable stack ID preserves upgrade names; a recreated stack gets a new instance suffix.
+            var instance = name.get(1).path("StackInstance");
+            assertEquals(2, instance.get(0).asInt());
+            assertEquals("/", instance.get(1).get(0).asText());
+            assertEquals("AWS::StackId", instance.get(1).get(1).asText());
+        }
+        assertEquals(10, hosts);
+    }
+
+    @Test
     void computeDisablesOnlyTransitionConsumptionAndRequiresExclusiveConsumerValidation() throws Exception {
         var template = template(); var resources = template.path("Resources");
         assertFalse(template.path("Parameters").path("TransitionWorkerPlacement").has("Default"));
@@ -49,7 +76,8 @@ class AwsDurableDeploymentHardeningTest {
                 assertEquals("LogRetentionDays", logs.path("Properties").path("RetentionInDays").asText());
                 assertEquals("HostKmsKeyArn", logs.path("Properties").path("KmsKeyId").asText());
                 assertEquals("Retain", logs.path("DeletionPolicy").asText());
-                assertEquals(entry.getKey() + "Logs", resource.path("DependsOn").asText());
+                // Ref establishes log-group creation before the function without a redundant DependsOn.
+                assertEquals(entry.getKey() + "Logs", resource.path("Properties").path("LoggingConfig").path("LogGroup").asText());
                 assertTrue(resources.has(entry.getKey() + "ErrorsAlarm"));
                 assertTrue(resources.has(entry.getKey() + "ThrottlesAlarm"));
             }
