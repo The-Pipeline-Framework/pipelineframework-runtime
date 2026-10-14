@@ -40,6 +40,58 @@ import org.pipelineframework.orchestrator.TransitionAwaitSuspension;
 class AwaitCoordinatorCompletionTest {
 
     @Test
+    void timeoutRecoverySkipsExistingTerminalUnitsAndTelemetry() {
+        for (var status : AwaitUnitStatus.values()) {
+            if (!status.terminal()) continue;
+            var interactions = new InMemoryAwaitInteractionStore();
+            var units = org.mockito.Mockito.spy(new InMemoryAwaitUnitStore());
+            var coordinator = coordinator(interactions);
+            coordinator.unitStores = new SimpleInstance<>(List.<AwaitUnitStore>of(units));
+            var created = coordinator.createOrGet(descriptor("FraudCheck"), "tenant-1", "exec-1", 1,
+                "cause", Map.of("paymentRecordId", "p-1"), "alice", "review").await().indefinitely().record();
+            long now = created.deadlineEpochMs() + 1;
+            var timedOut = interactions.markTimedOut(created.tenantId(), created.interactionId(),
+                created.version(), now).await().indefinitely().orElseThrow();
+            var terminal = units.markTerminal(created.tenantId(), created.unitId(), status, now)
+                .await().indefinitely().orElseThrow();
+            org.mockito.Mockito.clearInvocations(units);
+            coordinator.awaitTelemetry = mock(AwaitTelemetry.class);
+
+            coordinator.reconcileTimedOut(timedOut, now + 1).await().indefinitely();
+            coordinator.reconcileTimedOut(timedOut, now + 2).await().indefinitely();
+
+            assertEquals(terminal, units.get(created.tenantId(), created.unitId()).await().indefinitely().orElseThrow());
+            verify(units, never()).markTerminal(anyString(), anyString(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.anyLong());
+            org.mockito.Mockito.verifyNoInteractions(coordinator.awaitTelemetry);
+        }
+    }
+
+    @Test
+    void timeoutRecoveryMarksNonterminalUnitAndRecordsTelemetryOnce() {
+        var interactions = new InMemoryAwaitInteractionStore();
+        var units = org.mockito.Mockito.spy(new InMemoryAwaitUnitStore());
+        var coordinator = coordinator(interactions);
+        coordinator.unitStores = new SimpleInstance<>(List.<AwaitUnitStore>of(units));
+        var created = coordinator.createOrGet(descriptor("FraudCheck"), "tenant-1", "exec-1", 1,
+            "cause", Map.of("paymentRecordId", "p-1"), "alice", "review").await().indefinitely().record();
+        long now = created.deadlineEpochMs() + 1;
+        var timedOut = interactions.markTimedOut(created.tenantId(), created.interactionId(),
+            created.version(), now).await().indefinitely().orElseThrow();
+        coordinator.awaitTelemetry = mock(AwaitTelemetry.class);
+
+        coordinator.reconcileTimedOut(timedOut, now).await().indefinitely();
+        var terminal = units.get(created.tenantId(), created.unitId()).await().indefinitely().orElseThrow();
+        coordinator.reconcileTimedOut(timedOut, now + 1).await().indefinitely();
+
+        assertEquals(AwaitUnitStatus.TIMED_OUT, terminal.status());
+        verify(units).markTerminal(created.tenantId(), created.unitId(), AwaitUnitStatus.TIMED_OUT, now);
+        verify(units, org.mockito.Mockito.times(1)).markTerminal(anyString(), anyString(),
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyLong());
+        verify(coordinator.awaitTelemetry).recordUnitTerminal(timedOut, terminal);
+    }
+
+    @Test
     void qualifiedScalarCreateMustObservePrimaryAttachmentWinner() {
         var coordinator = coordinator(new InMemoryAwaitInteractionStore());
         var units = org.mockito.Mockito.spy(new InMemoryAwaitUnitStore());

@@ -138,12 +138,16 @@ class ExecutionReadModelTest {
   void clientKeyCheckpointRejectsInputDerivedKeysAndAdmissionDenialBeforeStorage() {
     when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
     when(orchestratorConfig.idempotencyPolicy()).thenReturn(org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy.SERVER_KEY_ONLY);
-    assertThrows(IllegalStateException.class, () -> readModel.getExecutionSemanticCheckpointByClientKey("tenant-1", "key-1"));
+    var invalidKeyRead = org.junit.jupiter.api.Assertions.assertDoesNotThrow(() ->
+        readModel.getExecutionSemanticCheckpointByClientKey("tenant-1", "key-1"));
+    assertThrows(IllegalStateException.class, () -> invalidKeyRead.await().indefinitely());
     org.mockito.Mockito.verifyNoInteractions(executionStateStore, admissionPolicy);
     when(orchestratorConfig.idempotencyPolicy()).thenReturn(org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy.CLIENT_KEY_REQUIRED);
     when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.deny("read-denied", "no reads"));
-    assertThrows(ControlPlaneAdmissionException.class, () ->
-        readModel.getExecutionSemanticCheckpointByClientKey("tenant-1", "key-1").await().indefinitely());
+    var deniedRead = org.junit.jupiter.api.Assertions.assertDoesNotThrow(() ->
+        readModel.getExecutionSemanticCheckpointByClientKey("tenant-1", "key-1"));
+    org.mockito.Mockito.verifyNoInteractions(executionStateStore, admissionPolicy);
+    assertThrows(ControlPlaneAdmissionException.class, () -> deniedRead.await().indefinitely());
     org.mockito.Mockito.verifyNoInteractions(executionStateStore);
   }
 

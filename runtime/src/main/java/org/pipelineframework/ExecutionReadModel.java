@@ -205,28 +205,30 @@ class ExecutionReadModel {
   /** An absent admission remains absent; this lookup never creates or redrives execution state. */
   Uni<Optional<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(
       String tenantId, String clientKey) {
-    if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
-      return Uni.createFrom().failure(new IllegalStateException("Async queue mode is disabled"));
-    }
-    String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
-    String resolvedKey = executionInputPolicy.requireRecoverableClientKey(clientKey);
-    // There is no execution identifier before the lookup. Policies may reject this tenant-scoped read.
-    Optional<RuntimeException> denied = admissionFailure(new ControlPlaneAdmissionRequest(resolvedTenant,
-        ControlPlaneAdmissionOperation.GET_EXECUTION_STATUS, pipelineId.get(), releaseVersion.get(),
-        "", "api", tenantId != null && !tenantId.isBlank()));
-    if (denied.isPresent()) return Uni.createFrom().failure(denied.get());
-    return executionStateStore.getExecutionByKey(resolvedTenant, resolvedKey).onItem().transform(record ->
-        record.map(value -> {
-          if (!resolvedTenant.equals(value.tenantId()) || !resolvedKey.equals(value.executionKey())) {
-            throw new IllegalStateException("Execution key lookup returned a foreign tenant or client key");
-          }
-          Optional<RuntimeException> executionDenied = admissionFailure(new ControlPlaneAdmissionRequest(resolvedTenant,
-              ControlPlaneAdmissionOperation.GET_EXECUTION_STATUS, pipelineId.get(), releaseVersion.get(),
-              value.executionId(), "api", tenantId != null && !tenantId.isBlank()));
-          if (executionDenied.isPresent()) throw executionDenied.get();
-          return new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint(value.tenantId(), value.executionId(),
-              value.pipelineId(), value.contractVersion(), value.releaseVersion(), value.status());
-        }));
+    return Uni.createFrom().deferred(() -> {
+      if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
+        return Uni.createFrom().failure(new IllegalStateException("Async queue mode is disabled"));
+      }
+      String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
+      String resolvedKey = executionInputPolicy.requireRecoverableClientKey(clientKey);
+      // There is no execution identifier before the lookup. Policies may reject this tenant-scoped read.
+      Optional<RuntimeException> denied = admissionFailure(new ControlPlaneAdmissionRequest(resolvedTenant,
+          ControlPlaneAdmissionOperation.GET_EXECUTION_STATUS, pipelineId.get(), releaseVersion.get(),
+          "", "api", tenantId != null && !tenantId.isBlank()));
+      if (denied.isPresent()) return Uni.createFrom().failure(denied.get());
+      return executionStateStore.getExecutionByKey(resolvedTenant, resolvedKey).onItem().transform(record ->
+          record.map(value -> {
+            if (!resolvedTenant.equals(value.tenantId()) || !resolvedKey.equals(value.executionKey())) {
+              throw new IllegalStateException("Execution key lookup returned a foreign tenant or client key");
+            }
+            Optional<RuntimeException> executionDenied = admissionFailure(new ControlPlaneAdmissionRequest(resolvedTenant,
+                ControlPlaneAdmissionOperation.GET_EXECUTION_STATUS, pipelineId.get(), releaseVersion.get(),
+                value.executionId(), "api", tenantId != null && !tenantId.isBlank()));
+            if (executionDenied.isPresent()) throw executionDenied.get();
+            return new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint(value.tenantId(), value.executionId(),
+                value.pipelineId(), value.contractVersion(), value.releaseVersion(), value.status());
+          }));
+    });
   }
 
   Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(

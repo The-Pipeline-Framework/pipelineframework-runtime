@@ -284,9 +284,8 @@ class AwaitItemContinuationRecoveryTest {
         Runtime interrupted = runtime(new Stores(stores.executions(), stores.interactions(), failingUnits),
             calls, Optional.empty(), 0);
 
-        var failure = assertThrows(IllegalStateException.class,
-            () -> interrupted.controlPlane().sweepOnce(deadline).await().atMost(TIMEOUT));
-        assertEquals("injected unit-store failure", failure.getMessage());
+        assertDoesNotThrow(() -> interrupted.controlPlane().sweepOnce(deadline).await().atMost(TIMEOUT));
+        verify(failingUnits).markTerminal(eq(tenant), eq(unitId), eq(AwaitUnitStatus.TIMED_OUT), anyLong());
         assertEquals(AwaitInteractionStatus.TIMED_OUT, stores.interactions().get(tenant, requested.interactionId())
             .await().atMost(TIMEOUT).orElseThrow().status(), "Actual interaction timeout committed before the cut");
         assertEquals(ExecutionStatus.WAITING_EXTERNAL, stores.executions().getExecution(tenant, parent.executionId())
@@ -357,9 +356,7 @@ class AwaitItemContinuationRecoveryTest {
         }
         var calls = new AtomicInteger();
         Runtime interrupted = runtime(interruptedStores, calls, Optional.empty(), 0, interruptedJournal);
-        var failure = assertThrows(IllegalStateException.class,
-            () -> interrupted.controlPlane().sweepOnce(seed.deadline()).await().atMost(TIMEOUT));
-        assertEquals(cut.name(), failure.getMessage());
+        assertDoesNotThrow(() -> interrupted.controlPlane().sweepOnce(seed.deadline()).await().atMost(TIMEOUT));
         assertEquals(AwaitInteractionStatus.TIMED_OUT, stores.interactions().get(seed.tenant(), seed.interaction().interactionId())
             .await().atMost(TIMEOUT).orElseThrow().status());
         assertEquals(AwaitUnitStatus.TIMED_OUT, stores.units().get(seed.tenant(), seed.unitId())

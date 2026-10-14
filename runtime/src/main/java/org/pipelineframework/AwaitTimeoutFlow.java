@@ -13,6 +13,8 @@ import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 
 class AwaitTimeoutFlow {
 
+  private static final org.jboss.logging.Logger LOG = org.jboss.logging.Logger.getLogger(AwaitTimeoutFlow.class);
+
   private final AwaitCoordinator awaitCoordinator;
   private final ExecutionStateStore executionStateStore;
   private final Supplier<SegmentBoundaryLedger> segmentBoundaryLedger;
@@ -34,7 +36,7 @@ class AwaitTimeoutFlow {
     int batchLimit = Math.min(limit, 100);
     return awaitCoordinator.findDueTimeoutConsequences(nowEpochMs, batchLimit)
         .onItem().transformToUni(retained -> Multi.createFrom().iterable(retained)
-            .onItem().transformToUniAndConcatenate(record -> finishTimeout(record, nowEpochMs))
+            .onItem().transformToUniAndConcatenate(record -> attemptTimeout(record, () -> finishTimeout(record, nowEpochMs)))
             .collect().asList()
             .onItem().transformToUni(counts -> {
               int remaining = batchLimit - retained.size();
@@ -45,10 +47,17 @@ class AwaitTimeoutFlow {
               return awaitCoordinator.findTimedOut(nowEpochMs, remaining)
                   .onItem().transform(records -> TimedOutAwaitInteractionsPlan.from(records, remaining))
                   .onItem().transformToUni(plan -> Multi.createFrom().iterable(plan.interactions())
-                      .onItem().transformToUniAndConcatenate(record -> admitTimeout(record, nowEpochMs))
+                      .onItem().transformToUniAndConcatenate(record -> attemptTimeout(record, () -> admitTimeout(record, nowEpochMs)))
                       .collect().asList()
                       .onItem().transform(admitted -> repaired + admitted.stream().mapToInt(Integer::intValue).sum()));
             }));
+  }
+
+  private Uni<Integer> attemptTimeout(AwaitInteractionRecord record, Supplier<Uni<Integer>> attempt) {
+    return Uni.createFrom().deferred(() -> attempt.get())
+        .onFailure().invoke(failure -> LOG.warnf(failure,
+            "Failed processing Await timeout tenant=%s, interactionId=%s", record.tenantId(), record.interactionId()))
+        .onFailure().recoverWithItem(0);
   }
 
   private Uni<Integer> admitTimeout(AwaitInteractionRecord interaction, long nowEpochMs) {

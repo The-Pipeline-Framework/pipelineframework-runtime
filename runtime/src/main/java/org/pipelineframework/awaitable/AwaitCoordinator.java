@@ -753,11 +753,14 @@ public class AwaitCoordinator {
                             || !Objects.equals(unit.executionId(), record.executionId())) {
                             return Uni.createFrom().failure(new IllegalStateException("Timeout unit belongs to another execution"));
                         }
+                        if (unit.status().terminal()) {
+                            return Uni.createFrom().voidItem();
+                        }
                         return unitStore().markTerminal(record.tenantId(), record.unitId(), AwaitUnitStatus.TIMED_OUT, nowEpochMs)
                             .invoke(updated -> {
                                 var terminal = updated.orElseThrow(() -> new IllegalStateException("Timeout unit is unavailable"));
-                                if (!unit.status().terminal()) recordUnitTerminal(record, terminal);
-                            });
+                                recordUnitTerminal(record, terminal);
+                            }).replaceWithVoid();
                     })
                     .chain(() -> releaseTimeoutAdmission(record));
             });
