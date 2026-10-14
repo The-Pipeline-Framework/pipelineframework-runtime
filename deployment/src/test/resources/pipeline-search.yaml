@@ -1,23 +1,44 @@
+version: 3
 appName: "Search Pipeline"
 basePackage: "org.pipelineframework.search"
 transport: "REST"
+types:
+  CrawlRequest:
+    java: org.pipelineframework.search.domain.CrawlRequest
+    fields: []
+  RawDocument:
+    java: org.pipelineframework.search.domain.RawDocument
+    fields: []
+  ParsedDocument:
+    java: org.pipelineframework.search.domain.ParsedDocument
+    fields: []
+  TokenBatch:
+    java: org.pipelineframework.search.domain.TokenBatch
+    fields: []
+  IndexAck:
+    java: org.pipelineframework.search.domain.IndexAck
+    fields: []
 steps:
   - name: "Crawl Source"
     service: "org.pipelineframework.search.ProcessCrawlSourceService"
-    input: "org.pipelineframework.search.domain.CrawlRequest"
-    output: "org.pipelineframework.search.domain.RawDocument"
+    cardinality: ONE_TO_ONE
+    input: CrawlRequest
+    output: RawDocument
   - name: "Parse Document"
     service: "org.pipelineframework.search.ProcessParseDocumentService"
-    input: "org.pipelineframework.search.domain.RawDocument"
-    output: "org.pipelineframework.search.domain.ParsedDocument"
+    cardinality: ONE_TO_ONE
+    input: RawDocument
+    output: ParsedDocument
   - name: "Tokenize Content"
     service: "org.pipelineframework.search.ProcessTokenizeContentService"
-    input: "org.pipelineframework.search.domain.ParsedDocument"
-    output: "org.pipelineframework.search.domain.TokenBatch"
+    cardinality: ONE_TO_ONE
+    input: ParsedDocument
+    output: TokenBatch
   - name: "Index Document"
     service: "org.pipelineframework.search.ProcessIndexDocumentService"
-    input: "org.pipelineframework.search.domain.TokenBatch"
-    output: "org.pipelineframework.search.domain.IndexAck"
+    cardinality: ONE_TO_ONE
+    input: TokenBatch
+    output: IndexAck
 
 aspects:
   persistence:

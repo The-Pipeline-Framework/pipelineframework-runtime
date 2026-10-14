@@ -37,14 +37,23 @@ class RestBindingSkipTest {
         Files.createDirectories(generatedSourcesDir);
 
         Files.writeString(projectRoot.resolve("pipeline.yaml"), """
+            version: 3
             appName: "Test Pipeline"
             basePackage: "com.example"
             transport: "REST"
+            types:
+              FooInput:
+                java: com.example.domain.FooInput
+                fields: []
+              FooOutput:
+                java: com.example.domain.FooOutput
+                fields: []
             steps:
               - name: "Process Foo"
                 service: "com.example.ProcessFooService"
-                input: "com.example.domain.FooInput"
-                output: "com.example.domain.FooOutput"
+                cardinality: ONE_TO_ONE
+                input: FooInput
+                output: FooOutput
             """);
 
         Compilation compilation = Compiler.javac()
@@ -74,7 +83,7 @@ class RestBindingSkipTest {
                     """
                         package com.example.domain;
 
-                        public class FooInput {
+                        public record FooInput() {
                         }
                         """),
                 JavaFileObjects.forSourceString(
@@ -82,7 +91,7 @@ class RestBindingSkipTest {
                     """
                         package com.example.domain;
 
-                        public class FooOutput {
+                        public record FooOutput() {
                         }
                         """),
                 JavaFileObjects.forSourceString(

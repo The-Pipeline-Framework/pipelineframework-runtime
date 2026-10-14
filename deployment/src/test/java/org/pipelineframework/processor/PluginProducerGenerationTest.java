@@ -37,14 +37,20 @@ class PluginProducerGenerationTest {
         Files.createDirectories(generatedSourcesDir);
 
         Files.writeString(projectRoot.resolve("pipeline.yaml"), """
+            version: 3
             appName: "Test Pipeline"
             basePackage: "com.example"
             transport: "REST"
+            types:
+              Text:
+                java: java.lang.String
+                wraps: string
             steps:
               - name: "Process Test"
                 service: "com.example.ProcessTestService"
-                input: "java.lang.String"
-                output: "java.lang.String"
+                cardinality: ONE_TO_ONE
+                input: Text
+                output: Text
             aspects:
               persistence:
                 enabled: true

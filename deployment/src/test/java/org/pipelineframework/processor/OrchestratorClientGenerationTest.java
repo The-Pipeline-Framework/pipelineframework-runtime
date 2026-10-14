@@ -492,7 +492,7 @@ class OrchestratorClientGenerationTest {
         String source = """
             package org.pipelineframework.search.domain;
 
-            public class %s {
+            public record %s() {
             }
             """.formatted(className);
         return JavaFileObjects.forSourceString(fqcn, source);
