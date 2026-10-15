@@ -16,10 +16,42 @@ COORDS = [
     ("org.pipelineframework", "pipelineframework-runtime-spring", "jar"),
     ("org.pipelineframework", "pipelineframework-release-maven-plugin", "jar"),
     ("org.pipelineframework", "pipelineframework-release-producer", "jar"),
+    ("org.pipelineframework", "pipelineframework-aws-durable-coordination-parent", "pom"),
+    ("org.pipelineframework", "pipelineframework-aws-durable-coordination-model", "jar"),
+    ("org.pipelineframework", "pipelineframework-aws-durable-coordination-host", "jar"),
+    ("org.pipelineframework", "pipelineframework-aws-durable-coordination-deployment", "jar"),
     ("org.pipelineframework", "cache-plugin", "jar"),
     ("org.pipelineframework", "persistence-plugin", "jar"),
     ("org.pipelineframework", "repository-plugin", "jar"),
 ]
+
+# Exercise the real collection boundary, including its POM-only AWS parent.
+snapshot = VERSION + "-SNAPSHOT"
+with tempfile.TemporaryDirectory(prefix="tpf-candidate-collection-") as temp:
+    installed = pathlib.Path(temp) / "installed"
+    expected = set()
+    for group, artifact, packaging in COORDS:
+        directory = installed / pathlib.Path(*group.split(".")) / artifact / snapshot
+        directory.mkdir(parents=True)
+        extensions = ("pom", "jar") if packaging == "jar" else ("pom",)
+        for extension in extensions:
+            file = directory / f"{artifact}-{snapshot}.{extension}"
+            file.write_bytes(b"installed candidate fixture")
+            expected.add(file.relative_to(installed))
+    output = pathlib.Path(temp) / "collected"
+    subprocess.run(["bash", str(ROOT / "scripts/collect-candidate-files.sh"), str(output), str(installed)],
+                   check=True, cwd=ROOT)
+    assert {p.relative_to(output / "repository") for p in (output / "repository").rglob("*") if p.is_file()} == expected
+    for _, artifact, packaging in [c for c in COORDS if "aws-durable" in c[1]]:
+        extension = "jar" if packaging == "jar" else "pom"
+        file = installed / "org/pipelineframework" / artifact / snapshot / f"{artifact}-{snapshot}.{extension}"
+        content = file.read_bytes()
+        file.unlink()
+        rejected = subprocess.run(
+            ["bash", str(ROOT / "scripts/collect-candidate-files.sh"), str(pathlib.Path(temp) / artifact), str(installed)],
+            cwd=ROOT, capture_output=True)
+        assert rejected.returncode != 0, f"missing AWS candidate file must fail: {artifact}"
+        file.write_bytes(content)
 
 for event, candidate_type, number in [("pull_request", "pr", "42"), ("push", "main", "")]:
     sha = "0123456789abcdef0123456789abcdef01234567"
@@ -56,6 +88,44 @@ for event, candidate_type, number in [("pull_request", "pr", "42"), ("push", "ma
         assert metadata["candidateVersion"] == candidate
         assert metadata["pullRequestNumber"] == (42 if number else None)
         assert len(metadata["mavenArtifacts"]) == len(COORDS)
+        if number:
+            # Only the external Maven CLI is substituted: execute the real publisher
+            # and require every owned coordinate, including the POM-only AWS parent.
+            publisher = candidate_root / "publisher"
+            (publisher / "scripts").mkdir(parents=True)
+            (publisher / "scripts/publish-candidate-files.sh").write_bytes(
+                (ROOT / "scripts/publish-candidate-files.sh").read_bytes())
+            wrapper = publisher / "mvnw"
+            wrapper.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+if "-Dtransitive=false" in args:
+    coordinate = next(a.removeprefix("-Dartifact=") for a in args if a.startswith("-Dartifact="))
+    if os.environ.get("FIXTURE_DENIED") == "true":
+        print("Authentication denied")
+    else:
+        print("Could not find artifact " + coordinate + " in github-candidates")
+    sys.exit(1)
+assert "org.apache.maven.plugins:maven-deploy-plugin:3.1.4:deploy-file" in args
+properties = dict(a[2:].split("=", 1) for a in args if a.startswith("-D") and "=" in a)
+assert pathlib.Path(properties["file"]).is_file(), properties
+assert pathlib.Path(properties["pomFile"]).is_file()
+with open(os.environ["FIXTURE_PUBLISH_CALLS"], "a") as f:
+    f.write(json.dumps(properties) + "\\n")
+''')
+            wrapper.chmod(0o755)
+            calls = publisher / "calls.jsonl"
+            publisher_env = env | {"FIXTURE_PUBLISH_CALLS": str(calls)}
+            publication = subprocess.run(["bash", str(publisher / "scripts/publish-candidate-files.sh"), str(candidate_root)],
+                                         cwd=publisher, env=publisher_env, capture_output=True)
+            assert publication.returncode == 0, publication.stderr.decode()
+            published = [json.loads(line) for line in calls.read_text().splitlines()]
+            assert [(c["groupId"], c["artifactId"], c["packaging"]) for c in published] == COORDS
+            assert all(c["version"] == candidate for c in published)
+            calls.unlink()
+            denied = subprocess.run(["bash", str(publisher / "scripts/publish-candidate-files.sh"), str(candidate_root)],
+                                    cwd=publisher, env=publisher_env | {"FIXTURE_DENIED": "true"}, capture_output=True)
+            assert denied.returncode != 0 and not calls.exists(), "registry denial must not become permission to publish"
         assert any(item["artifactId"] == "pipelineframework-release-producer" for item in metadata["mavenArtifacts"])
         producer_pom = repository / "org/pipelineframework/pipelineframework-release-producer" / candidate / f"pipelineframework-release-producer-{candidate}.pom"
         producer_bytes = producer_pom.read_bytes()
