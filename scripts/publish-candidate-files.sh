@@ -27,6 +27,10 @@ coordinates=(
   "org.pipelineframework:pipelineframework-runtime-spring:jar"
   "org.pipelineframework:pipelineframework-release-maven-plugin:jar"
   "org.pipelineframework:pipelineframework-release-producer:jar"
+  "org.pipelineframework:pipelineframework-aws-durable-coordination-parent:pom"
+  "org.pipelineframework:pipelineframework-aws-durable-coordination-model:jar"
+  "org.pipelineframework:pipelineframework-aws-durable-coordination-host:jar"
+  "org.pipelineframework:pipelineframework-aws-durable-coordination-deployment:jar"
   "org.pipelineframework:cache-plugin:jar"
   "org.pipelineframework:persistence-plugin:jar"
   "org.pipelineframework:repository-plugin:jar"
@@ -34,11 +38,12 @@ coordinates=(
 registry=https://maven.pkg.github.com/The-Pipeline-Framework/pipelineframework-runtime
 for coordinate in "${coordinates[@]}"; do
   IFS=: read -r group_id artifact_id packaging <<< "$coordinate"
-  directory="$repository/${group_id//./\/}/$artifact_id/$version"
+  group_path=${group_id//.//}
+  directory="$repository/$group_path/$artifact_id/$version"
   pom="$directory/$artifact_id-$version.pom"
   jar=""
   if [[ "$packaging" == jar ]]; then jar="$directory/$artifact_id-$version.jar"; fi
-  resolved_directory="$resolve_repo/${group_id//./\/}/$artifact_id/$version"
+  resolved_directory="$resolve_repo/$group_path/$artifact_id/$version"
   resolved_pom="$resolved_directory/$artifact_id-$version.pom"
   resolved_artifact=""
   if [[ "$packaging" == jar ]]; then resolved_artifact="$resolved_directory/$artifact_id-$version.jar"; fi
