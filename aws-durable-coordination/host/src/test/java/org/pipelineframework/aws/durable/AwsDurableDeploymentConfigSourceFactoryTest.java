@@ -14,6 +14,10 @@ import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueRequest;
 import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueResponse;
+import software.amazon.awssdk.services.ssm.model.GetParameterRequest;
+import software.amazon.awssdk.services.ssm.model.GetParameterResponse;
+import software.amazon.awssdk.services.ssm.model.Parameter;
+import software.amazon.awssdk.services.ssm.model.ParameterType;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -68,6 +72,125 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
         assertThat(source.toString()).doesNotContain(SECRET);
         assertThatThrownBy(() -> source.getProperties().put("anything", "value"))
             .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void selectsPinnedSsmVersionsWithoutReadingSecretsManager() {
+        var secretRequests = new ArrayList<GetSecretValueRequest>();
+        var parameterRequests = new ArrayList<GetParameterRequest>();
+        var config = buildSsm(validSsmConfiguration(), secretRequests, parameterRequests,
+            this::validParameterResponse);
+        assertThat(config.getValue("pipeline.orchestrator.resume-token-secret", String.class)).isEqualTo(SECRET);
+        assertThat(config.getValue("pipeline.orchestrator.worker.sqs.shared-secret", String.class)).isEqualTo(SECRET);
+        assertThat(secretRequests).isEmpty();
+        assertThat(parameterRequests).hasSize(2).allSatisfy(request -> {
+            assertThat(request.name()).startsWith("arn:aws:ssm:eu-west-1:123456789012:parameter/tpf/pilot/").endsWith(":7");
+            assertThat(request.withDecryption()).isTrue();
+        });
+        config.getValue("pipeline.orchestrator.resume-token-secret", String.class);
+        assertThat(parameterRequests).hasSize(2);
+    }
+
+    @Test
+    void ssmSelectionRejectsInvalidAndMixedReferencesBeforeEitherProviderRead() {
+        var valid = validSsmConfiguration();
+        for (String missing : List.of("tpf.aws.durable.resume-token-parameter-arn",
+            "tpf.aws.durable.resume-token-parameter-version", "tpf.aws.durable.worker-parameter-arn",
+            "tpf.aws.durable.worker-parameter-version")) {
+            var values = new HashMap<>(valid); values.remove(missing);
+            assertNoProviderRead(values);
+        }
+        for (Map.Entry<String, String> invalid : List.of(
+            Map.entry("tpf.aws.durable.signing-source", "UNKNOWN"),
+            Map.entry("tpf.aws.durable.resume-token-parameter-arn", "name-only"),
+            Map.entry("tpf.aws.durable.resume-token-parameter-version", "latest"),
+            Map.entry("tpf.aws.durable.resume-token-parameter-version", "0"),
+            Map.entry("tpf.aws.durable.resume-token-parameter-version", "-1"),
+            Map.entry("tpf.aws.durable.resume-token-parameter-version", "9223372036854775808"),
+            Map.entry("tpf.aws.durable.resume-token-secret-arn", "arn:aws:secretsmanager:eu-west-1:123456789012:secret:other-abcdef"),
+            Map.entry("pipeline.orchestrator.worker.sqs.shared-secret-ref", "env:worker"),
+            Map.entry("pipeline.orchestrator.resume-token-secret", SECRET))) {
+            var values = new HashMap<>(valid); values.put(invalid.getKey(), invalid.getValue());
+            assertNoProviderRead(values);
+        }
+        var same = new HashMap<>(valid);
+        same.put("tpf.aws.durable.worker-parameter-arn", same.get("tpf.aws.durable.resume-token-parameter-arn"));
+        assertNoProviderRead(same);
+        var smWithSsmField = validConfiguration();
+        smWithSsmField.put("tpf.aws.durable.worker-parameter-version", "7");
+        assertNoProviderRead(smWithSsmField);
+        var noPreflight = new HashMap<>(valid); noPreflight.remove("tpf.aws.durable.deployment-validation");
+        assertNoProviderRead(noPreflight);
+    }
+
+    @Test
+    void ssmFlatParameterNameMatchesExactArnResource() {
+        var values = validSsmConfiguration();
+        values.put("tpf.aws.durable.resume-token-parameter-arn",
+            "arn:aws:ssm:eu-west-1:123456789012:parameter/resume-token");
+        values.put("tpf.aws.durable.worker-parameter-arn",
+            "arn:aws:ssm:eu-west-1:123456789012:parameter/worker");
+        var config = buildSsm(values, new ArrayList<>(), new ArrayList<>(), request -> {
+            String arn = request.name().substring(0, request.name().lastIndexOf(':'));
+            return GetParameterResponse.builder().parameter(Parameter.builder().arn(arn)
+                .name(arn.substring(arn.indexOf(":parameter/") + ":parameter/".length()))
+                .version(7L).type(ParameterType.SECURE_STRING).value(SECRET).build()).build();
+        });
+        assertThat(config.getValue("pipeline.orchestrator.resume-token-secret", String.class)).isEqualTo(SECRET);
+        assertThat(config.getValue("pipeline.orchestrator.worker.sqs.shared-secret", String.class)).isEqualTo(SECRET);
+    }
+
+    @Test
+    void ssmResponseIdentityTypeVersionAndLengthFailuresRevealNoKey() {
+        var valid = validSsmConfiguration();
+        var request = GetParameterRequest.builder()
+            .name(valid.get("tpf.aws.durable.resume-token-parameter-arn") + ":7").withDecryption(true).build();
+        var good = validParameterResponse(request).parameter();
+        var oversized = "é".repeat(2050); // 2-byte UTF-8 characters: 4,100 bytes.
+        for (Parameter bad : List.of(
+            good.toBuilder().arn("arn:aws:ssm:eu-west-1:123456789012:parameter/other").build(),
+            good.toBuilder().name("/other").build(),
+            good.toBuilder().version(8L).build(),
+            good.toBuilder().type(ParameterType.STRING).build(),
+            good.toBuilder().value("short").build(),
+            good.toBuilder().value(" ".repeat(32)).build(),
+            good.toBuilder().value(oversized).build(),
+            good.toBuilder().value((String) null).build())) {
+            var parameterRequests = new ArrayList<GetParameterRequest>();
+            assertThatThrownBy(() -> buildSsm(valid, new ArrayList<>(), parameterRequests,
+                ignored -> GetParameterResponse.builder().parameter(bad).build()))
+                .isInstanceOf(IllegalStateException.class).hasMessageNotContaining(SECRET);
+            assertThat(parameterRequests).hasSize(1); // First invalid read prevents the second read and any config source.
+        }
+        assertThatThrownBy(() -> buildSsm(valid, new ArrayList<>(), new ArrayList<>(),
+            ignored -> GetParameterResponse.builder().build())).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> buildSsm(valid, new ArrayList<>(), new ArrayList<>(),
+            ignored -> null)).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void ssmSecondReadFailureDoesNotPublishPartialKeysOrProviderError() {
+        var parameterRequests = new ArrayList<GetParameterRequest>();
+        assertThatThrownBy(() -> buildSsm(validSsmConfiguration(), new ArrayList<>(), parameterRequests,
+            request -> {
+                if (request.name().contains("worker")) throw new IllegalStateException(SECRET);
+                return validParameterResponse(request);
+            })).isInstanceOf(IllegalStateException.class).hasMessageNotContaining(SECRET).hasNoCause();
+        assertThat(parameterRequests).hasSize(2);
+    }
+
+    @Test
+    void ssmSecondResponseIdentityMismatchFailsAfterBothExactReads() {
+        var parameterRequests = new ArrayList<GetParameterRequest>();
+        assertThatThrownBy(() -> buildSsm(validSsmConfiguration(), new ArrayList<>(), parameterRequests,
+            request -> {
+                var response = validParameterResponse(request);
+                if (request.name().contains("worker")) {
+                    return response.toBuilder().parameter(response.parameter().toBuilder().version(8L).build()).build();
+                }
+                return response;
+            })).isInstanceOf(IllegalStateException.class).hasMessageNotContaining(SECRET);
+        assertThat(parameterRequests).hasSize(2);
     }
 
     @Test
@@ -154,6 +277,36 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
             })).build();
     }
 
+    private SmallRyeConfig buildSsm(Map<String, String> values, List<GetSecretValueRequest> secrets,
+        List<GetParameterRequest> parameters,
+        java.util.function.Function<GetParameterRequest, GetParameterResponse> response) {
+        return new SmallRyeConfigBuilder().withMapping(PipelineOrchestratorConfig.class)
+            .withSources(new PropertiesConfigSource(values, "deployment", 300))
+            .withSources(new AwsDurableDeploymentConfigSourceFactory(request -> {
+                secrets.add(request);
+                throw new AssertionError("Secrets Manager must not be read in SSM mode");
+            }, request -> {
+                parameters.add(request);
+                return response.apply(request);
+            })).build();
+    }
+
+    private GetParameterResponse validParameterResponse(GetParameterRequest request) {
+        String arn = request.name().substring(0, request.name().lastIndexOf(':'));
+        String name = "/" + arn.substring(arn.indexOf(":parameter/") + ":parameter/".length());
+        return GetParameterResponse.builder().parameter(Parameter.builder().arn(arn).name(name)
+            .version(7L).type(ParameterType.SECURE_STRING).value(SECRET).build()).build();
+    }
+
+    private void assertNoProviderRead(Map<String, String> values) {
+        var secrets = new ArrayList<GetSecretValueRequest>();
+        var parameters = new ArrayList<GetParameterRequest>();
+        assertThatThrownBy(() -> buildSsm(values, secrets, parameters, this::validParameterResponse))
+            .isInstanceOf(IllegalArgumentException.class).hasMessageNotContaining(SECRET);
+        assertThat(secrets).isEmpty();
+        assertThat(parameters).isEmpty();
+    }
+
     private Map<String, String> validConfiguration() {
         var values = new HashMap<String, String>();
         values.put("tpf.aws.durable.deployment-validation", "validated");
@@ -193,6 +346,19 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
                 "arn:aws:secretsmanager:eu-west-1:123456789012:secret:" + purpose + "-abcdef");
             values.put("tpf.aws.durable." + purpose + "-secret-version", VERSION);
         }
+        return values;
+    }
+
+    private Map<String, String> validSsmConfiguration() {
+        var values = validConfiguration();
+        for (String purpose : List.of("resume-token", "worker")) {
+            values.remove("tpf.aws.durable." + purpose + "-secret-arn");
+            values.remove("tpf.aws.durable." + purpose + "-secret-version");
+            values.put("tpf.aws.durable." + purpose + "-parameter-arn",
+                "arn:aws:ssm:eu-west-1:123456789012:parameter/tpf/pilot/" + purpose);
+            values.put("tpf.aws.durable." + purpose + "-parameter-version", "7");
+        }
+        values.put("tpf.aws.durable.signing-source", "SSM_STANDARD");
         return values;
     }
 }
