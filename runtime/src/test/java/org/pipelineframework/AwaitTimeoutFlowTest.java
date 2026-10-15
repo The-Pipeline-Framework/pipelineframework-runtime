@@ -20,6 +20,8 @@ import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
@@ -45,6 +47,9 @@ class AwaitTimeoutFlowTest {
   @BeforeEach
   void setUp() {
     flow = new AwaitTimeoutFlow(awaitCoordinator, executionStateStore, () -> segmentBoundaryLedger);
+    lenient().when(awaitCoordinator.findDueTimeoutConsequences(1000L, 100)).thenReturn(Uni.createFrom().item(List.of()));
+    lenient().when(awaitCoordinator.reconcileTimedOut(any(), anyLong())).thenReturn(Uni.createFrom().voidItem());
+    lenient().when(awaitCoordinator.completeTimeoutConsequences(any())).thenReturn(Uni.createFrom().voidItem());
   }
 
   @Test
@@ -58,9 +63,9 @@ class AwaitTimeoutFlowTest {
         .thenReturn(Uni.createFrom().item(Optional.of(earlier)));
     when(awaitCoordinator.markTimedOut(later, 1000L))
         .thenReturn(Uni.createFrom().item(Optional.of(later)));
-    when(segmentBoundaryLedger.recordInteractionTimedOut(earlier, 1000L))
+    when(segmentBoundaryLedger.recordInteractionTimedOutRequired(earlier, 1L))
         .thenReturn(Uni.createFrom().voidItem());
-    when(segmentBoundaryLedger.recordInteractionTimedOut(later, 1000L))
+    when(segmentBoundaryLedger.recordInteractionTimedOutRequired(later, 1L))
         .thenReturn(Uni.createFrom().voidItem());
     when(executionStateStore.getExecution("tenant-1", "exec-1"))
         .thenReturn(
@@ -76,7 +81,7 @@ class AwaitTimeoutFlowTest {
             eq("Await interaction timed out: interaction-a"),
             anyLong()))
         .thenReturn(Uni.createFrom().item(Optional.of(failed)));
-    when(segmentBoundaryLedger.recordRunFailed(
+    when(segmentBoundaryLedger.recordRunFailedRequired(
             failed,
             "AWAIT_TIMEOUT",
             "Await interaction timed out: interaction-a",
@@ -88,7 +93,7 @@ class AwaitTimeoutFlowTest {
     assertEquals(2, timedOutCount);
     InOrder order = inOrder(awaitCoordinator, segmentBoundaryLedger, executionStateStore);
     order.verify(awaitCoordinator).markTimedOut(earlier, 1000L);
-    order.verify(segmentBoundaryLedger).recordInteractionTimedOut(earlier, 1000L);
+    order.verify(segmentBoundaryLedger).recordInteractionTimedOutRequired(earlier, 1L);
     order.verify(executionStateStore).getExecution("tenant-1", "exec-1");
     order.verify(executionStateStore).markTerminalFailure(
         eq("tenant-1"),
@@ -99,35 +104,34 @@ class AwaitTimeoutFlowTest {
         eq("AWAIT_TIMEOUT"),
         eq("Await interaction timed out: interaction-a"),
         anyLong());
-    order.verify(segmentBoundaryLedger).recordRunFailed(
+    order.verify(segmentBoundaryLedger).recordRunFailedRequired(
         failed,
         "AWAIT_TIMEOUT",
         "Await interaction timed out: interaction-a",
         1000L);
     order.verify(awaitCoordinator).markTimedOut(later, 1000L);
-    order.verify(segmentBoundaryLedger).recordInteractionTimedOut(later, 1000L);
+    order.verify(segmentBoundaryLedger).recordInteractionTimedOutRequired(later, 1L);
     order.verify(executionStateStore).getExecution("tenant-1", "exec-1");
   }
 
   @Test
-  void missingParentDoesNotFailExecution() {
+  void missingParentRetainsTimeoutWorkForRetry() {
     AwaitInteractionRecord interaction = interaction("unit-1");
     when(awaitCoordinator.findTimedOut(1000L, 100)).thenReturn(Uni.createFrom().item(List.of(interaction)));
     when(awaitCoordinator.markTimedOut(interaction, 1000L))
         .thenReturn(Uni.createFrom().item(Optional.of(interaction)));
-    when(segmentBoundaryLedger.recordInteractionTimedOut(interaction, 1000L))
+    when(segmentBoundaryLedger.recordInteractionTimedOutRequired(interaction, 1L))
         .thenReturn(Uni.createFrom().voidItem());
     when(executionStateStore.getExecution("tenant-1", "exec-1"))
         .thenReturn(Uni.createFrom().item(Optional.empty()));
 
-    int timedOutCount = flow.sweepTimedOut(1000L, 100).await().indefinitely();
-
-    assertEquals(1, timedOutCount);
+    assertEquals(0, flow.sweepTimedOut(1000L, 100).await().indefinitely());
+    verify(awaitCoordinator, never()).completeTimeoutConsequences(any());
     verify(executionStateStore).getExecution("tenant-1", "exec-1");
-    verify(segmentBoundaryLedger).recordInteractionTimedOut(interaction, 1000L);
+    verify(segmentBoundaryLedger).recordInteractionTimedOutRequired(interaction, 1L);
     verify(executionStateStore, never()).markTerminalFailure(
         any(), any(), anyLong(), any(), any(), any(), any(), anyLong());
-    verify(segmentBoundaryLedger, never()).recordRunFailed(any(), any(), any(), anyLong());
+    verify(segmentBoundaryLedger, never()).recordRunFailedRequired(any(), any(), any(), anyLong());
   }
 
   @Test
@@ -136,7 +140,7 @@ class AwaitTimeoutFlowTest {
     when(awaitCoordinator.findTimedOut(1000L, 100)).thenReturn(Uni.createFrom().item(List.of(interaction)));
     when(awaitCoordinator.markTimedOut(interaction, 1000L))
         .thenReturn(Uni.createFrom().item(Optional.of(interaction)));
-    when(segmentBoundaryLedger.recordInteractionTimedOut(interaction, 1000L))
+    when(segmentBoundaryLedger.recordInteractionTimedOutRequired(interaction, 1L))
         .thenReturn(Uni.createFrom().voidItem());
     when(executionStateStore.getExecution("tenant-1", "exec-1"))
         .thenReturn(Uni.createFrom().item(Optional.of(parent(ExecutionStatus.WAITING_EXTERNAL, "other-unit"))));
@@ -145,7 +149,7 @@ class AwaitTimeoutFlowTest {
 
     assertEquals(1, timedOutCount);
     verify(executionStateStore).getExecution("tenant-1", "exec-1");
-    verify(segmentBoundaryLedger).recordInteractionTimedOut(interaction, 1000L);
+    verify(segmentBoundaryLedger).recordInteractionTimedOutRequired(interaction, 1L);
     verify(executionStateStore, never()).markTerminalFailure(
         any(), any(), anyLong(), any(), any(), any(), any(), anyLong());
   }
@@ -161,7 +165,47 @@ class AwaitTimeoutFlowTest {
 
     assertEquals(0, timedOutCount);
     verify(executionStateStore, never()).getExecution(any(), any());
-    verify(segmentBoundaryLedger, never()).recordInteractionTimedOut(any(), anyLong());
+    verify(segmentBoundaryLedger, never()).recordInteractionTimedOutRequired(any(), anyLong());
+  }
+
+  @Test
+  void failedInteractionsDoNotAbortRetainedOrNewTimeoutWorkWithinTheBound() {
+    var retainedFailure = interaction("unit-a", "retained-failure", "corr-a", 800L);
+    var retainedSuccess = interaction("unit-b", "retained-success", "corr-b", 850L);
+    var newFailure = interaction("unit-c", "new-failure", "corr-c", 900L);
+    var newSuccess = interaction("unit-d", "new-success", "corr-d", 950L);
+    when(awaitCoordinator.findDueTimeoutConsequences(1000L, 4))
+        .thenReturn(Uni.createFrom().item(List.of(retainedFailure, retainedSuccess)));
+    when(awaitCoordinator.reconcileTimedOut(retainedFailure, 1000L))
+        .thenReturn(Uni.createFrom().failure(new IllegalStateException("retained failure")));
+    when(awaitCoordinator.findTimedOut(1000L, 2))
+        .thenReturn(Uni.createFrom().item(List.of(newFailure, newSuccess)));
+    when(awaitCoordinator.markTimedOut(newFailure, 1000L))
+        .thenThrow(new IllegalStateException("synchronous admission failure"));
+    when(awaitCoordinator.markTimedOut(newSuccess, 1000L))
+        .thenReturn(Uni.createFrom().item(Optional.of(newSuccess)));
+    for (var interaction : List.of(retainedSuccess, newSuccess)) {
+      when(segmentBoundaryLedger.recordInteractionTimedOutRequired(interaction, 1L))
+          .thenReturn(Uni.createFrom().voidItem());
+    }
+    when(executionStateStore.getExecution("tenant-1", "exec-1"))
+        .thenReturn(Uni.createFrom().item(Optional.of(parent(ExecutionStatus.FAILED, "other-unit"))));
+
+    assertEquals(2, flow.sweepTimedOut(1000L, 4).await().indefinitely());
+
+    verify(awaitCoordinator).completeTimeoutConsequences(retainedSuccess);
+    verify(awaitCoordinator).completeTimeoutConsequences(newSuccess);
+    verify(awaitCoordinator, never()).completeTimeoutConsequences(retainedFailure);
+    verify(awaitCoordinator, never()).completeTimeoutConsequences(newFailure);
+    verify(awaitCoordinator).findTimedOut(1000L, 2);
+  }
+
+  @Test
+  void failedDiscoveryRemainsASweepFailure() {
+    when(awaitCoordinator.findDueTimeoutConsequences(1000L, 100))
+        .thenReturn(Uni.createFrom().failure(new IllegalStateException("discovery unavailable")));
+    assertThrows(IllegalStateException.class, () -> flow.sweepTimedOut(1000L, 100).await().indefinitely());
+    verify(awaitCoordinator, never()).findTimedOut(anyLong(), org.mockito.ArgumentMatchers.anyInt());
   }
 
   @Test

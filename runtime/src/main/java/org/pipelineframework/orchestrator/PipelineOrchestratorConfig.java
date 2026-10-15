@@ -353,6 +353,11 @@ public interface PipelineOrchestratorConfig {
         @WithDefault("tpf_await_interaction_key")
         String awaitInteractionKeyTable();
 
+        /** Immutable Await admission/release facts and bounded primary-key open projections. */
+        @WithName("await-completion-lifecycle-table")
+        @WithDefault("tpf_await_completion_lifecycle")
+        String awaitCompletionLifecycleTable();
+
         /**
          * Await unit table name.
          *

@@ -12,6 +12,7 @@ public final class AwaitExecutionContext {
     private final TerminalOutputOwnership terminalOutputOwnership;
     private final Map<String, Object> traceMetadata;
     private final Optional<PagedTransitionContext> pageContext;
+    private final Optional<String> awaitOccurrenceCause;
     private int currentStepIndex;
 
     public AwaitExecutionContext(String tenantId, String executionId, int currentStepIndex) {
@@ -51,6 +52,20 @@ public final class AwaitExecutionContext {
         Map<String, Object> traceMetadata,
         Optional<PagedTransitionContext> pageContext
     ) {
+        this(tenantId, executionId, currentStepIndex, continuationMode, terminalOutputOwnership,
+            traceMetadata, pageContext, Optional.empty());
+    }
+
+    public AwaitExecutionContext(
+        String tenantId,
+        String executionId,
+        int currentStepIndex,
+        AwaitContinuationMode continuationMode,
+        TerminalOutputOwnership terminalOutputOwnership,
+        Map<String, Object> traceMetadata,
+        Optional<PagedTransitionContext> pageContext,
+        Optional<String> awaitOccurrenceCause
+    ) {
         if (tenantId == null || tenantId.isBlank()) {
             throw new IllegalArgumentException("tenantId must not be blank");
         }
@@ -68,6 +83,11 @@ public final class AwaitExecutionContext {
             terminalOutputOwnership, "terminalOutputOwnership must not be null");
         this.traceMetadata = Map.copyOf(java.util.Objects.requireNonNull(traceMetadata, "traceMetadata must not be null"));
         this.pageContext = java.util.Objects.requireNonNull(pageContext, "pageContext must not be null");
+        this.awaitOccurrenceCause = java.util.Objects.requireNonNull(
+            awaitOccurrenceCause, "awaitOccurrenceCause must not be null");
+        this.awaitOccurrenceCause.ifPresent(value -> {
+            if (value.isBlank()) throw new IllegalArgumentException("awaitOccurrenceCause must not be blank");
+        });
     }
 
     public String tenantId() { return tenantId; }
@@ -83,6 +103,8 @@ public final class AwaitExecutionContext {
     public Map<String, Object> traceMetadata() { return traceMetadata; }
 
     public Optional<PagedTransitionContext> pageContext() { return pageContext; }
+
+    public Optional<String> awaitOccurrenceCause() { return awaitOccurrenceCause; }
 
     /** Stable identity prefix shared by every item and effect in this execution page. */
     public String identityScope() {

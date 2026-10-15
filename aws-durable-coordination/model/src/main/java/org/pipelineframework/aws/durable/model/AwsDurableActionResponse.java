@@ -3,6 +3,7 @@ package org.pipelineframework.aws.durable.model;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import org.pipelineframework.awaitable.AwaitInteractionCursor;
 
 public record AwsDurableActionResponse(
     Optional<AwsDurableExecutionCheckpoint> checkpoint,
@@ -12,9 +13,24 @@ public record AwsDurableActionResponse(
     Optional<AwsDurableAwaitIdentity> awaitIdentity,
     Optional<AwsDurableAwaitCheckpoint> awaitCheckpoint,
     List<AwsDurableAwaitCheckpoint> awaitCheckpoints,
-    boolean bindingCreated
+    boolean bindingCreated,
+    Optional<AwaitInteractionCursor> awaitSelectionCursor
 ) {
+    public AwsDurableActionResponse(Optional<AwsDurableExecutionCheckpoint> checkpoint, boolean duplicate,
+        Optional<String> executionStatus, Optional<String> resultJson, Optional<AwsDurableAwaitIdentity> awaitIdentity,
+        Optional<AwsDurableAwaitCheckpoint> awaitCheckpoint, List<AwsDurableAwaitCheckpoint> awaitCheckpoints,
+        boolean bindingCreated) {
+        this(checkpoint, duplicate, executionStatus, resultJson, awaitIdentity, awaitCheckpoint, awaitCheckpoints,
+            bindingCreated, Optional.empty());
+    }
+
+    public AwsDurableActionResponse withAwaitSelectionCursor(Optional<AwaitInteractionCursor> cursor) {
+        return new AwsDurableActionResponse(checkpoint, duplicate, executionStatus, resultJson, awaitIdentity,
+            awaitCheckpoint, awaitCheckpoints, bindingCreated, cursor);
+    }
+
     public AwsDurableActionResponse {
+        awaitSelectionCursor = Objects.requireNonNull(awaitSelectionCursor, "awaitSelectionCursor");
         checkpoint = Objects.requireNonNull(checkpoint, "checkpoint");
         executionStatus = AwsDurableValidation.optional(executionStatus, "executionStatus");
         resultJson = AwsDurableValidation.optional(resultJson, "resultJson");

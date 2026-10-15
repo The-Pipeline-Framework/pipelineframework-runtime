@@ -45,6 +45,9 @@ class ExecutionReadModelTest {
   private ExecutionStateStore executionStateStore;
 
   @Mock
+  private org.pipelineframework.awaitable.AwaitCoordinator awaitCoordinator;
+
+  @Mock
   private ControlPlaneAdmissionPolicy admissionPolicy;
 
   private ExecutionInputPolicy executionInputPolicy;
@@ -60,10 +63,92 @@ class ExecutionReadModelTest {
         orchestratorConfig,
         executionInputPolicy,
         executionStateStore,
+        awaitCoordinator,
         admissionPolicy,
         () -> "pipeline-a",
         () -> "release-a",
         () -> payloadCodec);
+  }
+
+  @Test
+  void executionCheckpointObservesReleaseAndStatusThroughOneAdmittedPointRead() {
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.allow());
+    @SuppressWarnings("unchecked")
+    ExecutionRecord<Object, Object> record = org.mockito.Mockito.mock(ExecutionRecord.class);
+    when(record.tenantId()).thenReturn("tenant-1"); when(record.executionId()).thenReturn("exec-1");
+    when(record.pipelineId()).thenReturn("pipeline-a"); when(record.contractVersion()).thenReturn("contract-a");
+    when(record.releaseVersion()).thenReturn("release-a"); when(record.status()).thenReturn(ExecutionStatus.RUNNING);
+    when(executionStateStore.getExecution("tenant-1", "exec-1")).thenReturn(Uni.createFrom().item(Optional.of(record)));
+    assertEquals(new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint("tenant-1", "exec-1",
+        "pipeline-a", "contract-a", "release-a", ExecutionStatus.RUNNING),
+        readModel.getExecutionSemanticCheckpoint("tenant-1", "exec-1").await().indefinitely());
+    verify(executionStateStore).getExecution("tenant-1", "exec-1");
+    var admission = org.mockito.ArgumentCaptor.forClass(ControlPlaneAdmissionRequest.class);
+    verify(admissionPolicy).admit(admission.capture());
+    assertEquals(org.pipelineframework.orchestrator.ControlPlaneAdmissionOperation.GET_EXECUTION_STATUS,
+        admission.getValue().operation());
+  }
+
+  @Test
+  void executionCheckpointDenialRunsBeforeStorage() {
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.deny("read-denied", "no reads"));
+    assertThrows(ControlPlaneAdmissionException.class, () ->
+        readModel.getExecutionSemanticCheckpoint("tenant-1", "exec-1").await().indefinitely());
+    org.mockito.Mockito.verifyNoInteractions(executionStateStore);
+  }
+
+  @Test
+  void clientKeyCheckpointUsesTheSubmissionNormalizationAndNeverCreatesAdmission() {
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(orchestratorConfig.idempotencyPolicy()).thenReturn(org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy.CLIENT_KEY_REQUIRED);
+    when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.allow());
+    @SuppressWarnings("unchecked")
+    ExecutionRecord<Object, Object> record = org.mockito.Mockito.mock(ExecutionRecord.class);
+    when(record.tenantId()).thenReturn("tenant-1"); when(record.executionId()).thenReturn("exec-1");
+    when(record.executionKey()).thenReturn("key-1");
+    when(record.pipelineId()).thenReturn("pipeline-a"); when(record.contractVersion()).thenReturn("contract-a");
+    when(record.releaseVersion()).thenReturn("release-a"); when(record.status()).thenReturn(ExecutionStatus.RUNNING);
+    when(executionStateStore.getExecutionByKey("tenant-1", "key-1"))
+        .thenReturn(Uni.createFrom().item(Optional.of(record)));
+    assertEquals("exec-1", readModel.getExecutionSemanticCheckpointByClientKey(" tenant-1 ", " key-1 ")
+        .await().indefinitely().orElseThrow().executionId());
+    verify(executionStateStore).getExecutionByKey("tenant-1", "key-1");
+    org.mockito.Mockito.verifyNoMoreInteractions(executionStateStore);
+    var admitted = org.mockito.ArgumentCaptor.forClass(ControlPlaneAdmissionRequest.class);
+    verify(admissionPolicy, org.mockito.Mockito.times(2)).admit(admitted.capture());
+    assertEquals("", admitted.getAllValues().get(0).executionId());
+    assertEquals("exec-1", admitted.getAllValues().get(1).executionId());
+  }
+
+  @Test
+  void missingClientKeyCheckpointIsAnEmptyObservationWithoutResubmission() {
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(orchestratorConfig.idempotencyPolicy()).thenReturn(org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy.OPTIONAL_CLIENT_KEY);
+    when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.allow());
+    when(executionStateStore.getExecutionByKey("tenant-1", "not-yet-admitted"))
+        .thenReturn(Uni.createFrom().item(Optional.empty()));
+    assertTrue(readModel.getExecutionSemanticCheckpointByClientKey("tenant-1", "not-yet-admitted").await().indefinitely().isEmpty());
+    verify(executionStateStore).getExecutionByKey("tenant-1", "not-yet-admitted");
+    org.mockito.Mockito.verifyNoMoreInteractions(executionStateStore);
+  }
+
+  @Test
+  void clientKeyCheckpointRejectsInputDerivedKeysAndAdmissionDenialBeforeStorage() {
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(orchestratorConfig.idempotencyPolicy()).thenReturn(org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy.SERVER_KEY_ONLY);
+    var invalidKeyRead = org.junit.jupiter.api.Assertions.assertDoesNotThrow(() ->
+        readModel.getExecutionSemanticCheckpointByClientKey("tenant-1", "key-1"));
+    assertThrows(IllegalStateException.class, () -> invalidKeyRead.await().indefinitely());
+    org.mockito.Mockito.verifyNoInteractions(executionStateStore, admissionPolicy);
+    when(orchestratorConfig.idempotencyPolicy()).thenReturn(org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy.CLIENT_KEY_REQUIRED);
+    when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.deny("read-denied", "no reads"));
+    var deniedRead = org.junit.jupiter.api.Assertions.assertDoesNotThrow(() ->
+        readModel.getExecutionSemanticCheckpointByClientKey("tenant-1", "key-1"));
+    org.mockito.Mockito.verifyNoInteractions(executionStateStore, admissionPolicy);
+    assertThrows(ControlPlaneAdmissionException.class, () -> deniedRead.await().indefinitely());
+    org.mockito.Mockito.verifyNoInteractions(executionStateStore);
   }
 
   @Test

@@ -60,14 +60,20 @@ class PipelinePluginTest {
         // Create the pipeline.yaml file in the project root (where locator will find it)
         Path pipelineConfig = projectRoot.resolve("pipeline.yaml");
         Files.writeString(pipelineConfig, """
+            version: 3
             appName: "Test Pipeline"
             basePackage: "test.plugin"
             transport: "REST"
+            types:
+              Text:
+                java: java.lang.String
+                wraps: string
             steps:
               - name: "Process Test"
                 service: "test.plugin.ProcessTestService"
-                input: "java.lang.String"
-                output: "java.lang.String"
+                cardinality: ONE_TO_ONE
+                input: Text
+                output: Text
             aspects:
               persistence:
                 enabled: true
@@ -250,14 +256,20 @@ class PipelinePluginTest {
         // Create the pipeline.yaml file in the project root (where locator will find it)
         Path pipelineConfig = projectRoot.resolve("pipeline.yaml");
         Files.writeString(pipelineConfig, """
+            version: 3
             appName: "Test Pipeline"
             basePackage: "test.plugin"
             transport: "REST"
+            types:
+              Text:
+                java: java.lang.String
+                wraps: string
             steps:
               - name: "Process Test"
                 service: "test.plugin.ProcessTestService"
-                input: "java.lang.String"
-                output: "java.lang.String"
+                cardinality: ONE_TO_ONE
+                input: Text
+                output: Text
             aspects:
               cache:
                 enabled: true

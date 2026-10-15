@@ -29,9 +29,17 @@ class CheckpointPublicationGenerationTest {
             pipeline.orchestrator.mode=QUEUE_ASYNC
             """);
         Files.writeString(tempDir.resolve("pipeline.yaml"), """
+            version: 3
             appName: "Checkpoint Test"
             basePackage: "com.example.pipeline"
             transport: "LOCAL"
+            types:
+              OrderRequest:
+                java: com.example.domain.OrderRequest
+                fields: []
+              ReadyOrder:
+                java: com.example.domain.ReadyOrder
+                fields: []
             input:
               subscription:
                 publication: "orders-ready"
@@ -42,9 +50,10 @@ class CheckpointPublicationGenerationTest {
                 idempotencyKeyFields: ["orderId", "customerId"]
             steps:
               - name: "Order Ready"
+                service: "com.example.pipeline.ProcessOrderReadyService"
                 cardinality: "ONE_TO_ONE"
-                inputTypeName: "com.example.domain.OrderRequest"
-                outputTypeName: "com.example.domain.ReadyOrder"
+                input: OrderRequest
+                output: ReadyOrder
             """);
 
         Compilation compilation = Compiler.javac()
@@ -108,17 +117,26 @@ class CheckpointPublicationGenerationTest {
             pipeline.orchestrator.mode=QUEUE_ASYNC
             """);
         Files.writeString(configRoot.resolve("pipeline.yaml"), """
+            version: 3
             appName: "Checkpoint Test"
             basePackage: "com.example.pipeline"
             transport: "LOCAL"
+            types:
+              OrderRequest:
+                java: com.example.domain.OrderRequest
+                fields: []
+              ReadyOrder:
+                java: com.example.domain.ReadyOrder
+                fields: []
             connectors:
               - name: "orders-to-delivery"
                 transport: "GRPC"
             steps:
               - name: "Order Ready"
+                service: "com.example.pipeline.ProcessOrderReadyService"
                 cardinality: "ONE_TO_ONE"
-                inputTypeName: "com.example.domain.OrderRequest"
-                outputTypeName: "com.example.domain.ReadyOrder"
+                input: OrderRequest
+                output: ReadyOrder
             """);
 
         Compilation compilation = Compiler.javac()
@@ -185,7 +203,7 @@ class CheckpointPublicationGenerationTest {
             """
                 package com.example.domain;
 
-                public class %s {
+                public record %s() {
                 }
                 """.formatted(simpleName));
     }

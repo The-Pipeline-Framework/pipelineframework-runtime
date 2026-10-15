@@ -3,6 +3,7 @@ package org.pipelineframework;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.function.Supplier;
 
 import org.junit.jupiter.api.AfterAll;
@@ -35,12 +36,17 @@ class AwaitItemContinuationRecoveryIT extends AwaitItemContinuationRecoveryTest 
             .region(Region.of(LOCALSTACK.getRegion()))
             .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
                 LOCALSTACK.getAccessKey(), LOCALSTACK.getSecretKey()))).build();
-        table("_execution", "tenant_id", Optional.of("execution_id"), List.of());
-        table("_execution_key", "tenant_execution_key", Optional.empty(), List.of());
-        table("_execution_payload", "payload_id", Optional.of("payload_part"), List.of());
-        table("_unit", "tenant_id", Optional.of("unit_id"), List.of());
-        table("_interaction_key", "lookup_key", Optional.empty(), List.of());
-        table("_interaction", "tenant_id", Optional.of("interaction_id"), List.of(
+    }
+
+    private void createTables(String prefix) {
+        table(prefix, "_completion_lifecycle", "pk", Optional.of("sk"), List.of());
+        table(prefix, "_execution", "tenant_id", Optional.of("execution_id"), List.of());
+        table(prefix, "_execution_key", "tenant_execution_key", Optional.empty(), List.of());
+        table(prefix, "_execution_payload", "payload_id", Optional.of("payload_part"), List.of());
+        table(prefix, "_unit", "tenant_id", Optional.of("unit_id"), List.of());
+        table(prefix, "_interaction_key", "lookup_key", Optional.empty(), List.of());
+        table(prefix, "_interaction", "tenant_id", Optional.of("interaction_id"), List.of(
+            new Index("await-interaction-pending-by-deadline", "query_deadline_key", "query_deadline_sort", ScalarAttributeType.S),
             new Index("await-interaction-by-unit", "query_unit_key", "query_unit_sort", ScalarAttributeType.S),
             new Index("await-interaction-continuation-work", "query_continuation_key",
                 "query_continuation_due_epoch_ms", ScalarAttributeType.N)));
@@ -48,12 +54,16 @@ class AwaitItemContinuationRecoveryIT extends AwaitItemContinuationRecoveryTest 
 
     @Override
     protected Supplier<Stores> stores() {
-        return () -> new Stores(DynamoAwaitLifecycleTestStores.executionStore(dynamo, PREFIX),
-            org.pipelineframework.awaitable.store.DynamoAwaitLifecycleTestStores.interactionStore(dynamo, PREFIX),
-            org.pipelineframework.awaitable.store.DynamoAwaitLifecycleTestStores.unitStore(dynamo, PREFIX));
+        // Global due-work queries need isolated durable tables per scenario, including dynamic cases.
+        // Fresh callers within the scenario still recover from those same tables.
+        String prefix = PREFIX + "_" + UUID.randomUUID().toString().replace("-", "");
+        createTables(prefix);
+        return () -> new Stores(DynamoAwaitLifecycleTestStores.executionStore(dynamo, prefix),
+            org.pipelineframework.awaitable.store.DynamoAwaitLifecycleTestStores.interactionStore(dynamo, prefix),
+            org.pipelineframework.awaitable.store.DynamoAwaitLifecycleTestStores.unitStore(dynamo, prefix));
     }
 
-    private void table(String suffix, String hash, Optional<String> range, List<Index> indexes) {
+    private void table(String prefix, String suffix, String hash, Optional<String> range, List<Index> indexes) {
         List<AttributeDefinition> attributes = new ArrayList<>();
         attributes.add(attribute(hash, ScalarAttributeType.S));
         range.ifPresent(value -> attributes.add(attribute(value, ScalarAttributeType.S)));
@@ -70,13 +80,13 @@ class AwaitItemContinuationRecoveryIT extends AwaitItemContinuationRecoveryTest 
                 .projection(Projection.builder().projectionType(ProjectionType.ALL).build())
                 .provisionedThroughput(throughput).build();
         }).toList();
-        var request = CreateTableRequest.builder().tableName(PREFIX + suffix).attributeDefinitions(attributes)
+        var request = CreateTableRequest.builder().tableName(prefix + suffix).attributeDefinitions(attributes)
             .keySchema(keys).provisionedThroughput(throughput);
         if (!secondary.isEmpty()) {
             request.globalSecondaryIndexes(secondary);
         }
         dynamo.createTable(request.build());
-        dynamo.waiter().waitUntilTableExists(value -> value.tableName(PREFIX + suffix));
+        dynamo.waiter().waitUntilTableExists(value -> value.tableName(prefix + suffix));
     }
 
     private AttributeDefinition attribute(String name, ScalarAttributeType type) {

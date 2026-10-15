@@ -117,14 +117,23 @@ class PipelineGenerationPhaseIntegrationTest {
         Files.createDirectories(generatedSourcesDir);
 
         Files.writeString(projectRoot.resolve("pipeline.yaml"), """
+            version: 3
             appName: "Test Pipeline"
             basePackage: "org.pipelineframework.search"
             transport: "LOCAL"
+            types:
+              CrawlRequest:
+                java: org.pipelineframework.search.domain.CrawlRequest
+                fields: []
+              RawDocument:
+                java: org.pipelineframework.search.domain.RawDocument
+                fields: []
             steps:
               - name: "Process Crawl Source"
                 service: "org.pipelineframework.search.service.ProcessCrawlSourceService"
-                input: "org.pipelineframework.search.domain.CrawlRequest"
-                output: "org.pipelineframework.search.domain.RawDocument"
+                cardinality: ONE_TO_ONE
+                input: CrawlRequest
+                output: RawDocument
             """);
 
         Compilation compilation = Compiler.javac()
@@ -157,7 +166,7 @@ class PipelineGenerationPhaseIntegrationTest {
                     """
                         package org.pipelineframework.search.domain;
 
-                        public class CrawlRequest {
+                        public record CrawlRequest() {
                         }
                         """),
                 JavaFileObjects.forSourceString(
@@ -165,7 +174,7 @@ class PipelineGenerationPhaseIntegrationTest {
                     """
                         package org.pipelineframework.search.domain;
 
-                        public class RawDocument {
+                        public record RawDocument() {
                         }
                         """),
                 JavaFileObjects.forSourceString(
@@ -264,15 +273,24 @@ class PipelineGenerationPhaseIntegrationTest {
 
         Path pipelineConfig = projectRoot.resolve("pipeline.spring.yaml");
         Files.writeString(pipelineConfig, """
+            version: 3
             appName: "Spring Smoke"
             basePackage: "com.example"
             transport: "LOCAL"
             platform: "COMPUTE"
+            types:
+              PaymentRecord:
+                java: com.example.service.PaymentRecord
+                fields: []
+              PaymentStatus:
+                java: com.example.service.PaymentStatus
+                fields: []
             steps:
               - name: "payment"
                 service: "com.example.service.PaymentService"
-                input: "com.example.service.PaymentRecord"
-                output: "com.example.service.PaymentStatus"
+                cardinality: ONE_TO_ONE
+                input: PaymentRecord
+                output: PaymentStatus
             """);
 
         Compilation compilation = Compiler.javac()
@@ -304,7 +322,7 @@ class PipelineGenerationPhaseIntegrationTest {
                     """
                         package com.example.service;
 
-                        public class PaymentRecord {
+                        public record PaymentRecord() {
                         }
                         """),
                 JavaFileObjects.forSourceString(
@@ -312,7 +330,7 @@ class PipelineGenerationPhaseIntegrationTest {
                     """
                         package com.example.service;
 
-                        public class PaymentStatus {
+                        public record PaymentStatus() {
                         }
                         """));
 
@@ -353,16 +371,25 @@ class PipelineGenerationPhaseIntegrationTest {
 
         Path pipelineConfig = projectRoot.resolve("pipeline.spring-rest.yaml");
         Files.writeString(pipelineConfig, """
+            version: 3
             appName: "Spring REST Smoke"
             basePackage: "com.example"
             transport: "REST"
             platform: "COMPUTE"
+            types:
+              PaymentRecord:
+                java: com.example.domain.PaymentRecord
+                fields: []
+              PaymentStatus:
+                java: com.example.domain.PaymentStatus
+                fields: []
             steps:
               - name: "payment"
                 service: "com.example.service.PaymentService"
-                input: "com.example.domain.PaymentRecord"
+                cardinality: ONE_TO_ONE
+                input: PaymentRecord
                 inboundMapper: "com.example.mapper.PaymentRecordMapper"
-                output: "com.example.domain.PaymentStatus"
+                output: PaymentStatus
                 outboundMapper: "com.example.mapper.PaymentStatusMapper"
             """);
 
@@ -397,7 +424,7 @@ class PipelineGenerationPhaseIntegrationTest {
                     """
                         package com.example.domain;
 
-                        public class PaymentRecord {
+                        public record PaymentRecord() {
                         }
                         """),
                 JavaFileObjects.forSourceString(
@@ -405,7 +432,7 @@ class PipelineGenerationPhaseIntegrationTest {
                     """
                         package com.example.domain;
 
-                        public class PaymentStatus {
+                        public record PaymentStatus() {
                         }
                         """),
                 JavaFileObjects.forSourceString(
@@ -514,15 +541,24 @@ class PipelineGenerationPhaseIntegrationTest {
 
         Path pipelineConfig = projectRoot.resolve("pipeline.quarkus-blocking.yaml");
         Files.writeString(pipelineConfig, """
+            version: 3
             appName: "Quarkus Blocking"
             basePackage: "com.example"
             transport: "LOCAL"
             platform: "COMPUTE"
+            types:
+              PaymentRecord:
+                java: com.example.service.PaymentRecord
+                fields: []
+              PaymentStatus:
+                java: com.example.service.PaymentStatus
+                fields: []
             steps:
               - name: "payment"
                 service: "com.example.service.PaymentService"
-                input: "com.example.service.PaymentRecord"
-                output: "com.example.service.PaymentStatus"
+                cardinality: ONE_TO_ONE
+                input: PaymentRecord
+                output: PaymentStatus
                 runOnVirtualThreads: true
             """);
 
@@ -553,7 +589,7 @@ class PipelineGenerationPhaseIntegrationTest {
                     """
                         package com.example.service;
 
-                        public class PaymentRecord {
+                        public record PaymentRecord() {
                         }
                         """),
                 JavaFileObjects.forSourceString(
@@ -561,7 +597,7 @@ class PipelineGenerationPhaseIntegrationTest {
                     """
                         package com.example.service;
 
-                        public class PaymentStatus {
+                        public record PaymentStatus() {
                         }
                         """));
 
@@ -591,18 +627,25 @@ class PipelineGenerationPhaseIntegrationTest {
         Path configDir = projectRoot.resolve("config");
         Files.createDirectories(configDir);
         Files.writeString(configDir.resolve("pipeline.modular-lambda.yaml"), """
+            version: 3
             appName: "Search Pipeline"
             basePackage: "org.pipelineframework.search"
             transport: "REST"
             platform: "FUNCTION"
+            types:
+              CrawlRequest:
+                java: org.pipelineframework.search.common.domain.CrawlRequest
+                fields: []
+              RawDocument:
+                java: org.pipelineframework.search.common.domain.RawDocument
+                fields: []
             steps:
               - name: "Crawl Source"
                 service: "org.pipelineframework.search.crawl_source.service.ProcessCrawlSourceService"
-                input: "org.pipelineframework.search.common.domain.CrawlRequest"
-                inputTypeName: "CrawlRequest"
+                cardinality: ONE_TO_ONE
+                input: CrawlRequest
                 inboundMapper: "org.pipelineframework.search.crawl_source.mapper.CrawlRequestMapper"
-                output: "org.pipelineframework.search.common.domain.RawDocument"
-                outputTypeName: "RawDocument"
+                output: RawDocument
                 outboundMapper: "org.pipelineframework.search.crawl_source.mapper.RawDocumentMapper"
             """);
         Files.writeString(configDir.resolve("pipeline.runtime.yaml"), """
@@ -663,7 +706,7 @@ class PipelineGenerationPhaseIntegrationTest {
                     """
                         package org.pipelineframework.search.common.domain;
 
-                        public class CrawlRequest {
+                        public record CrawlRequest() {
                         }
                         """),
                 JavaFileObjects.forSourceString(
@@ -671,7 +714,7 @@ class PipelineGenerationPhaseIntegrationTest {
                     """
                         package org.pipelineframework.search.common.domain;
 
-                        public class RawDocument {
+                        public record RawDocument() {
                         }
                         """),
                 JavaFileObjects.forSourceString(

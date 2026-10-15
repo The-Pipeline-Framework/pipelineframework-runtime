@@ -1,6 +1,7 @@
 package org.pipelineframework.awaitable.store;
 
 import java.net.URI;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -8,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.UUID;
 import java.util.function.Supplier;
 import jakarta.annotation.PreDestroy;
@@ -18,12 +20,17 @@ import io.smallrye.mutiny.Uni;
 import io.smallrye.mutiny.infrastructure.Infrastructure;
 import org.jboss.logging.Logger;
 import org.pipelineframework.awaitable.AwaitCompletionCommand;
+import org.pipelineframework.awaitable.AwaitCompletionAdmission;
+import org.pipelineframework.awaitable.AwaitCompletionCursor;
+import org.pipelineframework.awaitable.AwaitCompletionPage;
 import org.pipelineframework.awaitable.AwaitCompletionResult;
 import org.pipelineframework.awaitable.AwaitDurablePayloadResolver;
 import org.pipelineframework.awaitable.AwaitCreateCommand;
 import org.pipelineframework.awaitable.AwaitCreateResult;
 import org.pipelineframework.awaitable.AwaitInteractionNotFoundException;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
+import org.pipelineframework.awaitable.AwaitInteractionCursor;
+import org.pipelineframework.awaitable.AwaitInteractionPage;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.AwaitInteractionTerminalException;
 import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
@@ -43,6 +50,7 @@ import software.amazon.awssdk.services.dynamodb.model.ReturnValue;
 import software.amazon.awssdk.services.dynamodb.model.TransactWriteItem;
 import software.amazon.awssdk.services.dynamodb.model.TransactWriteItemsRequest;
 import software.amazon.awssdk.services.dynamodb.model.TransactionCanceledException;
+import software.amazon.awssdk.services.dynamodb.model.Update;
 import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
 
 /**
@@ -112,6 +120,8 @@ public class DynamoAwaitInteractionStore implements
     private static final String QUERY_PENDING_DEADLINE_SORT = "query_pending_deadline_sort";
     private static final String QUERY_DEADLINE_KEY = "query_deadline_key";
     private static final String QUERY_DEADLINE_SORT = "query_deadline_sort";
+    private static final String TIMEOUT_CONSEQUENCES_PENDING = "timeout_consequences_pending";
+    private static final String TIMEOUT_CONSEQUENCES_PARTITION = "TIMEOUT_CONSEQUENCES";
     private static final String QUERY_CONTINUATION_KEY = "query_continuation_key";
     private static final String QUERY_CONTINUATION_DUE = "query_continuation_due_epoch_ms";
     private static final String QUERY_EXECUTION_KEY = "query_execution_key";
@@ -170,6 +180,18 @@ public class DynamoAwaitInteractionStore implements
     }
 
     @Override
+    public Uni<Optional<AwaitInteractionRecord>> getMetadata(String tenantId, String interactionId) {
+        return blocking(() -> {
+            var item = dynamoClient().getItem(GetItemRequest.builder().tableName(interactionTable())
+                .key(primaryKey(tenantId, interactionId)).consistentRead(true).build()).item();
+            if (item.isEmpty()) return Optional.empty();
+            var record = toMetadataRecord(item);
+            return record.ttlEpochS() > 0 && record.ttlEpochS() <= Instant.now().getEpochSecond()
+                ? Optional.empty() : Optional.of(record);
+        });
+    }
+
+    @Override
     public Uni<AwaitInteractionRecord> importRecord(AwaitInteractionRecord record) {
         return blocking(() -> {
             try {
@@ -196,9 +218,15 @@ public class DynamoAwaitInteractionStore implements
                     .build());
                 return record;
             } catch (TransactionCanceledException | ConditionalCheckFailedException ignored) {
-                return getBlocking(record.tenantId(), record.interactionId(), System.currentTimeMillis())
+                AwaitInteractionRecord existing = getBlocking(record.tenantId(), record.interactionId(), System.currentTimeMillis())
                     .orElseThrow(() -> new IllegalStateException(
                         "Await interaction import lost race but no interaction was found"));
+                requireSameOwner(existing, record);
+                if (org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(record.unitId()).isPresent()) {
+                    requireLookupOwner("idempotency", record.stepId() + ":" + record.idempotencyKey(), record);
+                    requireLookupOwner("correlation", record.correlationId(), record);
+                }
+                return existing;
             }
         });
     }
@@ -221,7 +249,8 @@ public class DynamoAwaitInteractionStore implements
                 "#ttl", TTL_EPOCH_S);
             Map<String, AttributeValue> values = Map.of(
                 ":unitKey", avS(scopedKey(tenantId, unitId)),
-                ":nowSec", avN(Instant.now().getEpochSecond()));
+                ":nowSec", avN(Instant.now().getEpochSecond()),
+                ":noExpiry", avN(0));
             List<AwaitInteractionRecord> records = new ArrayList<>();
             Map<String, AttributeValue> lastEvaluatedKey = null;
             do {
@@ -229,7 +258,7 @@ public class DynamoAwaitInteractionStore implements
                     .tableName(interactionTable())
                     .indexName(UNIT_INDEX)
                     .keyConditionExpression("#unitKey = :unitKey")
-                    .filterExpression("(attribute_not_exists(#ttl) OR #ttl > :nowSec)")
+                    .filterExpression("(attribute_not_exists(#ttl) OR #ttl = :noExpiry OR #ttl > :nowSec)")
                     .expressionAttributeNames(names)
                     .expressionAttributeValues(values)
                     .limit(queryPageLimit(100));
@@ -260,6 +289,64 @@ public class DynamoAwaitInteractionStore implements
     }
 
     @Override
+    public Uni<AwaitInteractionPage> findByUnitPage(
+        String tenantId, String unitId, int limit, Optional<AwaitInteractionCursor> cursor) {
+        return blocking(() -> {
+            if (limit < 1 || limit > 100) {
+                throw new IllegalArgumentException("Await page limit must be between 1 and 100");
+            }
+            Objects.requireNonNull(cursor, "cursor").ifPresent(value -> value.requireScope(tenantId, unitId));
+            QueryRequest.Builder request = QueryRequest.builder()
+                .tableName(interactionTable()).indexName(UNIT_INDEX)
+                .keyConditionExpression("#unitKey = :unitKey")
+                .filterExpression("attribute_not_exists(#ttl) OR #ttl = :noExpiry OR #ttl > :nowSec")
+                .expressionAttributeNames(Map.of("#unitKey", QUERY_UNIT_KEY, "#ttl", TTL_EPOCH_S))
+                .expressionAttributeValues(Map.of(":unitKey", avS(scopedKey(tenantId, unitId)),
+                    ":nowSec", avN(Instant.now().getEpochSecond()), ":noExpiry", avN(0)))
+                .scanIndexForward(true).limit(limit);
+            cursor.ifPresent(value -> request.exclusiveStartKey(decodeUnitPosition(value)));
+            var response = dynamoClient().query(request.build());
+            var records = response.items().stream().map(this::toRecord)
+                .filter(record -> tenantId.equals(record.tenantId()) && unitId.equals(record.unitId()))
+                .filter(record -> !ttlExpired(record, System.currentTimeMillis()))
+                .toList();
+            var lastKey = response.lastEvaluatedKey();
+            Optional<AwaitInteractionCursor> next = lastKey.isEmpty() ? Optional.empty()
+                : Optional.of(new AwaitInteractionCursor(tenantId, unitId, encodeUnitPosition(lastKey)));
+            return new AwaitInteractionPage(records, next);
+        });
+    }
+
+    private String encodeUnitPosition(Map<String, AttributeValue> key) {
+        try {
+            Map<String, String> values = new HashMap<>();
+            key.forEach((name, value) -> values.put(name, value.s()));
+            return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+                PipelineJson.mapper().writeValueAsBytes(values));
+        } catch (java.io.IOException failure) {
+            throw new IllegalArgumentException("Cannot encode Await unit cursor", failure);
+        }
+    }
+
+    private Map<String, AttributeValue> decodeUnitPosition(AwaitInteractionCursor cursor) {
+        try {
+            var values = PipelineJson.mapper().readValue(java.util.Base64.getUrlDecoder().decode(cursor.position()),
+                new com.fasterxml.jackson.core.type.TypeReference<Map<String, String>>() {});
+            if (!values.keySet().equals(java.util.Set.of(TENANT_ID, INTERACTION_ID, QUERY_UNIT_KEY, QUERY_UNIT_SORT))
+                || !cursor.tenantId().equals(values.get(TENANT_ID))
+                || !scopedKey(cursor.tenantId(), cursor.unitId()).equals(values.get(QUERY_UNIT_KEY))
+                || values.values().stream().anyMatch(value -> value == null || value.isBlank())) {
+                throw new IllegalArgumentException("Await unit cursor has invalid scope or keys");
+            }
+            Map<String, AttributeValue> key = new HashMap<>();
+            values.forEach((name, value) -> key.put(name, avS(value)));
+            return Map.copyOf(key);
+        } catch (java.io.IOException failure) {
+            throw new IllegalArgumentException("Cannot decode Await unit cursor", failure);
+        }
+    }
+
+    @Override
     public Uni<List<AwaitInteractionRecord>> findByExecution(
         String tenantId,
         String executionId,
@@ -276,13 +363,13 @@ public class DynamoAwaitInteractionStore implements
                     .tableName(interactionTable())
                     .indexName(EXECUTION_INDEX)
                     .keyConditionExpression("#executionKey = :executionKey")
-                    .filterExpression("attribute_not_exists(#ttl) OR #ttl > :nowSec")
+                    .filterExpression("attribute_not_exists(#ttl) OR #ttl = :noExpiry OR #ttl > :nowSec")
                     .expressionAttributeNames(Map.of(
                         "#executionKey", QUERY_EXECUTION_KEY,
                         "#ttl", TTL_EPOCH_S))
                     .expressionAttributeValues(Map.of(
                         ":executionKey", avS(scopedKey(tenantId, executionId)),
-                        ":nowSec", avN(Instant.now().getEpochSecond())))
+                        ":nowSec", avN(Instant.now().getEpochSecond()), ":noExpiry", avN(0)))
                     .scanIndexForward(false)
                     .limit(queryPageLimit(limit));
                 if (lastEvaluatedKey != null && !lastEvaluatedKey.isEmpty()) {
@@ -357,6 +444,26 @@ public class DynamoAwaitInteractionStore implements
     @Override
     public Uni<AwaitCompletionResult> complete(AwaitCompletionCommand command) {
         return blocking(() -> completeBlocking(command));
+    }
+
+    @Override
+    public Uni<Optional<AwaitCompletionAdmission>> getCompletionAdmission(String tenantId, String interactionId) {
+        return blocking(() -> completionLifecycleRepository().readAdmission(tenantId, interactionId));
+    }
+
+    @Override
+    public Uni<AwaitCompletionPage> findOpenCompletions(
+        String tenantId, int pageLimit, Optional<AwaitCompletionCursor> cursor
+    ) {
+        return blocking(() -> completionLifecycleRepository().findOpen(tenantId, pageLimit, cursor));
+    }
+
+    @Override
+    public Uni<Void> retireCompletionAdmission(AwaitCompletionAdmission admission) {
+        return blocking(() -> {
+            completionLifecycleRepository().retire(admission);
+            return Boolean.TRUE;
+        }).replaceWithVoid();
     }
 
     @Override
@@ -465,61 +572,110 @@ public class DynamoAwaitInteractionStore implements
     @Override
     public Uni<List<AwaitInteractionRecord>> findTimedOut(long nowEpochMs, int limit) {
         return blocking(() -> {
-            if (limit <= 0) {
-                return List.of();
+            if (limit <= 0) return List.of();
+            var response = dynamoClient().query(QueryRequest.builder().tableName(interactionTable())
+                .indexName(PENDING_DEADLINE_INDEX)
+                .keyConditionExpression("#deadlineKey = :deadlineKey AND #deadlineSort <= :deadlineCutoff")
+                .expressionAttributeNames(Map.of("#deadlineKey", QUERY_DEADLINE_KEY, "#deadlineSort", QUERY_DEADLINE_SORT))
+                .expressionAttributeValues(Map.of(":deadlineKey", avS(ACTIVE_DEADLINE_PARTITION),
+                    ":deadlineCutoff", avS(deadlineUpperBound(nowEpochMs))))
+                .limit(Math.min(limit, 100)).scanIndexForward(true).build());
+            var records = new ArrayList<AwaitInteractionRecord>();
+            for (var item : response.items()) {
+                var record = toMetadataRecord(item);
+                if (ttlExpired(record, nowEpochMs)) {
+                    retireExpiredActiveDeadline(record, nowEpochMs);
+                } else if (!record.status().terminal() && record.deadlineEpochMs() <= nowEpochMs) {
+                    records.add(record);
+                }
             }
-            Map<String, String> names = Map.of(
-                "#deadlineKey", QUERY_DEADLINE_KEY,
-                "#deadlineSort", QUERY_DEADLINE_SORT,
-                "#status", STATUS,
-                "#ttl", TTL_EPOCH_S);
-            Map<String, AttributeValue> values = Map.of(
-                ":deadlineKey", avS(ACTIVE_DEADLINE_PARTITION),
-                ":deadlineCutoff", avS(deadlineUpperBound(nowEpochMs)),
-                ":completed", avS(AwaitInteractionStatus.COMPLETED.name()),
-                ":failed", avS(AwaitInteractionStatus.FAILED.name()),
-                ":timedOut", avS(AwaitInteractionStatus.TIMED_OUT.name()),
-                ":cancelled", avS(AwaitInteractionStatus.CANCELLED.name()),
-                ":expired", avS(AwaitInteractionStatus.EXPIRED.name()),
-                ":nowSec", avN(Instant.ofEpochMilli(nowEpochMs).getEpochSecond()));
-            List<AwaitInteractionRecord> records = new ArrayList<>();
-            Map<String, AttributeValue> lastEvaluatedKey = null;
-            do {
-                QueryRequest.Builder request = QueryRequest.builder()
-                    .tableName(interactionTable())
-                    .indexName(PENDING_DEADLINE_INDEX)
-                    .keyConditionExpression("#deadlineKey = :deadlineKey AND #deadlineSort <= :deadlineCutoff")
-                    .filterExpression("#status <> :completed AND #status <> :failed "
-                        + "AND #status <> :timedOut AND #status <> :cancelled AND #status <> :expired "
-                        + "AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)")
-                    .expressionAttributeNames(names)
-                    .expressionAttributeValues(values)
-                    .limit(queryPageLimit(limit));
-                if (lastEvaluatedKey != null && !lastEvaluatedKey.isEmpty()) {
-                    request.exclusiveStartKey(lastEvaluatedKey);
-                }
-                var response = dynamoClient().query(request.build());
-                if (response.items() != null) {
-                    for (Map<String, AttributeValue> item : response.items()) {
-                        // Timeout discovery is a metadata-only control-plane read. Decoding an await
-                        // request/response here can require resolving the pinned release, even though
-                        // timeout admission only needs identity, status, deadline, and unit linkage.
-                        AwaitInteractionRecord record = toMetadataRecord(item);
-                        if (!record.status().terminal()
-                            && record.deadlineEpochMs() <= nowEpochMs
-                            && !ttlExpired(record, nowEpochMs)) {
-                            records.add(record);
-                        }
-                        if (records.size() >= limit) {
-                            break;
-                        }
-                    }
-                }
-                lastEvaluatedKey = response.lastEvaluatedKey();
-            } while (records.size() < limit && lastEvaluatedKey != null && !lastEvaluatedKey.isEmpty());
             records.sort(java.util.Comparator.comparingLong(AwaitInteractionRecord::deadlineEpochMs));
             return List.copyOf(records.subList(0, Math.min(records.size(), limit)));
         });
+    }
+
+    private void retireExpiredActiveDeadline(AwaitInteractionRecord record, long nowEpochMs) {
+        try {
+            dynamoClient().updateItem(UpdateItemRequest.builder().tableName(interactionTable())
+                .key(primaryKey(record.tenantId(), record.interactionId()))
+                .conditionExpression("#deadlineKey = :active AND #ttl > :zero AND #ttl <= :now")
+                .updateExpression("REMOVE #deadlineKey, #deadlineSort")
+                .expressionAttributeNames(Map.of("#deadlineKey", QUERY_DEADLINE_KEY,
+                    "#deadlineSort", QUERY_DEADLINE_SORT, "#ttl", TTL_EPOCH_S))
+                .expressionAttributeValues(Map.of(":active", avS(ACTIVE_DEADLINE_PARTITION), ":zero", avN(0),
+                    ":now", avN(Instant.ofEpochMilli(nowEpochMs).getEpochSecond())))
+                .build());
+        } catch (ConditionalCheckFailedException alreadyChanged) {
+            // TTL deletion or a concurrent lifecycle change has already retired this observation.
+        }
+    }
+
+    @Override
+    public Uni<List<AwaitInteractionRecord>> findDueTimeoutConsequences(long nowEpochMs, int limit) {
+        if (limit < 1 || limit > 100) throw new IllegalArgumentException("Timeout page limit must be between 1 and 100");
+        return blocking(() -> {
+            var response = dynamoClient().query(QueryRequest.builder().tableName(interactionTable())
+                .indexName(PENDING_DEADLINE_INDEX)
+                .keyConditionExpression("#deadlineKey = :work AND #deadlineSort <= :cutoff")
+                .expressionAttributeNames(Map.of("#deadlineKey", QUERY_DEADLINE_KEY, "#deadlineSort", QUERY_DEADLINE_SORT))
+                .expressionAttributeValues(Map.of(":work", avS(TIMEOUT_CONSEQUENCES_PARTITION),
+                    ":cutoff", avS(deadlineUpperBound(nowEpochMs))))
+                .limit(limit).scanIndexForward(true).build());
+            var due = new ArrayList<AwaitInteractionRecord>();
+            for (var item : response.items()) {
+                var record = toMetadataRecord(item);
+                if (record.status() != AwaitInteractionStatus.TIMED_OUT) {
+                    throw new IllegalStateException("Timeout work index contains a non-timeout interaction");
+                }
+                if (ttlExpired(record, nowEpochMs)) {
+                    // Logical semantic retention has expired; bounded cleanup prevents expired
+                    // index entries from starving retained work while Dynamo TTL cleanup lags.
+                    acknowledgeTimeoutConsequences(record, Optional.of(nowEpochMs));
+                } else {
+                    due.add(record);
+                }
+            }
+            return List.copyOf(due);
+        });
+    }
+
+    @Override
+    public Uni<Void> completeTimeoutConsequences(AwaitInteractionRecord interaction) {
+        Objects.requireNonNull(interaction, "interaction");
+        return blocking(() -> {
+            acknowledgeTimeoutConsequences(interaction, Optional.empty());
+            return Boolean.TRUE;
+        }).replaceWithVoid();
+    }
+
+    private void acknowledgeTimeoutConsequences(AwaitInteractionRecord interaction, Optional<Long> expiredAt) {
+        if (interaction.status() != AwaitInteractionStatus.TIMED_OUT) {
+            throw new IllegalArgumentException("Only a timed-out interaction can acknowledge timeout work");
+        }
+        var names = new HashMap<String, String>(Map.of("#version", VERSION, "#status", STATUS,
+            "#execution", EXECUTION_ID, "#unit", UNIT_ID, "#pending", TIMEOUT_CONSEQUENCES_PENDING,
+            "#deadlineKey", QUERY_DEADLINE_KEY, "#deadlineSort", QUERY_DEADLINE_SORT));
+        var values = new HashMap<String, AttributeValue>(Map.of(":version", avN(interaction.version()),
+            ":status", avS(AwaitInteractionStatus.TIMED_OUT.name()), ":execution", avS(interaction.executionId())));
+        var unit = Optional.ofNullable(interaction.unitId()).filter(id -> !id.isBlank());
+        unit.ifPresent(id -> values.put(":unit", avS(id)));
+        String condition = "#version = :version AND #status = :status AND #execution = :execution AND "
+            + (unit.isPresent() ? "#unit = :unit" : "attribute_not_exists(#unit)");
+        if (expiredAt.isPresent()) {
+            names.put("#ttl", TTL_EPOCH_S);
+            values.put(":expired", avN(Instant.ofEpochMilli(expiredAt.orElseThrow()).getEpochSecond()));
+            condition += " AND #ttl > :zero AND #ttl <= :expired";
+            values.put(":zero", avN(0));
+        }
+        try {
+            dynamoClient().updateItem(UpdateItemRequest.builder().tableName(interactionTable())
+                .key(primaryKey(interaction.tenantId(), interaction.interactionId()))
+                .conditionExpression(condition).updateExpression("REMOVE #pending, #deadlineKey, #deadlineSort")
+                .expressionAttributeNames(names).expressionAttributeValues(values).build());
+        } catch (ConditionalCheckFailedException mismatch) {
+            if (expiredAt.isPresent()) return; // Expiry cleanup may race native TTL deletion.
+            throw new IllegalStateException("Timeout acknowledgement does not match the retained interaction", mismatch);
+        }
     }
 
     @Override
@@ -552,10 +708,11 @@ public class DynamoAwaitInteractionStore implements
                 ":timedOut", avS(AwaitInteractionStatus.TIMED_OUT.name()),
                 ":cancelled", avS(AwaitInteractionStatus.CANCELLED.name()),
                 ":expired", avS(AwaitInteractionStatus.EXPIRED.name()),
-                ":nowSec", avN(Instant.now().getEpochSecond())));
+                ":nowSec", avN(Instant.now().getEpochSecond()),
+                ":noExpiry", avN(0)));
             StringBuilder filter = new StringBuilder("#status <> :completed AND #status <> :failed "
                 + "AND #status <> :timedOut AND #status <> :cancelled AND #status <> :expired "
-                + "AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)");
+                + "AND (attribute_not_exists(#ttl) OR #ttl = :noExpiry OR #ttl > :nowSec)");
             if (normalizedAssignee != null && indexSelection.filterAssignee()) {
                 names.put("#assignee", ASSIGNEE);
                 values.put(":assignee", avS(normalizedAssignee));
@@ -688,8 +845,33 @@ public class DynamoAwaitInteractionStore implements
                 lookupKey("idempotency", command.tenantId(), command.stepId() + ":" + command.idempotencyKey()),
                 command.tenantId(),
                 command.nowEpochMs())
-                .map(record -> new AwaitCreateResult(record, true))
+                .map(record -> {
+                    if (org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(record.unitId()).isPresent()
+                        || org.pipelineframework.awaitable.AwaitUnitOccurrence.fromUnitId(created.unitId()).isPresent()) {
+                        requireSameOwner(record, created);
+                    }
+                    return new AwaitCreateResult(record, true);
+                })
                 .orElseThrow(() -> ignored);
+        }
+    }
+
+    private void requireSameOwner(AwaitInteractionRecord existing, AwaitInteractionRecord incoming) {
+        if (!existing.tenantId().equals(incoming.tenantId()) || !Objects.equals(existing.unitId(), incoming.unitId())
+            || !existing.executionId().equals(incoming.executionId()) || !existing.stepId().equals(incoming.stepId())
+            || existing.stepIndex() != incoming.stepIndex() || !Objects.equals(existing.itemIndex(), incoming.itemIndex())
+            || !Objects.equals(existing.idempotencyKey(), incoming.idempotencyKey())
+            || !Objects.equals(existing.correlationId(), incoming.correlationId())) {
+            throw new IllegalStateException("Await interaction identity conflicts with its immutable owner");
+        }
+    }
+
+    private void requireLookupOwner(String kind, String key, AwaitInteractionRecord record) {
+        var retained = dynamoClient().getItem(GetItemRequest.builder().tableName(lookupTable())
+            .key(Map.of(LOOKUP_KEY, avS(lookupKey(kind, record.tenantId(), key)))).consistentRead(true).build()).item();
+        if (!record.interactionId().equals(readString(retained, INTERACTION_ID))
+            || !record.tenantId().equals(readString(retained, TENANT_ID))) {
+            throw new IllegalStateException("Qualified Await lookup does not retain its exact interaction owner");
         }
     }
 
@@ -709,10 +891,12 @@ public class DynamoAwaitInteractionStore implements
     private AwaitCompletionResult completeResolvedBlocking(AwaitInteractionRecord current,
         AwaitCompletionCommand command, int remainingRaces) {
         if (current.status() == AwaitInteractionStatus.COMPLETED) {
+            verifyRetainedCompletionAdmission(current);
             ensureItemContinuationProjection(current, command.nowEpochMs());
             return new AwaitCompletionResult(current, true);
         }
         if (current.status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
+            verifyRetainedCompletionAdmission(current);
             return new AwaitCompletionResult(current, true);
         }
         if (current.status().terminal()) {
@@ -735,32 +919,25 @@ public class DynamoAwaitInteractionStore implements
                     command.nowEpochMs());
                 if (refreshed.isPresent() && (refreshed.get().status() == AwaitInteractionStatus.COMPLETED
                     || refreshed.get().status() == AwaitInteractionStatus.COMPLETION_OBSERVED)) {
+                    verifyRetainedCompletionAdmission(refreshed.get());
                     return new AwaitCompletionResult(refreshed.get(), true);
                 }
             }
             throw new AwaitInteractionTerminalException("Await interaction timed out before completion");
         }
-        Optional<AwaitInteractionRecord> completed = transitionStatus(
-            current.tenantId(),
-            current.interactionId(),
-            current.version(),
-            null,
-            current.observedCompletionStatus(),
-            serializePayload(current, AwaitDurablePayloadResolver.Slot.RESPONSE, command.responsePayload()),
-            command.actor(),
-            null,
-            command.nowEpochMs(),
-            current.itemInteraction());
+        Optional<AwaitInteractionRecord> completed = transitionCompletionWithAdmission(current, command);
         if (completed.isPresent()) {
             return new AwaitCompletionResult(completed.get(), false);
         }
         AwaitInteractionRecord refreshed = getBlocking(current.tenantId(), current.interactionId(), command.nowEpochMs())
             .orElseThrow(() -> new IllegalStateException("Await completion transition lost OCC race and interaction disappeared"));
         if (refreshed.status() == AwaitInteractionStatus.COMPLETED) {
+            verifyRetainedCompletionAdmission(refreshed);
             ensureItemContinuationProjection(refreshed, command.nowEpochMs());
             return new AwaitCompletionResult(refreshed, true);
         }
         if (refreshed.status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
+            verifyRetainedCompletionAdmission(refreshed);
             return new AwaitCompletionResult(refreshed, true);
         }
         if (refreshed.status().terminal()) {
@@ -770,6 +947,114 @@ public class DynamoAwaitInteractionStore implements
             return completeResolvedBlocking(refreshed, command, remainingRaces - 1);
         }
         throw new IllegalStateException("Await completion transition lost OCC race");
+    }
+
+    private Optional<AwaitInteractionRecord> transitionCompletionWithAdmission(
+        AwaitInteractionRecord current, AwaitCompletionCommand command
+    ) {
+        AwaitCompletionAdmission admission = completionAdmission(current, command.nowEpochMs());
+        String status = current.observedCompletionStatus().name();
+        Map<String, String> names = new HashMap<>(Map.of(
+            "#version", VERSION, "#status", STATUS, "#updated", UPDATED_AT_EPOCH_MS,
+            "#ttl", TTL_EPOCH_S));
+        Map<String, AttributeValue> values = new HashMap<>(Map.of(
+            ":expected", avN(current.version()), ":expectedStatus", avS(current.status().name()),
+            ":status", avS(status), ":one", avN(1), ":now", avN(command.nowEpochMs()),
+                ":nowSec", avN(Instant.ofEpochMilli(command.nowEpochMs()).getEpochSecond()),
+                ":noExpiry", avN(0)));
+        StringBuilder update = new StringBuilder("SET #status = :status, #version = #version + :one, #updated = :now");
+        String responsePayload = serializePayload(
+            current, AwaitDurablePayloadResolver.Slot.RESPONSE, command.responsePayload());
+        if (responsePayload != null) {
+            names.put("#response", RESPONSE_PAYLOAD_JSON);
+            values.put(":response", avS(responsePayload));
+            update.append(", #response = :response");
+        }
+        if (command.actor() != null && !command.actor().isBlank()) {
+            names.put("#actor", ACTOR);
+            values.put(":actor", avS(command.actor()));
+            update.append(", #actor = :actor");
+        }
+        if (current.itemInteraction()) {
+            names.put("#continuationKey", QUERY_CONTINUATION_KEY);
+            names.put("#continuationDue", QUERY_CONTINUATION_DUE);
+            names.put("#continuationAttempt", CONTINUATION_ATTEMPT);
+            values.put(":continuationKey", avS(READY_CONTINUATION_PARTITION));
+            values.put(":continuationDue", avN(command.nowEpochMs()));
+            values.put(":continuationAttempt", avN(1));
+            update.append(", #continuationKey = :continuationKey")
+                .append(", #continuationDue = :continuationDue")
+                .append(", #continuationAttempt = :continuationAttempt");
+        }
+        Update parentUpdate = Update.builder()
+            .tableName(interactionTable())
+            .key(primaryKey(current.tenantId(), current.interactionId()))
+            .conditionExpression("#version = :expected AND #status = :expectedStatus "
+                + "AND (attribute_not_exists(#ttl) OR #ttl = :noExpiry OR #ttl > :nowSec)")
+            .updateExpression(update.toString())
+            .expressionAttributeNames(names)
+            .expressionAttributeValues(values)
+            .build();
+        List<TransactWriteItem> writes = new ArrayList<>();
+        writes.add(TransactWriteItem.builder().update(parentUpdate).build());
+        writes.addAll(completionLifecycleRepository().admissionWrites(admission));
+        try {
+            dynamoClient().transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writes).build());
+        } catch (ConditionalCheckFailedException conditionalRace) {
+            return Optional.empty();
+        } catch (TransactionCanceledException cancelled) {
+            if (conditionalCompletionCancellation(cancelled)) return Optional.empty();
+            throw cancelled;
+        }
+        Map<String, AttributeValue> stored = dynamoClient().getItem(GetItemRequest.builder()
+            .tableName(interactionTable())
+            .key(primaryKey(current.tenantId(), current.interactionId()))
+            .consistentRead(true)
+            .build()).item();
+        if (stored == null || stored.isEmpty()) {
+            throw new IllegalStateException("Await completion committed but its interaction could not be read");
+        }
+        return Optional.of(toRecord(stored));
+    }
+
+    private AwaitCompletionAdmission completionAdmission(AwaitInteractionRecord current, long admittedAtEpochMs) {
+        return new AwaitCompletionAdmission(
+            AwaitCompletionAdmission.CURRENT_SCHEMA_VERSION,
+            current.tenantId(),
+            current.executionId(),
+            current.interactionId(),
+            Optional.ofNullable(current.unitId()).filter(unit -> !unit.isBlank()),
+            current.stepId(),
+            current.stepIndex(),
+            current.itemIndex() == null ? OptionalInt.empty() : OptionalInt.of(current.itemIndex()),
+            Optional.ofNullable(current.causationId()).filter(causation -> !causation.isBlank()),
+            admittedAtEpochMs,
+            current.ttlEpochS());
+    }
+
+    private void verifyRetainedCompletionAdmission(AwaitInteractionRecord completed) {
+        completionLifecycleRepository().readAdmission(completed.tenantId(), completed.interactionId())
+            .ifPresent(admission -> {
+                if (!completionAdmission(completed, admission.firstAdmittedAtEpochMs()).equals(admission)) {
+                    throw new IllegalStateException("Retained Await completion admission conflicts with its interaction");
+                }
+            });
+    }
+
+    private boolean conditionalCompletionCancellation(TransactionCanceledException failure) {
+        var reasons = failure.cancellationReasons();
+        if (reasons == null || reasons.isEmpty()) return false;
+        boolean conditionalFailure = false;
+        for (var reason : reasons) {
+            if (reason == null) return false;
+            String code = reason.code();
+            if ("ConditionalCheckFailed".equals(code)) {
+                conditionalFailure = true;
+            } else if (!"None".equals(code)) {
+                return false;
+            }
+        }
+        return conditionalFailure;
     }
 
     private Optional<AwaitInteractionRecord> resolveForCompletion(AwaitCompletionCommand command) {
@@ -870,6 +1155,7 @@ public class DynamoAwaitInteractionStore implements
         values.put(":one", avN(1));
         values.put(":now", avN(nowEpochMs));
         values.put(":nowSec", avN(Instant.ofEpochMilli(nowEpochMs).getEpochSecond()));
+        values.put(":noExpiry", avN(0));
         if (requiredStatus != null) {
             values.put(":requiredStatus", avS(requiredStatus.name()));
         }
@@ -912,6 +1198,12 @@ public class DynamoAwaitInteractionStore implements
             names.put("#deadlineKey", QUERY_DEADLINE_KEY);
             names.put("#deadlineSort", QUERY_DEADLINE_SORT);
         }
+        if (status == AwaitInteractionStatus.TIMED_OUT) {
+            names.put("#timeoutPending", TIMEOUT_CONSEQUENCES_PENDING);
+            values.put(":timeoutPending", AttributeValue.builder().bool(true).build());
+            values.put(":timeoutWork", avS(TIMEOUT_CONSEQUENCES_PARTITION));
+            values.put(":timeoutSort", avS(deadlineSortKey(nowEpochMs, tenantId, interactionId)));
+        }
         StringBuilder update = new StringBuilder("SET #status = :status, #version = #version + :one, #updated = :now");
         if (responsePayloadJson != null) {
             update.append(", #response = :response");
@@ -933,16 +1225,29 @@ public class DynamoAwaitInteractionStore implements
                 .append(", #continuationDue = :continuationDue")
                 .append(", #continuationAttempt = :continuationAttempt");
         }
+        if (status == AwaitInteractionStatus.TIMED_OUT) {
+            update.append(", #timeoutPending = :timeoutPending, #deadlineKey = :timeoutWork, #deadlineSort = :timeoutSort");
+        }
         if (status.terminal()) {
             update.append(" REMOVE #pendingTenantKey, #pendingAssigneeKey, #pendingGroupKey, #pendingStepKey, ")
-                .append("#pendingDeadlineSort, #deadlineKey, #deadlineSort");
+                .append("#pendingDeadlineSort");
+            if (status != AwaitInteractionStatus.TIMED_OUT) update.append(", #deadlineKey, #deadlineSort");
         }
         if (clearStagedCompletion) {
             update.append(status.terminal() ? ", #stagedCompletion" : " REMOVE #stagedCompletion");
         }
-        String condition = "#version = :expected AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)";
+        String condition = "#version = :expected AND (attribute_not_exists(#ttl) OR #ttl = :noExpiry OR #ttl > :nowSec)";
         if (requiredStatus != null) {
-            condition = "#version = :expected AND #status = :requiredStatus AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)";
+            condition = "#version = :expected AND #status = :requiredStatus "
+                + "AND (attribute_not_exists(#ttl) OR #ttl = :noExpiry OR #ttl > :nowSec)";
+        }
+        if (status == AwaitInteractionStatus.TIMED_OUT) {
+            for (var terminal : List.of(AwaitInteractionStatus.COMPLETED, AwaitInteractionStatus.FAILED,
+                AwaitInteractionStatus.TIMED_OUT, AwaitInteractionStatus.CANCELLED, AwaitInteractionStatus.EXPIRED)) {
+                String valueKey = ":terminal" + terminal.name();
+                values.put(valueKey, avS(terminal.name()));
+                condition += " AND #status <> " + valueKey;
+            }
         }
         try {
             Map<String, AttributeValue> attributes = dynamoClient().updateItem(UpdateItemRequest.builder()
@@ -980,7 +1285,8 @@ public class DynamoAwaitInteractionStore implements
             Map<String, AttributeValue> values = Map.of(
                 ":continuationKey", avS(READY_CONTINUATION_PARTITION),
                 ":now", avN(nowEpochMs),
-                ":nowSec", avN(Instant.ofEpochMilli(nowEpochMs).getEpochSecond()));
+                ":nowSec", avN(Instant.ofEpochMilli(nowEpochMs).getEpochSecond()),
+                ":noExpiry", avN(0));
             List<AwaitItemContinuationCommand> commands = new ArrayList<>();
             Map<String, AttributeValue> lastEvaluatedKey = null;
             do {
@@ -988,7 +1294,7 @@ public class DynamoAwaitInteractionStore implements
                     .tableName(interactionTable())
                     .indexName(CONTINUATION_WORK_INDEX)
                     .keyConditionExpression("#continuationKey = :continuationKey AND #continuationDue <= :now")
-                    .filterExpression("attribute_not_exists(#ttl) OR #ttl > :nowSec")
+                    .filterExpression("attribute_not_exists(#ttl) OR #ttl = :noExpiry OR #ttl > :nowSec")
                     .expressionAttributeNames(names)
                     .expressionAttributeValues(values)
                     .limit(queryPageLimit(limit));
@@ -1149,7 +1455,7 @@ public class DynamoAwaitInteractionStore implements
         item.put(LOOKUP_KIND, avS(kind));
         item.put(TENANT_ID, avS(tenantId));
         item.put(INTERACTION_ID, avS(interactionId));
-        item.put(TTL_EPOCH_S, avN(ttlEpochS));
+        if (ttlEpochS > 0) item.put(TTL_EPOCH_S, avN(ttlEpochS));
         return Put.builder()
             .tableName(lookupTable())
             .item(item)
@@ -1178,7 +1484,7 @@ public class DynamoAwaitInteractionStore implements
         item.put(DEADLINE_EPOCH_MS, avN(record.deadlineEpochMs()));
         item.put(CREATED_AT_EPOCH_MS, avN(record.createdAtEpochMs()));
         item.put(UPDATED_AT_EPOCH_MS, avN(record.updatedAtEpochMs()));
-        item.put(TTL_EPOCH_S, avN(record.ttlEpochS()));
+        if (record.ttlEpochS() > 0) item.put(TTL_EPOCH_S, avN(record.ttlEpochS()));
         putIfPresent(item, CAUSATION_ID, record.causationId());
         putIfPresent(item, RESPONSE_PAYLOAD_JSON,
             serializePayload(record, AwaitDurablePayloadResolver.Slot.RESPONSE, record.responsePayload()));
@@ -1358,6 +1664,11 @@ public class DynamoAwaitInteractionStore implements
         return orchestratorConfig.dynamo().awaitInteractionTable();
     }
 
+    private DynamoAwaitCompletionLifecycleRepository completionLifecycleRepository() {
+        return new DynamoAwaitCompletionLifecycleRepository(
+            dynamoClient(), orchestratorConfig.dynamo().awaitCompletionLifecycleTable(), Clock.systemUTC());
+    }
+
     private String lookupTable() {
         return orchestratorConfig.dynamo().awaitInteractionKeyTable();
     }
@@ -1439,6 +1750,11 @@ public class DynamoAwaitInteractionStore implements
         if (record.unitId() != null && !record.unitId().isBlank()) {
             item.put(QUERY_UNIT_KEY, avS(scopedKey(record.tenantId(), record.unitId())));
             item.put(QUERY_UNIT_SORT, avS(itemSortKey(record.itemIndex(), record.causationId(), record.interactionId())));
+        }
+        if (record.status() == AwaitInteractionStatus.TIMED_OUT) {
+            item.put(TIMEOUT_CONSEQUENCES_PENDING, AttributeValue.builder().bool(true).build());
+            item.put(QUERY_DEADLINE_KEY, avS(TIMEOUT_CONSEQUENCES_PARTITION));
+            item.put(QUERY_DEADLINE_SORT, avS(deadlineSortKey(record.updatedAtEpochMs(), record.tenantId(), record.interactionId())));
         }
         if (record.status().terminal()) {
             return;

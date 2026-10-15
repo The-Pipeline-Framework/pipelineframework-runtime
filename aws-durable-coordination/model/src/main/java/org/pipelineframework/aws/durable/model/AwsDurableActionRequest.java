@@ -2,6 +2,7 @@ package org.pipelineframework.aws.durable.model;
 
 import java.util.Objects;
 import java.util.Optional;
+import org.pipelineframework.awaitable.AwaitInteractionCursor;
 
 public record AwsDurableActionRequest(
     AwsDurableOperation operation,
@@ -18,11 +19,83 @@ public record AwsDurableActionRequest(
     Optional<String> providerCallbackId,
     Optional<Long> expectedVersion,
     Optional<String> reason,
-    long generation
+    long generation,
+    Optional<AwaitInteractionCursor> awaitSelectionCursor,
+    Optional<org.pipelineframework.awaitable.AwaitCompletionCursor> completionCursor,
+    Optional<Integer> completionPageLimit
 ) {
+    public AwsDurableActionRequest(
+        AwsDurableOperation operation, String tenantId, Optional<String> executionId, Optional<String> idempotencyKey,
+        Optional<String> pipelineId, Optional<String> contractVersion, Optional<String> releaseVersion,
+        Optional<String> inputJson, Optional<AwsDurableAwaitIdentity> awaitIdentity,
+        Optional<String> providerExecutionName, Optional<String> providerExecutionArn, Optional<String> providerCallbackId,
+        Optional<Long> expectedVersion, Optional<String> reason, long generation,
+        Optional<AwaitInteractionCursor> awaitSelectionCursor) {
+        this(operation, tenantId, executionId, idempotencyKey, pipelineId, contractVersion, releaseVersion, inputJson,
+            awaitIdentity, providerExecutionName, providerExecutionArn, providerCallbackId, expectedVersion, reason,
+            generation, awaitSelectionCursor, Optional.empty(), Optional.empty());
+    }
+
+    public AwsDurableActionRequest(
+        AwsDurableOperation operation, String tenantId, Optional<String> executionId, Optional<String> idempotencyKey,
+        Optional<String> pipelineId, Optional<String> contractVersion, Optional<String> releaseVersion,
+        Optional<String> inputJson, Optional<AwsDurableAwaitIdentity> awaitIdentity,
+        Optional<String> providerExecutionName, Optional<String> providerExecutionArn, Optional<String> providerCallbackId,
+        Optional<Long> expectedVersion, Optional<String> reason, long generation) {
+        this(operation, tenantId, executionId, idempotencyKey, pipelineId, contractVersion, releaseVersion, inputJson,
+            awaitIdentity, providerExecutionName, providerExecutionArn, providerCallbackId, expectedVersion, reason,
+            generation, Optional.empty());
+    }
+
+    public AwsDurableActionRequest withAwaitSelectionCursor(Optional<AwaitInteractionCursor> cursor) {
+        return new AwsDurableActionRequest(operation, tenantId, executionId, idempotencyKey, pipelineId, contractVersion,
+            releaseVersion, inputJson, awaitIdentity, providerExecutionName, providerExecutionArn, providerCallbackId,
+            expectedVersion, reason, generation, cursor, completionCursor, completionPageLimit);
+    }
+
+    public AwsDurableActionRequest withCompletionSelection(
+        int limit, Optional<org.pipelineframework.awaitable.AwaitCompletionCursor> cursor) {
+        return new AwsDurableActionRequest(operation, tenantId, executionId, idempotencyKey, pipelineId, contractVersion,
+            releaseVersion, inputJson, awaitIdentity, providerExecutionName, providerExecutionArn, providerCallbackId,
+            expectedVersion, reason, generation, awaitSelectionCursor, cursor, Optional.of(limit));
+    }
+
+    public static AwsDurableActionRequest completionQuery(String tenantId, int limit,
+        Optional<org.pipelineframework.awaitable.AwaitCompletionCursor> cursor) {
+        return new AwsDurableActionRequest(AwsDurableOperation.QUERY_AWAIT_COMPLETIONS, tenantId,
+            Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+            Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), 1)
+            .withCompletionSelection(limit, cursor);
+    }
+
+    public static AwsDurableActionRequest completionObservation(AwsDurableAwaitIdentity identity) {
+        var base = awaitCheckpoint(identity);
+        return new AwsDurableActionRequest(AwsDurableOperation.READ_AWAIT_COMPLETION, base.tenantId(), base.executionId(),
+            base.idempotencyKey(), base.pipelineId(), base.contractVersion(), base.releaseVersion(), base.inputJson(),
+            base.awaitIdentity(), base.providerExecutionName(), base.providerExecutionArn(), base.providerCallbackId(),
+            base.expectedVersion(), base.reason(), base.generation());
+    }
+
+    public static AwsDurableActionRequest awaitResumed(AwsDurableAwaitIdentity identity,
+        AwsDurableDriverCheckpoint checkpoint, String providerExecutionArn) {
+        Objects.requireNonNull(identity, "identity");
+        var base = forExecution(AwsDurableOperation.RECORD_AWAIT_RESUMED, checkpoint);
+        return new AwsDurableActionRequest(AwsDurableOperation.RECORD_AWAIT_RESUMED,
+            base.tenantId(), base.executionId(), base.idempotencyKey(), base.pipelineId(),
+            base.contractVersion(), base.releaseVersion(), Optional.empty(), Optional.of(identity), Optional.empty(),
+            Optional.of(providerExecutionArn), Optional.empty(), Optional.empty(), Optional.empty(), base.generation());
+    }
+
     public AwsDurableActionRequest {
+        completionCursor = Objects.requireNonNull(completionCursor, "completionCursor");
+        completionPageLimit = Objects.requireNonNull(completionPageLimit, "completionPageLimit");
+        completionPageLimit.ifPresent(value -> {
+            if (value < 1 || value > 100) throw new IllegalArgumentException("Completion page limit must be between 1 and 100");
+        });
+        awaitSelectionCursor = Objects.requireNonNull(awaitSelectionCursor, "awaitSelectionCursor");
         operation = Objects.requireNonNull(operation, "operation");
         tenantId = AwsDurableValidation.required(tenantId, "tenantId");
+        if (completionCursor.isPresent()) completionCursor.orElseThrow().requireScope(tenantId);
         executionId = AwsDurableValidation.optional(executionId, "executionId");
         idempotencyKey = AwsDurableValidation.optional(idempotencyKey, "idempotencyKey");
         pipelineId = AwsDurableValidation.optional(pipelineId, "pipelineId");
@@ -61,6 +134,20 @@ public record AwsDurableActionRequest(
 
     public static AwsDurableActionRequest status(AwsDurableDriverCheckpoint checkpoint) {
         return forExecution(AwsDurableOperation.STATUS, checkpoint);
+    }
+
+    public static AwsDurableActionRequest registerAdmission(AwsDurableExecutionInput input, String name, String arn) {
+        return new AwsDurableActionRequest(AwsDurableOperation.REGISTER_EXECUTION, input.tenantId(),
+            input.resumeExecutionId(), Optional.of(input.idempotencyKey()), Optional.of(input.pipelineId()),
+            Optional.of(input.contractVersion()), Optional.of(input.releaseVersion()), Optional.empty(), Optional.empty(),
+            Optional.of(name), Optional.of(arn), Optional.empty(), Optional.empty(), Optional.empty(), input.generation());
+    }
+
+    public static AwsDurableActionRequest registerExecution(AwsDurableDriverCheckpoint checkpoint, String name, String arn) {
+        var base = forExecution(AwsDurableOperation.REGISTER_EXECUTION, checkpoint);
+        return new AwsDurableActionRequest(base.operation(), base.tenantId(), base.executionId(), base.idempotencyKey(),
+            base.pipelineId(), base.contractVersion(), base.releaseVersion(), base.inputJson(), base.awaitIdentity(),
+            Optional.of(name), Optional.of(arn), base.providerCallbackId(), base.expectedVersion(), base.reason(), base.generation());
     }
 
     public static AwsDurableActionRequest result(AwsDurableDriverCheckpoint checkpoint) {

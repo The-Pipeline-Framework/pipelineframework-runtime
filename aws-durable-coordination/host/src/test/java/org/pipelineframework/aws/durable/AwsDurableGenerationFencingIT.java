@@ -47,15 +47,97 @@ class AwsDurableGenerationFencingIT {
                 AwsBasicCredentials.create(LOCALSTACK.getAccessKey(), LOCALSTACK.getSecretKey()))).build();
         dynamo.createTable(request -> request.tableName(TABLE).billingMode(BillingMode.PAY_PER_REQUEST)
             .attributeDefinitions(AttributeDefinition.builder().attributeName("pk").attributeType(ScalarAttributeType.S).build(),
-                AttributeDefinition.builder().attributeName("sk").attributeType(ScalarAttributeType.S).build())
+                AttributeDefinition.builder().attributeName("sk").attributeType(ScalarAttributeType.S).build(),
+                AttributeDefinition.builder().attributeName("provider_execution_arn").attributeType(ScalarAttributeType.S).build())
             .keySchema(KeySchemaElement.builder().attributeName("pk").keyType(KeyType.HASH).build(),
-                KeySchemaElement.builder().attributeName("sk").keyType(KeyType.RANGE).build()));
+                KeySchemaElement.builder().attributeName("sk").keyType(KeyType.RANGE).build())
+            .globalSecondaryIndexes(index -> index.indexName(AwsDurableCallbackBindingRepository.PROVIDER_REGISTRATION_INDEX)
+                .keySchema(KeySchemaElement.builder().attributeName("provider_execution_arn").keyType(KeyType.HASH).build(),
+                    KeySchemaElement.builder().attributeName("sk").keyType(KeyType.RANGE).build())
+                .projection(projection -> projection.projectionType(software.amazon.awssdk.services.dynamodb.model.ProjectionType.ALL))));
         dynamo.waiter().waitUntilTableExists(request -> request.tableName(TABLE));
     }
 
     @AfterAll
     static void closeClient() {
         dynamo.close();
+    }
+
+    @Test
+    void recoveryLocatorSurvivesCallbackDeletionAndRejectsConflictingOrStaleAuthority() {
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, TABLE);
+        var registration = registration(UUID.randomUUID().toString(), 1);
+        var locator = new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(registration.checkpoint(),
+            registration.providerExecutionName(), registration.providerExecutionArn());
+        assertThat(repository.registerRecovery(locator)).isTrue();
+        assertThat(repository.registerRecovery(locator)).isFalse();
+        assertThatThrownBy(() -> repository.registerRecovery(new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(
+            locator.checkpoint(), "conflicting", "arn:conflicting"))).isInstanceOf(IllegalStateException.class);
+        repository.register(registration);
+        dynamo.deleteItem(request -> request.tableName(TABLE).key(java.util.Map.of(
+            "pk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(registration.partitionKey()).build(),
+            "sk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(registration.sortKey()).build())));
+        assertThat(repository.findRegistration(registration.checkpoint().tenantId(), registration.checkpoint().executionId(), 1)).isEmpty();
+        assertThat(repository.findRecoveryByProviderExecutionArn(locator.providerExecutionArn())).contains(locator);
+        var item = dynamo.getItem(request -> request.tableName(TABLE).consistentRead(true).key(java.util.Map.of(
+            "pk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(locator.partitionKey()).build(),
+            "sk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(locator.sortKey()).build()))).item();
+        assertThat(item).doesNotContainKey("expires_at_epoch_s");
+        repository.claimGeneration(new AwsDurableDriverCheckpoint(locator.checkpoint().execution(), 2));
+        assertThatThrownBy(() -> repository.registerRecovery(locator)).isInstanceOf(AwsDurableStaleGenerationException.class);
+    }
+
+    @Test
+    void admissionWithoutExecutionLocatorRecoversWithActualGenerationTransactionConditions() {
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, TABLE);
+        String executionId = UUID.randomUUID().toString();
+        String arn = "arn:aws:lambda:eu-west-1:123456789012:function:driver:7/durable-execution/original/" + executionId;
+        var admission = new org.pipelineframework.aws.durable.model.AwsDurableAdmissionLocator("tenant", "key-" + executionId,
+            "pipeline", "contract", "release", java.util.Optional.empty(), 1, "provider", arn);
+        repository.registerAdmission(admission);
+        var semantic = new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint("tenant", executionId,
+            "pipeline", "contract", "release", org.pipelineframework.orchestrator.ExecutionStatus.RUNNING);
+        var controlPlane = org.mockito.Mockito.mock(org.pipelineframework.orchestrator.PipelineControlPlane.class);
+        org.mockito.Mockito.when(controlPlane.getExecutionSemanticCheckpointByClientKey("tenant", "key-" + executionId))
+            .thenReturn(io.smallrye.mutiny.Uni.createFrom().item(java.util.Optional.of(semantic)));
+        var starter = org.mockito.Mockito.mock(AwsDurableExecutionStarter.class);
+        var pinned = org.mockito.Mockito.mock(AwsDurableExecutionStarter.class);
+        org.mockito.Mockito.when(starter.pinnedToExecution(arn)).thenReturn(pinned);
+        org.mockito.Mockito.when(pinned.start(org.mockito.ArgumentMatchers.any()))
+            .thenReturn(new org.pipelineframework.aws.durable.model.AwsDurableStartResponse("replacement", 202));
+        var repair = new AwsDurableTerminalReconciler(repository, controlPlane, starter,
+            ignored -> AwsDurableProviderExecutionState.MISSING, java.time.Duration.ofSeconds(2));
+
+        // No registerRecovery or callback registration occurred before provider/history loss.
+        assertThat(repository.findRecoveryByProviderExecutionArn(arn)).isEmpty();
+        assertThat(repair.reconcile(arn)).isTrue();
+        assertThat(repository.isSuperseded("tenant", executionId, 1)).isTrue();
+        assertThat(repository.isCurrentGeneration("tenant", executionId, 2)).isTrue();
+        org.mockito.Mockito.verify(pinned).start(org.mockito.ArgumentMatchers.argThat(input ->
+            input.resumeExecutionId().equals(java.util.Optional.of(executionId)) && input.generation() == 2
+                && input.releaseVersion().equals("release")));
+        org.mockito.Mockito.verify(controlPlane, org.mockito.Mockito.never()).executePipelineAsync(
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(),
+            org.mockito.ArgumentMatchers.anyBoolean(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(),
+            org.mockito.ArgumentMatchers.anyString());
+    }
+
+    @Test
+    void preSubmissionLocatorIsImmutableRetainedAndContainsNoSemanticAdmissionOrInput() {
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, TABLE);
+        String providerArn = "arn:provider:" + UUID.randomUUID();
+        var locator = new org.pipelineframework.aws.durable.model.AwsDurableAdmissionLocator("tenant", "client-key",
+            "pipeline", "contract", "release", java.util.Optional.empty(), 1, "provider-name", providerArn);
+        assertThat(repository.registerAdmission(locator)).isTrue();
+        assertThat(repository.registerAdmission(locator)).isFalse();
+        var conflict = new org.pipelineframework.aws.durable.model.AwsDurableAdmissionLocator("tenant", "another-key",
+            "pipeline", "contract", "release", java.util.Optional.empty(), 1, "provider-name", providerArn);
+        assertThatThrownBy(() -> repository.registerAdmission(conflict)).isInstanceOf(IllegalStateException.class);
+        assertThat(repository.findAdmissionByProviderExecutionArn(providerArn)).contains(locator);
+        var item = dynamo.getItem(request -> request.tableName(TABLE).consistentRead(true).key(Map.of(
+            "pk", AttributeValue.fromS(locator.partitionKey()), "sk", AttributeValue.fromS(locator.sortKey())))).item();
+        assertThat(item).doesNotContainKeys("expires_at_epoch_s", "execution_id", "input_json", "status");
+        assertThat(item.get("record_type").s()).isEqualTo("ADMISSION");
     }
 
     @Test

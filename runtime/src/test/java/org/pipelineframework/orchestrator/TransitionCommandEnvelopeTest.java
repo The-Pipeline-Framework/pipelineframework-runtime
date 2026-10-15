@@ -9,6 +9,7 @@ import com.google.protobuf.Int32Value;
 import com.google.protobuf.Value;
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.context.PipelineContext;
+import org.pipelineframework.config.pipeline.PipelineJson;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -49,6 +50,24 @@ class TransitionCommandEnvelopeTest {
         assertEquals("order-1", decodedPayload.id());
         assertEquals(42, decodedPayload.amount());
         assertEquals(Optional.of(pipelineContext), snapshot.pipelineContext());
+    }
+
+    @Test
+    void envelopeJsonCarriesCauseAndTreatsOmittedLegacyCauseAsUnknown() throws Exception {
+        TransitionWorkerCommand command = new TransitionWorkerCommand(
+            "tenant-1", "exec-1", 0, -1, 1, ExecutionResultShape.SINGLE, 9L,
+            "transition-9", "payload", ExecutionRedriveIntent.REPLAY, -1,
+            Optional.empty(), Optional.empty(), Optional.empty(), Optional.of("reissue-v9-target"));
+        TransitionCommandEnvelope envelope = TransitionCommandEnvelope.from(command, "pipeline-1",
+            "contract-1", "release-1", "trace-9", payloadCodec.encode(command.inputPayload()));
+        String json = PipelineJson.mapper().writeValueAsString(envelope);
+        TransitionCommandEnvelope decoded = PipelineJson.mapper().readValue(json, TransitionCommandEnvelope.class);
+        var legacyJson = PipelineJson.mapper().readTree(json);
+        ((com.fasterxml.jackson.databind.node.ObjectNode) legacyJson).remove("awaitOccurrenceCause");
+        TransitionCommandEnvelope legacy = PipelineJson.mapper().treeToValue(legacyJson, TransitionCommandEnvelope.class);
+
+        assertEquals(Optional.of("reissue-v9-target"), decoded.awaitOccurrenceCause());
+        assertEquals(Optional.empty(), legacy.awaitOccurrenceCause());
     }
 
     @Test

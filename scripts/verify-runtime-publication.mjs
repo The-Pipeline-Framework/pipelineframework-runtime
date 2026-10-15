@@ -19,12 +19,6 @@ export const expectedDeployability = new Map([
   ['repository-plugin', true],
   ['framework-plugins', false],
   ['framework-foundational-plugins', false],
-  ['pipelineframework-spring-smoke-tests', false],
-  ['pipelineframework-spring-blocking-smoke-tests', false],
-  ['pipelineframework-aws-durable-proof-parent', false],
-  ['pipelineframework-aws-durable-proof-driver', false],
-  ['pipelineframework-aws-durable-proof-action-host', false],
-  ['pipelineframework-aws-durable-proof-fault-tests', false],
 ]);
 
 function elementValue(xml, element) {

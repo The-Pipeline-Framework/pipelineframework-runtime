@@ -2,6 +2,7 @@ package org.pipelineframework.orchestrator.controlplane;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Objects;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -126,6 +127,14 @@ public class SegmentBoundaryLedger {
             record.executionId(),
             () -> facts.interactionTimedOut(record),
             nowEpochMs);
+    }
+
+    /** Timeout recovery must retain its work when a configured journal cannot persist the fact. */
+    public Uni<Void> recordInteractionTimedOutRequired(AwaitInteractionRecord record, long nowEpochMs) {
+        Objects.requireNonNull(record, "record must not be null");
+        return journal().map(journal -> appender.appendRequired(journal, record.tenantId(),
+            record.executionId(), facts.interactionTimedOut(record), nowEpochMs).replaceWithVoid())
+            .orElseGet(() -> Uni.createFrom().voidItem());
     }
 
     public Uni<Void> recordContinuationSegmentCreated(
@@ -264,6 +273,15 @@ public class SegmentBoundaryLedger {
             record.executionId(),
             () -> facts.runFailed(record, errorCode, errorMessage),
             nowEpochMs);
+    }
+
+    /** Required counterpart used while retained timeout work owns failure publication. */
+    public Uni<Void> recordRunFailedRequired(
+        ExecutionRecord<Object, Object> record, String errorCode, String errorMessage, long nowEpochMs) {
+        Objects.requireNonNull(record, "record must not be null");
+        return journal().map(journal -> appender.appendRequired(journal, record.tenantId(),
+            record.executionId(), facts.runFailed(record, errorCode, errorMessage), nowEpochMs).replaceWithVoid())
+            .orElseGet(() -> Uni.createFrom().voidItem());
     }
 
     public static String segmentId(ExecutionRecord<Object, Object> record) {

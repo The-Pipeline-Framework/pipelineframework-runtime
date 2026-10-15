@@ -81,6 +81,16 @@ class ExecutionInputPolicy {
     return deriveServerExecutionKey(tenantId, input);
   }
 
+  /** Resolves an explicit client key without recreating input-derived admission identity. */
+  String requireRecoverableClientKey(String clientKey) {
+    if (orchestratorConfig.idempotencyPolicy() != OrchestratorIdempotencyPolicy.CLIENT_KEY_REQUIRED
+        && orchestratorConfig.idempotencyPolicy() != OrchestratorIdempotencyPolicy.OPTIONAL_CLIENT_KEY) {
+      throw new IllegalStateException("Client-key recovery requires an explicit client-key idempotency policy");
+    }
+    return Optional.ofNullable(normalizeOptional(clientKey))
+        .orElseThrow(() -> new IllegalArgumentException("A recovery client key is required"));
+  }
+
   Object toReplayInput(Object inputPayload) {
     return rehydrateExecutionInput(inputPayload).reactiveInput();
   }

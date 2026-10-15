@@ -58,7 +58,8 @@ record ClaimedSegment(
             ? record.redriveTargetCommandId()
             : record.failedCommandId(),
         retryCompleted ? Optional.empty() : record.redriveReason(),
-        record.pagingState().map(org.pipelineframework.orchestrator.PagedExecutionState::toTransitionContext));
+        record.pagingState().map(org.pipelineframework.orchestrator.PagedExecutionState::toTransitionContext),
+        record.awaitOccurrenceCause());
     SerializedTransitionPayload encodedPayload = payloadCodec.encode(payload);
     return TransitionCommandEnvelope.from(
         command,

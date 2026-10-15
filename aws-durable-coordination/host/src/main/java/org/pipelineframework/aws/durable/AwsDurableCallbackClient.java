@@ -1,6 +1,7 @@
 package org.pipelineframework.aws.durable;
 
 import java.util.ArrayList;
+import java.time.Clock;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -22,21 +23,43 @@ public final class AwsDurableCallbackClient {
 
     private final LambdaClient lambda;
     private final ObjectMapper mapper;
+    private final Clock clock;
 
     public AwsDurableCallbackClient(LambdaClient lambda, ObjectMapper mapper) {
-        this.lambda = Objects.requireNonNull(lambda, "lambda");
-        this.mapper = Objects.requireNonNull(mapper, "mapper");
+        this(lambda, mapper, Clock.systemUTC());
     }
 
+    AwsDurableCallbackClient(LambdaClient lambda, ObjectMapper mapper, Clock clock) {
+        this.lambda = Objects.requireNonNull(lambda, "lambda");
+        this.mapper = Objects.requireNonNull(mapper, "mapper");
+        this.clock = Objects.requireNonNull(clock, "clock");
+    }
+
+    /** Preserves the public host API and JVM descriptor used by existing callers. */
     public void sendSuccess(AwsDurableCallbackBinding binding, AwsDurableCallbackSignal signal) {
+        sendSuccessObserved(binding, signal);
+    }
+
+    /** Returns the host-observed time after the provider accepted the callback API request. */
+    long sendSuccessObserved(AwsDurableCallbackBinding binding, AwsDurableCallbackSignal signal) {
         try {
             lambda.sendDurableExecutionCallbackSuccess(SendDurableExecutionCallbackSuccessRequest.builder()
                 .callbackId(binding.providerCallbackId())
                 .result(SdkBytes.fromUtf8String(mapper.writeValueAsString(signal)))
                 .build());
+            return clock.millis();
         } catch (JsonProcessingException exception) {
             throw new IllegalStateException("callback signal could not be serialized", exception);
         }
+    }
+
+    public void sendFailure(AwsDurableCallbackBinding binding, String terminalStatus) {
+        lambda.sendDurableExecutionCallbackFailure(
+            software.amazon.awssdk.services.lambda.model.SendDurableExecutionCallbackFailureRequest.builder()
+                .callbackId(binding.providerCallbackId())
+                .error(error -> error.errorType("TPF_TERMINAL_" + terminalStatus)
+                    .errorMessage("TPF execution is terminal; this callback cannot admit completion"))
+                .build());
     }
 
     public AwsDurableProviderCallbackState state(AwsDurableCallbackBinding binding) {

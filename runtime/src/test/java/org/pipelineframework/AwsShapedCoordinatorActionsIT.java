@@ -43,6 +43,7 @@ import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.AwaitLiveCompletionRegistry;
 import org.pipelineframework.awaitable.AwaitSuspendedException;
 import org.pipelineframework.awaitable.AwaitUnitRecord;
+import org.pipelineframework.awaitable.AwaitUnitOccurrence;
 import org.pipelineframework.awaitable.AwaitUnitStatus;
 import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
 import org.pipelineframework.awaitable.spi.AwaitUnitStore;
@@ -167,6 +168,7 @@ class AwsShapedCoordinatorActionsIT {
         createTable(TABLE_PREFIX + "_unit", "tenant_id", Optional.of("unit_id"));
         interactionStreamArn = createAwaitInteractionTable(TABLE_PREFIX + "_interaction");
         createTable(TABLE_PREFIX + "_interaction_key", "lookup_key", Optional.empty());
+        createTable(TABLE_PREFIX + "_completion_lifecycle", "pk", Optional.of("sk"));
     }
 
     @AfterAll
@@ -1176,7 +1178,20 @@ class AwsShapedCoordinatorActionsIT {
         ) {
             long now = System.currentTimeMillis();
             long ttl = now / 1_000L + 3_600L;
-            String unitId = "unit-" + executionId;
+            ExecutionRecord<Object, Object> execution = executionStore.getExecution(tenantId, executionId)
+                .await().atMost(Duration.ofSeconds(10))
+                .orElseThrow(() -> new IllegalStateException("Execution checkpoint is missing"));
+            String identityScope = execution.executionId()
+                + execution.pagingState().map(page -> ":page:" + page.pageIndex()).orElse("");
+            String unitId = new AwaitUnitOccurrence(
+                tenantId,
+                execution.executionId(),
+                identityScope,
+                "AwaitApproval",
+                1,
+                execution.awaitOccurrenceCause().orElseThrow(() ->
+                    new IllegalStateException("Execution Await occurrence cause is missing")))
+                .unitId();
             units.importRecord(new AwaitUnitRecord(
                     tenantId,
                     unitId,
@@ -1586,6 +1601,16 @@ class AwsShapedCoordinatorActionsIT {
             int limit
         ) {
             return interactions.queryPending(tenantId, assignee, group, stepId, limit);
+        }
+
+        @Override
+        public Uni<List<AwaitInteractionRecord>> findDueTimeoutConsequences(long nowEpochMs, int limit) {
+            return interactions.findDueTimeoutConsequences(nowEpochMs, limit);
+        }
+
+        @Override
+        public Uni<Void> completeTimeoutConsequences(AwaitInteractionRecord record) {
+            return interactions.completeTimeoutConsequences(record);
         }
 
         @Override

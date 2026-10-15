@@ -4,8 +4,9 @@ import { assertEffectivePublication, expectedDeployability } from './verify-runt
 
 const coordination = ['parent', 'model', 'host', 'deployment']
   .map((suffix) => `pipelineframework-aws-durable-coordination-${suffix}`);
-const proofs = ['parent', 'driver', 'action-host', 'fault-tests']
-  .map((suffix) => `pipelineframework-aws-durable-proof-${suffix}`);
+const consumerProofs = ['pipelineframework-spring-smoke-tests', 'pipelineframework-spring-blocking-smoke-tests',
+  'pipelineframework-aws-durable-proof-parent', 'pipelineframework-aws-durable-proof-driver',
+  'pipelineframework-aws-durable-proof-action-host', 'pipelineframework-aws-durable-proof-fault-tests'];
 
 function effectivePom(overrides = new Map()) {
   return `<projects>${[...expectedDeployability].map(([artifactId, expected]) => {
@@ -23,11 +24,11 @@ test('publishes the complete AWS Durable coordination dependency closure', () =>
   assert.doesNotThrow(() => assertEffectivePublication(effectivePom()));
 });
 
-test('keeps all AWS Durable proof modules internal', () => {
-  for (const artifactId of proofs) assert.equal(expectedDeployability.get(artifactId), false, artifactId);
+test('excludes relocated application proofs from the runtime reactor', () => {
+  for (const artifactId of consumerProofs) assert.equal(expectedDeployability.has(artifactId), false, artifactId);
 });
 
-for (const artifactId of [...coordination, ...proofs]) {
+for (const artifactId of coordination) {
   test(`rejects publication eligibility drift for ${artifactId}`, () => {
     assert.throws(() => assertEffectivePublication(effectivePom(
       new Map([[artifactId, !expectedDeployability.get(artifactId)]])

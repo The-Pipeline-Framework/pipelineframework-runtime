@@ -12,6 +12,7 @@ import com.google.protobuf.ByteString;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.smallrye.mutiny.Uni;
+import org.mockito.ArgumentCaptor;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.PipelineExecutionService;
@@ -70,7 +71,13 @@ class GrpcTransitionWorkerServiceTest {
 
     @Test
     void delegatesToLocalExecutionServiceWhenEnabled() throws Exception {
-        TransitionCommandEnvelope envelope = envelope();
+        TransitionCommandEnvelope base = envelope();
+        TransitionCommandEnvelope envelope = new TransitionCommandEnvelope(
+            base.tenantId(), base.executionId(), base.pipelineId(), base.contractVersion(), base.releaseVersion(),
+            base.currentStepIndex(), base.stopBeforeStepIndex(), base.attempt(), base.resultShape(),
+            base.executionVersion(), base.transitionKey(), base.traceId(), base.payloadTypeId(),
+            base.payloadEncoding(), base.payload(), base.redriveIntent(), base.redriveStepIndex(),
+            base.redriveCommandId(), base.redriveReason(), base.pageContext(), Optional.of("await-cycle-v1"));
         TransitionResultEnvelope result = TransitionResultEnvelope.completed(payloadCodec, List.of("ok"));
         when(grpcConfig.serverEnabled()).thenReturn(true);
         when(executionService.executePortableTransition(envelope))
@@ -82,6 +89,9 @@ class GrpcTransitionWorkerServiceTest {
 
         assertEquals(TransitionWorkerOutcome.COMPLETED, decoded.outcome());
         assertEquals(List.of("ok"), decoded.outputPayloads().stream().map(payloadCodec::decode).toList());
+        ArgumentCaptor<TransitionCommandEnvelope> received = ArgumentCaptor.forClass(TransitionCommandEnvelope.class);
+        org.mockito.Mockito.verify(executionService).executePortableTransition(received.capture());
+        assertEquals(Optional.of("await-cycle-v1"), received.getValue().awaitOccurrenceCause());
     }
 
     @Test

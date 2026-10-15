@@ -8,6 +8,9 @@ import static org.mockito.Mockito.when;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
+import org.pipelineframework.orchestrator.AwaitSemanticSelection;
+import org.pipelineframework.awaitable.AwaitInteractionCursor;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.smallrye.mutiny.Uni;
@@ -24,8 +27,8 @@ class AwsDurableControlPlaneActionsTest {
     @Test
     void currentAwaitUsesSemanticLocatorInsteadOfHistoricalOrdering() {
         PipelineControlPlane controlPlane = mock(PipelineControlPlane.class);
-        when(controlPlane.getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1"))
-            .thenReturn(Uni.createFrom().item(java.util.Optional.of(checkpoint("waiting", AwaitInteractionStatus.WAITING))));
+        when(controlPlane.getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1", Optional.empty()))
+            .thenReturn(Uni.createFrom().item(new AwaitSemanticSelection(Optional.of(checkpoint("waiting", AwaitInteractionStatus.WAITING)), Optional.empty())));
 
         var response = actions(controlPlane).invoke(AwsDurableActionRequest.pendingAwait(driverCheckpoint()));
 
@@ -33,7 +36,7 @@ class AwsDurableControlPlaneActionsTest {
             assertThat(identity.executionId()).isEqualTo("execution-1");
             assertThat(identity.interactionId()).isEqualTo("waiting");
         });
-        verify(controlPlane).getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1");
+        verify(controlPlane).getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1", Optional.empty());
         verify(controlPlane, never()).getAwaitSemanticCheckpoints("tenant-1", "execution-1", 100);
         verify(controlPlane, never()).queryPendingAwaitInteractions("tenant-1", "", "", "", 100);
     }
@@ -41,8 +44,8 @@ class AwsDurableControlPlaneActionsTest {
     @Test
     void pendingAwaitReturnsEmptyWhenExecutionHasNoPendingInteraction() {
         PipelineControlPlane controlPlane = mock(PipelineControlPlane.class);
-        when(controlPlane.getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1"))
-            .thenReturn(Uni.createFrom().item(java.util.Optional.empty()));
+        when(controlPlane.getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1", Optional.empty()))
+            .thenReturn(Uni.createFrom().item(new AwaitSemanticSelection(Optional.empty(), Optional.empty())));
 
         assertThat(actions(controlPlane).invoke(AwsDurableActionRequest.pendingAwait(driverCheckpoint()))
             .awaitIdentity()).isEmpty();
@@ -51,10 +54,30 @@ class AwsDurableControlPlaneActionsTest {
     @Test
     void completionBeforeRegistrationStillReturnsCurrentAwaitIdentity() {
         PipelineControlPlane controlPlane = mock(PipelineControlPlane.class);
-        when(controlPlane.getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1"))
-            .thenReturn(Uni.createFrom().item(java.util.Optional.of(checkpoint("completed", AwaitInteractionStatus.COMPLETED))));
+        when(controlPlane.getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1", Optional.empty()))
+            .thenReturn(Uni.createFrom().item(new AwaitSemanticSelection(Optional.of(checkpoint("completed", AwaitInteractionStatus.COMPLETED)), Optional.empty())));
         assertThat(actions(controlPlane).invoke(AwsDurableActionRequest.pendingAwait(driverCheckpoint()))
             .awaitIdentity()).hasValueSatisfying(identity -> assertThat(identity.interactionId()).isEqualTo("completed"));
+    }
+
+    @Test
+    void emptyPageContinuationIsPassedWithoutDecodingOrHistoryLookup() {
+        PipelineControlPlane controlPlane = mock(PipelineControlPlane.class);
+        var cursor = new AwaitInteractionCursor("tenant-1", "unit-1", "opaque-position");
+        when(controlPlane.getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1", Optional.empty()))
+            .thenReturn(Uni.createFrom().item(new AwaitSemanticSelection(Optional.empty(), Optional.of(cursor))));
+        when(controlPlane.getCurrentAwaitSemanticCheckpoint("tenant-1", "execution-1", Optional.of(cursor)))
+            .thenReturn(Uni.createFrom().item(new AwaitSemanticSelection(
+                Optional.of(checkpoint("beyond-page-one", AwaitInteractionStatus.DISPATCHED)), Optional.empty())));
+        var first = actions(controlPlane).invoke(AwsDurableActionRequest.pendingAwait(driverCheckpoint()));
+        assertThat(first.awaitIdentity()).isEmpty();
+        assertThat(first.awaitSelectionCursor()).contains(cursor);
+        var second = actions(controlPlane).invoke(AwsDurableActionRequest.pendingAwait(driverCheckpoint())
+            .withAwaitSelectionCursor(first.awaitSelectionCursor()));
+        assertThat(second.awaitIdentity()).hasValueSatisfying(identity ->
+            assertThat(identity.interactionId()).isEqualTo("beyond-page-one"));
+        assertThat(second.awaitSelectionCursor()).isEmpty();
+        verify(controlPlane, never()).getAwaitSemanticCheckpoints("tenant-1", "execution-1", 100);
     }
 
     private static AwsDurableControlPlaneActions actions(PipelineControlPlane controlPlane) {

@@ -161,6 +161,278 @@ class AwaitItemContinuationRecoveryTest {
             .findDueItemContinuations(seed.now() + 60_000, 10).await().atMost(TIMEOUT).isEmpty());
     }
 
+    @Test
+    void suspendedScalarTimeoutRequiresTickAndDuplicateTickPreservesTerminalFacts() throws Exception {
+        Stores stores = stores().get();
+        long now = System.currentTimeMillis();
+        long deadline = now + 1000;
+        long ttl = now / 1000 + 3600;
+        String tenant = "timeout-" + UUID.randomUUID();
+        var created = stores.executions().createOrGetExecution(new ExecutionCreateCommand(
+            tenant, "timeout-parent", new ExecutionInputSnapshot(ExecutionInputShape.UNI, "input"),
+            ExecutionResultShape.SINGLE, now, ttl)).await().atMost(TIMEOUT).record();
+        String unitId = qualifiedUnit(created);
+        var parent = stores.executions().markWaitingExternal(tenant, created.executionId(), created.version(),
+            "await", unitId, 2, now).await().atMost(TIMEOUT).orElseThrow();
+        stores.units().createOrGet(new AwaitUnitCreateCommand(tenant, unitId, parent.executionId(),
+            "AwaitApproval", 2, "ONE_TO_ONE", now, ttl)).await().atMost(TIMEOUT);
+        var requested = stores.interactions().createOrGet(new AwaitCreateCommand(tenant, parent.executionId(),
+            "AwaitApproval", 2, String.class.getName(), "cause", "request", "correlation", "request",
+            "reviewer", "reviewers", "test", unitId, null, now, deadline, ttl)).await().atMost(TIMEOUT).record();
+        var calls = new AtomicInteger();
+        Runtime runtime = runtime(stores, calls, Optional.empty(), 0);
+
+        // No provider polling, native scheduler, or semantic tick is started by this fixture.
+        assertEquals(1, stores.interactions().findTimedOut(deadline, 10).await().atMost(TIMEOUT).size());
+        assertEquals(AwaitInteractionStatus.WAITING, stores.interactions().get(tenant, requested.interactionId())
+            .await().atMost(TIMEOUT).orElseThrow().status());
+        assertEquals(ExecutionStatus.WAITING_EXTERNAL, stores.executions().getExecution(tenant, parent.executionId())
+            .await().atMost(TIMEOUT).orElseThrow().status());
+
+        var result = runtime.controlPlane().sweepOnce(deadline).await().atMost(TIMEOUT);
+        assertEquals(1, result.timedOutAwaitCount());
+        var timedOut = stores.interactions().get(tenant, requested.interactionId()).await().atMost(TIMEOUT).orElseThrow();
+        var failed = stores.executions().getExecution(tenant, parent.executionId()).await().atMost(TIMEOUT).orElseThrow();
+        assertEquals(AwaitInteractionStatus.TIMED_OUT, timedOut.status());
+        assertEquals(AwaitUnitStatus.TIMED_OUT, stores.units().get(tenant, unitId).await().atMost(TIMEOUT).orElseThrow().status());
+        assertEquals(ExecutionStatus.FAILED, failed.status());
+        assertEquals("AWAIT_TIMEOUT", failed.errorCode());
+        assertEquals(parent.version() + 1, failed.version());
+        var facts = runtime.journal().projection(tenant, parent.executionId()).await().atMost(TIMEOUT).factKeys();
+        assertTrue(facts.contains("interaction-timed-out:" + unitId + ":" + requested.interactionId()));
+        assertTrue(facts.contains("run-failed:" + parent.executionId() + ":AWAIT_TIMEOUT"));
+
+        assertEquals(0, runtime.controlPlane().sweepOnce(deadline).await().atMost(TIMEOUT).timedOutAwaitCount());
+        assertEquals(failed.version(), stores.executions().getExecution(tenant, parent.executionId())
+            .await().atMost(TIMEOUT).orElseThrow().version());
+        assertEquals(timedOut.version(), stores.interactions().get(tenant, requested.interactionId())
+            .await().atMost(TIMEOUT).orElseThrow().version());
+        assertEquals(facts, runtime.journal().projection(tenant, parent.executionId()).await().atMost(TIMEOUT).factKeys());
+        assertEquals(0, calls.get(), "Timeout admission must not invoke a business continuation");
+    }
+
+    @Test
+    void suspendedItemContinuationRetryConvergesOnlyOnDueTickAcrossRuntimeReplacement() throws Exception {
+        Stores stores = stores().get();
+        Seed seed = seed(stores);
+        var calls = new AtomicInteger();
+        Runtime failing = runtime(stores, calls, Optional.empty(), 1);
+        assertEquals(1, ((AwaitItemContinuationWorkStore) stores.interactions())
+            .findDueItemContinuations(seed.now(), 10).await().atMost(TIMEOUT).size());
+        assertEquals(ExecutionStatus.WAITING_EXTERNAL, stores.executions().getExecution(seed.tenant(), seed.parent().executionId())
+            .await().atMost(TIMEOUT).orElseThrow().status());
+        assertTrue(stores.executions().getExecutionByKey(seed.tenant(), seed.childKey()).await().atMost(TIMEOUT).isEmpty());
+        assertEquals(0, calls.get(), "An admitted completion alone must not supply suspended-host timing");
+
+        failing.controlPlane().sweepOnce(seed.now()).await().atMost(TIMEOUT);
+        assertEquals(1, calls.get());
+        var retry = due(stores, seed.now() + 60_000);
+        assertEquals(2, retry.attempt());
+        assertTrue(retry.nowEpochMs() > seed.now());
+        assertEquals(ExecutionStatus.WAITING_EXTERNAL, stores.executions().getExecution(seed.tenant(), seed.parent().executionId())
+            .await().atMost(TIMEOUT).orElseThrow().status());
+        assertTrue(stores.executions().getExecutionByKey(seed.tenant(), seed.childKey()).await().atMost(TIMEOUT).isEmpty());
+
+        Runtime recovered = runtime(stores, calls, Optional.empty(), 0);
+        recovered.controlPlane().sweepOnce(seed.now()).await().atMost(TIMEOUT);
+        assertEquals(1, calls.get(), "An early tick must not bypass persisted retry timing");
+        recovered.controlPlane().sweepOnce(retry.nowEpochMs()).await().atMost(TIMEOUT);
+        assertEquals(2, calls.get());
+        var child = stores.executions().getExecutionByKey(seed.tenant(), seed.childKey()).await().atMost(TIMEOUT).orElseThrow();
+        var parent = stores.executions().getExecution(seed.tenant(), seed.parent().executionId()).await().atMost(TIMEOUT).orElseThrow();
+        var unit = stores.units().get(seed.tenant(), seed.unitId()).await().atMost(TIMEOUT).orElseThrow();
+        assertEquals(ExecutionStatus.SUCCEEDED, child.status());
+        assertEquals(1, child.version());
+        assertEquals(ExecutionStatus.QUEUED, parent.status());
+        assertEquals(seed.parent().version() + 1, parent.version());
+        assertEquals(4, parent.currentStepIndex());
+        assertEquals(1, unit.completedItemCount());
+        assertEquals(1, unit.completedContinuationItemCount());
+        assertTrue(((AwaitItemContinuationWorkStore) stores.interactions())
+            .findDueItemContinuations(retry.nowEpochMs(), 10).await().atMost(TIMEOUT).isEmpty());
+
+        recovered.controlPlane().sweepOnce(retry.nowEpochMs()).await().atMost(TIMEOUT);
+        assertEquals(2, calls.get(), "Duplicate ticks must not repeat a retired continuation");
+        assertEquals(child.version(), stores.executions().getExecutionByKey(seed.tenant(), seed.childKey())
+            .await().atMost(TIMEOUT).orElseThrow().version());
+        assertEquals(parent.version(), stores.executions().getExecution(seed.tenant(), seed.parent().executionId())
+            .await().atMost(TIMEOUT).orElseThrow().version());
+    }
+
+    @Test
+    void suspendedTimeoutAdmissionSurvivesUnitStoreFailureAndReplacementRuntimeTicks() throws Exception {
+        Stores stores = stores().get();
+        long now = System.currentTimeMillis();
+        long deadline = now + 1000;
+        long ttl = now / 1000 + 3600;
+        String tenant = "timeout-crash-" + UUID.randomUUID();
+        var created = stores.executions().createOrGetExecution(new ExecutionCreateCommand(
+            tenant, "timeout-parent", new ExecutionInputSnapshot(ExecutionInputShape.UNI, "input"),
+            ExecutionResultShape.SINGLE, now, ttl)).await().atMost(TIMEOUT).record();
+        String unitId = qualifiedUnit(created);
+        var parent = stores.executions().markWaitingExternal(tenant, created.executionId(), created.version(),
+            "await", unitId, 2, now).await().atMost(TIMEOUT).orElseThrow();
+        stores.units().createOrGet(new AwaitUnitCreateCommand(tenant, unitId, parent.executionId(),
+            "AwaitApproval", 2, "ONE_TO_ONE", now, ttl)).await().atMost(TIMEOUT);
+        var requested = stores.interactions().createOrGet(new AwaitCreateCommand(tenant, parent.executionId(),
+            "AwaitApproval", 2, String.class.getName(), "cause", "request", "correlation", "request",
+            "reviewer", "reviewers", "test", unitId, null, now, deadline, ttl)).await().atMost(TIMEOUT).record();
+        var calls = new AtomicInteger();
+        var failingUnits = spy(stores.units());
+        doReturn(Uni.createFrom().failure(new IllegalStateException("injected unit-store failure")))
+            .when(failingUnits).markTerminal(eq(tenant), eq(unitId), eq(AwaitUnitStatus.TIMED_OUT), anyLong());
+        Runtime interrupted = runtime(new Stores(stores.executions(), stores.interactions(), failingUnits),
+            calls, Optional.empty(), 0);
+
+        assertDoesNotThrow(() -> interrupted.controlPlane().sweepOnce(deadline).await().atMost(TIMEOUT));
+        verify(failingUnits).markTerminal(eq(tenant), eq(unitId), eq(AwaitUnitStatus.TIMED_OUT), anyLong());
+        assertEquals(AwaitInteractionStatus.TIMED_OUT, stores.interactions().get(tenant, requested.interactionId())
+            .await().atMost(TIMEOUT).orElseThrow().status(), "Actual interaction timeout committed before the cut");
+        assertEquals(ExecutionStatus.WAITING_EXTERNAL, stores.executions().getExecution(tenant, parent.executionId())
+            .await().atMost(TIMEOUT).orElseThrow().status());
+
+        Runtime recovered = runtime(stores, calls, Optional.empty(), 0);
+        recovered.controlPlane().sweepOnce(deadline + 1).await().atMost(TIMEOUT);
+        recovered.controlPlane().sweepOnce(deadline + 2).await().atMost(TIMEOUT);
+        var terminalParent = stores.executions().getExecution(tenant, parent.executionId()).await().atMost(TIMEOUT).orElseThrow();
+        var terminalUnit = stores.units().get(tenant, unitId).await().atMost(TIMEOUT).orElseThrow();
+        var facts = recovered.journal().projection(tenant, parent.executionId()).await().atMost(TIMEOUT).factKeys();
+        assertAll("Retained timeout must converge before repair retires",
+            () -> assertEquals(ExecutionStatus.FAILED, terminalParent.status()),
+            () -> assertEquals("AWAIT_TIMEOUT", terminalParent.errorCode()),
+            () -> assertEquals(parent.version() + 1, terminalParent.version()),
+            () -> assertEquals(AwaitUnitStatus.TIMED_OUT, terminalUnit.status()),
+            () -> assertTrue(facts.contains("interaction-timed-out:" + unitId + ":" + requested.interactionId())),
+            () -> assertTrue(facts.contains("run-failed:" + parent.executionId() + ":AWAIT_TIMEOUT")));
+        recovered.controlPlane().sweepOnce(deadline + 2).await().atMost(TIMEOUT);
+        assertEquals(terminalParent.version(), stores.executions().getExecution(tenant, parent.executionId())
+            .await().atMost(TIMEOUT).orElseThrow().version());
+        assertEquals(terminalUnit.version(), stores.units().get(tenant, unitId).await().atMost(TIMEOUT).orElseThrow().version());
+        assertEquals(facts, recovered.journal().projection(tenant, parent.executionId()).await().atMost(TIMEOUT).factKeys());
+        assertEquals(0, calls.get());
+    }
+
+    @TestFactory
+    Stream<DynamicTest> admittedTimeoutConsequencesSurvivePostCommitCuts() {
+        return Stream.of(TimeoutCut.AFTER_UNIT, TimeoutCut.AFTER_TIMEOUT_FACT, TimeoutCut.AFTER_PARENT)
+            .map(cut -> DynamicTest.dynamicTest(cut.name(), () -> recoverTimeoutCut(cut)));
+    }
+
+    @SuppressWarnings("unchecked")
+    private void recoverTimeoutCut(TimeoutCut cut) throws Exception {
+        Stores stores = stores().get();
+        TimeoutSeed seed = timeoutSeed(stores);
+        var journal = new InMemoryControlPlaneJournal();
+        Stores interruptedStores = stores;
+        var interruptedJournal = journal;
+        if (cut == TimeoutCut.AFTER_UNIT) {
+            var units = spy(stores.units());
+            doAnswer(invocation -> {
+                Uni<Optional<AwaitUnitRecord>> committed = (Uni<Optional<AwaitUnitRecord>>) invocation.callRealMethod();
+                return committed.chain(result -> Uni.createFrom().failure(new IllegalStateException(cut.name())));
+            }).when(units).markTerminal(eq(seed.tenant()), eq(seed.unitId()), eq(AwaitUnitStatus.TIMED_OUT), anyLong());
+            interruptedStores = new Stores(stores.executions(), stores.interactions(), units);
+        } else if (cut == TimeoutCut.AFTER_TIMEOUT_FACT) {
+            interruptedJournal = spy(journal);
+            doAnswer(invocation -> {
+                List<org.pipelineframework.orchestrator.controlplane.ControlPlaneFact> facts = invocation.getArgument(3);
+                Uni<org.pipelineframework.orchestrator.controlplane.ControlPlaneAppendResult> committed =
+                    (Uni<org.pipelineframework.orchestrator.controlplane.ControlPlaneAppendResult>) invocation.callRealMethod();
+                return facts.stream().anyMatch(fact -> fact instanceof
+                    org.pipelineframework.orchestrator.controlplane.ControlPlaneFact.InteractionTimedOut)
+                    ? committed.chain(result -> Uni.createFrom().failure(new IllegalStateException(cut.name())))
+                    : committed;
+            }).when(interruptedJournal).append(eq(seed.tenant()), eq(seed.parent().executionId()),
+                anyLong(), anyList(), anyLong());
+        } else {
+            var executions = spy(stores.executions());
+            doAnswer(invocation -> {
+                Uni<Optional<ExecutionRecord<Object, Object>>> committed =
+                    (Uni<Optional<ExecutionRecord<Object, Object>>>) invocation.callRealMethod();
+                return committed.chain(result -> Uni.createFrom().failure(new IllegalStateException(cut.name())));
+            }).when(executions).markTerminalFailure(eq(seed.tenant()), eq(seed.parent().executionId()), anyLong(),
+                eq(ExecutionStatus.FAILED), anyString(), eq("AWAIT_TIMEOUT"), anyString(), anyLong());
+            interruptedStores = new Stores(executions, stores.interactions(), stores.units());
+        }
+        var calls = new AtomicInteger();
+        Runtime interrupted = runtime(interruptedStores, calls, Optional.empty(), 0, interruptedJournal);
+        assertDoesNotThrow(() -> interrupted.controlPlane().sweepOnce(seed.deadline()).await().atMost(TIMEOUT));
+        assertEquals(AwaitInteractionStatus.TIMED_OUT, stores.interactions().get(seed.tenant(), seed.interaction().interactionId())
+            .await().atMost(TIMEOUT).orElseThrow().status());
+        assertEquals(AwaitUnitStatus.TIMED_OUT, stores.units().get(seed.tenant(), seed.unitId())
+            .await().atMost(TIMEOUT).orElseThrow().status(), "The unit write must precede the selected cut");
+        var cutFacts = journal.projection(seed.tenant(), seed.parent().executionId()).await().atMost(TIMEOUT).factKeys();
+        assertEquals(cut != TimeoutCut.AFTER_UNIT, cutFacts.contains(seed.timeoutFactKey()));
+        assertFalse(cutFacts.contains(seed.failureFactKey()));
+        assertEquals(cut == TimeoutCut.AFTER_PARENT ? ExecutionStatus.FAILED : ExecutionStatus.WAITING_EXTERNAL,
+            stores.executions().getExecution(seed.tenant(), seed.parent().executionId()).await().atMost(TIMEOUT).orElseThrow().status());
+        assertEquals(1, stores.interactions().findDueTimeoutConsequences(seed.deadline() + 1, 10)
+            .await().atMost(TIMEOUT).size(), "Partial consequences must remain rediscoverable");
+
+        Runtime recovered = runtime(stores, calls, Optional.empty(), 0, journal);
+        recovered.controlPlane().sweepOnce(seed.deadline() + 1).await().atMost(TIMEOUT);
+        recovered.controlPlane().sweepOnce(seed.deadline() + 2).await().atMost(TIMEOUT);
+        var parent = stores.executions().getExecution(seed.tenant(), seed.parent().executionId()).await().atMost(TIMEOUT).orElseThrow();
+        var projection = journal.projection(seed.tenant(), parent.executionId()).await().atMost(TIMEOUT);
+        assertEquals(ExecutionStatus.FAILED, parent.status());
+        assertEquals("AWAIT_TIMEOUT", parent.errorCode());
+        assertEquals(seed.parent().version() + 1, parent.version(), "Recovery must not commit failure twice");
+        assertEquals(java.util.Set.of(seed.timeoutFactKey(), seed.failureFactKey()), projection.factKeys());
+        assertEquals(2, projection.version(), "Each required fact must have one durable append");
+        assertTrue(stores.interactions().findDueTimeoutConsequences(seed.deadline() + 2, 10).await().atMost(TIMEOUT).isEmpty());
+        assertEquals(0, calls.get());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void completionWinningTimeoutAdmissionDoesNotCreateTimeoutWorkOrFailParent() throws Exception {
+        Stores stores = stores().get();
+        TimeoutSeed seed = timeoutSeed(stores);
+        var interactions = spy(stores.interactions());
+        doAnswer(invocation -> {
+            // An in-flight pre-deadline completion commits between due discovery and the optimistic timeout write.
+            stores.interactions().complete(new AwaitCompletionCommand(seed.tenant(), seed.interaction().interactionId(),
+                seed.interaction().correlationId(), "race-completion", "approved", "actor", seed.deadline() - 1))
+                .await().atMost(TIMEOUT);
+            return invocation.callRealMethod();
+        }).when(interactions).markTimedOut(eq(seed.tenant()), eq(seed.interaction().interactionId()), anyLong(), anyLong());
+        var calls = new AtomicInteger();
+        Runtime runtime = runtime(new Stores(stores.executions(), interactions, stores.units()), calls, Optional.empty(), 0);
+        runtime.controlPlane().sweepOnce(seed.deadline()).await().atMost(TIMEOUT);
+        assertEquals(AwaitInteractionStatus.COMPLETED, stores.interactions().get(seed.tenant(), seed.interaction().interactionId())
+            .await().atMost(TIMEOUT).orElseThrow().status());
+        assertEquals(ExecutionStatus.WAITING_EXTERNAL, stores.executions().getExecution(seed.tenant(), seed.parent().executionId())
+            .await().atMost(TIMEOUT).orElseThrow().status(), "Timeout loser must not fail the owning parent");
+        assertTrue(stores.interactions().findDueTimeoutConsequences(seed.deadline(), 10).await().atMost(TIMEOUT).isEmpty());
+        assertTrue(runtime.journal().projection(seed.tenant(), seed.parent().executionId()).await().atMost(TIMEOUT).factKeys().isEmpty());
+        assertEquals(0, calls.get());
+    }
+
+    private TimeoutSeed timeoutSeed(Stores stores) {
+        long now = System.currentTimeMillis();
+        long ttl = now / 1000 + 3600;
+        String tenant = "timeout-cut-" + UUID.randomUUID();
+        var created = stores.executions().createOrGetExecution(new ExecutionCreateCommand(tenant, "parent",
+            new ExecutionInputSnapshot(ExecutionInputShape.UNI, "input"), ExecutionResultShape.SINGLE, now, ttl))
+            .await().atMost(TIMEOUT).record();
+        String unitId = qualifiedUnit(created);
+        var parent = stores.executions().markWaitingExternal(tenant, created.executionId(), created.version(),
+            "await", unitId, 2, now).await().atMost(TIMEOUT).orElseThrow();
+        stores.units().createOrGet(new AwaitUnitCreateCommand(tenant, unitId, parent.executionId(), "AwaitApproval", 2,
+            "ONE_TO_ONE", now, ttl)).await().atMost(TIMEOUT);
+        var interaction = stores.interactions().createOrGet(new AwaitCreateCommand(tenant, parent.executionId(),
+            "AwaitApproval", 2, String.class.getName(), "cause", "request", "correlation", "request", "reviewer",
+            "reviewers", "test", unitId, null, now, now + 1000, ttl)).await().atMost(TIMEOUT).record();
+        return new TimeoutSeed(tenant, unitId, parent, interaction, now + 1000);
+    }
+
+    private enum TimeoutCut { AFTER_UNIT, AFTER_TIMEOUT_FACT, AFTER_PARENT }
+    private record TimeoutSeed(String tenant, String unitId, ExecutionRecord<Object, Object> parent,
+        AwaitInteractionRecord interaction, long deadline) {
+        String timeoutFactKey() { return "interaction-timed-out:" + unitId + ":" + interaction.interactionId(); }
+        String failureFactKey() { return "run-failed:" + parent.executionId() + ":AWAIT_TIMEOUT"; }
+    }
+
     private AwaitItemContinuationCommand due(Stores stores, long now) {
         return ((AwaitItemContinuationWorkStore) stores.interactions()).findDueItemContinuations(now, 10)
             .await().atMost(TIMEOUT).getFirst();
@@ -170,10 +442,10 @@ class AwaitItemContinuationRecoveryTest {
         long now = System.currentTimeMillis();
         long ttl = now / 1000 + 3600;
         String tenant = UUID.randomUUID().toString();
-        String unitId = "unit-" + tenant;
         ExecutionRecord<Object, Object> created = stores.executions().createOrGetExecution(new ExecutionCreateCommand(
             tenant, "parent", new ExecutionInputSnapshot(ExecutionInputShape.UNI, "input"),
             ExecutionResultShape.MATERIALIZED_MULTI, now, ttl)).await().atMost(TIMEOUT).record();
+        String unitId = qualifiedUnit(created);
         ExecutionRecord<Object, Object> parent = stores.executions().markWaitingExternal(
             tenant, created.executionId(), created.version(), "await", unitId, 2, now).await().atMost(TIMEOUT).orElseThrow();
         stores.units().createOrGet(new AwaitUnitCreateCommand(
@@ -191,6 +463,13 @@ class AwaitItemContinuationRecoveryTest {
             ItemContinuationKey.from(parent, unit, 0).childExecutionKey(), now);
     }
 
+    private String qualifiedUnit(ExecutionRecord<Object, Object> created) {
+        String identityScope = created.executionId() + created.pagingState()
+            .map(page -> ":page:" + page.pageIndex()).orElse("");
+        return new AwaitUnitOccurrence(created.tenantId(), created.executionId(), identityScope, "AwaitApproval", 2,
+            created.awaitOccurrenceCause().orElseThrow()).unitId();
+    }
+
     private void persistChild(Stores stores, Seed seed) {
         var child = stores.executions().createOrGetExecution(new ExecutionCreateCommand(seed.tenant(), seed.childKey(),
             new ExecutionInputSnapshot(ExecutionInputShape.UNI, "approved"), ExecutionResultShape.MATERIALIZED_MULTI,
@@ -200,12 +479,18 @@ class AwaitItemContinuationRecoveryTest {
     }
 
     private Runtime runtime(Stores stores, AtomicInteger calls, Optional<CyclicBarrier> barrier, int failures) throws Exception {
+        return runtime(stores, calls, barrier, failures, new InMemoryControlPlaneJournal());
+    }
+
+    private Runtime runtime(Stores stores, AtomicInteger calls, Optional<CyclicBarrier> barrier, int failures,
+        InMemoryControlPlaneJournal journal) throws Exception {
         AwaitCoordinator await = new AwaitCoordinator();
         inject(await, "resolvedInteractionStore", stores.interactions());
         inject(await, "resolvedUnitStore", stores.units());
         PipelineOrchestratorConfig config = mock(PipelineOrchestratorConfig.class);
         PipelineOrchestratorConfig.WorkerConfig worker = mock(PipelineOrchestratorConfig.WorkerConfig.class);
         when(config.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        when(config.sweepLimit()).thenReturn(10);
         when(config.worker()).thenReturn(worker);
         when(worker.maxInFlight()).thenReturn(1);
         when(worker.saturatedDelay()).thenReturn(Duration.ofMillis(10));
@@ -219,7 +504,7 @@ class AwaitItemContinuationRecoveryTest {
         coordinator.awaitCoordinator = await;
         coordinator.transitionWorkerExecutor = executor;
         coordinator.transitionPayloadCodec = new JsonTransitionPayloadCodec();
-        coordinator.segmentBoundaryLedger = new SegmentBoundaryLedger(new InMemoryControlPlaneJournal());
+        coordinator.segmentBoundaryLedger = new SegmentBoundaryLedger(journal);
         AtomicInteger remaining = new AtomicInteger(failures);
         AwaitItemContinuationHandler handler = new AwaitItemContinuationHandler() {
             @Override
@@ -249,7 +534,7 @@ class AwaitItemContinuationRecoveryTest {
         LocalPipelineControlPlane facade = new LocalPipelineControlPlane();
         facade.queueAsyncCoordinator = coordinator;
         facade.pipelineExecutionService = service;
-        return new Runtime(facade, executor, coordinator.workDispatcher);
+        return new Runtime(facade, executor, coordinator.workDispatcher, journal);
     }
 
     private void inject(AwaitCoordinator target, String name, Object value) throws Exception {
@@ -259,7 +544,8 @@ class AwaitItemContinuationRecoveryTest {
     }
 
     private enum CrashCut { INTERACTION_ADMITTED, CHILD_COMPLETED, CONTINUATION_RECORDED }
-    private record Runtime(PipelineControlPlane controlPlane, TransitionWorkerExecutor executor, WorkDispatcher dispatcher) {
+    private record Runtime(PipelineControlPlane controlPlane, TransitionWorkerExecutor executor, WorkDispatcher dispatcher,
+        InMemoryControlPlaneJournal journal) {
         AwaitItemContinuationResult invoke(AwaitItemContinuationCommand command) {
             return controlPlane.processAwaitItemContinuation(command).await().atMost(TIMEOUT);
         }
