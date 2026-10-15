@@ -18,6 +18,10 @@
             <artifactId>secretsmanager</artifactId>
         </dependency>
         <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>ssm</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.smallrye.config</groupId>
             <artifactId>smallrye-config-core</artifactId>
         </dependency>
