@@ -211,15 +211,15 @@ class QueueAsyncSegmentPipeline {
       ClaimedSegment segment,
       PipelineTransitionWorker worker) {
     if (isCoordinatorTerminalMaterialization(segment)) {
-      if (segment.resumesFromAwait()) {
-        return inputPayload(segment)
-            .onItem().transform(payload ->
-                TransitionResultEnvelope.completedInProcess(terminalOutputItems(segment, payload)));
-      }
-      // The terminal cursor has no business step left to invoke. Keep its materialized input at
-      // the coordinator so SegmentCommitPlan can publish it without serializing a large result
-      // through an otherwise no-op remote worker call.
-      return Uni.createFrom().item(TransitionResultEnvelope.completedTerminalInputPassthrough());
+      // Keep terminal inputs at the coordinator instead of re-encoding them through a no-op worker.
+      Uni<TransitionResultEnvelope> completed = segment.resumesFromAwait()
+          ? inputPayload(segment).onItem().transform(payload ->
+              TransitionResultEnvelope.completedInProcess(terminalOutputItems(segment, payload)))
+          : Uni.createFrom().item(TransitionResultEnvelope.completedTerminalInputPassthrough());
+      return completed.onItem().transform(result -> segment.record().pagingState()
+          .map(page -> result.withPageCompletion(page.suspendedCompletion().orElseThrow(() ->
+              new IllegalStateException("a terminal paged segment requires retained page completion"))))
+          .orElse(result));
     }
     return transitionCommand(segment)
         .onItem().transformToUni(command -> transitionWorkerExecutor.execute(worker, command));
