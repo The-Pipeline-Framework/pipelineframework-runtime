@@ -56,7 +56,9 @@ public class AwaitCompletionDescriptorRegistry {
             && existing.transportInputType().equals(candidate.transportInputType())
             && existing.transportOutputType().equals(candidate.transportOutputType())
             && java.util.Objects.equals(existing.completionProjectorId(), candidate.completionProjectorId())
-            && existing.requestAwareCompletion() == candidate.requestAwareCompletion();
+            && existing.requestAwareCompletion() == candidate.requestAwareCompletion()
+            && existing.acknowledgementAwareCommandCompletion() == candidate.acknowledgementAwareCommandCompletion()
+            && java.util.Objects.equals(existing.commandAcknowledgementType(), candidate.commandAcknowledgementType());
         if (!compatible) {
             throw new IllegalStateException(
                 "Conflicting deferred-completion descriptors were registered for step '"
