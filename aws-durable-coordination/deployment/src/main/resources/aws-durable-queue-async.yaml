@@ -3,10 +3,44 @@ Transform: AWS::Serverless-2016-10-31
 Description: Supported TPF QUEUE_ASYNC coordination host using AWS Lambda Durable Functions
 
 Parameters:
+  DeploymentProfile:
+    Type: String
+    Default: HARDENED
+    AllowedValues: [HARDENED, RESTRICTED_PILOT]
+    Description: Restricted pilot is a fresh isolated supervised deployment; it preserves every native recovery mechanism
+  RestrictedPilotValidation:
+    Type: String
+    Default: not-applicable
+    AllowedValues: [not-applicable, validated]
+    Description: Attest supervised admissions, operator failure checks, service-owned encryption and exact external resource metadata; no unattended operations acceptance
+  SigningSource:
+    Type: String
+    Default: SECRETS_MANAGER
+    AllowedValues: [SECRETS_MANAGER, SSM_STANDARD]
+  SigningParameterLifecycleValidation:
+    Type: String
+    Default: not-applicable
+    AllowedValues: [not-applicable, validated]
+    Description: Owner verified Standard SecureString aws/ssm parameters, unique immutable purpose/generation names, version 1, no overwrite/deletion while any retained release needs them; IAM-only account authority accepted
+  ResumeTokenParameterArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|arn:[a-z-]+:ssm:[a-z0-9-]+:[0-9]{12}:parameter/tpf/durable/[A-Za-z0-9._-]+/resume-token/g-[a-f0-9]{32,64}'
+  ResumeTokenParameterVersion: {Type: String, Default: '', AllowedValues: ['', '1']}
+  WorkerSharedParameterArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|arn:[a-z-]+:ssm:[a-z0-9-]+:[0-9]{12}:parameter/tpf/durable/[A-Za-z0-9._-]+/worker/g-[a-f0-9]{32,64}'
+  WorkerSharedParameterVersion: {Type: String, Default: '', AllowedValues: ['', '1']}
+  SigningParameterAccessArns:
+    Type: CommaDelimitedList
+    Default: ''
+    AllowedPattern: '^$|arn:[a-z-]+:ssm:[a-z0-9-]+:[0-9]{12}:parameter/tpf/durable/[A-Za-z0-9._-]+/(resume-token|worker)/g-[a-f0-9]{32,64}'
+    Description: Exact current and retained immutable signing parameter ARNs; never remove while retained versions/executions require them
   AlarmTopicArn:
     Type: String
-    AllowedPattern: 'arn:[a-z-]+:sns:[a-z0-9-]+:[0-9]{12}:.+'
-    Description: Owned notification destination; validate subscription and response ownership before admission
+    AllowedPattern: '^$|arn:[a-z-]+:sns:[a-z0-9-]+:[0-9]{12}:.+'
+    Description: HARDENED requires owned SNS notification delivery; RESTRICTED_PILOT requires explicit empty input and supervised failure checks
   DeploymentPreflightValidation:
     Type: String
     AllowedValues: [validated]
@@ -14,7 +48,7 @@ Parameters:
       Set only after validating region, Java21 Durable SDK/runtime capability, account
       start/checkpoint/history quotas, reserved concurrency, operation/state/payload budgets,
       semantic table/index readiness, encryption key policies, retained release compatibility
-      and notification delivery. This attestation performs no AWS probes or provisioning.
+      and profile-specific observation (HARDENED notification delivery or RESTRICTED_PILOT supervised failure checks). This attestation performs no AWS probes or provisioning.
   ReleaseIsolationMode:
     Type: String
     AllowedValues: [FRESH_RELEASE_ISOLATED_STACK, DRAINED_RELEASE_MIGRATION]
@@ -37,8 +71,9 @@ Parameters:
     AllowedPattern: 'arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
     Description: Retained CMK with validated Lambda Durable, DynamoDB, SQS, EventBridge and scoped Logs service/key policies
   SemanticKmsKeyArns:
+    Default: ''
     Type: CommaDelimitedList
-    AllowedPattern: 'arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
+    AllowedPattern: '^$|arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
     Description: Exact externally owned semantic table and release artifact CMKs; validate scoped key policies and retention in preflight
   DurableEstimatedOperations: {Type: Number, MinValue: 1, MaxValue: 3000}
   DurableEstimatedWrittenStateBytes: {Type: Number, MinValue: 1, MaxValue: 104857600}
@@ -122,24 +157,27 @@ Parameters:
     Type: CommaDelimitedList
     Description: Exact TPF semantic table and index ARNs required by the action host
   ResumeTokenSecretArn:
+    Default: ''
     Type: String
-    AllowedPattern: 'arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}'
-  ResumeTokenSecretVersion: {Type: String, AllowedPattern: '[A-Za-z0-9-]{32,64}'}
+    AllowedPattern: '^$|arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}'
+  ResumeTokenSecretVersion: {Type: String, Default: '', AllowedPattern: '^$|[A-Za-z0-9-]{32,64}'}
   WorkerSharedSecretArn:
+    Default: ''
     Type: String
-    AllowedPattern: 'arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}'
-  WorkerSharedSecretVersion: {Type: String, AllowedPattern: '[A-Za-z0-9-]{32,64}'}
+    AllowedPattern: '^$|arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}'
+  WorkerSharedSecretVersion: {Type: String, Default: '', AllowedPattern: '^$|[A-Za-z0-9-]{32,64}'}
   SigningKmsKeyArn:
+    Default: ''
     Type: String
-    AllowedPattern: 'arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
+    AllowedPattern: '^$|arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
     Description: Retained CMK of both signing secrets; reads are constrained to Secrets Manager and those exact secret ARNs
   SigningSecretAccessArns:
     Type: CommaDelimitedList
-    AllowedPattern: 'arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}'
+    AllowedPattern: '^$|arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}'
     Description: Exact current and retained signing secret ARNs; retain access while numbered host versions or executions require them
   SigningKmsAccessArns:
     Type: CommaDelimitedList
-    AllowedPattern: 'arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
+    AllowedPattern: '^$|arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
     Description: Exact current and retained signing CMKs; do not remove keys needed by retained signing secret versions
   DurableExecutionTimeoutSeconds: {Type: Number, Default: 2592000, MinValue: 1, MaxValue: 31622400}
   DurableRetentionDays: {Type: Number, Default: 30, MinValue: 1, MaxValue: 90}
@@ -155,14 +193,93 @@ Parameters:
   ReconciliationHandler: {Type: String, Default: aws-durable-reconcile}
 
 Conditions:
+  HardenedProfile: !Equals [!Ref DeploymentProfile, HARDENED]
+  RestrictedPilotProfile: !Equals [!Ref DeploymentProfile, RESTRICTED_PILOT]
+  HardenedFunctionTransition: !And [!Condition HardenedProfile, !Condition FunctionTransitionConsumer]
+  SecretsManagerSigning: !Equals [!Ref SigningSource, SECRETS_MANAGER]
   FunctionTransitionConsumer: !Equals [!Ref TransitionWorkerPlacement, FUNCTION]
 
 Rules:
+  ProfileSigningSelection:
+    Assertions:
+      - Assert: !Or
+          - !And [!Equals [!Ref DeploymentProfile, HARDENED], !Equals [!Ref SigningSource, SECRETS_MANAGER]]
+          - !And [!Equals [!Ref DeploymentProfile, RESTRICTED_PILOT], !Equals [!Ref SigningSource, SSM_STANDARD]]
+        AssertDescription: Signing and encryption modes must match the selected profile; no mixed authority
+  RestrictedPilotRequirements:
+    RuleCondition: !Equals [!Ref DeploymentProfile, RESTRICTED_PILOT]
+    Assertions:
+      - Assert: !Equals [!Ref AlarmTopicArn, '']
+        AssertDescription: Restricted pilot provisions no alarm and requires no SNS destination
+      - Assert: !Equals [!Ref RestrictedPilotValidation, validated]
+        AssertDescription: Restricted pilot requires supervised operational and security acceptance
+      - Assert: !Equals [!Ref SigningParameterLifecycleValidation, validated]
+        AssertDescription: Signing parameter metadata and immutable retention must be verified by its owner
+      - Assert: !Equals [!Ref ReleaseIsolationMode, FRESH_RELEASE_ISOLATED_STACK]
+        AssertDescription: Never retrofit service-owned encryption or SSM onto retained release resources
+      - Assert: !Equals [!Ref TransitionWorkerPlacement, FUNCTION]
+        AssertDescription: Restricted profile qualifies only the native FUNCTION consumer
+      - Assert: !Equals [!Ref ResumeTokenParameterVersion, '1']
+        AssertDescription: Immutable generation starts at version 1; rotation creates a new parameter
+      - Assert: !Equals [!Ref WorkerSharedParameterVersion, '1']
+        AssertDescription: Immutable generation starts at version 1; rotation creates a new parameter
+      - Assert: !Not [!Equals [!Ref ResumeTokenParameterArn, '']]
+        AssertDescription: Require the exact purpose and generation resume parameter ARN
+      - Assert: !Not [!Equals [!Ref WorkerSharedParameterArn, '']]
+        AssertDescription: Require the exact purpose and generation worker parameter ARN
+      - Assert: !Contains [!Ref SigningParameterAccessArns, !Ref ResumeTokenParameterArn]
+        AssertDescription: Current resume parameter must remain accessible
+      - Assert: !Contains [!Ref SigningParameterAccessArns, !Ref WorkerSharedParameterArn]
+        AssertDescription: Current worker parameter must remain accessible
+      - Assert: !Equals [!Ref ResumeTokenSecretArn, '']
+        AssertDescription: Mixed signing sources are forbidden
+      - Assert: !Equals [!Ref WorkerSharedSecretArn, '']
+        AssertDescription: Mixed signing sources are forbidden
+      - Assert: !Equals [!Ref ResumeTokenSecretVersion, '']
+        AssertDescription: Mixed signing sources are forbidden
+      - Assert: !Equals [!Ref WorkerSharedSecretVersion, '']
+        AssertDescription: Mixed signing sources are forbidden
+      - Assert: !Equals [!Ref SigningKmsKeyArn, '']
+        AssertDescription: SSM uses aws/ssm and cannot claim a signing CMK
+      - Assert: !EachMemberEquals [!Ref SigningSecretAccessArns, '']
+        AssertDescription: SSM signing must not retain a Secrets Manager grant
+      - Assert: !EachMemberEquals [!Ref SigningKmsAccessArns, '']
+        AssertDescription: SSM signing must not retain a signing CMK grant
+      - Assert: !EachMemberEquals [!Ref SemanticKmsKeyArns, '']
+        AssertDescription: Service-owned semantic encryption must not claim semantic CMKs
+  HardenedRequirements:
+    RuleCondition: !Equals [!Ref DeploymentProfile, HARDENED]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AlarmTopicArn, '']]
+        AssertDescription: Hardened operations require an owned SNS destination
+      - Assert: !Not [!Equals [!Ref ResumeTokenSecretArn, '']]
+        AssertDescription: Hardened signing requires Secrets Manager
+      - Assert: !Not [!Equals [!Ref WorkerSharedSecretArn, '']]
+        AssertDescription: Hardened signing requires Secrets Manager
+      - Assert: !Not [!Equals [!Ref ResumeTokenSecretVersion, '']]
+        AssertDescription: Hardened signing requires exact retained version
+      - Assert: !Not [!Equals [!Ref WorkerSharedSecretVersion, '']]
+        AssertDescription: Hardened signing requires exact retained version
+      - Assert: !Not [!Equals [!Ref SigningKmsKeyArn, '']]
+        AssertDescription: Hardened signing requires a retained CMK
+      - Assert: !Not [!Contains [!Ref SemanticKmsKeyArns, '']]
+        AssertDescription: Hardened semantic encryption requires scoped CMKs
+      - Assert: !Equals [!Ref ResumeTokenParameterArn, '']
+        AssertDescription: Mixed signing sources are forbidden
+      - Assert: !Equals [!Ref WorkerSharedParameterArn, '']
+        AssertDescription: Mixed signing sources are forbidden
+      - Assert: !Equals [!Ref ResumeTokenParameterVersion, '']
+        AssertDescription: Mixed signing sources are forbidden
+      - Assert: !Equals [!Ref WorkerSharedParameterVersion, '']
+        AssertDescription: Mixed signing sources are forbidden
+      - Assert: !EachMemberEquals [!Ref SigningParameterAccessArns, '']
+        AssertDescription: Hardened signing cannot include SSM grants
   ReleaseIsolationValidated:
     Assertions:
       - Assert: !Equals [!Ref ReleaseIsolationValidation, validated]
         AssertDescription: Require a fresh release-isolated stack or fully drained migration; compatible in-place upgrades are not accepted
   CurrentSigningReferencesAccessible:
+    RuleCondition: !Equals [!Ref SigningSource, SECRETS_MANAGER]
     Assertions:
       - Assert: !Contains [!Ref SigningSecretAccessArns, !Ref ResumeTokenSecretArn]
         AssertDescription: Resume signing reference must be included in the scoped secret access set
@@ -206,7 +323,7 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      SSESpecification: {SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !Ref HostKmsKeyArn}
+      SSESpecification: !If [HardenedProfile, {SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !Ref HostKmsKeyArn}, {SSEEnabled: false}]
       DeletionProtectionEnabled: true
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
@@ -236,56 +353,59 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue'], SqsManagedSseEnabled: !If [HardenedProfile, !Ref 'AWS::NoValue', true]}
   WorkQueue:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
     Properties:
-      KmsMasterKeyId: !Ref HostKmsKeyArn
+      KmsMasterKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
+      SqsManagedSseEnabled: !If [HardenedProfile, !Ref 'AWS::NoValue', true]
       VisibilityTimeout: 5400
       RedrivePolicy: {deadLetterTargetArn: !GetAtt WorkDlq.Arn, maxReceiveCount: 5}
   AwaitCompletionDlq:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue'], SqsManagedSseEnabled: !If [HardenedProfile, !Ref 'AWS::NoValue', true]}
   AwaitCompletionQueue:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
     Properties:
-      KmsMasterKeyId: !Ref HostKmsKeyArn
+      KmsMasterKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
+      SqsManagedSseEnabled: !If [HardenedProfile, !Ref 'AWS::NoValue', true]
       VisibilityTimeout: 720
       RedrivePolicy: {deadLetterTargetArn: !GetAtt AwaitCompletionDlq.Arn, maxReceiveCount: 5}
   TransitionDlq:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue'], SqsManagedSseEnabled: !If [HardenedProfile, !Ref 'AWS::NoValue', true]}
   TransitionRequestQueue:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
     Properties:
-      KmsMasterKeyId: !Ref HostKmsKeyArn
+      KmsMasterKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
+      SqsManagedSseEnabled: !If [HardenedProfile, !Ref 'AWS::NoValue', true]
       VisibilityTimeout: 5400
       RedrivePolicy: {deadLetterTargetArn: !GetAtt TransitionDlq.Arn, maxReceiveCount: 5}
   TransitionResponseQueue:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {VisibilityTimeout: 720, MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
+    Properties: {VisibilityTimeout: 720, MessageRetentionPeriod: 1209600, KmsMasterKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue'], SqsManagedSseEnabled: !If [HardenedProfile, !Ref 'AWS::NoValue', true]}
   DurableDlq:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue'], SqsManagedSseEnabled: !If [HardenedProfile, !Ref 'AWS::NoValue', true]}
   StreamFailureDlq:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
-    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !Ref HostKmsKeyArn}
+    Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue'], SqsManagedSseEnabled: !If [HardenedProfile, !Ref 'AWS::NoValue', true]}
 
   DueWorkDlq:
     DeletionPolicy: Retain
@@ -318,22 +438,34 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref SigningSecretAccessArns
-              - Effect: Allow
-                Action: kms:Decrypt
-                Resource: !Ref SigningKmsAccessArns
-                Condition:
-                  StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
-                  StringLike:
-                    kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
-              - Effect: Allow
-                Action: [kms:Decrypt, kms:GenerateDataKey]
-                Resource: !Ref HostKmsKeyArn
-              - Effect: Allow
-                Action: [kms:Decrypt, kms:GenerateDataKey]
-                Resource: !Ref SemanticKmsKeyArns
+              - !If
+                - SecretsManagerSigning
+                - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref SigningSecretAccessArns}
+                - {Effect: Allow, Action: 'ssm:GetParameter', Resource: !Ref SigningParameterAccessArns}
+              - !If
+                - SecretsManagerSigning
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref SigningKmsAccessArns
+                  Condition:
+                    StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                    StringLike:
+                      kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref HostKmsKeyArn}
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref HostKmsKeyArn
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub 'sqs.${AWS::Region}.amazonaws.com'
+                      kms:EncryptionContext:aws:sqs:arn: !GetAtt DueWorkQueue.Arn
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref SemanticKmsKeyArns}
+                - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
                 Resource: [!GetAtt DueWorkQueue.Arn, !GetAtt TransitionResponseQueue.Arn]
@@ -365,9 +497,10 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
-                Action: [kms:Decrypt, kms:GenerateDataKey]
-                Resource: !Ref HostKmsKeyArn
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref HostKmsKeyArn}
+                - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action: ['lambda:CheckpointDurableExecution', 'lambda:GetDurableExecutionState']
                 Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable:*'
@@ -392,9 +525,10 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
-                Action: [kms:Decrypt, kms:GenerateDataKey]
-                Resource: !Ref HostKmsKeyArn
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref HostKmsKeyArn}
+                - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt DurableDlq.Arn
@@ -418,22 +552,28 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref SigningSecretAccessArns
-              - Effect: Allow
-                Action: kms:Decrypt
-                Resource: !Ref SigningKmsAccessArns
-                Condition:
-                  StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
-                  StringLike:
-                    kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
-              - Effect: Allow
-                Action: [kms:Decrypt, kms:GenerateDataKey]
-                Resource: !Ref HostKmsKeyArn
-              - Effect: Allow
-                Action: [kms:Decrypt, kms:GenerateDataKey]
-                Resource: !Ref SemanticKmsKeyArns
+              - !If
+                - SecretsManagerSigning
+                - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref SigningSecretAccessArns}
+                - {Effect: Allow, Action: 'ssm:GetParameter', Resource: !Ref SigningParameterAccessArns}
+              - !If
+                - SecretsManagerSigning
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref SigningKmsAccessArns
+                  Condition:
+                    StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                    StringLike:
+                      kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref HostKmsKeyArn}
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref SemanticKmsKeyArns}
+                - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
                 Resource: !GetAtt TransitionResponseQueue.Arn
@@ -468,22 +608,28 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref SigningSecretAccessArns
-              - Effect: Allow
-                Action: kms:Decrypt
-                Resource: !Ref SigningKmsAccessArns
-                Condition:
-                  StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
-                  StringLike:
-                    kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
-              - Effect: Allow
-                Action: [kms:Decrypt, kms:GenerateDataKey]
-                Resource: !Ref HostKmsKeyArn
-              - Effect: Allow
-                Action: [kms:Decrypt, kms:GenerateDataKey]
-                Resource: !Ref SemanticKmsKeyArns
+              - !If
+                - SecretsManagerSigning
+                - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref SigningSecretAccessArns}
+                - {Effect: Allow, Action: 'ssm:GetParameter', Resource: !Ref SigningParameterAccessArns}
+              - !If
+                - SecretsManagerSigning
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref SigningKmsAccessArns
+                  Condition:
+                    StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                    StringLike:
+                      kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref HostKmsKeyArn}
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref SemanticKmsKeyArns}
+                - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
                 Resource: [!GetAtt WorkQueue.Arn, !GetAtt AwaitCompletionQueue.Arn, !GetAtt TransitionRequestQueue.Arn]
@@ -513,22 +659,34 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
-                Action: kms:Decrypt
-                Resource: !Ref SemanticKmsKeyArns
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref SigningSecretAccessArns
-              - Effect: Allow
-                Action: kms:Decrypt
-                Resource: !Ref SigningKmsAccessArns
-                Condition:
-                  StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
-                  StringLike:
-                    kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
-              - Effect: Allow
-                Action: [kms:Decrypt, kms:GenerateDataKey]
-                Resource: !Ref HostKmsKeyArn
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: kms:Decrypt, Resource: !Ref SemanticKmsKeyArns}
+                - !Ref 'AWS::NoValue'
+              - !If
+                - SecretsManagerSigning
+                - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref SigningSecretAccessArns}
+                - {Effect: Allow, Action: 'ssm:GetParameter', Resource: !Ref SigningParameterAccessArns}
+              - !If
+                - SecretsManagerSigning
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref SigningKmsAccessArns
+                  Condition:
+                    StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                    StringLike:
+                      kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref HostKmsKeyArn}
+                - Effect: Allow
+                  Action: [kms:Decrypt, kms:GenerateDataKey]
+                  Resource: !Ref HostKmsKeyArn
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub 'sqs.${AWS::Region}.amazonaws.com'
+                      kms:EncryptionContext:aws:sqs:arn: !GetAtt RepairFailureDlq.Arn
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt RepairFailureDlq.Arn
@@ -575,10 +733,10 @@ Resources:
       MemorySize: 1024
       Timeout: 900
       DeadLetterConfig: {TargetArn: !GetAtt DurableDlq.Arn}
-      KmsKeyArn: !Ref HostKmsKeyArn
+      KmsKeyArn: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       ReservedConcurrentExecutions: 32
       DurableConfig:
-        KMSKeyArn: !Ref HostKmsKeyArn
+        KMSKeyArn: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
         ExecutionTimeout: !Ref DurableExecutionTimeoutSeconds
         RetentionPeriodInDays: !Ref DurableRetentionDays
       Environment:
@@ -615,7 +773,7 @@ Resources:
       MemorySize: 1536
       Timeout: 120
       ReservedConcurrentExecutions: 32
-      KmsKeyArn: !Ref HostKmsKeyArn
+      KmsKeyArn: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       Environment:
         Variables: &ActionEnvironment
           # Environment changes qualify a new publication even when the package SHA is unchanged.
@@ -624,6 +782,7 @@ Resources:
             {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref DurableActionTimeoutSeconds
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref CallbackRetentionSeconds
+          TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref SigningSource
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref DeploymentPreflightValidation
           TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref DurableEstimatedOperations
           TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref DurableEstimatedWrittenStateBytes
@@ -631,10 +790,14 @@ Resources:
           TPF_AWS_DURABLE_RETENTION_DAYS: !Ref DurableRetentionDays
           TPF_AWS_DURABLE_WORKER_TIMEOUT_SECONDS: '900'
           TPF_AWS_DURABLE_SQS_VISIBILITY_SECONDS: '5400'
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
-          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !Ref WorkerSharedSecretArn
-          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !Ref WorkerSharedSecretVersion
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [SecretsManagerSigning, !Ref ResumeTokenSecretArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref ResumeTokenParameterArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [SecretsManagerSigning, !Ref ResumeTokenSecretVersion, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref ResumeTokenParameterVersion]
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !If [SecretsManagerSigning, !Ref WorkerSharedSecretArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref WorkerSharedParameterArn]
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !If [SecretsManagerSigning, !Ref WorkerSharedSecretVersion, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref WorkerSharedParameterVersion]
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
           TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
           TPF_AWS_DURABLE_QUALIFIER: !Ref DurableAlias
@@ -658,7 +821,7 @@ Resources:
       Code: {S3Bucket: !Ref DurableArtifactBucket, S3Key: !Ref DurableArtifactKey}
       FunctionName: !Sub '${AWS::StackName}-ingress'
       LoggingConfig: {LogGroup: !Ref IngressFunctionLogs}
-      KmsKeyArn: !Ref HostKmsKeyArn
+      KmsKeyArn: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       ReservedConcurrentExecutions: 16
       Handler: org.pipelineframework.aws.durable.AwsDurableIngressHandler::handleRequest
       Runtime: java21
@@ -1010,6 +1173,7 @@ Resources:
 
   WorkDlqAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties: &QueueAlarmProperties
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
@@ -1024,16 +1188,19 @@ Resources:
       Dimensions: [{Name: QueueName, Value: !GetAtt WorkDlq.QueueName}]
   AwaitDlqAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *QueueAlarmProperties
       Dimensions: [{Name: QueueName, Value: !GetAtt AwaitCompletionDlq.QueueName}]
   TransitionDlqAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *QueueAlarmProperties
       Dimensions: [{Name: QueueName, Value: !GetAtt TransitionDlq.QueueName}]
   StreamFailureAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *QueueAlarmProperties
       Dimensions: [{Name: QueueName, Value: !GetAtt StreamFailureDlq.QueueName}]
@@ -1046,7 +1213,7 @@ Resources:
       LogGroupName: !Sub
         - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/durable'
         - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
-      KmsKeyId: !Ref HostKmsKeyArn
+      KmsKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       RetentionInDays: !Ref LogRetentionDays
   ExecutionWakeupFunctionLogs:
     Type: AWS::Logs::LogGroup
@@ -1057,7 +1224,7 @@ Resources:
         - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/execution-wakeup'
         - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       RetentionInDays: !Ref LogRetentionDays
-      KmsKeyId: !Ref HostKmsKeyArn
+      KmsKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
   DueWorkFunctionLogs:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -1067,9 +1234,10 @@ Resources:
         - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/due-work'
         - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
       RetentionInDays: !Ref LogRetentionDays
-      KmsKeyId: !Ref HostKmsKeyArn
+      KmsKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
   DurableFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties: &DurableFunctionAlarmProperties
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
@@ -1084,11 +1252,13 @@ Resources:
       Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-durable'}]
   DurableFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *DurableFunctionAlarmProperties
       MetricName: Throttles
   DurableOperationBudgetAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *DurableFunctionAlarmProperties
       # Native provider metric is cumulative per execution. Sum would add unrelated executions.
@@ -1098,6 +1268,7 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
   DurableWrittenStateBudgetAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *DurableFunctionAlarmProperties
       MetricName: DurableExecutionStorageWrittenBytes
@@ -1112,10 +1283,11 @@ Resources:
       LogGroupName: !Sub
         - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/action'
         - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
-      KmsKeyId: !Ref HostKmsKeyArn
+      KmsKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       RetentionInDays: !Ref LogRetentionDays
   ActionFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties: &ActionFunctionAlarmProperties
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
@@ -1130,6 +1302,7 @@ Resources:
       Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-action'}]
   ActionFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ActionFunctionAlarmProperties
       MetricName: Throttles
@@ -1141,10 +1314,11 @@ Resources:
       LogGroupName: !Sub
         - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/ingress'
         - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
-      KmsKeyId: !Ref HostKmsKeyArn
+      KmsKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       RetentionInDays: !Ref LogRetentionDays
   IngressFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties: &IngressFunctionAlarmProperties
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
@@ -1159,6 +1333,7 @@ Resources:
       Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-ingress'}]
   IngressFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *IngressFunctionAlarmProperties
       MetricName: Throttles
@@ -1170,10 +1345,11 @@ Resources:
       LogGroupName: !Sub
         - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/work'
         - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
-      KmsKeyId: !Ref HostKmsKeyArn
+      KmsKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       RetentionInDays: !Ref LogRetentionDays
   WorkFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties: &WorkFunctionAlarmProperties
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
@@ -1188,6 +1364,7 @@ Resources:
       Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-work'}]
   WorkFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *WorkFunctionAlarmProperties
       MetricName: Throttles
@@ -1199,10 +1376,11 @@ Resources:
       LogGroupName: !Sub
         - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/await-completion'
         - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
-      KmsKeyId: !Ref HostKmsKeyArn
+      KmsKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       RetentionInDays: !Ref LogRetentionDays
   AwaitCompletionFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties: &AwaitCompletionFunctionAlarmProperties
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
@@ -1217,6 +1395,7 @@ Resources:
       Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-await-completion'}]
   AwaitCompletionFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitCompletionFunctionAlarmProperties
       MetricName: Throttles
@@ -1229,11 +1408,11 @@ Resources:
       LogGroupName: !Sub
         - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/transition-worker'
         - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
-      KmsKeyId: !Ref HostKmsKeyArn
+      KmsKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       RetentionInDays: !Ref LogRetentionDays
   TransitionWorkerFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: FunctionTransitionConsumer
+    Condition: HardenedFunctionTransition
     Properties: &TransitionWorkerFunctionAlarmProperties
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
@@ -1248,7 +1427,7 @@ Resources:
       Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-transition-worker'}]
   TransitionWorkerFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: FunctionTransitionConsumer
+    Condition: HardenedFunctionTransition
     Properties:
       <<: *TransitionWorkerFunctionAlarmProperties
       MetricName: Throttles
@@ -1260,10 +1439,11 @@ Resources:
       LogGroupName: !Sub
         - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/await-wakeup'
         - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
-      KmsKeyId: !Ref HostKmsKeyArn
+      KmsKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       RetentionInDays: !Ref LogRetentionDays
   AwaitWakeupFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties: &AwaitWakeupFunctionAlarmProperties
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
@@ -1278,6 +1458,7 @@ Resources:
       Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-await-wakeup'}]
   AwaitWakeupFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       MetricName: Throttles
@@ -1289,10 +1470,11 @@ Resources:
       LogGroupName: !Sub
         - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/reconcile'
         - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
-      KmsKeyId: !Ref HostKmsKeyArn
+      KmsKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       RetentionInDays: !Ref LogRetentionDays
   ReconciliationFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties: &ReconciliationFunctionAlarmProperties
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
@@ -1307,21 +1489,25 @@ Resources:
       Dimensions: [{Name: FunctionName, Value: !Sub '${AWS::StackName}-reconcile'}]
   ReconciliationFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ReconciliationFunctionAlarmProperties
       MetricName: Throttles
   DurableDlqAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *QueueAlarmProperties
       Dimensions: [{Name: QueueName, Value: !GetAtt DurableDlq.QueueName}]
   RepairFailureDlqAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *QueueAlarmProperties
       Dimensions: [{Name: QueueName, Value: !GetAtt RepairFailureDlq.QueueName}]
   WorkQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *QueueAlarmProperties
       MetricName: ApproximateAgeOfOldestMessage
@@ -1329,6 +1515,7 @@ Resources:
       Dimensions: [{Name: QueueName, Value: !GetAtt WorkQueue.QueueName}]
   AwaitCompletionQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *QueueAlarmProperties
       MetricName: ApproximateAgeOfOldestMessage
@@ -1336,6 +1523,7 @@ Resources:
       Dimensions: [{Name: QueueName, Value: !GetAtt AwaitCompletionQueue.QueueName}]
   TransitionRequestQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *QueueAlarmProperties
       MetricName: ApproximateAgeOfOldestMessage
@@ -1343,6 +1531,7 @@ Resources:
       Dimensions: [{Name: QueueName, Value: !GetAtt TransitionRequestQueue.QueueName}]
   TransitionResponseQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *QueueAlarmProperties
       MetricName: ApproximateAgeOfOldestMessage
@@ -1350,6 +1539,7 @@ Resources:
       Dimensions: [{Name: QueueName, Value: !GetAtt TransitionResponseQueue.QueueName}]
   AwaitStreamAgeAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       MetricName: IteratorAge
@@ -1357,23 +1547,27 @@ Resources:
       Threshold: 60000
   AwaitStateDroppedEventAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       MetricName: DroppedEventCount
       Dimensions: [{Name: EventSourceMappingUUID, Value: !Ref AwaitWakeupFunctionAwaitState}]
   CallbackBindingDroppedEventAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       MetricName: DroppedEventCount
       Dimensions: [{Name: EventSourceMappingUUID, Value: !Ref AwaitWakeupFunctionCallbackBinding}]
   StreamDestinationDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       MetricName: DestinationDeliveryFailures
   RepairDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ReconciliationFunctionAlarmProperties
       Namespace: AWS/Events
@@ -1381,47 +1575,55 @@ Resources:
       Dimensions: [{Name: RuleName, Value: !Ref DurableTerminalRule}]
   IngressAsyncDroppedAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *IngressFunctionAlarmProperties
       MetricName: AsyncEventsDropped
   RepairAsyncDroppedAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ReconciliationFunctionAlarmProperties
       MetricName: AsyncEventsDropped
 
   ExecutionWakeupFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       MetricName: Errors
       Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
   ExecutionWakeupFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       MetricName: Throttles
       Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
   DueWorkFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ActionFunctionAlarmProperties
       MetricName: Errors
       Dimensions: [{Name: FunctionName, Value: !Ref DueWorkFunction}]
   DueWorkFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ActionFunctionAlarmProperties
       MetricName: Throttles
       Dimensions: [{Name: FunctionName, Value: !Ref DueWorkFunction}]
   ExecutionStateDroppedEventAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       MetricName: DroppedEventCount
       Dimensions: [{Name: EventSourceMappingUUID, Value: !Ref ExecutionWakeupFunctionExecutionState}]
   ExecutionStreamAgeAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       MetricName: IteratorAge
@@ -1430,17 +1632,20 @@ Resources:
       Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
   ExecutionStreamDestinationDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       MetricName: DestinationDeliveryFailures
       Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
   DueWorkDlqAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *QueueAlarmProperties
       Dimensions: [{Name: QueueName, Value: !GetAtt DueWorkDlq.QueueName}]
   DueWorkAgeAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *QueueAlarmProperties
       MetricName: ApproximateAgeOfOldestMessage
@@ -1449,6 +1654,7 @@ Resources:
       Dimensions: [{Name: QueueName, Value: !GetAtt DueWorkQueue.QueueName}]
   DueWorkDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ReconciliationFunctionAlarmProperties
       Namespace: AWS/Events
@@ -1457,6 +1663,7 @@ Resources:
 
   CompletionObservationUnknownAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ActionFunctionAlarmProperties
       AlarmDescription: Native completion observations could not establish release; sampled reads do not constitute a global inventory
@@ -1467,6 +1674,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: COMPLETION}, {Name: Outcome, Value: UNKNOWN}]
   CompletionObservationOutstandingAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ActionFunctionAlarmProperties
       AlarmDescription: Observed outstanding native completions exceed the configured read-count threshold; repeated reads count separately and absent samples do not establish global zero or health
@@ -1478,6 +1686,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: COMPLETION}, {Name: Outcome, Value: OUTSTANDING}]
   CompletionReleaseLatencyAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ActionFunctionAlarmProperties
       AlarmDescription: Maximum known native admission-to-release latency among sampled released completions; absence of samples does not establish health
@@ -1489,6 +1698,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: COMPLETION}, {Name: Outcome, Value: RELEASED}]
   CallbackResumeObservedLatencyAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ActionFunctionAlarmProperties
       AlarmDescription: Maximum host API-success observation to first verified resumed action sample; missing or lost samples do not establish provider latency or health
@@ -1500,6 +1710,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: CALLBACK_RESUME}, {Name: Outcome, Value: MEASURED}]
   CallbackResumeUnknownAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ActionFunctionAlarmProperties
       AlarmDescription: Callback resume observations have invalid timestamps; this sample cannot measure lost acknowledgements or missing history timestamps
@@ -1510,6 +1721,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: CALLBACK_RESUME}, {Name: Outcome, Value: UNKNOWN}]
   RepairObservedAgeAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ReconciliationFunctionAlarmProperties
       AlarmDescription: Maximum repair age sampled from the first retained host observation on targeted attempts; missing samples or accepted replacement do not establish convergence
@@ -1521,6 +1733,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: REPAIR}, {Name: Outcome, Value: REPAIR_AGE_SAMPLED}]
   RepairObservedAgeUnknownAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ReconciliationFunctionAlarmProperties
       AlarmDescription: Targeted repair age samples are missing or invalid; retry exhaustion and DLQs remain separate alarms
@@ -1531,6 +1744,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: REPAIR}, {Name: Outcome, Value: REPAIR_AGE_UNKNOWN}]
   WakeupProviderUnknownAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       Namespace: TPF/AwsDurable
@@ -1540,6 +1754,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: WAKEUP}, {Name: Outcome, Value: PROVIDER_UNKNOWN}]
   WakeupTransientFailureAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       Namespace: TPF/AwsDurable
@@ -1549,6 +1764,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: WAKEUP}, {Name: Outcome, Value: TRANSIENT_FAILURE}]
   ReplacementRejectedAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       Namespace: TPF/AwsDurable
@@ -1558,6 +1774,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: REPLACEMENT}, {Name: Outcome, Value: REJECTED}]
   ReplacementFailedAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       Namespace: TPF/AwsDurable
@@ -1567,6 +1784,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: REPLACEMENT}, {Name: Outcome, Value: FAILED}]
   RepairFailedAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       Namespace: TPF/AwsDurable
@@ -1577,22 +1795,26 @@ Resources:
 
   IngressDestinationDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *IngressFunctionAlarmProperties
       MetricName: DestinationDeliveryFailures
   RepairDestinationDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *ReconciliationFunctionAlarmProperties
       MetricName: DestinationDeliveryFailures
   DurableDeadLetterDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *DurableFunctionAlarmProperties
       MetricName: DeadLetterErrors
 
   CallbackBindingConflictAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       Namespace: TPF/AwsDurable
@@ -1602,6 +1824,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: BINDING}, {Name: Outcome, Value: CONFLICT}]
   CallbackRegistrationConflictAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       Namespace: TPF/AwsDurable
@@ -1611,6 +1834,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: REGISTRATION}, {Name: Outcome, Value: CONFLICT}]
   GenerationClaimConflictAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       Namespace: TPF/AwsDurable
@@ -1620,6 +1844,7 @@ Resources:
       Dimensions: [{Name: Stage, Value: GENERATION}, {Name: Outcome, Value: CONFLICT}]
   StaleGenerationRejectionAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
     Properties:
       <<: *AwaitWakeupFunctionAlarmProperties
       Namespace: TPF/AwsDurable
@@ -1646,9 +1871,25 @@ Outputs:
     Description: Export this resolved manifest to the immutable release bundle before admission; never overwrite a prior publication manifest
     Value: !Sub
       - |
-        {"schemaVersion":1,"stackId":"${AWS::StackId}","pipelineId":"${PipelineId}","contractVersion":"${ContractVersion}","releaseId":"${ReleaseVersion}","artifactId":"${ReleaseArtifactId}","artifactSha256":"${ReleaseArtifactDigest}","actionCodeSha256":"${ActionCodeSha256}","durableCodeSha256":"${DurableCodeSha256}","publicationId":"${VersionPublicationId}","placement":"${TransitionWorkerPlacement}","isolationMode":"${ReleaseIsolationMode}","runtimeUpdateMode":"FunctionUpdate","functionVersionArns":{"durable":"${DurableVersion}","action":"${ActionVersion}","ingress":"${IngressVersion}","work":"${WorkVersion}","transition":"${TransitionVersionArn}","awaitCompletion":"${AwaitCompletionVersion}","awaitWakeup":"${AwaitWakeupVersion}","executionWakeup":"${ExecutionWakeupVersion}","dueWork":"${DueWorkVersion}","reconciliation":"${ReconciliationVersion}"},"queueUrls":{"work":"${WorkQueue}","workDlq":"${WorkDlq}","awaitCompletion":"${AwaitCompletionQueue}","awaitCompletionDlq":"${AwaitCompletionDlq}","transitionRequest":"${TransitionRequestQueue}","transitionResponse":"${TransitionResponseQueue}","transitionDlq":"${TransitionDlq}","dueWork":"${DueWorkQueue}","dueWorkDlq":"${DueWorkDlq}","streamFailure":"${StreamFailureDlq}","repairFailure":"${RepairFailureDlq}","durableDlq":"${DurableDlq}"},"mappingIds":{"work":"${WorkFunctionWork}","awaitCompletion":"${AwaitCompletionFunctionAwaitCompletion}","transition":"${TransitionMappingId}","awaitState":"${AwaitWakeupFunctionAwaitState}","callbackBinding":"${AwaitWakeupFunctionCallbackBinding}","executionState":"${ExecutionWakeupFunctionExecutionState}","dueWork":"${DueWorkFunctionTick}"},"signing":{"resumeToken":{"arn":"${ResumeTokenSecretArn}","versionId":"${ResumeTokenSecretVersion}"},"worker":{"arn":"${WorkerSharedSecretArn}","versionId":"${WorkerSharedSecretVersion}"},"currentKmsKeyArn":"${SigningKmsKeyArn}","retainedSecretAccessArns":["${SigningSecretArns}"],"retainedKmsAccessArns":["${SigningKeyArns}"]},"hostKmsKeyArn":"${HostKmsKeyArn}","semanticKmsKeyArns":["${SemanticKeyArns}"]}
-      - TransitionVersionArn: !If [FunctionTransitionConsumer, !Ref TransitionWorkerVersion, '']
+        {"schemaVersion":2,"deploymentProfile":"${DeploymentProfile}","observability":"${ObservationMode}","scheduleProvider":"EVENTBRIDGE_RULE","encryption":{"host":"${HostEncryptionMode}","semantic":"${SemanticEncryptionMode}"},"stackId":"${AWS::StackId}","pipelineId":"${PipelineId}","contractVersion":"${ContractVersion}","releaseId":"${ReleaseVersion}","artifactId":"${ReleaseArtifactId}","artifactSha256":"${ReleaseArtifactDigest}","actionCodeSha256":"${ActionCodeSha256}","durableCodeSha256":"${DurableCodeSha256}","publicationId":"${VersionPublicationId}","placement":"${TransitionWorkerPlacement}","isolationMode":"${ReleaseIsolationMode}","runtimeUpdateMode":"FunctionUpdate","functionVersionArns":{"durable":"${DurableVersion}","action":"${ActionVersion}","ingress":"${IngressVersion}","work":"${WorkVersion}","transition":"${TransitionVersionArn}","awaitCompletion":"${AwaitCompletionVersion}","awaitWakeup":"${AwaitWakeupVersion}","executionWakeup":"${ExecutionWakeupVersion}","dueWork":"${DueWorkVersion}","reconciliation":"${ReconciliationVersion}"},"logGroupNames":{"durable":"${DurableFunctionLogs}","action":"${ActionFunctionLogs}","ingress":"${IngressFunctionLogs}","work":"${WorkFunctionLogs}","transition":"${TransitionLogGroupName}","awaitCompletion":"${AwaitCompletionFunctionLogs}","awaitWakeup":"${AwaitWakeupFunctionLogs}","executionWakeup":"${ExecutionWakeupFunctionLogs}","dueWork":"${DueWorkFunctionLogs}","reconciliation":"${ReconciliationFunctionLogs}"},"queueUrls":{"work":"${WorkQueue}","workDlq":"${WorkDlq}","awaitCompletion":"${AwaitCompletionQueue}","awaitCompletionDlq":"${AwaitCompletionDlq}","transitionRequest":"${TransitionRequestQueue}","transitionResponse":"${TransitionResponseQueue}","transitionDlq":"${TransitionDlq}","dueWork":"${DueWorkQueue}","dueWorkDlq":"${DueWorkDlq}","streamFailure":"${StreamFailureDlq}","repairFailure":"${RepairFailureDlq}","durableDlq":"${DurableDlq}"},"mappingIds":{"work":"${WorkFunctionWork}","awaitCompletion":"${AwaitCompletionFunctionAwaitCompletion}","transition":"${TransitionMappingId}","awaitState":"${AwaitWakeupFunctionAwaitState}","callbackBinding":"${AwaitWakeupFunctionCallbackBinding}","executionState":"${ExecutionWakeupFunctionExecutionState}","dueWork":"${DueWorkFunctionTick}"},"signing":${SigningManifest},"hostKmsKeyArn":"${HostKmsKeyArn}","semanticKmsKeyArns":${SemanticKeysManifest}}
+      - ObservationMode: !If [HardenedProfile, ALARMS, SUPERVISED_NO_ALARMS]
+        HostEncryptionMode: !If [HardenedProfile, CUSTOMER_MANAGED, SERVICE_OWNED_EXCEPT_EVENTBRIDGE_CMK]
+        SemanticEncryptionMode: !If [HardenedProfile, CUSTOMER_MANAGED, AWS_OWNED_AND_S3_MANAGED]
+        SigningManifest: !If
+          - SecretsManagerSigning
+          - !Sub
+            - '{"resumeToken":{"arn":"${ResumeTokenSecretArn}","versionId":"${ResumeTokenSecretVersion}"},"worker":{"arn":"${WorkerSharedSecretArn}","versionId":"${WorkerSharedSecretVersion}"},"currentKmsKeyArn":"${SigningKmsKeyArn}","retainedSecretAccessArns":["${SigningSecretArns}"],"retainedKmsAccessArns":["${SigningKeyArns}"],"source":"SECRETS_MANAGER"}'
+            - SigningSecretArns: !Join ['","', !Ref SigningSecretAccessArns]
+              SigningKeyArns: !Join ['","', !Ref SigningKmsAccessArns]
+          - !Sub
+            - '{"source":"SSM_STANDARD","tier":"Standard","type":"SecureString","keyKind":"AWS_MANAGED_SSM","lifecycle":"IMMUTABLE_GENERATION","resumeToken":{"arn":"${ResumeTokenParameterArn}","version":${ResumeTokenParameterVersion}},"worker":{"arn":"${WorkerSharedParameterArn}","version":${WorkerSharedParameterVersion}},"retainedParameterAccessArns":["${ParameterArns}"]}'
+            - ParameterArns: !Join ['","', !Ref SigningParameterAccessArns]
+        TransitionVersionArn: !If [FunctionTransitionConsumer, !Ref TransitionWorkerVersion, '']
+        TransitionLogGroupName: !If [FunctionTransitionConsumer, !Ref TransitionWorkerFunctionLogs, '']
         TransitionMappingId: !If [FunctionTransitionConsumer, !Ref TransitionWorkerFunctionTransition, '']
-        SigningSecretArns: !Join ['","', !Ref SigningSecretAccessArns]
-        SigningKeyArns: !Join ['","', !Ref SigningKmsAccessArns]
-        SemanticKeyArns: !Join ['","', !Ref SemanticKmsKeyArns]
+        SemanticKeysManifest: !If
+          - HardenedProfile
+          - !Sub
+            - '["${SemanticKeyArns}"]'
+            - SemanticKeyArns: !Join ['","', !Ref SemanticKmsKeyArns]
+          - '[]'
