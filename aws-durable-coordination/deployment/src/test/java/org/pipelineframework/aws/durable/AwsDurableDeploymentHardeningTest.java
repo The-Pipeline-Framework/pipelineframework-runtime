@@ -14,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class AwsDurableDeploymentHardeningTest {
     private JsonNode template() throws Exception {
         try (var input = getClass().getResourceAsStream("/aws-durable-queue-async.yaml")) {
-            return new ObjectMapper(new YAMLFactory()).readTree(input);
+            return DeploymentProfileTestSupport.hardened(new ObjectMapper(new YAMLFactory()).readTree(input));
         }
     }
 
@@ -263,7 +263,7 @@ class AwsDurableDeploymentHardeningTest {
         assertEquals("ReleaseIsolationValidation", template.path("Rules").path("ReleaseIsolationValidated")
             .path("Assertions").get(0).path("Assert").get(0).asText());
         var manifest = new ObjectMapper().readTree(template.path("Outputs").path("DeploymentReleaseManifest").path("Value").get(0).asText());
-        assertEquals(1, manifest.path("schemaVersion").asInt());
+        assertEquals(2, manifest.path("schemaVersion").asInt());
         for (var identity : Map.of("pipelineId", "PipelineId", "contractVersion", "ContractVersion", "releaseId", "ReleaseVersion",
             "artifactId", "ReleaseArtifactId", "artifactSha256", "ReleaseArtifactDigest").entrySet()) {
             assertEquals("${" + identity.getValue() + "}", manifest.path(identity.getKey()).asText());

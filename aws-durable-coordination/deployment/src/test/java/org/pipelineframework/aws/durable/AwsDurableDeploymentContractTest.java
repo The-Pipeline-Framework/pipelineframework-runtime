@@ -12,7 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AwsDurableDeploymentContractTest {
     private JsonNode template() throws Exception {
         try (var template = getClass().getResourceAsStream("/aws-durable-queue-async.yaml")) {
-            return new ObjectMapper(new YAMLFactory()).readTree(template);
+            return DeploymentProfileTestSupport.hardened(new ObjectMapper(new YAMLFactory()).readTree(template));
         }
     }
 

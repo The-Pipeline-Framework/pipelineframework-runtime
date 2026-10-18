@@ -6,7 +6,10 @@ contracts; application pipeline semantics remain with their existing owners.
 
 The existing signing source is Secrets Manager. The explicit `SSM_STANDARD`
 reader is an experimental source candidate, not a supported deployment profile;
-the hardened SAM template and v1 deployment manifest still use Secrets Manager.
+the published hardened SAM template and v1 deployment manifest use Secrets Manager.
+A [new unpublished restricted profile qualification](../deployment/profiles/README.md)
+adds conditional deployment/IAM/schema2 support without changing the host binary;
+it does not establish live AWS conformance or zero fixed cost.
 
 The canonical [AWS Durable deployment contract](https://pipelineframework.org/deploy/orchestrator-runtime/aws-durable#experimental-pinned-ssm-signing-source)
 owns configuration details, retained-version requirements and support limits.
