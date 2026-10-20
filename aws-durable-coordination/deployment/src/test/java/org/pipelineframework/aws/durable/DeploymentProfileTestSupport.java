@@ -9,7 +9,7 @@ import java.util.Set;
 /** Resolve only the new profile choices before applying all existing hardened assertions. */
 final class DeploymentProfileTestSupport {
     private static final Set<String> TRUE_DEFAULT = Set.of("HardenedProfile", "SecretsManagerSigning", "HardenedFunctionTransition");
-    private static final Set<String> FALSE_DEFAULT = Set.of("RestrictedPilotProfile");
+    private static final Set<String> FALSE_DEFAULT = Set.of("RestrictedPilotProfile", "RuntimePermissionsBoundarySelected");
 
     private DeploymentProfileTestSupport() {}
 

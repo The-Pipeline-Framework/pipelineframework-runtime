@@ -1,4 +1,9 @@
-# Restricted pilot deployment profile (unpublished qualification)
+> **20 October deployment-only boundary amendment (unpublished):** the new optional
+> `RuntimePermissionsBoundaryArn` raises this candidate template from 73 to 74
+> parameters. The signed runtime64 73-parameter artifact remains an unchanged legacy
+> contract; no deployment may substitute these unpublished bytes for that pin.
+
+# Restricted pilot deployment profile
 
 The canonical `src/main/resources/aws-durable-queue-async.yaml` remains one SAM graph.
 `DeploymentProfile=HARDENED` is the default. Its resolved resource graph matches
@@ -117,8 +122,44 @@ Signing is discriminated by `source`. SSM includes `tier=Standard`, `type=Secure
 `{arn,version:1}` and `retainedParameterAccessArns`. Hardened retains its original
 `{arn,versionId}` / CMK fields with `source=SECRETS_MANAGER` added.
 
-This template/preflight/schema2 extension is uncommitted and unpublished. Existing
-public runtime63 deployment bytes do not contain it; copying a profile name into
-published inputs does not enable it. The unchanged host JAR already contains the
-reader. Canonical documentation, downstream authenticated manifest consumers,
-owner CI/system tests, publication and live AWS conformance remain separate gates.
+The existing profile/preflight/schema2 baseline was published by runtime64
+(`931196a7bf7aa1102129da98f5344c5fd7b82f7b`), with 73 parameters and template SHA256
+`5fee5ee1b7afa687903deaf19b9f10b4f6ad02c85cf6afd2cd91d3ca4414a3bc`.
+Only the new 74-parameter permissions-boundary amendment below is unpublished;
+copying its parameter into the old signed artifact does not enable it. The host
+JAR is unchanged. Matching canonical documentation/consumers, owner/downstream CI,
+normal signed publication and live AWS conformance remain distinct gates.
+
+## Optional runtime permissions boundary
+
+`RuntimePermissionsBoundaryArn` defaults to an empty string. Empty retains the
+published hardened/restricted role graph exactly; it does not impose a boundary
+on generic customers. A nonempty exact same-account customer-managed policy ARN
+sets `Properties.PermissionsBoundary` on all six explicit roles: DueWork, Durable,
+Ingress, Action, Worker and Wakeup. No role/queue/function/consumer is added, and
+trust, inline/managed policies, runtime handlers, binaries, recovery and retention
+are unchanged. The schema2 release manifest fields remain unchanged. Cloud's pilot
+wrapper must separately require its approved boundary and verify actual GetRole
+boundary ARNs for all six roles against the new authenticated deployment pin.
+
+An execution-role boundary is not inherited by roles created through CloudFormation.
+A platform policy requiring `iam:PermissionsBoundary` on CreateRole needs this
+explicit resource property; CloudFormation/SAM does not inject a default. Owners
+must retain the managed boundary policy and effective rights while any retained
+role/execution/replay/redrive obligation needs them, and prevent unauthorized policy
+version changes or boundary removal/replacement. This parameter supplies neither
+IAM permission nor lifecycle enforcement. Do not deploy a boundary that denies a
+required native recovery action or grants cross-application authority.
+
+The offline preflight accepts optional `--account-id <owner-observed-account>` and
+then rejects a boundary from another account. Without that observation it validates
+syntax only; it does not infer the Lambda role account from a possibly separately
+owned KMS key, call AWS, inspect policy versions/effective rights or claim lifecycle
+verification. Actual account/partition, GetPolicy/default version, all role boundaries,
+retained-policy authority and runtime recovery permissions remain deployment-owner
+checks before admission. The ARN is a policy identity, not a secret or a version pin.
+
+This is a provisioning-policy extension requiring owner review, canonical parameter
+reference alignment, normal owner/downstream CI and signed publication before use.
+The prior 73-parameter contract stays pinned for legacy deployments; no local source
+fallback or Cloud-side mutation of a signed template is supported.

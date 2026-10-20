@@ -66,6 +66,11 @@ Parameters:
     AllowedValues: [not-applicable, validated]
     Description: For COMPUTE validate exclusive queue ownership, pinned release/digest, signing keys and retry/DLQ protocol
   LogRetentionDays: {Type: Number, Default: 30, AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]}
+  RuntimePermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|arn:[a-z-]+:iam::[0-9]{12}:policy/([A-Za-z0-9+=,.@_-]+/)*[A-Za-z0-9+=,.@_-]+)$'
+    Description: Optional exact same-account customer-managed runtime role permissions boundary; owner retains policy and verifies effective permissions for every retained role
   HostKmsKeyArn:
     Type: String
     AllowedPattern: 'arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+'
@@ -193,6 +198,7 @@ Parameters:
   ReconciliationHandler: {Type: String, Default: aws-durable-reconcile}
 
 Conditions:
+  RuntimePermissionsBoundarySelected: !Not [!Equals [!Ref RuntimePermissionsBoundaryArn, '']]
   HardenedProfile: !Equals [!Ref DeploymentProfile, HARDENED]
   RestrictedPilotProfile: !Equals [!Ref DeploymentProfile, RESTRICTED_PILOT]
   HardenedFunctionTransition: !And [!Condition HardenedProfile, !Condition FunctionTransitionConsumer]
@@ -427,6 +433,7 @@ Resources:
     UpdateReplacePolicy: Retain
     Type: AWS::IAM::Role
     Properties:
+      PermissionsBoundary: !If [RuntimePermissionsBoundarySelected, !Ref RuntimePermissionsBoundaryArn, !Ref 'AWS::NoValue']
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
@@ -486,6 +493,7 @@ Resources:
     UpdateReplacePolicy: Retain
     Type: AWS::IAM::Role
     Properties:
+      PermissionsBoundary: !If [RuntimePermissionsBoundarySelected, !Ref RuntimePermissionsBoundaryArn, !Ref 'AWS::NoValue']
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
@@ -516,6 +524,7 @@ Resources:
     UpdateReplacePolicy: Retain
     Type: AWS::IAM::Role
     Properties:
+      PermissionsBoundary: !If [RuntimePermissionsBoundarySelected, !Ref RuntimePermissionsBoundaryArn, !Ref 'AWS::NoValue']
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
@@ -541,6 +550,7 @@ Resources:
     UpdateReplacePolicy: Retain
     Type: AWS::IAM::Role
     Properties:
+      PermissionsBoundary: !If [RuntimePermissionsBoundarySelected, !Ref RuntimePermissionsBoundaryArn, !Ref 'AWS::NoValue']
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
@@ -597,6 +607,7 @@ Resources:
     UpdateReplacePolicy: Retain
     Type: AWS::IAM::Role
     Properties:
+      PermissionsBoundary: !If [RuntimePermissionsBoundarySelected, !Ref RuntimePermissionsBoundaryArn, !Ref 'AWS::NoValue']
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
@@ -648,6 +659,7 @@ Resources:
     UpdateReplacePolicy: Retain
     Type: AWS::IAM::Role
     Properties:
+      PermissionsBoundary: !If [RuntimePermissionsBoundarySelected, !Ref RuntimePermissionsBoundaryArn, !Ref 'AWS::NoValue']
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
