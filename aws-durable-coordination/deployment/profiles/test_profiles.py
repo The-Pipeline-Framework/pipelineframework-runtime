@@ -54,7 +54,7 @@ def fixture(profile='RESTRICTED_PILOT'):
 def graph(template, profile):
     return p.resources(template, {'DeploymentProfile': profile,
                        'SigningSource': 'SECRETS_MANAGER' if profile == 'HARDENED' else 'SSM_STANDARD',
-                       'TransitionWorkerPlacement': 'FUNCTION'})
+                       'TransitionWorkerPlacement': 'FUNCTION', 'RuntimePermissionsBoundaryArn': ''})
 
 
 def normalized_hardened(template):
@@ -73,6 +73,63 @@ class Profiles(unittest.TestCase):
         self.assertEqual('HARDENED', self.template['Parameters']['DeploymentProfile']['Default'])
         digest = hashlib.sha256(json.dumps(normalized_hardened(self.template), sort_keys=True).encode()).hexdigest()
         self.assertEqual('af88bff8b42a5696793faee2356ae8610f031a0d1159afcabeb632d6b80ba222', digest)
+
+    def test_optional_boundary_default_preserves_all_existing_parameters(self):
+        # The old published 73-parameter input remains valid; only this optional
+        # field is new and no release-manifest schema field is changed.
+        self.assertEqual(74, len(self.template['Parameters']))
+        spec = self.template['Parameters']['RuntimePermissionsBoundaryArn']
+        self.assertEqual('', spec['Default'])
+        for profile in ['HARDENED', 'RESTRICTED_PILOT']:
+            values, inventory, guard = fixture(profile)
+            values.pop('RuntimePermissionsBoundaryArn')
+            checked = p.check(self.template, values, inventory, guard)
+            self.assertEqual('', checked['RuntimePermissionsBoundaryArn'])
+            roles = {name: resource for name, resource in p.resources(self.template, checked).items()
+                     if resource['Type'] == 'AWS::IAM::Role'}
+            self.assertEqual({'DueWorkRole', 'DurableRole', 'IngressRole', 'ActionRole', 'WorkerRole', 'WakeupRole'}, set(roles))
+            self.assertTrue(all('PermissionsBoundary' not in role['Properties'] for role in roles.values()))
+
+    def test_selected_boundary_changes_only_all_six_role_properties(self):
+        boundary = 'arn:aws:iam::123456789012:policy/tpf/runtime-boundary'
+        for profile in ['HARDENED', 'RESTRICTED_PILOT']:
+            values, inventory, guard = fixture(profile)
+            baseline = p.resources(self.template, p.check(self.template, values, inventory, guard))
+            values['RuntimePermissionsBoundaryArn'] = boundary
+            checked = p.check(self.template, values, inventory, guard, account_id='123456789012')
+            selected = p.resources(self.template, checked)
+            self.assertEqual(set(baseline), set(selected))
+            count = 0
+            for name, resource in selected.items():
+                if resource['Type'] == 'AWS::IAM::Role':
+                    count += 1
+                    self.assertEqual(boundary, resource['Properties'].pop('PermissionsBoundary'))
+                self.assertEqual(baseline[name], resource, name)
+            self.assertEqual(6, count)
+
+    def test_boundary_parameter_rejects_malformed_wildcard_or_other_authorities(self):
+        for invalid in ['*', 'arn:aws:iam::123456789012:role/runtime',
+                        'arn:aws:iam::aws:policy/AdministratorAccess',
+                        'arn:aws:iam::123456789012:policy/*',
+                        'arn:aws:iam::123456789012:policy/',
+                        'arn:aws:iam:us-east-2:123456789012:policy/runtime',
+                        'arn:aws:iam::123456789012:policy/runtime?other',
+                        'arn:aws:iam::123456789012:policy/runtime\n']:
+            with self.subTest(boundary=invalid):
+                values, inventory, guard = fixture()
+                values['RuntimePermissionsBoundaryArn'] = invalid
+                with self.assertRaisesRegex(ValueError, 'Invalid parameter: RuntimePermissionsBoundaryArn'):
+                    p.check(self.template, values, inventory, guard)
+
+    def test_observed_account_rejects_foreign_boundary_without_claiming_live_iam(self):
+        values, inventory, guard = fixture()
+        values['RuntimePermissionsBoundaryArn'] = 'arn:aws:iam::999999999999:policy/foreign'
+        with self.assertRaisesRegex(ValueError, 'deployment account'):
+            p.check(self.template, values, inventory, guard, account_id='123456789012')
+        with self.assertRaisesRegex(ValueError, 'Invalid owner deployment account'):
+            p.check(self.template, values, inventory, guard, account_id='not-an-account')
+        # Without actual owner context, syntax success is not ownership evidence.
+        p.check(self.template, values, inventory, guard)
 
     def test_both_profiles_preflight(self):
         for profile in ['HARDENED', 'RESTRICTED_PILOT']:

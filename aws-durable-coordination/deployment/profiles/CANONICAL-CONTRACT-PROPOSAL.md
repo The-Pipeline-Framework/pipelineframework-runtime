@@ -45,3 +45,26 @@ controls and local packaging. Owner CI/system tests, canonical acceptance, signe
 publication, authentic deployment, IAM/lifecycle enforcement and live fault evidence
 are still required. The one CMK is a necessary nonzero baseline under current primary
 service support evidence; no $0 idle result is claimed.
+
+## 20 October optional permissions-boundary amendment
+
+The canonical AWS Durable deployment parameter reference needs one optional field:
+`RuntimePermissionsBoundaryArn` (empty default; exact same-account customer-managed
+IAM policy ARN). Nonempty applies to all six explicit native runtime roles; empty
+preserves the published 73-parameter input/resource behavior. Candidate parameter
+count 74, same schema2 manifest, no host binary or recovery change. The Cloud pilot
+requires its owned boundary in its new exact published contract; generic customers
+are not forced to select one. Document actual account/effective policy and retained
+lifecycle verification separately from this offline selector. Canonical files remain
+owned outside this worktree; this proposal is not a canonical edit or publication.
+
+Canonical source was located through the existing GitNexus `tpf` group/query and
+verified read-only at `/Users/mari/.gitnexus/clones/github.com/The-Pipeline-Framework/pipelineframework`,
+HEAD `2357ea91c112cd0dcec30b5e164fe588888c8e2c`. The narrow public-contract edit belongs
+in `docs/deploy/orchestrator-runtime/aws-durable.md`, adjacent to the profile/input
+and authentic deployment-verification guidance (around lines 300–362 at that revision).
+An optional lifecycle cross-reference belongs in
+`docs/evolve/durable-coordinator/aws-durable-coordination-host.md`; no new host ADR
+or runtime protocol change follows. The index reported one commit of staleness;
+source verification, not that index, supplies this exact revision evidence. No
+canonical file was edited by this worker.

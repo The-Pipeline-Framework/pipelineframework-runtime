@@ -122,7 +122,7 @@ def conditions(template, parameters):
     return result
 
 
-def check(template, supplied, inventory=None, guard=None):
+def check(template, supplied, inventory=None, guard=None, account_id=None):
     if set(supplied) - set(template['Parameters']): raise ValueError('Unknown deployment parameter')
     parameters = defaults(template) | supplied
     for name, spec in template['Parameters'].items():
@@ -138,6 +138,14 @@ def check(template, supplied, inventory=None, guard=None):
             if 'AllowedPattern' in spec and not re.fullmatch(spec['AllowedPattern'], str(item)): raise ValueError('Invalid parameter: ' + name)
             if 'MinValue' in spec and float(item) < spec['MinValue']: raise ValueError('Invalid parameter: ' + name)
             if 'MaxValue' in spec and float(item) > spec['MaxValue']: raise ValueError('Invalid parameter: ' + name)
+    # Optional observed deployment context; never infer the role account from a KMS
+    # key, which may have a separately owned/cross-account authority.
+    if account_id is not None:
+        if not isinstance(account_id, str) or not re.fullmatch(r'[0-9]{12}', account_id):
+            raise ValueError('Invalid owner deployment account')
+        boundary = parameters.get('RuntimePermissionsBoundaryArn', '')
+        if boundary and boundary.split(':')[4] != account_id:
+            raise ValueError('Runtime permissions boundary must belong to the deployment account')
     selected = conditions(template, parameters)
     for name, rule in template['Rules'].items():
         if 'RuleCondition' in rule and not rule_boolean(rule['RuleCondition'], parameters, selected): continue
@@ -170,12 +178,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--parameters', required=True, type=Path)
     parser.add_argument('--signing-inventory', type=Path)
+    parser.add_argument('--account-id', help='Owner-observed 12-digit deployment account; checks optional boundary ownership, not live IAM')
     parser.add_argument('--retention-guard', type=Path)
     args = parser.parse_args()
     try:
         check(load_template(), json.loads(args.parameters.read_text()),
               json.loads(args.signing_inventory.read_text()) if args.signing_inventory else None,
-              json.loads(args.retention_guard.read_text()) if args.retention_guard else None)
+              json.loads(args.retention_guard.read_text()) if args.retention_guard else None,
+              account_id=args.account_id)
     except (ValueError, TypeError, KeyError) as error:
         parser.exit(1, 'Preflight rejected: ' + str(error) + '\n')
     print('Offline deployment contract passed; owner observations are not live AWS verification or deployment approval.')
