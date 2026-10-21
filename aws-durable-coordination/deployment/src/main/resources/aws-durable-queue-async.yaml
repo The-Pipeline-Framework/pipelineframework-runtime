@@ -772,11 +772,11 @@ Resources:
       FunctionName: !Ref DurableFunction
       FunctionVersion: !GetAtt DurableVersion.Version
 
-  ActionFunction: &ActionFunction
+  ActionFunction:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::Serverless::Function
-    Properties: &ActionProperties
+    Properties:
       FunctionName: !Sub '${AWS::StackName}-action'
       LoggingConfig: {LogGroup: !Ref ActionFunctionLogs}
       CodeUri: !Ref ActionArtifactUri
@@ -787,7 +787,7 @@ Resources:
       ReservedConcurrentExecutions: 32
       KmsKeyArn: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       Environment:
-        Variables: &ActionEnvironment
+        Variables:
           # Environment changes qualify a new publication even when the package SHA is unchanged.
           TPF_AWS_DURABLE_PUBLICATION_ID: !Ref VersionPublicationId
           TPF_AWS_DURABLE_CONFIGURATION: !Sub |
@@ -858,78 +858,267 @@ Resources:
       Description: !Sub 'TPF ingress ${VersionPublicationId}'
 
   WorkFunction:
-    <<: *ActionFunction
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Serverless::Function
     Properties:
-      <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-work'
-      LoggingConfig: {LogGroup: !Ref WorkFunctionLogs}
-      Role: !GetAtt WorkerRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref 'WorkFunctionLogs'
+      CodeUri: !Ref 'ActionArtifactUri'
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt 'WorkerRole.Arn'
+      MemorySize: 1536
       Timeout: 900
+      ReservedConcurrentExecutions: 32
+      KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
-        Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref WorkHandler}
+        Variables:
+          TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
+            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
+          TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
+          TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
+          TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
+          TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
+          TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
+          TPF_AWS_DURABLE_RETENTION_DAYS: !Ref 'DurableRetentionDays'
+          TPF_AWS_DURABLE_WORKER_TIMEOUT_SECONDS: '900'
+          TPF_AWS_DURABLE_SQS_VISIBILITY_SECONDS: '5400'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterArn']
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterVersion']
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterArn']
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterVersion']
+          TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
+          TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
+          TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          QUARKUS_LAMBDA_HANDLER: !Ref 'WorkHandler'
 
   AwaitCompletionFunction:
-    <<: *ActionFunction
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Serverless::Function
     Properties:
-      <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-await-completion'
-      LoggingConfig: {LogGroup: !Ref AwaitCompletionFunctionLogs}
-      Role: !GetAtt WorkerRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref 'AwaitCompletionFunctionLogs'
+      CodeUri: !Ref 'ActionArtifactUri'
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt 'WorkerRole.Arn'
+      MemorySize: 1536
+      Timeout: 120
+      ReservedConcurrentExecutions: 32
+      KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
-        Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref AwaitCompletionHandler}
+        Variables:
+          TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
+            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
+          TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
+          TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
+          TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
+          TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
+          TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
+          TPF_AWS_DURABLE_RETENTION_DAYS: !Ref 'DurableRetentionDays'
+          TPF_AWS_DURABLE_WORKER_TIMEOUT_SECONDS: '900'
+          TPF_AWS_DURABLE_SQS_VISIBILITY_SECONDS: '5400'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterArn']
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterVersion']
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterArn']
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterVersion']
+          TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
+          TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
+          TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          QUARKUS_LAMBDA_HANDLER: !Ref 'AwaitCompletionHandler'
 
   TransitionWorkerFunction:
-    Condition: FunctionTransitionConsumer
-    <<: *ActionFunction
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Serverless::Function
     Properties:
-      <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-transition-worker'
-      LoggingConfig: {LogGroup: !Ref TransitionWorkerFunctionLogs}
-      Role: !GetAtt WorkerRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref 'TransitionWorkerFunctionLogs'
+      CodeUri: !Ref 'ActionArtifactUri'
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt 'WorkerRole.Arn'
+      MemorySize: 1536
       Timeout: 900
+      ReservedConcurrentExecutions: 32
+      KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
-        Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref TransitionWorkerHandler}
+        Variables:
+          TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
+            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
+          TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
+          TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
+          TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
+          TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
+          TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
+          TPF_AWS_DURABLE_RETENTION_DAYS: !Ref 'DurableRetentionDays'
+          TPF_AWS_DURABLE_WORKER_TIMEOUT_SECONDS: '900'
+          TPF_AWS_DURABLE_SQS_VISIBILITY_SECONDS: '5400'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterArn']
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterVersion']
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterArn']
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterVersion']
+          TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
+          TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
+          TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          QUARKUS_LAMBDA_HANDLER: !Ref 'TransitionWorkerHandler'
+    Condition: FunctionTransitionConsumer
 
   AwaitWakeupFunction:
-    <<: *ActionFunction
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Serverless::Function
     Properties:
-      <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-await-wakeup'
-      LoggingConfig: {LogGroup: !Ref AwaitWakeupFunctionLogs}
-      Role: !GetAtt WakeupRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref 'AwaitWakeupFunctionLogs'
+      CodeUri: !Ref 'ActionArtifactUri'
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt 'WakeupRole.Arn'
+      MemorySize: 1536
+      Timeout: 120
+      ReservedConcurrentExecutions: 32
+      KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
         Variables:
-          <<: *ActionEnvironment
-          QUARKUS_LAMBDA_HANDLER: !Ref AwaitWakeupHandler
-          TPF_AWS_DURABLE_AWAIT_STREAM_ARN: !Ref AwaitInteractionStreamArn
-          TPF_AWS_DURABLE_BINDING_STREAM_ARN: !GetAtt CallbackBindingTable.StreamArn
+          TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
+            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
+          TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
+          TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
+          TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
+          TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
+          TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
+          TPF_AWS_DURABLE_RETENTION_DAYS: !Ref 'DurableRetentionDays'
+          TPF_AWS_DURABLE_WORKER_TIMEOUT_SECONDS: '900'
+          TPF_AWS_DURABLE_SQS_VISIBILITY_SECONDS: '5400'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterArn']
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterVersion']
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterArn']
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterVersion']
+          TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
+          TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
+          TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          QUARKUS_LAMBDA_HANDLER: !Ref 'AwaitWakeupHandler'
+          TPF_AWS_DURABLE_AWAIT_STREAM_ARN: !Ref 'AwaitInteractionStreamArn'
+          TPF_AWS_DURABLE_BINDING_STREAM_ARN: !GetAtt 'CallbackBindingTable.StreamArn'
 
   ExecutionWakeupFunction:
-    <<: *ActionFunction
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Serverless::Function
     Properties:
-      <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-execution-wakeup'
-      LoggingConfig: {LogGroup: !Ref ExecutionWakeupFunctionLogs}
-      Role: !GetAtt WakeupRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref 'ExecutionWakeupFunctionLogs'
+      CodeUri: !Ref 'ActionArtifactUri'
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt 'WakeupRole.Arn'
+      MemorySize: 1536
+      Timeout: 120
+      ReservedConcurrentExecutions: 32
+      KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
         Variables:
-          <<: *ActionEnvironment
-          QUARKUS_LAMBDA_HANDLER: !Ref ExecutionWakeupHandler
-          TPF_AWS_DURABLE_EXECUTION_STREAM_ARN: !Ref ExecutionStateStreamArn
+          TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
+            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
+          TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
+          TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
+          TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
+          TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
+          TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
+          TPF_AWS_DURABLE_RETENTION_DAYS: !Ref 'DurableRetentionDays'
+          TPF_AWS_DURABLE_WORKER_TIMEOUT_SECONDS: '900'
+          TPF_AWS_DURABLE_SQS_VISIBILITY_SECONDS: '5400'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterArn']
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterVersion']
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterArn']
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterVersion']
+          TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
+          TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
+          TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          QUARKUS_LAMBDA_HANDLER: !Ref 'ExecutionWakeupHandler'
+          TPF_AWS_DURABLE_EXECUTION_STREAM_ARN: !Ref 'ExecutionStateStreamArn'
 
   DueWorkFunction:
-    <<: *ActionFunction
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Serverless::Function
     Properties:
-      <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-due-work'
-      LoggingConfig: {LogGroup: !Ref DueWorkFunctionLogs}
-      Role: !GetAtt DueWorkRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref 'DueWorkFunctionLogs'
+      CodeUri: !Ref 'ActionArtifactUri'
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt 'DueWorkRole.Arn'
+      MemorySize: 1536
+      Timeout: 120
       ReservedConcurrentExecutions: 2
+      KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
         Variables:
-          <<: *ActionEnvironment
-          QUARKUS_LAMBDA_HANDLER: !Ref DueWorkHandler
-          PIPELINE_ORCHESTRATOR_SWEEP_LIMIT: !Ref DueWorkSweepLimit
+          TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
+            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
+          TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
+          TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
+          TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
+          TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
+          TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
+          TPF_AWS_DURABLE_RETENTION_DAYS: !Ref 'DurableRetentionDays'
+          TPF_AWS_DURABLE_WORKER_TIMEOUT_SECONDS: '900'
+          TPF_AWS_DURABLE_SQS_VISIBILITY_SECONDS: '5400'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterArn']
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterVersion']
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterArn']
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterVersion']
+          TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
+          TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
+          TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          QUARKUS_LAMBDA_HANDLER: !Ref 'DueWorkHandler'
+          PIPELINE_ORCHESTRATOR_SWEEP_LIMIT: !Ref 'DueWorkSweepLimit'
 
   WorkVersion:
     Type: AWS::Lambda::Version
@@ -1051,7 +1240,7 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::Lambda::EventSourceMapping
-    Properties: &StreamMapping
+    Properties:
       FunctionName: !Ref AwaitWakeupVersion
       EventSourceArn: !Ref AwaitInteractionStreamArn
       StartingPosition: TRIM_HORIZON
@@ -1067,16 +1256,42 @@ Resources:
     UpdateReplacePolicy: Retain
     Type: AWS::Lambda::EventSourceMapping
     Properties:
-      <<: *StreamMapping
-      EventSourceArn: !GetAtt CallbackBindingTable.StreamArn
+      FunctionName: !Ref 'AwaitWakeupVersion'
+      EventSourceArn: !GetAtt 'CallbackBindingTable.StreamArn'
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 10
+      BisectBatchOnFunctionError: true
+      MetricsConfig:
+        Metrics:
+        - EventCount
+      MaximumRecordAgeInSeconds: 3600
+      MaximumRetryAttempts: 5
+      FunctionResponseTypes:
+      - ReportBatchItemFailures
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt 'StreamFailureDlq.Arn'
+
   ExecutionWakeupFunctionExecutionState:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::Lambda::EventSourceMapping
     Properties:
-      <<: *StreamMapping
-      FunctionName: !Ref ExecutionWakeupVersion
-      EventSourceArn: !Ref ExecutionStateStreamArn
+      FunctionName: !Ref 'ExecutionWakeupVersion'
+      EventSourceArn: !Ref 'ExecutionStateStreamArn'
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 10
+      BisectBatchOnFunctionError: true
+      MetricsConfig:
+        Metrics:
+        - EventCount
+      MaximumRecordAgeInSeconds: 3600
+      MaximumRetryAttempts: 5
+      FunctionResponseTypes:
+      - ReportBatchItemFailures
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt 'StreamFailureDlq.Arn'
 
   DueWorkRule:
     DeletionPolicy: Retain
@@ -1107,15 +1322,47 @@ Resources:
             Condition: {ArnEquals: {'aws:SourceArn': !GetAtt DueWorkRule.Arn}}
 
   ReconciliationFunction:
-    <<: *ActionFunction
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Serverless::Function
     Properties:
-      <<: *ActionProperties
       FunctionName: !Sub '${AWS::StackName}-reconcile'
-      LoggingConfig: {LogGroup: !Ref ReconciliationFunctionLogs}
-      Role: !GetAtt WakeupRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref 'ReconciliationFunctionLogs'
+      CodeUri: !Ref 'ActionArtifactUri'
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt 'WakeupRole.Arn'
+      MemorySize: 1536
+      Timeout: 120
       ReservedConcurrentExecutions: 2
+      KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
-        Variables: {<<: *ActionEnvironment, QUARKUS_LAMBDA_HANDLER: !Ref ReconciliationHandler}
+        Variables:
+          TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
+            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
+          TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
+          TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
+          TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
+          TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
+          TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
+          TPF_AWS_DURABLE_RETENTION_DAYS: !Ref 'DurableRetentionDays'
+          TPF_AWS_DURABLE_WORKER_TIMEOUT_SECONDS: '900'
+          TPF_AWS_DURABLE_SQS_VISIBILITY_SECONDS: '5400'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterArn']
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'ResumeTokenSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'ResumeTokenParameterVersion']
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretArn', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterArn']
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !If [SecretsManagerSigning, !Ref 'WorkerSharedSecretVersion', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref 'WorkerSharedParameterVersion']
+          TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
+          TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
+          TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          QUARKUS_LAMBDA_HANDLER: !Ref 'ReconciliationHandler'
 
   ReconciliationInvokeConfig:
     DeletionPolicy: Retain
@@ -1186,7 +1433,7 @@ Resources:
   WorkDlqAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
-    Properties: &QueueAlarmProperties
+    Properties:
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
       EvaluationPeriods: 1
@@ -1202,20 +1449,61 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *QueueAlarmProperties
-      Dimensions: [{Name: QueueName, Value: !GetAtt AwaitCompletionDlq.QueueName}]
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'AwaitCompletionDlq.QueueName'
+
   TransitionDlqAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *QueueAlarmProperties
-      Dimensions: [{Name: QueueName, Value: !GetAtt TransitionDlq.QueueName}]
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'TransitionDlq.QueueName'
+
   StreamFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *QueueAlarmProperties
-      Dimensions: [{Name: QueueName, Value: !GetAtt StreamFailureDlq.QueueName}]
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'StreamFailureDlq.QueueName'
 
   DurableFunctionLogs:
     Type: AWS::Logs::LogGroup
@@ -1250,7 +1538,7 @@ Resources:
   DurableFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
-    Properties: &DurableFunctionAlarmProperties
+    Properties:
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
       Namespace: AWS/Lambda
@@ -1266,27 +1554,62 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *DurableFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Throttles
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-durable'
+
   DurableOperationBudgetAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *DurableFunctionAlarmProperties
-      # Native provider metric is cumulative per execution. Sum would add unrelated executions.
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: DurableExecutionOperations
       Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
       Threshold: 2700
       ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-durable'
+
   DurableWrittenStateBudgetAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *DurableFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: DurableExecutionStorageWrittenBytes
       Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
       Threshold: 90000000
       ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-durable'
+
   ActionFunctionLogs:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -1300,7 +1623,7 @@ Resources:
   ActionFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
-    Properties: &ActionFunctionAlarmProperties
+    Properties:
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
       Namespace: AWS/Lambda
@@ -1316,8 +1639,22 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ActionFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Throttles
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-action'
+
   IngressFunctionLogs:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -1331,7 +1668,7 @@ Resources:
   IngressFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
-    Properties: &IngressFunctionAlarmProperties
+    Properties:
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
       Namespace: AWS/Lambda
@@ -1347,8 +1684,22 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *IngressFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Throttles
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-ingress'
+
   WorkFunctionLogs:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -1362,7 +1713,7 @@ Resources:
   WorkFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
-    Properties: &WorkFunctionAlarmProperties
+    Properties:
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
       Namespace: AWS/Lambda
@@ -1378,8 +1729,22 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *WorkFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Throttles
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-work'
+
   AwaitCompletionFunctionLogs:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -1393,7 +1758,7 @@ Resources:
   AwaitCompletionFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
-    Properties: &AwaitCompletionFunctionAlarmProperties
+    Properties:
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
       Namespace: AWS/Lambda
@@ -1409,8 +1774,22 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitCompletionFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Throttles
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-await-completion'
+
   TransitionWorkerFunctionLogs:
     Type: AWS::Logs::LogGroup
     Condition: FunctionTransitionConsumer
@@ -1425,7 +1804,7 @@ Resources:
   TransitionWorkerFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedFunctionTransition
-    Properties: &TransitionWorkerFunctionAlarmProperties
+    Properties:
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
       Namespace: AWS/Lambda
@@ -1441,8 +1820,22 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedFunctionTransition
     Properties:
-      <<: *TransitionWorkerFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Throttles
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-transition-worker'
+
   AwaitWakeupFunctionLogs:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -1456,7 +1849,7 @@ Resources:
   AwaitWakeupFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
-    Properties: &AwaitWakeupFunctionAlarmProperties
+    Properties:
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
       Namespace: AWS/Lambda
@@ -1472,8 +1865,22 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Throttles
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-await-wakeup'
+
   ReconciliationFunctionLogs:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -1487,7 +1894,7 @@ Resources:
   ReconciliationFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
-    Properties: &ReconciliationFunctionAlarmProperties
+    Properties:
       AlarmActions: [!Ref AlarmTopicArn]
       OKActions: [!Ref AlarmTopicArn]
       Namespace: AWS/Lambda
@@ -1503,367 +1910,902 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ReconciliationFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Throttles
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-reconcile'
+
   DurableDlqAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *QueueAlarmProperties
-      Dimensions: [{Name: QueueName, Value: !GetAtt DurableDlq.QueueName}]
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'DurableDlq.QueueName'
+
   RepairFailureDlqAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *QueueAlarmProperties
-      Dimensions: [{Name: QueueName, Value: !GetAtt RepairFailureDlq.QueueName}]
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'RepairFailureDlq.QueueName'
+
   WorkQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *QueueAlarmProperties
-      MetricName: ApproximateAgeOfOldestMessage
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      EvaluationPeriods: 1
       Threshold: 300
-      Dimensions: [{Name: QueueName, Value: !GetAtt WorkQueue.QueueName}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateAgeOfOldestMessage
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'WorkQueue.QueueName'
+
   AwaitCompletionQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *QueueAlarmProperties
-      MetricName: ApproximateAgeOfOldestMessage
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      EvaluationPeriods: 1
       Threshold: 300
-      Dimensions: [{Name: QueueName, Value: !GetAtt AwaitCompletionQueue.QueueName}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateAgeOfOldestMessage
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'AwaitCompletionQueue.QueueName'
+
   TransitionRequestQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *QueueAlarmProperties
-      MetricName: ApproximateAgeOfOldestMessage
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      EvaluationPeriods: 1
       Threshold: 300
-      Dimensions: [{Name: QueueName, Value: !GetAtt TransitionRequestQueue.QueueName}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateAgeOfOldestMessage
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'TransitionRequestQueue.QueueName'
+
   TransitionResponseQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *QueueAlarmProperties
-      MetricName: ApproximateAgeOfOldestMessage
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      EvaluationPeriods: 1
       Threshold: 300
-      Dimensions: [{Name: QueueName, Value: !GetAtt TransitionResponseQueue.QueueName}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateAgeOfOldestMessage
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'TransitionResponseQueue.QueueName'
+
   AwaitStreamAgeAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: IteratorAge
       Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
       Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-await-wakeup'
+
   AwaitStateDroppedEventAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: DroppedEventCount
-      Dimensions: [{Name: EventSourceMappingUUID, Value: !Ref AwaitWakeupFunctionAwaitState}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: EventSourceMappingUUID
+        Value: !Ref 'AwaitWakeupFunctionAwaitState'
+
   CallbackBindingDroppedEventAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: DroppedEventCount
-      Dimensions: [{Name: EventSourceMappingUUID, Value: !Ref AwaitWakeupFunctionCallbackBinding}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: EventSourceMappingUUID
+        Value: !Ref 'AwaitWakeupFunctionCallbackBinding'
+
   StreamDestinationDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: DestinationDeliveryFailures
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-await-wakeup'
+
   RepairDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ReconciliationFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: AWS/Events
       MetricName: FailedInvocations
-      Dimensions: [{Name: RuleName, Value: !Ref DurableTerminalRule}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: RuleName
+        Value: !Ref 'DurableTerminalRule'
+
   IngressAsyncDroppedAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *IngressFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: AsyncEventsDropped
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-ingress'
+
   RepairAsyncDroppedAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ReconciliationFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: AsyncEventsDropped
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-reconcile'
 
   ExecutionWakeupFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Errors
-      Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Ref 'ExecutionWakeupFunction'
+
   ExecutionWakeupFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Throttles
-      Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Ref 'ExecutionWakeupFunction'
+
   DueWorkFunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ActionFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Errors
-      Dimensions: [{Name: FunctionName, Value: !Ref DueWorkFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Ref 'DueWorkFunction'
+
   DueWorkFunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ActionFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: Throttles
-      Dimensions: [{Name: FunctionName, Value: !Ref DueWorkFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Ref 'DueWorkFunction'
+
   ExecutionStateDroppedEventAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: DroppedEventCount
-      Dimensions: [{Name: EventSourceMappingUUID, Value: !Ref ExecutionWakeupFunctionExecutionState}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: EventSourceMappingUUID
+        Value: !Ref 'ExecutionWakeupFunctionExecutionState'
+
   ExecutionStreamAgeAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: IteratorAge
       Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
       Threshold: 60000
-      Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Ref 'ExecutionWakeupFunction'
+
   ExecutionStreamDestinationDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: DestinationDeliveryFailures
-      Dimensions: [{Name: FunctionName, Value: !Ref ExecutionWakeupFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Ref 'ExecutionWakeupFunction'
+
   DueWorkDlqAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *QueueAlarmProperties
-      Dimensions: [{Name: QueueName, Value: !GetAtt DueWorkDlq.QueueName}]
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'DueWorkDlq.QueueName'
+
   DueWorkAgeAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *QueueAlarmProperties
-      MetricName: ApproximateAgeOfOldestMessage
-      Statistic: Maximum
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      EvaluationPeriods: 1
       Threshold: 120
-      Dimensions: [{Name: QueueName, Value: !GetAtt DueWorkQueue.QueueName}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      MetricName: ApproximateAgeOfOldestMessage
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Maximum
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'DueWorkQueue.QueueName'
+
   DueWorkDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ReconciliationFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: AWS/Events
       MetricName: FailedInvocations
-      Dimensions: [{Name: RuleName, Value: !Ref DueWorkRule}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: RuleName
+        Value: !Ref 'DueWorkRule'
 
   CompletionObservationUnknownAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ActionFunctionAlarmProperties
-      AlarmDescription: Native completion observations could not establish release; sampled reads do not constitute a global inventory
-      Namespace: TPF/AwsDurable
-      MetricName: CompletionObservationCount
-      Period: 300
-      Threshold: 0
-      Dimensions: [{Name: Stage, Value: COMPLETION}, {Name: Outcome, Value: UNKNOWN}]
-  CompletionObservationOutstandingAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Condition: HardenedProfile
-    Properties:
-      <<: *ActionFunctionAlarmProperties
-      AlarmDescription: Observed outstanding native completions exceed the configured read-count threshold; repeated reads count separately and absent samples do not establish global zero or health
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: CompletionObservationCount
       Statistic: Sum
       Period: 300
-      Threshold: !Ref OutstandingCompletionObservationAlarmCount
-      Dimensions: [{Name: Stage, Value: COMPLETION}, {Name: Outcome, Value: OUTSTANDING}]
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: COMPLETION
+      - Name: Outcome
+        Value: UNKNOWN
+      AlarmDescription: Native completion observations could not establish release; sampled reads do not constitute a global inventory
+
+  CompletionObservationOutstandingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HardenedProfile
+    Properties:
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: TPF/AwsDurable
+      MetricName: CompletionObservationCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref 'OutstandingCompletionObservationAlarmCount'
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: COMPLETION
+      - Name: Outcome
+        Value: OUTSTANDING
+      AlarmDescription: Observed outstanding native completions exceed the configured read-count threshold; repeated reads count separately and absent samples do not
+        establish global zero or health
+
   CompletionReleaseLatencyAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ActionFunctionAlarmProperties
-      AlarmDescription: Maximum known native admission-to-release latency among sampled released completions; absence of samples does not establish health
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: AdmissionToReleaseLatencyMilliseconds
       Statistic: Maximum
       Period: 300
-      Threshold: !Ref CompletionReleaseLatencyAlarmMilliseconds
-      Dimensions: [{Name: Stage, Value: COMPLETION}, {Name: Outcome, Value: RELEASED}]
+      EvaluationPeriods: 1
+      Threshold: !Ref 'CompletionReleaseLatencyAlarmMilliseconds'
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: COMPLETION
+      - Name: Outcome
+        Value: RELEASED
+      AlarmDescription: Maximum known native admission-to-release latency among sampled released completions; absence of samples does not establish health
+
   CallbackResumeObservedLatencyAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ActionFunctionAlarmProperties
-      AlarmDescription: Maximum host API-success observation to first verified resumed action sample; missing or lost samples do not establish provider latency or health
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: CallbackToFirstResumedActionMilliseconds
       Statistic: Maximum
       Period: 300
-      Threshold: !Ref CallbackResumeLatencyAlarmMilliseconds
-      Dimensions: [{Name: Stage, Value: CALLBACK_RESUME}, {Name: Outcome, Value: MEASURED}]
+      EvaluationPeriods: 1
+      Threshold: !Ref 'CallbackResumeLatencyAlarmMilliseconds'
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: CALLBACK_RESUME
+      - Name: Outcome
+        Value: MEASURED
+      AlarmDescription: Maximum host API-success observation to first verified resumed action sample; missing or lost samples do not establish provider latency or health
+
   CallbackResumeUnknownAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ActionFunctionAlarmProperties
-      AlarmDescription: Callback resume observations have invalid timestamps; this sample cannot measure lost acknowledgements or missing history timestamps
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: CallbackResumeUnknownCount
+      Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
       Threshold: 0
-      Dimensions: [{Name: Stage, Value: CALLBACK_RESUME}, {Name: Outcome, Value: UNKNOWN}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: CALLBACK_RESUME
+      - Name: Outcome
+        Value: UNKNOWN
+      AlarmDescription: Callback resume observations have invalid timestamps; this sample cannot measure lost acknowledgements or missing history timestamps
+
   RepairObservedAgeAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ReconciliationFunctionAlarmProperties
-      AlarmDescription: Maximum repair age sampled from the first retained host observation on targeted attempts; missing samples or accepted replacement do not establish convergence
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: RepairAgeMilliseconds
       Statistic: Maximum
       Period: 300
-      Threshold: !Ref RepairAgeAlarmMilliseconds
-      Dimensions: [{Name: Stage, Value: REPAIR}, {Name: Outcome, Value: REPAIR_AGE_SAMPLED}]
+      EvaluationPeriods: 1
+      Threshold: !Ref 'RepairAgeAlarmMilliseconds'
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: REPAIR
+      - Name: Outcome
+        Value: REPAIR_AGE_SAMPLED
+      AlarmDescription: Maximum repair age sampled from the first retained host observation on targeted attempts; missing samples or accepted replacement do not establish
+        convergence
+
   RepairObservedAgeUnknownAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ReconciliationFunctionAlarmProperties
-      AlarmDescription: Targeted repair age samples are missing or invalid; retry exhaustion and DLQs remain separate alarms
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: RepairAgeUnknownCount
+      Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
       Threshold: 0
-      Dimensions: [{Name: Stage, Value: REPAIR}, {Name: Outcome, Value: REPAIR_AGE_UNKNOWN}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: REPAIR
+      - Name: Outcome
+        Value: REPAIR_AGE_UNKNOWN
+      AlarmDescription: Targeted repair age samples are missing or invalid; retry exhaustion and DLQs remain separate alarms
+
   WakeupProviderUnknownAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: HostOutcomeCount
+      Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
       Threshold: 5
-      Dimensions: [{Name: Stage, Value: WAKEUP}, {Name: Outcome, Value: PROVIDER_UNKNOWN}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: WAKEUP
+      - Name: Outcome
+        Value: PROVIDER_UNKNOWN
+
   WakeupTransientFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: HostOutcomeCount
+      Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
       Threshold: 5
-      Dimensions: [{Name: Stage, Value: WAKEUP}, {Name: Outcome, Value: TRANSIENT_FAILURE}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: WAKEUP
+      - Name: Outcome
+        Value: TRANSIENT_FAILURE
+
   ReplacementRejectedAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: HostOutcomeCount
+      Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
       Threshold: 5
-      Dimensions: [{Name: Stage, Value: REPLACEMENT}, {Name: Outcome, Value: REJECTED}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: REPLACEMENT
+      - Name: Outcome
+        Value: REJECTED
+
   ReplacementFailedAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: HostOutcomeCount
+      Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
       Threshold: 5
-      Dimensions: [{Name: Stage, Value: REPLACEMENT}, {Name: Outcome, Value: FAILED}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: REPLACEMENT
+      - Name: Outcome
+        Value: FAILED
+
   RepairFailedAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: HostOutcomeCount
+      Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
       Threshold: 5
-      Dimensions: [{Name: Stage, Value: REPAIR}, {Name: Outcome, Value: FAILED}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: REPAIR
+      - Name: Outcome
+        Value: FAILED
 
   IngressDestinationDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *IngressFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: DestinationDeliveryFailures
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-ingress'
+
   RepairDestinationDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *ReconciliationFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: DestinationDeliveryFailures
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-reconcile'
+
   DurableDeadLetterDeliveryFailureAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *DurableFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
       MetricName: DeadLetterErrors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Sub '${AWS::StackName}-durable'
 
   CallbackBindingConflictAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: HostOutcomeCount
+      Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
       Threshold: 5
-      Dimensions: [{Name: Stage, Value: BINDING}, {Name: Outcome, Value: CONFLICT}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: BINDING
+      - Name: Outcome
+        Value: CONFLICT
+
   CallbackRegistrationConflictAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: HostOutcomeCount
+      Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
       Threshold: 5
-      Dimensions: [{Name: Stage, Value: REGISTRATION}, {Name: Outcome, Value: CONFLICT}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: REGISTRATION
+      - Name: Outcome
+        Value: CONFLICT
+
   GenerationClaimConflictAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: HostOutcomeCount
+      Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
       Threshold: 5
-      Dimensions: [{Name: Stage, Value: GENERATION}, {Name: Outcome, Value: CONFLICT}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: GENERATION
+      - Name: Outcome
+        Value: CONFLICT
+
   StaleGenerationRejectionAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HardenedProfile
     Properties:
-      <<: *AwaitWakeupFunctionAlarmProperties
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
       Namespace: TPF/AwsDurable
       MetricName: HostOutcomeCount
+      Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
       Threshold: 5
-      Dimensions: [{Name: Stage, Value: GENERATION}, {Name: Outcome, Value: STALE_REJECTED}]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: Stage
+        Value: GENERATION
+      - Name: Outcome
+        Value: STALE_REJECTED
 
 Outputs:
   TransitionWorkerPlacement: {Value: !Ref TransitionWorkerPlacement}
