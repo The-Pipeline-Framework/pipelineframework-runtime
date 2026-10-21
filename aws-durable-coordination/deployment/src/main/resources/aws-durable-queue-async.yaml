@@ -1,5 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
+Transform:
+  - AWS::LanguageExtensions
+  - AWS::Serverless-2016-10-31
 Description: Supported TPF QUEUE_ASYNC coordination host using AWS Lambda Durable Functions
 
 Parameters:
@@ -779,7 +781,7 @@ Resources:
     Properties:
       FunctionName: !Sub '${AWS::StackName}-action'
       LoggingConfig: {LogGroup: !Ref ActionFunctionLogs}
-      CodeUri: !Ref ActionArtifactUri
+      CodeUri: !Sub '${ActionArtifactUri}'
       Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
       Role: !GetAtt ActionRole.Arn
       MemorySize: 1536
@@ -865,7 +867,7 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-work'
       LoggingConfig:
         LogGroup: !Ref 'WorkFunctionLogs'
-      CodeUri: !Ref 'ActionArtifactUri'
+      CodeUri: !Sub '${ActionArtifactUri}'
       Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
       Role: !GetAtt 'WorkerRole.Arn'
       MemorySize: 1536
@@ -908,7 +910,7 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-await-completion'
       LoggingConfig:
         LogGroup: !Ref 'AwaitCompletionFunctionLogs'
-      CodeUri: !Ref 'ActionArtifactUri'
+      CodeUri: !Sub '${ActionArtifactUri}'
       Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
       Role: !GetAtt 'WorkerRole.Arn'
       MemorySize: 1536
@@ -951,7 +953,7 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-transition-worker'
       LoggingConfig:
         LogGroup: !Ref 'TransitionWorkerFunctionLogs'
-      CodeUri: !Ref 'ActionArtifactUri'
+      CodeUri: !Sub '${ActionArtifactUri}'
       Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
       Role: !GetAtt 'WorkerRole.Arn'
       MemorySize: 1536
@@ -995,7 +997,7 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-await-wakeup'
       LoggingConfig:
         LogGroup: !Ref 'AwaitWakeupFunctionLogs'
-      CodeUri: !Ref 'ActionArtifactUri'
+      CodeUri: !Sub '${ActionArtifactUri}'
       Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
       Role: !GetAtt 'WakeupRole.Arn'
       MemorySize: 1536
@@ -1040,7 +1042,7 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-execution-wakeup'
       LoggingConfig:
         LogGroup: !Ref 'ExecutionWakeupFunctionLogs'
-      CodeUri: !Ref 'ActionArtifactUri'
+      CodeUri: !Sub '${ActionArtifactUri}'
       Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
       Role: !GetAtt 'WakeupRole.Arn'
       MemorySize: 1536
@@ -1084,7 +1086,7 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-due-work'
       LoggingConfig:
         LogGroup: !Ref 'DueWorkFunctionLogs'
-      CodeUri: !Ref 'ActionArtifactUri'
+      CodeUri: !Sub '${ActionArtifactUri}'
       Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
       Role: !GetAtt 'DueWorkRole.Arn'
       MemorySize: 1536
@@ -1329,7 +1331,7 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-reconcile'
       LoggingConfig:
         LogGroup: !Ref 'ReconciliationFunctionLogs'
-      CodeUri: !Ref 'ActionArtifactUri'
+      CodeUri: !Sub '${ActionArtifactUri}'
       Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
       Role: !GetAtt 'WakeupRole.Arn'
       MemorySize: 1536

@@ -57,8 +57,21 @@ def graph(template, profile):
                        'TransitionWorkerPlacement': 'FUNCTION', 'RuntimePermissionsBoundaryArn': ''})
 
 
+def legacy_code_location_contract(template):
+    """Compare all existing fields while separately proving the exact CodeUri rewrite."""
+    template = copy.deepcopy(template)
+    count = 0
+    for resource in template['Resources'].values():
+        if resource['Type'] == 'AWS::Serverless::Function':
+            assert resource['Properties']['CodeUri'] == {'Fn::Sub': '${ActionArtifactUri}'}
+            resource['Properties']['CodeUri'] = {'Ref': 'ActionArtifactUri'}
+            count += 1
+    assert count == 8
+    return template
+
+
 def normalized_hardened(template):
-    resources = graph(template, 'HARDENED')
+    resources = graph(legacy_code_location_contract(template), 'HARDENED')
     for resource in resources.values():
         resource.pop('Condition', None)
         env = resource.get('Properties', {}).get('Environment', {}).get('Variables', {})

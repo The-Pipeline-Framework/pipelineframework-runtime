@@ -166,3 +166,29 @@ This is a provisioning-policy extension requiring owner review, canonical parame
 reference alignment, normal owner/downstream CI and signed publication before use.
 The prior 73-parameter contract stays pinned for legacy deployments; no local source
 fallback or Cloud-side mutation of a signed template is supported.
+
+## SAM transform processing
+
+The amended template runs `AWS::LanguageExtensions` before
+`AWS::Serverless-2016-10-31`. Each SAM function expresses the existing
+`ActionArtifactUri` as `!Sub '${ActionArtifactUri}'`, so the first transform
+resolves the entire S3 URI before SAM parses its bucket and complete object key.
+The `Fn::Sub` form also retains a resolvable CodeUri for the conditional transition
+function when COMPUTE placement disables that function. All 74 parameters and
+their existing values remain valid; no new code package, handler, consumer or
+recovery mechanism is introduced.
+
+The deployment principal must be allowed to use both exact AWS-owned transforms.
+For stack updates, provide the original template rather than a previously
+processed template: LanguageExtensions resolves parameter values during processing.
+The offline tests pin AWS SAM CLI 1.169.0 and SAM Translator 1.115.0 and exercise
+both official local stages across all 16 profile/signing/placement/boundary variants.
+They reproduce the previous eight CodeUri rejections and compare the resulting
+active graph against the intended original code locations, including nested keys.
+These local processors do not execute the AWS-hosted macros. AWS ValidateTemplate
+and GetTemplateSummary alone also do not establish transform success; an owner
+must inspect an AWS change-set preview before executing a newly qualified asset.
+
+AWS references: [CodeUri](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-function.html#sam-function-codeuri),
+[language extensions](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-specification-language-extensions.html),
+and [transform ordering and parameter resolution](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/transform-aws-languageextensions.html).
