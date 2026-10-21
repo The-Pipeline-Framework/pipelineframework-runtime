@@ -43,7 +43,7 @@ jobs:
           ./mvnw -q -DskipTests help:effective-pom -Doutput=target/runtime-effective-pom.xml -Dmaven.repo.local="$GITHUB_WORKSPACE/.m2/repository"
           node scripts/verify-runtime-publication.mjs target/runtime-effective-pom.xml
       - name: Verify and publish
-        run: ./mvnw -B clean deploy -U --no-transfer-progress -Dgpg.skip=false -Dmaven.repo.local="$GITHUB_WORKSPACE/.m2/repository"
+        run: ./mvnw -B clean deploy -U --no-transfer-progress -Dspotless.skip=true -Dgpg.skip=false -Dmaven.repo.local="$GITHUB_WORKSPACE/.m2/repository"
         env:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
           CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
