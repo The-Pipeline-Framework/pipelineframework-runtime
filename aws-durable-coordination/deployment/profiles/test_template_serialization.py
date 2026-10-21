@@ -6,7 +6,7 @@ from pathlib import Path
 import unittest
 import yaml
 import preflight as p
-from test_profiles import fixture, TEMPLATE
+from test_profiles import fixture, TEMPLATE, legacy_code_location_contract
 
 # Captured from merged runtime66 dda35144f50f214bbf663352bcb591401b8c9a37.
 PARSED_TEMPLATE_SHA256 = '2df7b40cacdff91f15130cb417a8f9d84c5e5a375ccb9b873886707ea91e5c1b'
@@ -49,10 +49,15 @@ class TemplateSerialization(unittest.TestCase):
 
     def test_complete_parsed_contract_equals_merged_runtime66(self):
         # Includes all74 Parameters, Rules, Conditions, Globals, resources, properties and Outputs.
-        self.assertEqual(PARSED_TEMPLATE_SHA256, digest(p.load_template(TEMPLATE)))
+        template = legacy_code_location_contract(p.load_template(TEMPLATE))
+        self.assertEqual(['AWS::LanguageExtensions', 'AWS::Serverless-2016-10-31'], template['Transform'])
+        # Transform ordering and the eight separately checked equivalent CodeUri wrappers change.
+        # Every other parameter, resource and property remains exact.
+        template['Transform'] = 'AWS::Serverless-2016-10-31'
+        self.assertEqual(PARSED_TEMPLATE_SHA256, digest(template))
 
     def test_all_profile_signing_placement_boundary_graphs_equal_merged_runtime66(self):
-        template = p.load_template(TEMPLATE)
+        template = legacy_code_location_contract(p.load_template(TEMPLATE))
         for profile, signing, placement, boundary in itertools.product(
                 ['HARDENED', 'RESTRICTED_PILOT'], ['SECRETS_MANAGER', 'SSM_STANDARD'],
                 ['FUNCTION', 'COMPUTE'], ['', 'arn:aws:iam::123456789012:policy/runtime-boundary']):
