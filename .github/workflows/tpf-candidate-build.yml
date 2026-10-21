@@ -41,7 +41,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || '' }}
         run: bash scripts/system-tests.sh candidate-version "$EVENT_NAME" "${PR_NUMBER:--}" "$SOURCE_SHA" && bash scripts/system-tests.sh reactor-coordinates && bash scripts/system-tests.sh reactor-dependencies
       - name: Verify and install candidate reactor
-        run: ./mvnw -B clean install --no-transfer-progress -Dmaven.deploy.skip=true -Dgpg.skip=true -Dmaven.repo.local="$RUNNER_TEMP/tpf-candidate-maven-repository"
+        run: ./mvnw -B clean install --no-transfer-progress -Dspotless.skip=true -Dmaven.deploy.skip=true -Dgpg.skip=true -Dmaven.repo.local="$RUNNER_TEMP/tpf-candidate-maven-repository"
       - name: Dump Maven Invoker diagnostics
         if: failure()
         shell: bash
