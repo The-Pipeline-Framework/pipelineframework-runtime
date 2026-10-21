@@ -207,6 +207,136 @@ class DynamoAwaitInteractionStoreTest {
     }
 
     @Test
+    void acknowledgedCommandCasWritesBothEvidenceSlotsAndReconstructsThem() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
+        var dispatching = new java.util.HashMap<>(item("tenant-a", "interaction-1", "unit-1", null,
+            AwaitInteractionStatus.DISPATCHING, 70_000L, "alice", "finance"));
+        dispatching.put("transport_metadata_json", avS("{\"completionMode\":\"CONNECTOR_CALLBACK\","
+            + "\"commandCompletionMode\":\"ACKNOWLEDGEMENT_REQUIRED\","
+            + "\"commandAcknowledgementType\":\"java.lang.String\","
+            + "\"tpf.await.completion.projector\":\"test.Projector\"}"));
+        dispatching.put("request_payload_json", avS("{\"id\":\"job\"}"));
+        when(client.getItem(any(GetItemRequest.class)))
+            .thenReturn(GetItemResponse.builder().item(dispatching).build());
+        var rehydrated = store.get("tenant-a", "interaction-1").await().indefinitely().orElseThrow();
+        var current = new AwaitInteractionRecord(rehydrated.tenantId(), rehydrated.executionId(),
+            rehydrated.stepId(), rehydrated.stepIndex(), rehydrated.outputType(), rehydrated.interactionId(),
+            rehydrated.correlationId(), rehydrated.causationId(), rehydrated.idempotencyKey(), rehydrated.version(),
+            rehydrated.status(), new AckRequest("job"), rehydrated.responsePayload(), rehydrated.unitId(),
+            rehydrated.itemIndex(), rehydrated.actor(), rehydrated.assignee(), rehydrated.group(),
+            rehydrated.transportType(), rehydrated.transportMetadata(), rehydrated.deadlineEpochMs(),
+            rehydrated.createdAtEpochMs(), rehydrated.updatedAtEpochMs(), rehydrated.ttlEpochS(),
+            rehydrated.transportOutputType(), rehydrated.commandAcknowledgement(),
+            rehydrated.stagedCompletionPayload());
+        var staged = commandState(current, AwaitInteractionStatus.COMPLETION_OBSERVED, null,
+            current.transportMetadata(), Optional.empty(), Optional.of("callback"));
+        var stagedItem = new java.util.HashMap<>(dispatching);
+        stagedItem.put("version", avN(1));
+        stagedItem.put("status", avS("COMPLETION_OBSERVED"));
+        stagedItem.put("updated_at_epoch_ms", avN(staged.updatedAtEpochMs()));
+        stagedItem.put("staged_completion_json", avS("\"callback\""));
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(
+            GetItemResponse.builder().item(dispatching).build(),
+            GetItemResponse.builder().item(stagedItem).build());
+        when(client.updateItem(any(UpdateItemRequest.class)))
+            .thenReturn(UpdateItemResponse.builder().attributes(stagedItem).build());
+        var persistedStage = store.compareAndSetCommandCompletion(current, staged)
+            .await().indefinitely().orElseThrow();
+        assertEquals(Optional.of("callback"), persistedStage.stagedCompletionPayload());
+        ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        verify(client).updateItem(update.capture());
+        assertEquals("\"callback\"", update.getValue().expressionAttributeValues().get(":stagedCompletion").s());
+        assertTrue(update.getValue().conditionExpression().contains("#status = :requiredStatus"));
+
+        var settledMetadata = new java.util.HashMap<>(persistedStage.transportMetadata());
+        settledMetadata.put("commandSettlement", "SUCCEEDED");
+        var completed = commandState(persistedStage, AwaitInteractionStatus.COMPLETED, "result",
+            settledMetadata, Optional.of("ack"), Optional.of("callback"));
+        var completedItem = new java.util.HashMap<>(stagedItem);
+        completedItem.put("version", avN(2));
+        completedItem.put("status", avS("COMPLETED"));
+        completedItem.put("transport_metadata_json", avS("{\"completionMode\":\"CONNECTOR_CALLBACK\","
+            + "\"commandCompletionMode\":\"ACKNOWLEDGEMENT_REQUIRED\","
+            + "\"commandAcknowledgementType\":\"java.lang.String\","
+            + "\"tpf.await.completion.projector\":\"test.Projector\","
+            + "\"commandSettlement\":\"SUCCEEDED\"}"));
+        completedItem.put("command_acknowledgement_json", avS("\"ack\""));
+        completedItem.put("response_payload_json", avS("\"result\""));
+        when(client.updateItem(any(UpdateItemRequest.class)))
+            .thenReturn(UpdateItemResponse.builder().attributes(completedItem).build());
+        var persisted = store.compareAndSetCommandCompletion(persistedStage, completed)
+            .await().indefinitely().orElseThrow();
+        assertEquals(Optional.of("ack"), persisted.commandAcknowledgement());
+        assertEquals(Optional.of("callback"), persisted.stagedCompletionPayload());
+        assertEquals("result", persisted.responsePayload());
+        verify(client, times(2)).updateItem(update.capture());
+        assertEquals("\"ack\"", update.getValue().expressionAttributeValues().get(":acknowledgement").s());
+        assertTrue(update.getValue().updateExpression().contains("REMOVE #pendingTenantKey"));
+    }
+
+    @Test
+    void rejectedEarlyCallbackClearsStagedPayloadWhenAcknowledgementRestoresDispatch() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
+        var observedItem = new java.util.HashMap<>(item("tenant-a", "interaction-1", "unit-1", null,
+            AwaitInteractionStatus.COMPLETION_OBSERVED, 70_000L, "alice", "finance"));
+        observedItem.put("ttl_epoch_s", avN(0));
+        observedItem.put("version", avN(1));
+        observedItem.put("transport_metadata_json", avS("{\"completionMode\":\"CONNECTOR_CALLBACK\","
+            + "\"commandCompletionMode\":\"ACKNOWLEDGEMENT_REQUIRED\","
+            + "\"commandAcknowledgementType\":\"java.lang.String\","
+            + "\"tpf.await.completion.projector\":\"test.Projector\"}"));
+        observedItem.put("request_payload_json", avS("\"request\""));
+        observedItem.put("staged_completion_json", avS("\"rejected-callback\""));
+        var dispatchedItem = new java.util.HashMap<>(observedItem);
+        dispatchedItem.put("version", avN(2));
+        dispatchedItem.put("status", avS("DISPATCHED"));
+        dispatchedItem.put("transport_metadata_json", avS("{\"completionMode\":\"CONNECTOR_CALLBACK\","
+            + "\"commandCompletionMode\":\"ACKNOWLEDGEMENT_REQUIRED\","
+            + "\"commandAcknowledgementType\":\"java.lang.String\","
+            + "\"tpf.await.completion.projector\":\"test.Projector\","
+            + "\"commandSettlement\":\"SUCCEEDED\",\"rejectedEarlyCallback\":true}"));
+        dispatchedItem.put("command_acknowledgement_json", avS("\"ack\""));
+        dispatchedItem.remove("staged_completion_json");
+        when(client.getItem(any(GetItemRequest.class)))
+            .thenReturn(GetItemResponse.builder().item(observedItem).build());
+        when(client.updateItem(any(UpdateItemRequest.class)))
+            .thenReturn(UpdateItemResponse.builder().attributes(dispatchedItem).build());
+
+        var observed = store.get("tenant-a", "interaction-1").await().indefinitely().orElseThrow();
+        var rejectedMetadata = new java.util.HashMap<>(observed.transportMetadata());
+        rejectedMetadata.put("commandSettlement", "SUCCEEDED");
+        rejectedMetadata.put("rejectedEarlyCallback", true);
+        var rejected = commandState(observed, AwaitInteractionStatus.DISPATCHED, observed.responsePayload(),
+            rejectedMetadata, Optional.of("ack"), Optional.empty());
+        var persisted = store.compareAndSetCommandCompletion(observed, rejected)
+            .await().indefinitely().orElseThrow();
+
+        assertEquals(AwaitInteractionStatus.DISPATCHED, persisted.status());
+        assertEquals(Optional.of("ack"), persisted.commandAcknowledgement());
+        assertTrue(persisted.stagedCompletionPayload().isEmpty());
+        ArgumentCaptor<UpdateItemRequest> updates = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        verify(client).updateItem(updates.capture());
+        assertTrue(updates.getValue().updateExpression().contains("REMOVE #stagedCompletion"));
+        assertTrue(updates.getValue().conditionExpression().contains("#ttl = :noExpiry"));
+        assertEquals("0", updates.getValue().expressionAttributeValues().get(":noExpiry").n());
+        assertFalse(updates.getValue().expressionAttributeValues().containsKey(":stagedCompletion"));
+        assertEquals("staged_completion_json", updates.getValue().expressionAttributeNames().get("#stagedCompletion"));
+    }
+
+    private static AwaitInteractionRecord commandState(AwaitInteractionRecord current, AwaitInteractionStatus status,
+        Object response, Map<String, Object> metadata, Optional<Object> acknowledgement, Optional<Object> staged) {
+        return new AwaitInteractionRecord(current.tenantId(), current.executionId(), current.stepId(),
+            current.stepIndex(), current.outputType(), current.interactionId(), current.correlationId(),
+            current.causationId(), current.idempotencyKey(), current.version() + 1, status,
+            current.requestPayload(), response, current.unitId(), current.itemIndex(), current.actor(),
+            current.assignee(), current.group(), current.transportType(), metadata, current.deadlineEpochMs(),
+            current.createdAtEpochMs(), current.updatedAtEpochMs() + 1, current.ttlEpochS(),
+            current.transportOutputType(), acknowledgement, staged);
+    }
+
+    @Test
     void firstCreateUsesItsConditionalTransactionWithoutAnIdempotencyLookupRead() {
         DynamoDbClient client = mock(DynamoDbClient.class);
         DynamoAwaitInteractionStore store = new DynamoAwaitInteractionStore(client, mockConfig());
@@ -296,6 +426,12 @@ class DynamoAwaitInteractionStoreTest {
     }
 
     private record Decision(String result) {
+    }
+
+    private static final class AckRequest {
+        private final String id;
+        private AckRequest(String id) { this.id = id; }
+        public String getId() { return id; }
     }
 
     @Test

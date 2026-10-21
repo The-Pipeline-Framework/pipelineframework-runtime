@@ -807,6 +807,21 @@ public class InMemoryAwaitInteractionStore implements
             expected.status(), current -> current.settleCommandDispatch(settlement, nowEpochMs));
     }
 
+    @Override
+    public Uni<Optional<AwaitInteractionRecord>> compareAndSetCommandCompletion(
+        AwaitInteractionRecord expected, AwaitInteractionRecord replacement) {
+        if (!expected.permitsCommandCompletionReplacement(replacement)) {
+            return Uni.createFrom().failure(new IllegalArgumentException("Invalid Command completion transition"));
+        }
+        return transition(expected.tenantId(), expected.interactionId(), expected.version(),
+            replacement.updatedAtEpochMs(), expected.status(), current -> {
+                if (!current.equals(expected) || !current.permitsCommandCompletionReplacement(replacement)) {
+                    throw new IllegalArgumentException("Command completion CAS expected state differs from durable state");
+                }
+                return replacement;
+            });
+    }
+
     private Optional<AwaitInteractionRecord> resolveForCompletion(AwaitCompletionCommand command) {
         if (command.interactionId() != null && !command.interactionId().isBlank()) {
             return Optional.ofNullable(interactionsByScopedId.get(scopedInteractionId(command.tenantId(), command.interactionId())));
@@ -858,7 +873,7 @@ public class InMemoryAwaitInteractionStore implements
             current.createdAtEpochMs(),
             nowEpochMs,
             current.ttlEpochS(),
-            current.transportOutputType());
+            current.transportOutputType(), current.commandAcknowledgement(), current.stagedCompletionPayload());
     }
 
     private void purgeExpired(long nowEpochMs) {

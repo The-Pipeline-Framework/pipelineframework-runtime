@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.awaitable.AwaitCompletionCommand;
@@ -166,6 +167,63 @@ class InMemoryAwaitInteractionStoreTest {
             "tenant", "other-unit", 100, first.nextCursor()).await().indefinitely());
         assertThrows(IllegalArgumentException.class, () -> store.findByUnitPage(
             "tenant", "unit-1", 101, java.util.Optional.empty()).await().indefinitely());
+    }
+
+    @Test
+    void commandCompletionCasRetainsEvidenceAndRejectsStaleOrMutatedAuthority() {
+        InMemoryAwaitInteractionStore store = new InMemoryAwaitInteractionStore();
+        var created = store.createOrGet(new AwaitCreateCommand("tenant", "execution-1", "review", 0,
+            String.class.getName(), String.class.getName(), "cause-1", "ack-idem", "ack-corr", "request",
+            "alice", "finance", "interaction-api", "unit-1", null,
+            Map.of("completionMode", "CONNECTOR_CALLBACK", "commandCompletionMode", "ACKNOWLEDGEMENT_REQUIRED",
+                "commandAcknowledgementType", String.class.getName(),
+                "tpf.await.completion.projector", "test.Projector"), 10_000L, 70_000L, Long.MAX_VALUE))
+            .await().indefinitely().record();
+        var dispatching = store.markDispatching("tenant", created.interactionId(), created.version(), 11_000L)
+            .await().indefinitely().orElseThrow();
+        var staged = new AwaitInteractionRecord(dispatching.tenantId(), dispatching.executionId(),
+            dispatching.stepId(), dispatching.stepIndex(), dispatching.outputType(), dispatching.interactionId(),
+            dispatching.correlationId(), dispatching.causationId(), dispatching.idempotencyKey(),
+            dispatching.version() + 1, AwaitInteractionStatus.COMPLETION_OBSERVED, dispatching.requestPayload(),
+            dispatching.responsePayload(), dispatching.unitId(), dispatching.itemIndex(), "provider",
+            dispatching.assignee(), dispatching.group(), dispatching.transportType(), dispatching.transportMetadata(),
+            dispatching.deadlineEpochMs(), dispatching.createdAtEpochMs(), 12_000L, dispatching.ttlEpochS(),
+            dispatching.transportOutputType(), Optional.empty(), Optional.of("callback"));
+        assertEquals(Optional.of("callback"), store.compareAndSetCommandCompletion(dispatching, staged)
+            .await().indefinitely().orElseThrow().stagedCompletionPayload());
+        assertTrue(store.compareAndSetCommandCompletion(dispatching, staged).await().indefinitely().isEmpty());
+        assertEquals(Optional.of("callback"), store.get("tenant", created.interactionId())
+            .await().indefinitely().orElseThrow().stagedCompletionPayload());
+        var forged = new AwaitInteractionRecord(staged.tenantId(), "different-execution", staged.stepId(),
+            staged.stepIndex(), staged.outputType(), staged.interactionId(), staged.correlationId(),
+            staged.causationId(), staged.idempotencyKey(), staged.version() + 1, AwaitInteractionStatus.COMPLETED,
+            staged.requestPayload(), "result", staged.unitId(), staged.itemIndex(), staged.actor(), staged.assignee(),
+            staged.group(), staged.transportType(), staged.transportMetadata(), staged.deadlineEpochMs(),
+            staged.createdAtEpochMs(), 13_000L, staged.ttlEpochS(), staged.transportOutputType(),
+            Optional.of("ack"), staged.stagedCompletionPayload());
+        assertThrows(IllegalArgumentException.class, () -> store.compareAndSetCommandCompletion(staged, forged)
+            .await().indefinitely());
+        var forgedExpected = new AwaitInteractionRecord(staged.tenantId(), "different-execution", staged.stepId(),
+            staged.stepIndex(), staged.outputType(), staged.interactionId(), staged.correlationId(),
+            staged.causationId(), staged.idempotencyKey(), staged.version(), staged.status(), staged.requestPayload(),
+            staged.responsePayload(), staged.unitId(), staged.itemIndex(), staged.actor(), staged.assignee(),
+            staged.group(), staged.transportType(), staged.transportMetadata(), staged.deadlineEpochMs(),
+            staged.createdAtEpochMs(), staged.updatedAtEpochMs(), staged.ttlEpochS(), staged.transportOutputType(),
+            staged.commandAcknowledgement(), staged.stagedCompletionPayload());
+        var forgedMetadata = new java.util.HashMap<>(forgedExpected.transportMetadata());
+        forgedMetadata.put("commandSettlement", "SUCCEEDED");
+        var forgedNext = new AwaitInteractionRecord(forgedExpected.tenantId(), forgedExpected.executionId(),
+            forgedExpected.stepId(), forgedExpected.stepIndex(), forgedExpected.outputType(),
+            forgedExpected.interactionId(), forgedExpected.correlationId(), forgedExpected.causationId(),
+            forgedExpected.idempotencyKey(), forgedExpected.version() + 1, AwaitInteractionStatus.COMPLETED,
+            forgedExpected.requestPayload(), "result", forgedExpected.unitId(), forgedExpected.itemIndex(),
+            forgedExpected.actor(), forgedExpected.assignee(), forgedExpected.group(), forgedExpected.transportType(),
+            forgedMetadata, forgedExpected.deadlineEpochMs(), forgedExpected.createdAtEpochMs(), 13_000L,
+            forgedExpected.ttlEpochS(), forgedExpected.transportOutputType(), Optional.of("ack"),
+            forgedExpected.stagedCompletionPayload());
+        assertTrue(forgedExpected.permitsCommandCompletionReplacement(forgedNext));
+        assertThrows(IllegalArgumentException.class, () -> store.compareAndSetCommandCompletion(
+            forgedExpected, forgedNext).await().indefinitely());
     }
 
     @Test
