@@ -6,6 +6,9 @@
 # Restricted pilot deployment profile
 
 The canonical `src/main/resources/aws-durable-queue-async.yaml` remains one SAM graph.
+Publish its literal YAML resource structures: CloudFormation rejects YAML aliases
+and merge keys. Serialization tests retain the complete parsed runtime66 contract
+and every profile/signing/transition-placement/boundary condition combination.
 `DeploymentProfile=HARDENED` is the default. Its resolved resource graph matches
 published runtime63 (`a084c50e672645cde42b592b5415d218a8a24b73`), including its
 CMKs, Secrets Manager reads and 64 alarms. The explicit signing-source environment
