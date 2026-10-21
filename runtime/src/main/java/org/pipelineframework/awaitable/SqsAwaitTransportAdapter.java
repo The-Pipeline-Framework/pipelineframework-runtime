@@ -68,12 +68,12 @@ public class SqsAwaitTransportAdapter implements AwaitTransportAdapter<Object> {
     @Override
     public boolean supportsLiveAwaitWindow(AwaitCompletionDescriptor descriptor) {
         Objects.requireNonNull(descriptor, "descriptor must not be null");
-        return resolvedLiveAwaitWindowConfig().matches(SqsConfig.from(descriptor.transportConfig()));
+        return resolvedLiveAwaitWindowConfig().matches(configuration(descriptor));
     }
 
     @Override
     public Optional<String> admissionEndpoint(AwaitCompletionDescriptor descriptor) {
-        return Optional.of("sqs://" + SqsConfig.from(descriptor.transportConfig()).requestQueueUrl());
+        return Optional.of("sqs://" + configuration(descriptor).requestQueueUrl());
     }
 
     @Override
@@ -81,7 +81,7 @@ public class SqsAwaitTransportAdapter implements AwaitTransportAdapter<Object> {
         Objects.requireNonNull(request, "request must not be null");
         AwaitCompletionDescriptor descriptor = request.descriptor();
         AwaitInteractionRecord interaction = request.interaction();
-        SqsConfig config = SqsConfig.from(descriptor.transportConfig());
+        SqsConfig config = configuration(descriptor);
         String resumeToken = resumeTokenService.sign(interaction, System.currentTimeMillis());
         Map<String, Object> metadata = dispatchMetadata(config);
         Object normalizedPayload = AwaitPayloadSupport.normalize(request.payload());
@@ -163,11 +163,21 @@ public class SqsAwaitTransportAdapter implements AwaitTransportAdapter<Object> {
         }
     }
 
+    private SqsConfig configuration(AwaitCompletionDescriptor descriptor) {
+        SqsConfig config = SqsConfig.from(descriptor.transportConfig());
+        if (config.responseQueueUrl().isEmpty() && resolvedLiveAwaitWindowConfig().pollerEnabled()) {
+            throw new IllegalStateException("sqs HOST_MANAGED response requires the local response poller to be disabled");
+        }
+        return config;
+    }
+
     private static Map<String, Object> dispatchMetadata(SqsConfig config) {
         Map<String, Object> metadata = new LinkedHashMap<>();
         metadata.put("adapter", "sqs");
         metadata.put("requestQueueUrl", config.requestQueueUrl());
-        metadata.put("responseQueueUrl", config.responseQueueUrl());
+        config.responseQueueUrl().ifPresentOrElse(
+            queue -> metadata.put("responseQueueUrl", queue),
+            () -> metadata.put("responseMode", "HOST_MANAGED"));
         metadata.put("dispatchedAtEpochMs", System.currentTimeMillis());
         return metadata;
     }
@@ -184,16 +194,26 @@ public class SqsAwaitTransportAdapter implements AwaitTransportAdapter<Object> {
         return Uni.createFrom().item(supplier).runSubscriptionOn(Infrastructure.getDefaultExecutor());
     }
 
-    record SqsConfig(String requestQueueUrl, String responseQueueUrl) {
+    record SqsConfig(String requestQueueUrl, Optional<String> responseQueueUrl) {
         static SqsConfig from(Map<String, Object> transportConfig) {
             if (transportConfig == null) {
                 throw new IllegalArgumentException("transportConfig must not be null");
             }
             Map<?, ?> request = requiredMap(transportConfig.get("request"), "sqs await transport requires request.queueUrl");
             Map<?, ?> response = requiredMap(transportConfig.get("response"), "sqs await transport requires response.queueUrl");
+            String requestQueueUrl = requiredString(request.get("queueUrl"), "sqs await transport requires request.queueUrl");
+            if (response.containsKey("mode")) {
+                if (!"HOST_MANAGED".equals(response.get("mode"))) {
+                    throw new IllegalArgumentException("sqs response.mode must be HOST_MANAGED when explicitly selected");
+                }
+                if (response.containsKey("queueUrl")) {
+                    throw new IllegalArgumentException("sqs HOST_MANAGED response must not include response.queueUrl");
+                }
+                return new SqsConfig(requestQueueUrl, Optional.empty());
+            }
             return new SqsConfig(
-                requiredString(request.get("queueUrl"), "sqs await transport requires request.queueUrl"),
-                requiredString(response.get("queueUrl"), "sqs await transport requires response.queueUrl"));
+                requestQueueUrl,
+                Optional.of(requiredString(response.get("queueUrl"), "sqs await transport requires response.queueUrl")));
         }
 
         private static Map<?, ?> requiredMap(Object value, String message) {
@@ -211,8 +231,10 @@ public class SqsAwaitTransportAdapter implements AwaitTransportAdapter<Object> {
         }
 
         public SqsConfig {
+            Objects.requireNonNull(responseQueueUrl, "responseQueueUrl must not be null");
             if (normalizedQueueUrlForTypeCheck(requestQueueUrl).endsWith(".fifo")
-                || normalizedQueueUrlForTypeCheck(responseQueueUrl).endsWith(".fifo")) {
+                || responseQueueUrl.map(SqsConfig::normalizedQueueUrlForTypeCheck)
+                    .filter(queue -> queue.endsWith(".fifo")).isPresent()) {
                 throw new IllegalArgumentException("sqs await transport supports standard queues only in v1");
             }
         }
@@ -243,7 +265,7 @@ public class SqsAwaitTransportAdapter implements AwaitTransportAdapter<Object> {
 
         boolean matches(SqsConfig transportConfig) {
             return pollerEnabled
-                && responseQueueUrl.map(transportConfig.responseQueueUrl()::equals).orElse(false);
+                && transportConfig.responseQueueUrl().filter(queue -> responseQueueUrl.filter(queue::equals).isPresent()).isPresent();
         }
     }
 }
