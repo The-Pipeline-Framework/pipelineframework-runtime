@@ -457,7 +457,7 @@ Resources:
                   Action: kms:Decrypt
                   Resource: !Ref SigningKmsAccessArns
                   Condition:
-                    StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                    StringEquals: {'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
                     StringLike:
                       kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
                 - !Ref 'AWS::NoValue'
@@ -574,7 +574,7 @@ Resources:
                   Action: kms:Decrypt
                   Resource: !Ref SigningKmsAccessArns
                   Condition:
-                    StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                    StringEquals: {'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
                     StringLike:
                       kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
                 - !Ref 'AWS::NoValue'
@@ -631,7 +631,7 @@ Resources:
                   Action: kms:Decrypt
                   Resource: !Ref SigningKmsAccessArns
                   Condition:
-                    StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                    StringEquals: {'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
                     StringLike:
                       kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
                 - !Ref 'AWS::NoValue'
@@ -687,7 +687,7 @@ Resources:
                   Action: kms:Decrypt
                   Resource: !Ref SigningKmsAccessArns
                   Condition:
-                    StringEquals: {kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                    StringEquals: {'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
                     StringLike:
                       kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
                 - !Ref 'AWS::NoValue'
