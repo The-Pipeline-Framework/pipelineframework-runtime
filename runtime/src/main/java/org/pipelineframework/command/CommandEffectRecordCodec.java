@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import org.pipelineframework.connector.CommandRecoveryBinding;
 
+import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.Message;
@@ -76,7 +77,7 @@ final class CommandEffectRecordCodec {
         requireText(encoded, "encoded command effect record");
         JsonNode root;
         try {
-            root = json.readTree(encoded);
+            root = json.reader().with(StreamReadFeature.STRICT_DUPLICATE_DETECTION).readTree(encoded);
         } catch (IOException | RuntimeException failure) {
             throw new CommandEffectStoreException("Failed decoding durable Command effect record", failure);
         }
@@ -93,8 +94,8 @@ final class CommandEffectRecordCodec {
         }
         try {
             return schemaVersion == LEGACY_SCHEMA_VERSION
-                ? decodeLegacy(json.treeToValue(root, PersistedSnapshotV1.class))
-                : decodeCurrent(json.treeToValue(root, PersistedSnapshotV3.class));
+                ? decodeLegacy(json.treeToValue(root, PersistedSnapshotV1.class), encoded)
+                : decodeCurrent(json.treeToValue(root, PersistedSnapshotV3.class), encoded);
         } catch (CommandEffectStoreException failure) {
             throw failure;
         } catch (IOException | RuntimeException failure) {
@@ -107,7 +108,7 @@ final class CommandEffectRecordCodec {
             || schemaVersion == SCHEMA_VERSION;
     }
 
-    private DecodedSnapshot decodeCurrent(PersistedSnapshotV3 snapshot) {
+    private DecodedSnapshot decodeCurrent(PersistedSnapshotV3 snapshot, String encoded) {
         requireText(snapshot.inputDeclaredType(), "input declared type");
         requireText(snapshot.outputDeclaredType(), "output declared type");
         try {
@@ -118,15 +119,15 @@ final class CommandEffectRecordCodec {
                 snapshot.command(),
                 snapshot.commandId(),
                 Objects.requireNonNull(snapshot.status(), "command effect status must not be null"),
-                decodeValue(requireOptional(snapshot.input(), "input value"), snapshot.inputDeclaredType())
+                decodeValue(requireOptional(snapshot.input(), "input value"), snapshot.inputDeclaredType(), encoded, "/input/value")
                     .orElse(null),
-                decodeValue(requireOptional(snapshot.output(), "output value"), snapshot.outputDeclaredType())
+                decodeValue(requireOptional(snapshot.output(), "output value"), snapshot.outputDeclaredType(), encoded, "/output/value")
                     .orElse(null),
                 requireOptional(snapshot.errorClass(), "error class").orElse(null),
                 requireOptional(snapshot.errorMessage(), "error message").orElse(null),
                 requireOptional(snapshot.outcome(), "outcome snapshot"),
-                snapshot.attempts().stream()
-                    .map(attempt -> decodeAttempt(attempt, snapshot.outputDeclaredType()))
+                java.util.stream.IntStream.range(0, snapshot.attempts().size())
+                    .mapToObj(index -> decodeAttempt(snapshot.attempts().get(index), snapshot.outputDeclaredType(), encoded, index))
                     .toList(),
                 snapshot.createdAtEpochMs(),
                 snapshot.updatedAtEpochMs());
@@ -139,11 +140,11 @@ final class CommandEffectRecordCodec {
         }
     }
 
-    private DecodedSnapshot decodeLegacy(PersistedSnapshotV1 snapshot) {
+    private DecodedSnapshot decodeLegacy(PersistedSnapshotV1 snapshot, String encoded) {
         requireText(snapshot.inputDeclaredType(), "input declared type");
         requireText(snapshot.outputDeclaredType(), "output declared type");
         Object currentOutput = decodeValue(
-            requireOptional(snapshot.output(), "output value"), snapshot.outputDeclaredType()).orElse(null);
+            requireOptional(snapshot.output(), "output value"), snapshot.outputDeclaredType(), encoded, "/output/value").orElse(null);
         List<CommandEffectAttemptRecord> attempts = new java.util.ArrayList<>();
         for (PersistedAttemptSnapshotV1 attempt : snapshot.attempts()) {
             boolean current = attempt.attemptNumber() == snapshot.attempts().size();
@@ -167,7 +168,7 @@ final class CommandEffectRecordCodec {
         CommandEffectRecord record = new CommandEffectRecord(
             snapshot.tenantId(), snapshot.executionId(), snapshot.stepId(), snapshot.command(),
             snapshot.commandId(), Objects.requireNonNull(snapshot.status(), "command effect status must not be null"),
-            decodeValue(requireOptional(snapshot.input(), "input value"), snapshot.inputDeclaredType()).orElse(null),
+            decodeValue(requireOptional(snapshot.input(), "input value"), snapshot.inputDeclaredType(), encoded, "/input/value").orElse(null),
             currentOutput,
             requireOptional(snapshot.errorClass(), "error class").orElse(null),
             requireOptional(snapshot.errorMessage(), "error message").orElse(null),
@@ -202,7 +203,9 @@ final class CommandEffectRecordCodec {
 
     private CommandEffectAttemptRecord decodeAttempt(
         PersistedAttemptSnapshotV3 attempt,
-        String outputDeclaredType
+        String outputDeclaredType,
+        String encoded,
+        int index
     ) {
         return new CommandEffectAttemptRecord(
             attempt.attemptId(),
@@ -211,7 +214,7 @@ final class CommandEffectRecordCodec {
             attempt.executionId(),
             attempt.purpose(),
             attempt.status(),
-            decodeValue(requireOptional(attempt.output(), "attempt output"), outputDeclaredType),
+            decodeValue(requireOptional(attempt.output(), "attempt output"), outputDeclaredType, encoded, "/attempts/" + index + "/output/value"),
             requireOptional(attempt.errorClass(), "attempt error class").orElse(null),
             requireOptional(attempt.errorMessage(), "attempt error message").orElse(null),
             requireOptional(attempt.outcome(), "attempt outcome snapshot"),
@@ -307,11 +310,11 @@ final class CommandEffectRecordCodec {
         }
     }
 
-    private Optional<Object> decodeValue(Optional<TypedValueSnapshot> encoded, String declaredType) {
-        if (encoded.isEmpty()) {
+    private Optional<Object> decodeValue(Optional<TypedValueSnapshot> snapshotValue, String declaredType, String encoded, String pointer) {
+        if (snapshotValue.isEmpty()) {
             return Optional.empty();
         }
-        TypedValueSnapshot snapshot = encoded.orElseThrow();
+        TypedValueSnapshot snapshot = snapshotValue.orElseThrow();
         requireText(snapshot.runtimeType(), "runtime type");
         requireText(snapshot.encoding(), "value encoding");
         if (snapshot.value() == null) {
@@ -321,7 +324,9 @@ final class CommandEffectRecordCodec {
         verifyDeclaredType(declaredType, runtimeType);
         try {
             return Optional.of(switch (snapshot.encoding()) {
-                case JSON_ENCODING -> json.treeToValue(snapshot.value(), runtimeType);
+                // Read typed JSON directly: an intermediate JsonNode would round decimal timestamps through Double.
+                // The declared/runtime checks above still apply, and the original numeric coercions remain intact.
+                case JSON_ENCODING -> json.readerFor(runtimeType).at(pointer).readValue(encoded);
                 case PROTOBUF_JSON_ENCODING -> decodeProtobuf(snapshot.value(), runtimeType);
                 default -> throw new CommandEffectStoreException(
                     "Unsupported durable Command value encoding " + snapshot.encoding());
