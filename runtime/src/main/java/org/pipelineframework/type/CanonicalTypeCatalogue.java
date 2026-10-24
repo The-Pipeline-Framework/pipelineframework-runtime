@@ -72,13 +72,19 @@ public final class CanonicalTypeCatalogue {
                 throw new IllegalStateException("Canonical type '" + entry.getKey() + "' has no definition");
             }
             bindings.put(entry.getKey(), new TypeBinding(
-                entry.getKey(), definition, optionalText(binding, "contributedIdentity")));
+                entry.getKey(), definition, optionalText(binding, "contributedIdentity"),
+                optionalText(binding, "runtimeClass")));
         });
         return new CanonicalTypeCatalogue(bindings);
     }
 
     public String schema(String typeName) {
         return schema(typeName, Set.of());
+    }
+
+    /** Java representation pinned by the compiled canonical contract, when one is declared. */
+    public Optional<String> runtimeClass(String typeName) {
+        return requireType(typeName).runtimeClass();
     }
 
     /** Projects a record contract for model-authored fields while retaining the canonical type as authority. */
@@ -563,11 +569,14 @@ public final class CanonicalTypeCatalogue {
         return new IllegalArgumentException("invalid canonical payload at " + path + ": " + reason);
     }
 
-    private record TypeBinding(String name, JsonNode definition, Optional<String> contributedIdentity) {
+    private record TypeBinding(
+        String name, JsonNode definition, Optional<String> contributedIdentity, Optional<String> runtimeClass
+    ) {
         private TypeBinding {
             Objects.requireNonNull(name, "canonical type name must not be null");
             Objects.requireNonNull(definition, "canonical type definition must not be null");
             Objects.requireNonNull(contributedIdentity, "contributed identity must not be null");
+            Objects.requireNonNull(runtimeClass, "runtime class must not be null");
         }
     }
 }
