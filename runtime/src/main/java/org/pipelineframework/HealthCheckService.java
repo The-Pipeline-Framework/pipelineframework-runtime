@@ -465,11 +465,11 @@ public class HealthCheckService {
 
         HttpClient serviceHttpClient = clientBuilder.build();
 
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest request = customizeHttpHealthRequest(clientType, clientName, HttpRequest.newBuilder()
             .uri(healthUri)
             .timeout(Duration.ofSeconds(5))
             .GET()
-            .build();
+            .build());
 
         try {
             CompletableFuture<HttpResponse<String>> responseFuture =
@@ -548,6 +548,14 @@ public class HealthCheckService {
                 throw new RuntimeException(ex);
             }
         }
+    }
+
+    /**
+     * Allows an application specialization to authenticate dependency health requests.
+     * The default leaves the request unchanged; HTTP status and TLS checks still apply.
+     */
+    protected HttpRequest customizeHttpHealthRequest(String clientType, String clientName, HttpRequest request) {
+        return request;
     }
 
     private boolean isGrpcClientTlsEnabled(String grpcClientName) {
