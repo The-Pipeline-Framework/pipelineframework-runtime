@@ -465,13 +465,19 @@ public class HealthCheckService {
 
         HttpClient serviceHttpClient = clientBuilder.build();
 
-        HttpRequest request = customizeHttpHealthRequest(clientType, clientName, HttpRequest.newBuilder()
-            .uri(healthUri)
-            .timeout(Duration.ofSeconds(5))
-            .GET()
-            .build());
-
         try {
+            HttpRequest request = customizeHttpHealthRequest(clientType, clientName, HttpRequest.newBuilder()
+                .uri(healthUri)
+                .timeout(Duration.ofSeconds(5))
+                .GET()
+                .build());
+            if (request.headers().map().keySet().stream().anyMatch(name ->
+                    name.equalsIgnoreCase("Authorization") || name.equalsIgnoreCase("Cookie")
+                        || name.equalsIgnoreCase("X-API-Key"))
+                && !"https".equalsIgnoreCase(request.uri().getScheme())) {
+                LOG.warn("Rejecting credential-bearing health request without HTTPS");
+                return false;
+            }
             CompletableFuture<HttpResponse<String>> responseFuture =
                 serviceHttpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString());
 

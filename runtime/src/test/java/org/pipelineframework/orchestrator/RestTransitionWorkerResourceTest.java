@@ -35,6 +35,8 @@ class RestTransitionWorkerResourceTest {
         identityResolver = mock(PipelineReleaseIdentityResolver.class);
         resource.orchestratorConfig = config;
         resource.executionService = executionService;
+        resource.requestThreadContext = mock(org.eclipse.microprofile.context.ThreadContext.class);
+        when(resource.requestThreadContext.currentContextExecutor()).thenReturn(Runnable::run);
         resource.identityResolver = identityResolver;
         when(config.workerRest()).thenReturn(restConfig);
         when(restConfig.path()).thenReturn("/pipeline/worker/transitions/execute");
@@ -183,6 +185,59 @@ class RestTransitionWorkerResourceTest {
 
         assertEquals(200, first.getStatus());
         assertEquals(401, replay.getStatus());
+    }
+
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void asynchronousResponseRestoresTheOriginatingRequestContext(boolean failed) throws Exception {
+        var context = new ThreadLocal<String>();
+        context.set("original-request");
+        java.util.concurrent.Executor captured = task -> {
+            String previous = context.get();
+            context.set("original-request");
+            try { task.run(); } finally {
+                if (previous == null) context.remove(); else context.set(previous);
+            }
+        };
+        when(resource.requestThreadContext.currentContextExecutor()).thenReturn(captured);
+        var completed = new java.util.concurrent.CompletableFuture<TransitionResultEnvelope>();
+        var command = envelope();
+        when(restConfig.serverEnabled()).thenReturn(true);
+        when(executionService.executePortableTransition(command))
+            .thenReturn(Uni.createFrom().completionStage(completed));
+        SignedRequest request = signed(command);
+        try {
+            var subscriber = resource.execute(request.timestamp(), request.nonce(), request.signature(), request.body())
+                .onItemOrFailure().invoke((response, failure) -> assertEquals("original-request", context.get()))
+                .subscribe().withSubscriber(io.smallrye.mutiny.helpers.test.UniAssertSubscriber.create());
+            var completion = java.util.concurrent.CompletableFuture.runAsync(() -> {
+                context.set("unrelated-provider-request");
+                if (failed) completed.completeExceptionally(new IllegalStateException("provider-failure"));
+                else completed.complete(TransitionResultEnvelope.completed(payloadCodec, List.of("ok")));
+                assertEquals("unrelated-provider-request", context.get());
+                context.remove();
+            });
+            completion.join();
+            if (failed) subscriber.awaitFailure().assertFailedWith(IllegalStateException.class, "provider-failure");
+            else assertEquals(200, subscriber.awaitItem().getItem().getStatus());
+            assertEquals("original-request", context.get());
+        } finally { context.remove(); }
+    }
+
+
+    @Test
+    void responseContextRestorationPreservesCancellation() throws Exception {
+        var cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+        var command = envelope();
+        when(restConfig.serverEnabled()).thenReturn(true);
+        when(executionService.executePortableTransition(command)).thenReturn(
+            Uni.createFrom().<TransitionResultEnvelope>nothing().onCancellation().invoke(() -> cancelled.set(true)));
+        SignedRequest request = signed(command);
+        var subscriber = resource.execute(request.timestamp(), request.nonce(), request.signature(), request.body())
+            .subscribe().withSubscriber(io.smallrye.mutiny.helpers.test.UniAssertSubscriber.create());
+        subscriber.cancel();
+        org.junit.jupiter.api.Assertions.assertTrue(cancelled.get());
     }
 
     private TransitionCommandEnvelope envelope() {
