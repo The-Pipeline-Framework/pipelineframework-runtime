@@ -66,6 +66,19 @@ class CanonicalTypeCatalogueFieldSemanticsTest {
         assertEquals("null", schema.path("properties").path("note").path("oneOf").get(1).path("type").textValue());
     }
 
+    @Test
+    void retainsCompiledRuntimeClassBindingWithoutChangingCanonicalValidation() {
+        var bound = CanonicalTypeCatalogue.fromCanonicalTypes(Map.of(
+            "Customer", Map.of(
+                "runtimeClass", "org.example.shared.Customer",
+                "definition", Map.of("id", "Customer", "kind", "record", "fields", List.of(
+                    field("name", "REQUIRED", "NON_NULL"))))));
+
+        assertEquals(java.util.Optional.of("org.example.shared.Customer"), bound.runtimeClass("Customer"));
+        assertEquals(java.util.Optional.empty(), catalogue.runtimeClass("Customer"));
+        assertEquals("{\"name\":\"Ada\"}", bound.validateAndCanonicalize("Customer", "{\"name\":\"Ada\"}"));
+    }
+
     private static Map<String, Object> field(String name, String presence, String nullability) {
         return Map.of("name", name, "type", Map.of("kind", "scalar", "id", "string"),
             "presence", presence, "nullability", nullability);
