@@ -21,6 +21,22 @@ class AwsDurableDeploymentContractTest {
     }
 
     @Test
+    void everySemanticHostDisablesInProcessSqsDispatch() throws Exception {
+        var resources = resources();
+        int hosts = 0;
+        for (var resource : resources) {
+            var encoded = resource.path("Properties").path("Environment").path("Variables")
+                .path("TPF_AWS_DURABLE_CONFIGURATION");
+            if (encoded.isMissingNode()) continue;
+            assertTrue(encoded.isTextual(), "Native deployment settings must be a JSON string");
+            hosts++;
+            assertEquals("false", new ObjectMapper().readTree(encoded.asText())
+                .path("sqs.local-loopback").asText(), "Each native semantic host must dispatch only through SQS");
+        }
+        assertEquals(8, hosts, "Must inspect every native semantic host");
+    }
+
+    @Test
     void deploymentRequiresExplicitGenerationMigrationValidation() throws Exception {
         JsonNode template = template();
         JsonNode validation = template.path("Parameters").path("CallbackGenerationMigrationValidation");
