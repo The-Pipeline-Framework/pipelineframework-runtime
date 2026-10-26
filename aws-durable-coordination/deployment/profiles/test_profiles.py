@@ -57,21 +57,29 @@ def graph(template, profile):
                        'TransitionWorkerPlacement': 'FUNCTION', 'RuntimePermissionsBoundaryArn': ''})
 
 
-def legacy_code_location_contract(template):
-    """Compare all existing fields while separately proving the exact CodeUri rewrite."""
+def legacy_deployment_contract(template):
+    """Preserve frozen graphs after proving only the reviewed CodeUri/queue-isolation deltas."""
     template = copy.deepcopy(template)
     count = 0
     for resource in template['Resources'].values():
         if resource['Type'] == 'AWS::Serverless::Function':
             assert resource['Properties']['CodeUri'] == {'Fn::Sub': '${ActionArtifactUri}'}
             resource['Properties']['CodeUri'] = {'Ref': 'ActionArtifactUri'}
+            settings = resource['Properties']['Environment']['Variables']['TPF_AWS_DURABLE_CONFIGURATION']
+            encoded = settings['Fn::Sub']
+            field = ',"sqs.local-loopback":"false"'
+            if encoded.count(field) != 1 or json.loads(encoded).get('sqs.local-loopback') != 'false':
+                raise AssertionError('Every semantic host must contain exactly the queue-only correction')
+            # Remove only this exact reviewed field. Every other JSON byte and
+            # resource property still participates in the original frozen hashes.
+            settings['Fn::Sub'] = encoded.replace(field, '', 1)
             count += 1
     assert count == 8
     return template
 
 
 def normalized_hardened(template):
-    resources = graph(legacy_code_location_contract(template), 'HARDENED')
+    resources = graph(legacy_deployment_contract(template), 'HARDENED')
     for resource in resources.values():
         resource.pop('Condition', None)
         env = resource.get('Properties', {}).get('Environment', {}).get('Variables', {})
@@ -81,6 +89,18 @@ def normalized_hardened(template):
 
 class Profiles(unittest.TestCase):
     def setUp(self): self.template = p.load_template(TEMPLATE)
+
+    def test_legacy_comparison_rejects_missing_or_enabled_queue_isolation(self):
+        for name, resource in self.template['Resources'].items():
+            if resource['Type'] != 'AWS::Serverless::Function':
+                continue
+            for replacement in ['', ',"sqs.local-loopback":"true"']:
+                with self.subTest(host=name, replacement=replacement):
+                    changed = copy.deepcopy(self.template)
+                    settings = changed['Resources'][name]['Properties']['Environment']['Variables']['TPF_AWS_DURABLE_CONFIGURATION']
+                    settings['Fn::Sub'] = settings['Fn::Sub'].replace(',"sqs.local-loopback":"false"', replacement, 1)
+                    with self.assertRaisesRegex(AssertionError, 'queue-only correction'):
+                        legacy_deployment_contract(changed)
 
     def test_default_hardened_resource_graph_matches_published_runtime63(self):
         self.assertEqual('HARDENED', self.template['Parameters']['DeploymentProfile']['Default'])
