@@ -27,6 +27,7 @@ import software.amazon.awssdk.services.ssm.model.ParameterType;
 /** Validates the deployment-owned Lambda configuration before resolving pinned signing keys. */
 public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSourceFactory {
     private static final String PREFIX = "tpf.aws.durable.";
+    private static final int PINNED_SOURCE_ORDINAL = 500;
     private final Function<GetSecretValueRequest, GetSecretValueResponse> secrets;
     private final Function<GetParameterRequest, GetParameterResponse> parameters;
 
@@ -65,7 +66,7 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             @Override public ConfigValue getValue(String name) {
                 return settings.containsKey(name)
                     ? ConfigValue.builder().withName(name).withValue(settings.get(name))
-                        .withConfigSourceName("aws-durable-deployment-settings").withConfigSourceOrdinal(500).build()
+                        .withConfigSourceName("aws-durable-deployment-settings").withConfigSourceOrdinal(PINNED_SOURCE_ORDINAL).build()
                     : originalContext.getValue(name);
             }
             @Override public java.util.Iterator<String> iterateNames() { return originalContext.iterateNames(); }
@@ -94,6 +95,12 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         }
         requireEqual(context, "pipeline.orchestrator.state-provider", "dynamo");
         requireEqual(context, "pipeline.orchestrator.dispatcher-provider", "sqs");
+        requireEqual(context, "pipeline.orchestrator.sqs.local-loopback", "false");
+        // Compact settings cannot hide an effective override of the pinned source.
+        ConfigValue loopbackOverride = originalContext.getValue("pipeline.orchestrator.sqs.local-loopback");
+        if (loopbackOverride != null && loopbackOverride.getConfigSourceOrdinal() >= PINNED_SOURCE_ORDINAL) {
+            requireEqual(originalContext, "pipeline.orchestrator.sqs.local-loopback", "false");
+        }
         requireEqual(context, "pipeline.orchestrator.dlq-provider", "sqs");
         requireEqual(context, "pipeline.orchestrator.releases.registry.provider", "dynamo");
         requireEqual(context, "pipeline.orchestrator.releases.storage.provider", "s3");
@@ -166,7 +173,7 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         if (encoded.isEmpty()) {
             return Map.of();
         }
-        Set<String> allowed = Set.of("mode", "strict-startup", "state-provider", "dispatcher-provider", "dlq-provider",
+        Set<String> allowed = Set.of("mode", "strict-startup", "state-provider", "dispatcher-provider", "dlq-provider", "sqs.local-loopback",
             "pipeline-id", "release-version", "idempotency-policy", "coordination-host", "process-loops-disabled", "queue-url", "dlq-url",
             "dynamo.region", "dynamo.execution-table", "dynamo.execution-key-table", "dynamo.execution-payload-table",
             "dynamo.await-interaction-table", "dynamo.await-interaction-key-table", "dynamo.await-completion-lifecycle-table", "dynamo.await-unit-table",
@@ -303,7 +310,7 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         @Override public Set<String> getPropertyNames() { return values.keySet(); }
         @Override public String getValue(String name) { return values.get(name); }
         @Override public String getName() { return "aws-durable-pinned-signing-keys"; }
-        @Override public int getOrdinal() { return 500; }
+        @Override public int getOrdinal() { return PINNED_SOURCE_ORDINAL; }
         @Override public String toString() { return getName(); }
     }
 }

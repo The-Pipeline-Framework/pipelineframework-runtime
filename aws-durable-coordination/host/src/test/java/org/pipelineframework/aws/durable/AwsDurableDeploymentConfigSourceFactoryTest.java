@@ -74,6 +74,58 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
             .isInstanceOf(UnsupportedOperationException.class);
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"true", ""})
+    void rejectsLocalDispatchOrMissingQueueIsolationBeforeReadingSigningKeys(String value) {
+        var values = validConfiguration();
+        if (value.isEmpty()) values.remove("pipeline.orchestrator.sqs.local-loopback");
+        else values.put("pipeline.orchestrator.sqs.local-loopback", value);
+        var requests = new ArrayList<GetSecretValueRequest>();
+        assertThatThrownBy(() -> build(values, requests)).isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("sqs.local-loopback");
+        assertThat(requests).isEmpty();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints = {500, 900})
+    void compactSettingsCannotHideAnEffectiveLocalDispatchOverride(int ordinal) throws Exception {
+        var values = validConfiguration();
+        var compact = new HashMap<String, String>();
+        values.entrySet().removeIf(entry -> {
+            if (!entry.getKey().startsWith("pipeline.orchestrator.")) return false;
+            compact.put(entry.getKey().substring("pipeline.orchestrator.".length()), entry.getValue());
+            return true;
+        });
+        values.put("tpf.aws.durable.configuration", new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(compact));
+        var requests = new ArrayList<GetSecretValueRequest>();
+        var override = new PropertiesConfigSource(Map.of("pipeline.orchestrator.sqs.local-loopback", "true"),
+            "unsafe-override", ordinal);
+        assertThatThrownBy(() -> build(values, requests, override)).isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("sqs.local-loopback");
+        assertThat(requests).isEmpty();
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void nativeConfigurationEnqueuesOnceWithoutInvokingLocalExecutionObservers() throws Exception {
+        var config = build(validConfiguration(), new ArrayList<>());
+        var runtime = config.getConfigMapping(PipelineOrchestratorConfig.class);
+        var client = org.mockito.Mockito.mock(software.amazon.awssdk.services.sqs.SqsClient.class);
+        var event = org.mockito.Mockito.mock(jakarta.enterprise.event.Event.class);
+        var work = new org.pipelineframework.orchestrator.ExecutionWorkItem("tenant-a", "execution-a");
+        org.mockito.Mockito.when(event.fireAsync(org.mockito.ArgumentMatchers.any()))
+            .thenReturn(java.util.concurrent.CompletableFuture.completedFuture(work));
+        var constructor = org.pipelineframework.orchestrator.SqsWorkDispatcher.class.getDeclaredConstructor(
+            software.amazon.awssdk.services.sqs.SqsClient.class, PipelineOrchestratorConfig.class,
+            jakarta.enterprise.event.Event.class);
+        constructor.setAccessible(true);
+        var dispatcher = constructor.newInstance(client, runtime, event);
+        dispatcher.enqueueNow(work).await().atMost(java.time.Duration.ofSeconds(5));
+        org.mockito.Mockito.verify(client).sendMessage(org.mockito.ArgumentMatchers.any(
+            software.amazon.awssdk.services.sqs.model.SendMessageRequest.class));
+        org.mockito.Mockito.verifyNoInteractions(event);
+    }
+
     @Test
     void selectsPinnedSsmVersionsWithoutReadingSecretsManager() {
         var secretRequests = new ArrayList<GetSecretValueRequest>();
@@ -246,6 +298,7 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
         var requests = new ArrayList<GetSecretValueRequest>();
         var config = build(values, requests);
         assertThat(config.getConfigMapping(PipelineOrchestratorConfig.class).dynamo().executionTable()).isEqualTo("test_execution");
+        assertThat(config.getConfigMapping(PipelineOrchestratorConfig.class).sqs().localLoopback()).isFalse();
         assertThat(config.getConfigMapping(PipelineOrchestratorConfig.class).idempotencyPolicy().name()).isEqualTo("CLIENT_KEY_REQUIRED");
         assertThat(config.getConfigMapping(PipelineOrchestratorConfig.class).workerSqs().contractVersion())
             .contains("sha256:" + "a".repeat(64));
@@ -268,8 +321,9 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
         }
     }
 
-    private SmallRyeConfig build(Map<String, String> values, List<GetSecretValueRequest> requests) {
+    private SmallRyeConfig build(Map<String, String> values, List<GetSecretValueRequest> requests, org.eclipse.microprofile.config.spi.ConfigSource... overrides) {
         return new SmallRyeConfigBuilder().withMapping(PipelineOrchestratorConfig.class).withSources(new PropertiesConfigSource(values, "deployment", 300))
+            .withSources(overrides)
             .withSources(new AwsDurableDeploymentConfigSourceFactory(request -> {
                 requests.add(request);
                 return GetSecretValueResponse.builder().arn(request.secretId()).versionId(request.versionId())
@@ -317,6 +371,7 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
         values.put("pipeline.orchestrator.idempotency-policy", "CLIENT_KEY_REQUIRED");
         values.put("pipeline.orchestrator.state-provider", "dynamo");
         values.put("pipeline.orchestrator.dispatcher-provider", "sqs");
+        values.put("pipeline.orchestrator.sqs.local-loopback", "false");
         values.put("pipeline.orchestrator.dlq-provider", "sqs");
         values.put("pipeline.orchestrator.releases.registry.provider", "dynamo");
         values.put("pipeline.orchestrator.releases.storage.provider", "s3");

@@ -25,3 +25,18 @@ Build from the repository root with its isolated Maven repository:
 Publication and immutable candidate validation follow the repository's normal
 runtime workflow. This module does not provision parameters or attest their tier,
 permissions, retention, deployment provenance or real-AWS conformance.
+
+### Queue-only native execution
+
+The native deployment sets `pipeline.orchestrator.sqs.local-loopback=false` (the
+`sqs.local-loopback` entry in `TPF_AWS_DURABLE_CONFIGURATION`) on all eight semantic
+hosts. Validated startup rejects a missing or enabled value before resolving signing
+keys, including an unsafe override at or above the pinned configuration's priority.
+Update the deployment configuration together with the host artifact.
+
+`process-loops-disabled=true` does not disable the SQS dispatcher's local CDI event.
+Leaving local loopback enabled would both enqueue the work and start asynchronous
+execution inside the submitting Lambda, competing with the native Work consumer
+and allowing work to outlive the Lambda invocation. Native execution belongs to
+the SQS handler, which awaits processing before acknowledging the message. The
+ordinary runtime's local-development default is unchanged.
