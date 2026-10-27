@@ -45,7 +45,22 @@ public final class AwsDurableHostServices {
     public AwsDurableAwaitStreamProcessor streamProcessor() {
         return new AwsDurableAwaitStreamProcessor(bindings(), actions(), wakeups(),
             requiredEnvironment("TPF_AWS_DURABLE_AWAIT_STREAM_ARN"),
-            requiredEnvironment("TPF_AWS_DURABLE_BINDING_STREAM_ARN"), this::observeAwaitStream, terminalCallbacks()::settle);
+            requiredEnvironment("TPF_AWS_DURABLE_BINDING_STREAM_ARN"), this::observeAwaitStream, terminalCallbacks()::settle,
+            this::terminalWithoutRegistration);
+    }
+
+    boolean terminalWithoutRegistration(AwsDurableAwaitCheckpoint checkpoint) {
+        var execution = controlPlane.getExecutionSemanticCheckpoint(checkpoint.tenantId(), checkpoint.executionId())
+            .await().atMost(duration("TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS", 30));
+        if (!checkpoint.tenantId().equals(execution.tenantId())
+            || !checkpoint.executionId().equals(execution.executionId())
+            || !checkpoint.pipelineId().equals(execution.pipelineId())
+            || !checkpoint.contractVersion().equals(execution.contractVersion())
+            || !checkpoint.releaseVersion().equals(execution.releaseVersion())) {
+            throw new IllegalStateException("semantic execution observation does not match the Await checkpoint");
+        }
+        return java.util.Set.of("SUCCEEDED", "FAILED", "DLQ", "REMOTE_OUTCOME_UNKNOWN")
+            .contains(execution.status().name());
     }
 
     Optional<AwsDurableAwaitCheckpoint> observeAwaitStream(

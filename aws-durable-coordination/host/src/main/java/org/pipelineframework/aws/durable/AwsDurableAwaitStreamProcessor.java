@@ -4,6 +4,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 import com.amazonaws.services.lambda.runtime.events.DynamodbEvent;
 import com.amazonaws.services.lambda.runtime.events.models.dynamodb.AttributeValue;
@@ -24,6 +25,7 @@ public final class AwsDurableAwaitStreamProcessor {
     private final String bindingStreamArn;
     private final Function<DynamodbEvent.DynamodbStreamRecord, Optional<AwsDurableAwaitCheckpoint>> observations;
     private final Function<AwsDurableCallbackRegistration, Optional<AwsDurableWakeupDisposition>> terminalSettlements;
+    private final Predicate<AwsDurableAwaitCheckpoint> terminalWithoutRegistration;
 
     public AwsDurableAwaitStreamProcessor(
         AwsDurableCallbackBindingRepository bindings,
@@ -40,6 +42,15 @@ public final class AwsDurableAwaitStreamProcessor {
         AwsDurableWakeupService wakeups, String awaitStreamArn, String bindingStreamArn,
         Function<DynamodbEvent.DynamodbStreamRecord, Optional<AwsDurableAwaitCheckpoint>> observations,
         Function<AwsDurableCallbackRegistration, Optional<AwsDurableWakeupDisposition>> terminalSettlements) {
+        this(bindings, actions, wakeups, awaitStreamArn, bindingStreamArn, observations, terminalSettlements,
+            ignored -> false);
+    }
+
+    AwsDurableAwaitStreamProcessor(AwsDurableCallbackBindingRepository bindings, AwsDurableActionInvoker actions,
+        AwsDurableWakeupService wakeups, String awaitStreamArn, String bindingStreamArn,
+        Function<DynamodbEvent.DynamodbStreamRecord, Optional<AwsDurableAwaitCheckpoint>> observations,
+        Function<AwsDurableCallbackRegistration, Optional<AwsDurableWakeupDisposition>> terminalSettlements,
+        Predicate<AwsDurableAwaitCheckpoint> terminalWithoutRegistration) {
         this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.actions = Objects.requireNonNull(actions, "actions");
         this.wakeups = Objects.requireNonNull(wakeups, "wakeups");
@@ -50,6 +61,8 @@ public final class AwsDurableAwaitStreamProcessor {
         }
         this.observations = Objects.requireNonNull(observations, "observations");
         this.terminalSettlements = Objects.requireNonNull(terminalSettlements, "terminalSettlements");
+        this.terminalWithoutRegistration = Objects.requireNonNull(terminalWithoutRegistration,
+            "terminalWithoutRegistration");
     }
 
     public AwsDurableWakeupDisposition process(DynamodbEvent.DynamodbStreamRecord record) {
@@ -87,7 +100,11 @@ public final class AwsDurableAwaitStreamProcessor {
         Optional<AwsDurableCallbackRegistration> registration = bindings.findLatestRegistration(
             semantic.tenantId(), semantic.executionId());
         if (registration.isEmpty()) {
-            return AwsDurableWakeupDisposition.RETRY;
+            // A completed execution need not ever have suspended its provider on a callback.
+            // Retrying its scheduling projections can starve unrelated live callbacks.
+            // A late registration still repairs itself from its own retained stream record.
+            return terminalWithoutRegistration.test(semantic)
+                ? AwsDurableWakeupDisposition.ACKNOWLEDGE : AwsDurableWakeupDisposition.RETRY;
         }
         AwsDurableCallbackRegistration current = registration.orElseThrow();
         if (current.awaitIdentity().filter(pinned -> !pinned.interactionId().equals(semantic.interactionId())
