@@ -171,6 +171,16 @@ class DynamoTypedAwaitImportIT {
             .await().indefinitely().record();
         assertEquals(AwaitInteractionStatus.COMPLETED, completed.status());
         assertEquals(new AcknowledgedDecision("r-1", "trusted-run"), completed.responsePayload());
+        var admission = store().getCompletionAdmission("tenant", imported.interactionId())
+            .await().indefinitely().orElseThrow();
+        assertEquals(completed.updatedAtEpochMs(), admission.firstAdmittedAtEpochMs());
+        assertTrue(store().findOpenCompletions("tenant", 100, Optional.empty()).await().indefinitely()
+            .admissions().contains(admission));
+        store().retireCompletionAdmission(admission).await().indefinitely();
+        assertFalse(store().findOpenCompletions("tenant", 100, Optional.empty()).await().indefinitely()
+            .admissions().contains(admission));
+        assertEquals(Optional.of(admission), store().getCompletionAdmission("tenant", imported.interactionId())
+            .await().indefinitely());
         assertTrue(first.complete(callbackCommand(imported, token, "trusted-run"))
             .await().indefinitely().duplicate());
         var stored = row(imported.interactionId());
@@ -258,6 +268,23 @@ class DynamoTypedAwaitImportIT {
         coordinator.durablePayloadResolver = resolver(registry);
         coordinator.resumeTokenService = new AwaitResumeTokenService("test-only-resume-token-secret");
         return coordinator;
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value = CommandDispatchSettlement.class,
+        names = {"TERMINAL", "USER_ACTION_REQUIRED"})
+    void ordinaryAcknowledgedCommandFailurePreservesLegacyReason(CommandDispatchSettlement settlement) {
+        var descriptor = commandDescriptor("test.AcknowledgedProjector", Acknowledgement.class.getName(), true);
+        descriptors.register(descriptor);
+        var imported = commandInteraction(descriptor);
+        store().importRecord(imported).await().indefinitely();
+        var failed = completionCoordinator().settleCommandDispatch(imported, settlement, Optional.empty())
+            .await().indefinitely().record();
+        var expected = imported.settleCommandDispatch(settlement, failed.updatedAtEpochMs());
+        assertEquals(expected.status(), failed.status());
+        assertEquals(expected.transportMetadata().get("completionFailure"),
+            failed.transportMetadata().get("completionFailure"));
+        assertTrue(store().getCompletionAdmission("tenant", imported.interactionId()).await().indefinitely().isEmpty());
     }
 
     private AwaitCompletionDescriptor commandDescriptor(String projectorId, String acknowledgementType,

@@ -482,7 +482,9 @@ public class AwaitCoordinator {
                 status = AwaitInteractionStatus.WAITING;
             } else {
                 status = AwaitInteractionStatus.FAILED;
-                metadata.put("completionFailure", "contradictory-provider-evidence");
+                if (staged.isPresent()) {
+                    metadata.put("completionFailure", "contradictory-provider-evidence");
+                }
             }
             AwaitInteractionRecord next = commandState(current, status, response, current.actor(), metadata,
                 acceptedAcknowledgement, staged, nowEpochMs);

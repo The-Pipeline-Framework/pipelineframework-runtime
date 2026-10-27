@@ -250,6 +250,17 @@ public class CommandDeferredCompletionSupportTest {
         assertEquals(1, provider.operation.dispatches.get());
         assertEquals(Optional.of("accepted"), interactions.get("tenant", record.interactionId())
             .await().indefinitely().orElseThrow().commandAcknowledgement());
+        var completedRecord = interactions.get("tenant", record.interactionId()).await().indefinitely().orElseThrow();
+        var admission = interactions.getCompletionAdmission("tenant", record.interactionId())
+            .await().indefinitely().orElseThrow();
+        assertEquals(completedRecord.updatedAtEpochMs(), admission.firstAdmittedAtEpochMs());
+        assertTrue(interactions.findOpenCompletions("tenant", 100, Optional.empty()).await().indefinitely()
+            .admissions().contains(admission));
+        interactions.retireCompletionAdmission(admission).await().indefinitely();
+        assertFalse(interactions.findOpenCompletions("tenant", 100, Optional.empty()).await().indefinitely()
+            .admissions().contains(admission));
+        assertEquals(Optional.of(admission), interactions.getCompletionAdmission("tenant", record.interactionId())
+            .await().indefinitely());
     }
 
     private void expireStoredDeadlineAfterStaging(String interactionId) throws ReflectiveOperationException {

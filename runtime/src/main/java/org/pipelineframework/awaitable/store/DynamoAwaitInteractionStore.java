@@ -512,7 +512,9 @@ public class DynamoAwaitInteractionStore implements
                     replacement.commandAcknowledgement()),
                 serializeOptionalPayload(replacement, AwaitDurablePayloadResolver.Slot.STAGED_COMPLETION,
                     replacement.stagedCompletionPayload()),
-                expected.stagedCompletionPayload().isPresent() && replacement.stagedCompletionPayload().isEmpty());
+                expected.stagedCompletionPayload().isPresent() && replacement.stagedCompletionPayload().isEmpty(),
+                replacement.status() == AwaitInteractionStatus.COMPLETED
+                    ? Optional.of(completionAdmission(replacement, replacement.updatedAtEpochMs())) : Optional.empty());
         });
     }
 
@@ -1127,7 +1129,7 @@ public class DynamoAwaitInteractionStore implements
         long nowEpochMs,
         boolean projectItemContinuation) {
         return transitionStatus(tenantId, interactionId, expectedVersion, requiredStatus, status,
-            responsePayloadJson, actor, transportMetadata, nowEpochMs, projectItemContinuation, null, null, false);
+            responsePayloadJson, actor, transportMetadata, nowEpochMs, projectItemContinuation, null, null, false, Optional.empty());
     }
 
     private Optional<AwaitInteractionRecord> transitionStatus(
@@ -1143,7 +1145,8 @@ public class DynamoAwaitInteractionStore implements
         boolean projectItemContinuation,
         String acknowledgementJson,
         String stagedCompletionJson,
-        boolean clearStagedCompletion) {
+        boolean clearStagedCompletion,
+        Optional<AwaitCompletionAdmission> admission) {
         Map<String, String> names = new HashMap<>();
         names.put("#version", VERSION);
         names.put("#status", STATUS);
@@ -1250,6 +1253,22 @@ public class DynamoAwaitInteractionStore implements
             }
         }
         try {
+            if (admission.isPresent()) {
+                var interactionUpdate = Update.builder().tableName(interactionTable())
+                    .key(primaryKey(tenantId, interactionId)).conditionExpression(condition)
+                    .updateExpression(update.toString()).expressionAttributeNames(names)
+                    .expressionAttributeValues(values).build();
+                List<TransactWriteItem> writes = new ArrayList<>();
+                writes.add(TransactWriteItem.builder().update(interactionUpdate).build());
+                writes.addAll(completionLifecycleRepository().admissionWrites(admission.orElseThrow()));
+                dynamoClient().transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writes).build());
+                var stored = dynamoClient().getItem(GetItemRequest.builder().tableName(interactionTable())
+                    .key(primaryKey(tenantId, interactionId)).consistentRead(true).build()).item();
+                if (stored == null || stored.isEmpty()) {
+                    throw new IllegalStateException("Command completion committed but its interaction could not be read");
+                }
+                return Optional.of(toRecord(stored));
+            }
             Map<String, AttributeValue> attributes = dynamoClient().updateItem(UpdateItemRequest.builder()
                 .tableName(interactionTable())
                 .key(primaryKey(tenantId, interactionId))
@@ -1269,6 +1288,9 @@ public class DynamoAwaitInteractionStore implements
                 : toRecord(attributes));
         } catch (ConditionalCheckFailedException ignored) {
             return Optional.empty();
+        } catch (TransactionCanceledException cancelled) {
+            if (conditionalCompletionCancellation(cancelled)) return Optional.empty();
+            throw cancelled;
         }
     }
 

@@ -143,6 +143,8 @@ public class AwaitDurablePayloadResolver {
                 if (!descriptor.acknowledgementAwareCommandCompletion()) {
                     throw new IllegalStateException("Staged callback is unavailable in the pinned descriptor");
                 }
+                // Retain the callback contract here. outputType is the final projected value,
+                // which can have a different shape and does not exist until acknowledgement joins.
                 yield descriptor.transportOutputType();
             }
         };

@@ -263,16 +263,25 @@ class DynamoAwaitInteractionStoreTest {
             + "\"commandSettlement\":\"SUCCEEDED\"}"));
         completedItem.put("command_acknowledgement_json", avS("\"ack\""));
         completedItem.put("response_payload_json", avS("\"result\""));
-        when(client.updateItem(any(UpdateItemRequest.class)))
-            .thenReturn(UpdateItemResponse.builder().attributes(completedItem).build());
+        when(client.getItem(any(GetItemRequest.class)))
+            .thenReturn(GetItemResponse.builder().item(stagedItem).build(),
+                GetItemResponse.builder().item(completedItem).build());
+        when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
+            .thenReturn(TransactWriteItemsResponse.builder().build());
         var persisted = store.compareAndSetCommandCompletion(persistedStage, completed)
             .await().indefinitely().orElseThrow();
         assertEquals(Optional.of("ack"), persisted.commandAcknowledgement());
         assertEquals(Optional.of("callback"), persisted.stagedCompletionPayload());
         assertEquals("result", persisted.responsePayload());
-        verify(client, times(2)).updateItem(update.capture());
-        assertEquals("\"ack\"", update.getValue().expressionAttributeValues().get(":acknowledgement").s());
-        assertTrue(update.getValue().updateExpression().contains("REMOVE #pendingTenantKey"));
+        verify(client).updateItem(any(UpdateItemRequest.class));
+        var transaction = ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+        verify(client).transactWriteItems(transaction.capture());
+        assertEquals(3, transaction.getValue().transactItems().size());
+        var completion = transaction.getValue().transactItems().getFirst().update();
+        assertEquals("\"ack\"", completion.expressionAttributeValues().get(":acknowledgement").s());
+        assertTrue(completion.updateExpression().contains("REMOVE #pendingTenantKey"));
+        assertTrue(transaction.getValue().transactItems().get(1).put().conditionExpression()
+            .contains("attribute_not_exists"));
     }
 
     @Test
