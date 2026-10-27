@@ -146,6 +146,70 @@ class AwsDurableAwaitStreamProcessorTest {
         assertThat(processor.process(record(AWAIT_STREAM, Map.of()))).isEqualTo(AwsDurableWakeupDisposition.RETRY);
     }
 
+    @Test
+    void terminalExecutionWithoutRegistrationDoesNotBlockTheSharedStream() {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var actions = mock(AwsDurableActionInvoker.class);
+        var wakeups = mock(AwsDurableWakeupService.class);
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, AWAIT_STREAM, BINDING_STREAM,
+            ignored -> Optional.of(semantic("COMPLETED")), ignored -> Optional.empty(), ignored -> true);
+
+        assertThat(processor.process(record(AWAIT_STREAM, Map.of())))
+            .isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        org.mockito.Mockito.verifyNoInteractions(actions, wakeups);
+        verify(bindings, org.mockito.Mockito.never()).bind(org.mockito.ArgumentMatchers.any());
+    }
+
+    @Test
+    void lateRegistrationStillRepairsCompletionAfterTerminalRecordWasAcknowledged() {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var actions = mock(AwsDurableActionInvoker.class);
+        var wakeups = mock(AwsDurableWakeupService.class);
+        when(actions.invoke(org.mockito.ArgumentMatchers.any()))
+            .thenReturn(AwsDurableActionResponse.awaitCheckpoint(semantic("COMPLETED")));
+        when(wakeups.wake(org.mockito.ArgumentMatchers.any()))
+            .thenReturn(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, actions, wakeups, AWAIT_STREAM, BINDING_STREAM,
+            ignored -> Optional.of(semantic("COMPLETED")), ignored -> Optional.empty(), ignored -> true);
+
+        assertThat(processor.process(record(AWAIT_STREAM, Map.of())))
+            .isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        assertThat(processor.process(record(BINDING_STREAM, registrationImage(registration()))))
+            .isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        verify(wakeups).wake(registration().awaitIdentity().orElseThrow());
+    }
+
+    @Test
+    void registeredCompletionNeverUsesTheTerminalWithoutRegistrationShortcut() {
+        var bindings = mock(AwsDurableCallbackBindingRepository.class);
+        var wakeups = mock(AwsDurableWakeupService.class);
+        when(bindings.findLatestRegistration("tenant", "execution")).thenReturn(Optional.of(registration()));
+        when(wakeups.wake(org.mockito.ArgumentMatchers.any()))
+            .thenReturn(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        var processor = new AwsDurableAwaitStreamProcessor(bindings, mock(AwsDurableActionInvoker.class), wakeups,
+            AWAIT_STREAM, BINDING_STREAM, ignored -> Optional.of(semantic("COMPLETED")), ignored -> Optional.empty(),
+            ignored -> { throw new AssertionError("registered callback must retain normal fencing and delivery"); });
+
+        assertThat(processor.process(record(AWAIT_STREAM, Map.of())))
+            .isEqualTo(AwsDurableWakeupDisposition.ACKNOWLEDGE);
+        verify(wakeups).wake(registration().awaitIdentity().orElseThrow());
+    }
+
+    @Test
+    void unavailableTerminalObservationRetainsTheOriginalStreamSequence() {
+        var processor = new AwsDurableAwaitStreamProcessor(mock(AwsDurableCallbackBindingRepository.class),
+            mock(AwsDurableActionInvoker.class), mock(AwsDurableWakeupService.class), AWAIT_STREAM, BINDING_STREAM,
+            ignored -> Optional.of(semantic("COMPLETED")), ignored -> Optional.empty(),
+            ignored -> { throw new IllegalStateException("semantic store unavailable"); });
+        var event = new DynamodbEvent();
+        var record = record(AWAIT_STREAM, Map.of());
+        record.getDynamodb().setSequenceNumber("retain-this-sequence");
+        event.setRecords(List.of(record));
+
+        assertThat(new AwsDurableAwaitStreamBatchAdapter().handle(event, processor::process).getBatchItemFailures())
+            .extracting(failure -> failure.getItemIdentifier()).containsExactly("retain-this-sequence");
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.CsvSource({"WAITING,COMPLETED", "COMPLETED,WAITING"})
     void semanticObservationOverridesStaleImagesAndMechanicalLookingFields(String actualStatus, String imageStatus) {
