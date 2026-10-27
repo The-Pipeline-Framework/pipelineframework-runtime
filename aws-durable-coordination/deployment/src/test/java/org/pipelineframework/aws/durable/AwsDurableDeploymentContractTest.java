@@ -12,12 +12,28 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AwsDurableDeploymentContractTest {
     private JsonNode template() throws Exception {
         try (var template = getClass().getResourceAsStream("/aws-durable-queue-async.yaml")) {
-            return new ObjectMapper(new YAMLFactory()).readTree(template);
+            return DeploymentProfileTestSupport.hardened(new ObjectMapper(new YAMLFactory()).readTree(template));
         }
     }
 
     private JsonNode resources() throws Exception {
         return template().path("Resources");
+    }
+
+    @Test
+    void everySemanticHostDisablesInProcessSqsDispatch() throws Exception {
+        var resources = resources();
+        int hosts = 0;
+        for (var resource : resources) {
+            var encoded = resource.path("Properties").path("Environment").path("Variables")
+                .path("TPF_AWS_DURABLE_CONFIGURATION");
+            if (encoded.isMissingNode()) continue;
+            assertTrue(encoded.isTextual(), "Native deployment settings must be a JSON string");
+            hosts++;
+            assertEquals("false", new ObjectMapper().readTree(encoded.asText())
+                .path("sqs.local-loopback").asText(), "Each native semantic host must dispatch only through SQS");
+        }
+        assertEquals(8, hosts, "Must inspect every native semantic host");
     }
 
     @Test

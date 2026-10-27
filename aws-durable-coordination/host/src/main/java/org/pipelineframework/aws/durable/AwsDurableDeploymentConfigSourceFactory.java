@@ -1,6 +1,7 @@
 package org.pipelineframework.aws.durable;
 
 import java.time.Duration;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -18,11 +19,17 @@ import org.eclipse.microprofile.config.spi.ConfigSource;
 import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueRequest;
 import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueResponse;
+import software.amazon.awssdk.services.ssm.SsmClient;
+import software.amazon.awssdk.services.ssm.model.GetParameterRequest;
+import software.amazon.awssdk.services.ssm.model.GetParameterResponse;
+import software.amazon.awssdk.services.ssm.model.ParameterType;
 
 /** Validates the deployment-owned Lambda configuration before resolving pinned signing keys. */
 public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSourceFactory {
     private static final String PREFIX = "tpf.aws.durable.";
+    private static final int PINNED_SOURCE_ORDINAL = 500;
     private final Function<GetSecretValueRequest, GetSecretValueResponse> secrets;
+    private final Function<GetParameterRequest, GetParameterResponse> parameters;
 
     public AwsDurableDeploymentConfigSourceFactory() {
         this(request -> {
@@ -31,11 +38,25 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
                     .apiCallAttemptTimeout(Duration.ofSeconds(5))).build()) {
                 return client.getSecretValue(request);
             }
+        }, request -> {
+            try (var client = SsmClient.builder()
+                .overrideConfiguration(config -> config.apiCallTimeout(Duration.ofSeconds(15))
+                    .apiCallAttemptTimeout(Duration.ofSeconds(5))).build()) {
+                return client.getParameter(request);
+            }
         });
     }
 
     AwsDurableDeploymentConfigSourceFactory(Function<GetSecretValueRequest, GetSecretValueResponse> secrets) {
+        this(secrets, request -> {
+            throw new IllegalStateException("SSM reader was not supplied");
+        });
+    }
+
+    AwsDurableDeploymentConfigSourceFactory(Function<GetSecretValueRequest, GetSecretValueResponse> secrets,
+        Function<GetParameterRequest, GetParameterResponse> parameters) {
         this.secrets = Objects.requireNonNull(secrets);
+        this.parameters = Objects.requireNonNull(parameters);
     }
 
     @Override
@@ -45,13 +66,15 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             @Override public ConfigValue getValue(String name) {
                 return settings.containsKey(name)
                     ? ConfigValue.builder().withName(name).withValue(settings.get(name))
-                        .withConfigSourceName("aws-durable-deployment-settings").withConfigSourceOrdinal(500).build()
+                        .withConfigSourceName("aws-durable-deployment-settings").withConfigSourceOrdinal(PINNED_SOURCE_ORDINAL).build()
                     : originalContext.getValue(name);
             }
             @Override public java.util.Iterator<String> iterateNames() { return originalContext.iterateNames(); }
         };
         if (value(context, PREFIX + "deployment-validation").isEmpty()) {
             if (!settings.isEmpty() || List.of(PREFIX + "configuration",
+                PREFIX + "signing-source", PREFIX + "resume-token-parameter-arn", PREFIX + "worker-parameter-arn",
+                PREFIX + "resume-token-parameter-version", PREFIX + "worker-parameter-version",
                 PREFIX + "resume-token-secret-arn", PREFIX + "worker-secret-arn",
                 PREFIX + "resume-token-secret-version", PREFIX + "worker-secret-version",
                 "pipeline.orchestrator.resume-token-secret", "pipeline.orchestrator.worker.sqs.shared-secret",
@@ -72,6 +95,12 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         }
         requireEqual(context, "pipeline.orchestrator.state-provider", "dynamo");
         requireEqual(context, "pipeline.orchestrator.dispatcher-provider", "sqs");
+        requireEqual(context, "pipeline.orchestrator.sqs.local-loopback", "false");
+        // Compact settings cannot hide an effective override of the pinned source.
+        ConfigValue loopbackOverride = originalContext.getValue("pipeline.orchestrator.sqs.local-loopback");
+        if (loopbackOverride != null && loopbackOverride.getConfigSourceOrdinal() >= PINNED_SOURCE_ORDINAL) {
+            requireEqual(originalContext, "pipeline.orchestrator.sqs.local-loopback", "false");
+        }
         requireEqual(context, "pipeline.orchestrator.dlq-provider", "sqs");
         requireEqual(context, "pipeline.orchestrator.releases.registry.provider", "dynamo");
         requireEqual(context, "pipeline.orchestrator.releases.storage.provider", "s3");
@@ -110,11 +139,32 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             }
         }
         // Validate both references before the first network call; absent or floating versions fail closed.
-        GetSecretValueRequest resume = request(context, "resume-token");
-        GetSecretValueRequest worker = request(context, "worker");
+        String signingSource = value(context, PREFIX + "signing-source").orElse("SECRETS_MANAGER");
+        String resume;
+        String worker;
+        if ("SECRETS_MANAGER".equals(signingSource)) {
+            rejectConfigured(context, "resume-token-parameter-arn", "resume-token-parameter-version",
+                "worker-parameter-arn", "worker-parameter-version");
+            GetSecretValueRequest resumeRequest = request(context, "resume-token");
+            GetSecretValueRequest workerRequest = request(context, "worker");
+            resume = resolve(resumeRequest);
+            worker = resolve(workerRequest);
+        } else if ("SSM_STANDARD".equals(signingSource)) {
+            rejectConfigured(context, "resume-token-secret-arn", "resume-token-secret-version",
+                "worker-secret-arn", "worker-secret-version");
+            PinnedParameter resumeRequest = parameterRequest(context, "resume-token");
+            PinnedParameter workerRequest = parameterRequest(context, "worker");
+            if (resumeRequest.arn().equals(workerRequest.arn())) {
+                throw new IllegalArgumentException("Purpose-specific SSM parameters must be distinct");
+            }
+            resume = resolve(resumeRequest);
+            worker = resolve(workerRequest);
+        } else {
+            throw new IllegalArgumentException("Unsupported AWS Durable signing source");
+        }
         var resolved = new java.util.HashMap<>(settings);
-        resolved.put("pipeline.orchestrator.resume-token-secret", resolve(resume));
-        resolved.put("pipeline.orchestrator.worker.sqs.shared-secret", resolve(worker));
+        resolved.put("pipeline.orchestrator.resume-token-secret", resume);
+        resolved.put("pipeline.orchestrator.worker.sqs.shared-secret", worker);
         return List.of(new PinnedSecrets(resolved));
     }
 
@@ -123,7 +173,7 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         if (encoded.isEmpty()) {
             return Map.of();
         }
-        Set<String> allowed = Set.of("mode", "strict-startup", "state-provider", "dispatcher-provider", "dlq-provider",
+        Set<String> allowed = Set.of("mode", "strict-startup", "state-provider", "dispatcher-provider", "dlq-provider", "sqs.local-loopback",
             "pipeline-id", "release-version", "idempotency-policy", "coordination-host", "process-loops-disabled", "queue-url", "dlq-url",
             "dynamo.region", "dynamo.execution-table", "dynamo.execution-key-table", "dynamo.execution-payload-table",
             "dynamo.await-interaction-table", "dynamo.await-interaction-key-table", "dynamo.await-completion-lifecycle-table", "dynamo.await-unit-table",
@@ -160,6 +210,58 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         }
         return GetSecretValueRequest.builder().secretId(arn).versionId(version).build();
     }
+
+    private void rejectConfigured(ConfigSourceContext context, String... suffixes) {
+        for (String suffix : suffixes) {
+            if (value(context, PREFIX + suffix).isPresent()) {
+                throw new IllegalArgumentException("Mixed AWS Durable signing sources are not allowed");
+            }
+        }
+    }
+
+    private PinnedParameter parameterRequest(ConfigSourceContext context, String purpose) {
+        String arn = required(context, PREFIX + purpose + "-parameter-arn");
+        String versionText = required(context, PREFIX + purpose + "-parameter-version");
+        if (!arn.matches("arn:(aws|aws-us-gov|aws-cn):ssm:[a-z0-9-]+:[0-9]{12}:parameter/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*")
+            || !versionText.matches("[1-9][0-9]*")) {
+            throw new IllegalArgumentException("A full SSM parameter ARN and exact numeric version are required for " + purpose);
+        }
+        final long version;
+        try {
+            version = Long.parseLong(versionText);
+        } catch (NumberFormatException invalid) {
+            throw new IllegalArgumentException("Invalid SSM parameter version for " + purpose);
+        }
+        String name = arn.substring(arn.indexOf(":parameter/") + ":parameter/".length());
+        return new PinnedParameter(arn, name, version,
+            GetParameterRequest.builder().name(arn + ":" + version).withDecryption(true).build());
+    }
+
+    private String resolve(PinnedParameter request) {
+        final GetParameterResponse response;
+        try {
+            response = parameters.apply(request.read());
+        } catch (RuntimeException failure) {
+            // AWS exceptions may include request context or response bodies; never attach them.
+            throw new IllegalStateException("Pinned deployment signing key could not be loaded");
+        }
+        var parameter = response == null ? null : response.parameter();
+        if (parameter == null || !request.arn().equals(parameter.arn())
+            || !matchesParameterName(request.name(), parameter.name()) || parameter.version() == null
+            || request.version() != parameter.version().longValue()
+            || parameter.type() != ParameterType.SECURE_STRING || parameter.value() == null
+            || parameter.value().isBlank() || parameter.value().length() < 32
+            || parameter.value().getBytes(StandardCharsets.UTF_8).length > 4096) {
+            throw new IllegalStateException("Pinned SSM signing key response has invalid identity, version, type or length");
+        }
+        return parameter.value();
+    }
+
+    private boolean matchesParameterName(String arnResourceName, String returnedName) {
+        return arnResourceName.equals(returnedName) || ("/" + arnResourceName).equals(returnedName);
+    }
+
+    private record PinnedParameter(String arn, String name, long version, GetParameterRequest read) {}
 
     private String resolve(GetSecretValueRequest request) {
         final GetSecretValueResponse response;
@@ -208,7 +310,7 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         @Override public Set<String> getPropertyNames() { return values.keySet(); }
         @Override public String getValue(String name) { return values.get(name); }
         @Override public String getName() { return "aws-durable-pinned-signing-keys"; }
-        @Override public int getOrdinal() { return 500; }
+        @Override public int getOrdinal() { return PINNED_SOURCE_ORDINAL; }
         @Override public String toString() { return getName(); }
     }
 }

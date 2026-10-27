@@ -12,6 +12,20 @@
     <artifactId>pipelineframework-aws-durable-coordination-deployment</artifactId>
     <name>TPF AWS Durable Coordination Deployment</name>
     <description>Reference SAM deployment contract for AWS Durable QUEUE_ASYNC coordination</description>
+    <build>
+        <resources>
+            <resource><directory>src/main/resources</directory></resource>
+            <resource>
+                <directory>profiles</directory>
+                <targetPath>deployment-profiles</targetPath>
+                <includes>
+                    <include>README.md</include>
+                    <include>preflight.py</include>
+                    <include>requirements.txt</include>
+                </includes>
+            </resource>
+        </resources>
+    </build>
     <dependencies>
         <dependency>
             <groupId>org.junit.jupiter</groupId>

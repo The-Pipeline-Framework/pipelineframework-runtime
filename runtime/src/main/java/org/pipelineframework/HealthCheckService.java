@@ -465,13 +465,19 @@ public class HealthCheckService {
 
         HttpClient serviceHttpClient = clientBuilder.build();
 
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(healthUri)
-            .timeout(Duration.ofSeconds(5))
-            .GET()
-            .build();
-
         try {
+            HttpRequest request = customizeHttpHealthRequest(clientType, clientName, HttpRequest.newBuilder()
+                .uri(healthUri)
+                .timeout(Duration.ofSeconds(5))
+                .GET()
+                .build());
+            if (request.headers().map().keySet().stream().anyMatch(name ->
+                    name.equalsIgnoreCase("Authorization") || name.equalsIgnoreCase("Cookie")
+                        || name.equalsIgnoreCase("X-API-Key"))
+                && !"https".equalsIgnoreCase(request.uri().getScheme())) {
+                LOG.warn("Rejecting credential-bearing health request without HTTPS");
+                return false;
+            }
             CompletableFuture<HttpResponse<String>> responseFuture =
                 serviceHttpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString());
 
@@ -548,6 +554,14 @@ public class HealthCheckService {
                 throw new RuntimeException(ex);
             }
         }
+    }
+
+    /**
+     * Allows an application specialization to authenticate dependency health requests.
+     * The default leaves the request unchanged; HTTP status and TLS checks still apply.
+     */
+    protected HttpRequest customizeHttpHealthRequest(String clientType, String clientName, HttpRequest request) {
+        return request;
     }
 
     private boolean isGrpcClientTlsEnabled(String grpcClientName) {

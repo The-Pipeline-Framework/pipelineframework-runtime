@@ -40,6 +40,9 @@ public class RestTransitionWorkerResource {
     PipelineExecutionService executionService;
 
     @Inject
+    org.eclipse.microprofile.context.ThreadContext requestThreadContext;
+
+    @Inject
     PipelineReleaseIdentityResolver identityResolver;
 
     @Inject
@@ -104,7 +107,11 @@ public class RestTransitionWorkerResource {
         if (envelope == null) {
             return Uni.createFrom().item(Response.status(Response.Status.BAD_REQUEST).build());
         }
+        // Provider completions may carry another, already terminated CDI request context.
+        // Restore this HTTP request for response filters without blocking or replacing its lifecycle.
+        java.util.concurrent.Executor responseContext = requestThreadContext.currentContextExecutor();
         return executionService.executePortableTransition(envelope)
+            .emitOn(responseContext)
             .onItem().transform(result -> Response.ok(result.toWireResult()).build());
     }
 

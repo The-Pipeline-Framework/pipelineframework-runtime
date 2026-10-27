@@ -14,8 +14,19 @@ import static org.junit.jupiter.api.Assertions.*;
 class AwsDurableDeploymentHardeningTest {
     private JsonNode template() throws Exception {
         try (var input = getClass().getResourceAsStream("/aws-durable-queue-async.yaml")) {
-            return new ObjectMapper(new YAMLFactory()).readTree(input);
+            return DeploymentProfileTestSupport.hardened(new ObjectMapper(new YAMLFactory()).readTree(input));
         }
+    }
+
+    /** Check each formerly merged default as a literal CloudFormation property. */
+    private static void assertInheritedProperties(JsonNode actual, JsonNode defaults, String... overrides) {
+        var replaced = java.util.Set.of(overrides);
+        assertFalse(actual.has("<<"), "CloudFormation requires literal properties");
+        defaults.fields().forEachRemaining(entry -> {
+            if (!replaced.contains(entry.getKey())) {
+                assertEquals(entry.getValue(), actual.path(entry.getKey()), entry.getKey());
+            }
+        });
     }
 
     @Test
@@ -83,12 +94,9 @@ class AwsDurableDeploymentHardeningTest {
             }
             if ("AWS::CloudWatch::Alarm".equals(resource.path("Type").asText())) {
                 var properties = resource.path("Properties");
-                if (properties.has("<<")) {
-                    assertTrue(properties.path("<<").asText().endsWith("AlarmProperties"));
-                } else {
-                    assertEquals("AlarmTopicArn", properties.path("AlarmActions").get(0).asText(), entry.getKey());
-                    assertEquals("AlarmTopicArn", properties.path("OKActions").get(0).asText(), entry.getKey());
-                }
+                assertFalse(properties.has("<<"), "CloudFormation requires literal properties");
+                assertEquals("AlarmTopicArn", properties.path("AlarmActions").get(0).asText(), entry.getKey());
+                assertEquals("AlarmTopicArn", properties.path("OKActions").get(0).asText(), entry.getKey());
             }
         }
     }
@@ -248,7 +256,8 @@ class AwsDurableDeploymentHardeningTest {
             assertEquals("AWS::Lambda::EventSourceMapping", resource.path("Type").asText());
             assertEquals(mapping.getValue(), resource.path("Properties").path("FunctionName").asText());
         }
-        assertEquals("StreamMapping", resources.path("AwaitWakeupFunctionCallbackBinding").path("Properties").path("<<").asText());
+        assertInheritedProperties(resources.path("AwaitWakeupFunctionCallbackBinding").path("Properties"),
+            resources.path("AwaitWakeupFunctionAwaitState").path("Properties"), "FunctionName", "EventSourceArn");
         assertEquals("ReconciliationVersion", resources.path("DurableTerminalRule").path("Properties").path("Targets").get(0).path("Arn").asText());
         assertEquals("ReconciliationVersion", resources.path("DurableTerminalPermission").path("Properties").path("FunctionName").asText());
         assertEquals("ReconciliationVersion.Version", resources.path("ReconciliationInvokeConfig").path("Properties").path("Qualifier").asText());
@@ -263,7 +272,7 @@ class AwsDurableDeploymentHardeningTest {
         assertEquals("ReleaseIsolationValidation", template.path("Rules").path("ReleaseIsolationValidated")
             .path("Assertions").get(0).path("Assert").get(0).asText());
         var manifest = new ObjectMapper().readTree(template.path("Outputs").path("DeploymentReleaseManifest").path("Value").get(0).asText());
-        assertEquals(1, manifest.path("schemaVersion").asInt());
+        assertEquals(2, manifest.path("schemaVersion").asInt());
         for (var identity : Map.of("pipelineId", "PipelineId", "contractVersion", "ContractVersion", "releaseId", "ReleaseVersion",
             "artifactId", "ReleaseArtifactId", "artifactSha256", "ReleaseArtifactDigest").entrySet()) {
             assertEquals("${" + identity.getValue() + "}", manifest.path(identity.getKey()).asText());
@@ -290,7 +299,8 @@ class AwsDurableDeploymentHardeningTest {
         var thresholds = List.of(2700L, 90_000_000L);
         for (int index = 0; index < names.size(); index++) {
             var properties = resources.path(names.get(index)).path("Properties");
-            assertEquals("DurableFunctionAlarmProperties", properties.path("<<").asText());
+            assertInheritedProperties(properties, resources.path("DurableFunctionErrorsAlarm").path("Properties"),
+                "MetricName", "Statistic", "Threshold", "ComparisonOperator");
             assertEquals(metrics.get(index), properties.path("MetricName").asText());
             assertEquals("Maximum", properties.path("Statistic").asText());
             assertEquals(thresholds.get(index).longValue(), properties.path("Threshold").asLong());
@@ -334,7 +344,9 @@ class AwsDurableDeploymentHardeningTest {
         assertEquals("CompletionReleaseLatencyAlarmMilliseconds", latency.path("Threshold").asText());
         assertEquals("RELEASED", latency.path("Dimensions").get(1).path("Value").asText());
         for (var properties : List.of(unknown, latency)) {
-            assertEquals("ActionFunctionAlarmProperties", properties.path("<<").asText());
+            assertInheritedProperties(properties, resources.path("ActionFunctionErrorsAlarm").path("Properties"),
+                "MetricName", "Statistic", "Threshold", "ComparisonOperator", "Namespace", "Dimensions", "Period");
+            assertEquals(300, properties.path("Period").asInt());
             assertEquals("TPF/AwsDurable", properties.path("Namespace").asText());
             assertEquals(2, properties.path("Dimensions").size());
             assertEquals("Stage", properties.path("Dimensions").get(0).path("Name").asText());
@@ -359,7 +371,9 @@ class AwsDurableDeploymentHardeningTest {
         assertEquals("CallbackResumeUnknownCount", unknown.path("MetricName").asText());
         assertEquals("UNKNOWN", unknown.path("Dimensions").get(1).path("Value").asText());
         for (var properties : List.of(latency, unknown)) {
-            assertEquals("ActionFunctionAlarmProperties", properties.path("<<").asText());
+            assertInheritedProperties(properties, resources.path("ActionFunctionErrorsAlarm").path("Properties"),
+                "MetricName", "Statistic", "Threshold", "ComparisonOperator", "Namespace", "Dimensions", "Period");
+            assertEquals(300, properties.path("Period").asInt());
             assertEquals("TPF/AwsDurable", properties.path("Namespace").asText());
             assertEquals(2, properties.path("Dimensions").size());
             assertEquals("CALLBACK_RESUME", properties.path("Dimensions").get(0).path("Value").asText());
@@ -411,7 +425,9 @@ class AwsDurableDeploymentHardeningTest {
         assertEquals("RepairAgeUnknownCount", unknown.path("MetricName").asText());
         assertEquals("REPAIR_AGE_UNKNOWN", unknown.path("Dimensions").get(1).path("Value").asText());
         for (var properties : List.of(age, unknown)) {
-            assertEquals("ReconciliationFunctionAlarmProperties", properties.path("<<").asText());
+            assertInheritedProperties(properties, resources.path("ReconciliationFunctionErrorsAlarm").path("Properties"),
+                "MetricName", "Statistic", "Threshold", "ComparisonOperator", "Namespace", "Dimensions", "Period");
+            assertEquals(300, properties.path("Period").asInt());
             assertEquals("TPF/AwsDurable", properties.path("Namespace").asText());
             assertEquals(2, properties.path("Dimensions").size());
             assertEquals("REPAIR", properties.path("Dimensions").get(0).path("Value").asText());

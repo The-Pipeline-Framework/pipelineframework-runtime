@@ -19,6 +19,8 @@ import io.smallrye.mutiny.helpers.test.UniAssertSubscriber;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.pipelineframework.config.boundary.PipelineObjectNamingConfig;
@@ -32,6 +34,10 @@ import org.pipelineframework.config.boundary.PipelineOutputBoundaryConfig;
 import org.pipelineframework.config.pipeline.PipelineYamlConfig;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
+import org.pipelineframework.orchestrator.ExecutionRecord;
+import org.pipelineframework.orchestrator.ExecutionStatus;
+import org.pipelineframework.orchestrator.PagedExecutionState;
+import org.pipelineframework.orchestrator.PagedTransitionCompletion;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
 import org.pipelineframework.orchestrator.PipelineBundleCapabilities;
@@ -56,6 +62,7 @@ import org.pipelineframework.telemetry.PipelineRunContext;
 import org.pipelineframework.objectpublish.ObjectPayloadChunk;
 import org.pipelineframework.objectpublish.ObjectPublishGroupRenderer;
 import org.pipelineframework.objectpublish.ObjectPublishRunner;
+import org.pipelineframework.objectpublish.ObjectPublishCompletionService;
 import org.pipelineframework.objectpublish.ObjectPublishTelemetry;
 import org.pipelineframework.objectpublish.ObjectTargetProvider;
 import org.pipelineframework.objectpublish.ObjectTargetRegistry;
@@ -64,6 +71,8 @@ import org.pipelineframework.objectpublish.ObjectWriteOpenRequest;
 import org.pipelineframework.objectpublish.ObjectWriteResult;
 import org.pipelineframework.objectpublish.ObjectWriteSession;
 import org.pipelineframework.objectpublish.StreamingObjectPublishMapper;
+import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
+import org.pipelineframework.orchestrator.controlplane.TerminalPublicationClaim;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -74,6 +83,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -568,6 +578,78 @@ class PipelineExecutionServiceTest {
         assertTrue(envelope.terminalInputPassthrough());
         assertFalse(envelope.terminalOutputPublished());
         assertTrue(envelope.outputPayloads().isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void terminalPortableAwaitResumeRetainsPageCompletionForPublication(boolean exhausted) throws Exception {
+        markStartupHealthy(service);
+        JsonTransitionPayloadCodec codec = new JsonTransitionPayloadCodec();
+        service.transitionPayloadCodec = codec;
+        when(releaseIdentityResolver.validateCommandIdentity(any(), isNull())).thenReturn(Optional.empty());
+        when(pipelineStepResolver.loadPipelineSteps()).thenReturn(List.of(new Object()));
+        PagedTransitionCompletion completion = new PagedTransitionCompletion(
+            1, exhausted ? Optional.empty() : Optional.of("next-page"), exhausted);
+        ExecutionRecord<Object, Object> parent = terminalPagedAwaitParent(Optional.of(completion));
+        ClaimedSegment segment = ClaimedSegment.from(parent);
+
+        TransitionResultEnvelope envelope = service.executePortableTransition(
+            segment.transitionCommand(parent.inputPayload(), codec)).await().indefinitely();
+
+        assertEquals(TransitionWorkerOutcome.COMPLETED, envelope.outcome());
+        assertTrue(envelope.terminalInputPassthrough());
+        assertTrue(envelope.outputPayloads().isEmpty());
+        assertEquals(Optional.of(completion), envelope.pageCompletion());
+        verify(pipelineRunner, never()).runFromStepUntilWithContext(any(), any(), any(Integer.class), any(Integer.class));
+
+        ObjectPublishCompletionService publication = mock(ObjectPublishCompletionService.class);
+        SegmentBoundaryLedger ledger = mock(SegmentBoundaryLedger.class);
+        when(publication.enabled()).thenReturn(true);
+        when(publication.publishIfConfigured(any(), eq(parent.executionId()), eq(parent.pagingState().orElseThrow())))
+            .thenReturn(Uni.createFrom().voidItem());
+        when(ledger.claimTerminalPublication(parent, segment.transitionKey(), TerminalPublicationIntent.OBJECT_PUBLISH, 100L))
+            .thenReturn(Uni.createFrom().item(TerminalPublicationClaim.untracked("publication-1", "key-1")));
+        if (exhausted) {
+            when(publication.completePagedIfConfigured(parent.executionId(), 0))
+                .thenReturn(Uni.createFrom().voidItem());
+        }
+        CompletedSegment completed = (CompletedSegment) SegmentCommitPlan.from(segment, envelope, codec);
+        assertEquals(List.of("payment-output"), completed.outputItems());
+        new TerminalPublicationBoundary(null, publication, () -> codec, () -> ledger)
+            .publishBeforeSuccess(completed, 100L).await().indefinitely();
+
+        verify(publication, exhausted ? org.mockito.Mockito.times(1) : never())
+            .completePagedIfConfigured(parent.executionId(), 0);
+    }
+
+    @Test
+    void terminalPortablePagedTransitionRequiresRetainedCompletion() throws Exception {
+        markStartupHealthy(service);
+        JsonTransitionPayloadCodec codec = new JsonTransitionPayloadCodec();
+        service.transitionPayloadCodec = codec;
+        when(releaseIdentityResolver.validateCommandIdentity(any(), isNull())).thenReturn(Optional.empty());
+        when(pipelineStepResolver.loadPipelineSteps()).thenReturn(List.of(new Object()));
+        ExecutionRecord<Object, Object> parent = terminalPagedAwaitParent(Optional.empty());
+
+        TransitionResultEnvelope envelope = service.executePortableTransition(
+            ClaimedSegment.from(parent).transitionCommand(parent.inputPayload(), codec)).await().indefinitely();
+
+        assertEquals(TransitionWorkerOutcome.FAILED, envelope.outcome());
+        assertTrue(envelope.failureException().getMessage().contains("retained page completion"));
+        assertTrue(envelope.pageCompletion().isEmpty());
+    }
+
+    private static ExecutionRecord<Object, Object> terminalPagedAwaitParent(
+        Optional<PagedTransitionCompletion> completion) {
+        return new ExecutionRecord<>(
+            "tenant-1", "exec-paged-await", "key-1",
+            PipelineContractDescriptor.DEFAULT_PIPELINE_ID,
+            PipelineContractDescriptor.DEFAULT_CONTRACT_VERSION,
+            PipelineContractDescriptor.DEFAULT_CONTRACT_VERSION,
+            ExecutionResultShape.MATERIALIZED_MULTI, ExecutionStatus.QUEUED,
+            1L, 1, 0, null, 0L, 0L, null, List.of("payment-output"),
+            null, "await-unit-1", null, null, 1L, 1L, 99999999L,
+            Optional.of(new PagedExecutionState(0, "source-version-1", Optional.empty(), 1000, completion)));
     }
 
     @Test

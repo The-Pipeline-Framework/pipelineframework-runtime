@@ -531,13 +531,12 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
           }
         })
         .onItem().transformToUni(items -> {
-          if (terminalInputPassthrough.get()) {
-            return Uni.createFrom().item(TransitionResultEnvelope.completedTerminalInputPassthrough());
-          }
           boolean published = terminalOutputPublished.get();
-          TransitionResultEnvelope completed = policy.encodeOutputs()
-              ? TransitionResultEnvelope.completed(payloadCodec(), published ? List.of() : items, published)
-              : TransitionResultEnvelope.completedInProcess(items, published);
+          TransitionResultEnvelope completed = terminalInputPassthrough.get()
+              ? TransitionResultEnvelope.completedTerminalInputPassthrough()
+              : policy.encodeOutputs()
+                  ? TransitionResultEnvelope.completed(payloadCodec(), published ? List.of() : items, published)
+                  : TransitionResultEnvelope.completedInProcess(items, published);
           if (command.pageContext().isEmpty()) {
             return Uni.createFrom().item(completed);
           }

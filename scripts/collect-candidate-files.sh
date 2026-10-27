@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 print(ET.parse(sys.argv[1]).getroot().findtext("{http://maven.apache.org/POM/4.0.0}version", ""))
 PY
 )
-for artifact_id in pipelineframework-runtime-parent pipelineframework pipelineframework-deployment pipelineframework-runtime-spring pipelineframework-release-maven-plugin pipelineframework-release-producer cache-plugin persistence-plugin repository-plugin; do
+for artifact_id in pipelineframework-runtime-parent pipelineframework pipelineframework-deployment pipelineframework-runtime-spring pipelineframework-release-maven-plugin pipelineframework-release-producer pipelineframework-aws-durable-coordination-parent pipelineframework-aws-durable-coordination-model pipelineframework-aws-durable-coordination-host pipelineframework-aws-durable-coordination-deployment cache-plugin persistence-plugin repository-plugin; do
   group_path=org/pipelineframework
   artifact_dir="$maven_repository/$group_path/$artifact_id/$version"
   [[ -d "$artifact_dir" ]] || { echo "missing installed candidate coordinate: $artifact_id:$version" >&2; exit 1; }
@@ -20,13 +20,13 @@ for artifact_id in pipelineframework-runtime-parent pipelineframework pipelinefr
   mkdir -p "$output_dir/repository/$(dirname "$relative")"
   destination="$output_dir/repository/$relative"
   mkdir -p "$destination"
-  artifact_id=$(basename "$(dirname "$artifact_dir")")
-  for file in "$artifact_dir/$artifact_id-$version.pom" "$artifact_dir/$artifact_id-$version.jar"; do
-    [[ -f "$file" ]] || { [[ "$artifact_id" == pipelineframework-runtime-parent && "$file" == *.jar ]] && continue; echo "missing candidate file: $file" >&2; exit 1; }
+  files=("$artifact_dir/$artifact_id-$version.pom")
+  case "$artifact_id" in
+    pipelineframework-runtime-parent|pipelineframework-aws-durable-coordination-parent) ;;
+    *) files+=("$artifact_dir/$artifact_id-$version.jar") ;;
+  esac
+  for file in "${files[@]}"; do
+    [[ -f "$file" ]] || { echo "missing candidate file: $file" >&2; exit 1; }
     cp "$file" "$destination/"
   done
-  if [[ "$artifact_id" != pipelineframework-runtime-parent && ( ! -f "$destination/$artifact_id-$version.jar" || ! -f "$destination/$artifact_id-$version.pom" ) ]]; then
-    echo "missing required published candidate files for $artifact_id" >&2
-    exit 1
-  fi
 done

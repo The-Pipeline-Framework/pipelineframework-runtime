@@ -26,6 +26,11 @@ jobs:
           node --test scripts/verify-runtime-publication.test.mjs
           python3 scripts/test-candidate-metadata.py
           python3 scripts/test-published-candidate.py
+      - name: Verify Durable deployment profiles without AWS credentials
+        run: |
+          python3 -m venv "$RUNNER_TEMP/tpf-durable-profiles"
+          "$RUNNER_TEMP/tpf-durable-profiles/bin/pip" install -r aws-durable-coordination/deployment/profiles/requirements.txt
+          "$RUNNER_TEMP/tpf-durable-profiles/bin/python" -m unittest discover -s aws-durable-coordination/deployment/profiles -v
       - run: ./mvnw clean verify --no-transfer-progress -Dmaven.repo.local="$PWD/.m2/repository"
       - name: Summarize Surefire unit coverage
         if: always()

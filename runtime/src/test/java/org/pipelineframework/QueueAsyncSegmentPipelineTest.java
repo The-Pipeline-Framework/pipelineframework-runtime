@@ -13,6 +13,8 @@ import io.smallrye.mutiny.Uni;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -45,6 +47,7 @@ import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 import org.pipelineframework.orchestrator.controlplane.TerminalPublicationClaim;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -469,6 +472,101 @@ class QueueAsyncSegmentPipelineTest {
         anyLong());
   }
 
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void terminalPagedMaterializationComposesBeforeSuccessWithoutWorkerDispatch(boolean resumesFromAwait) {
+    PagedTransitionCompletion completion = new PagedTransitionCompletion(1, Optional.empty(), true);
+    ExecutionRecord<Object, Object> claimed = terminalPagedRecord(resumesFromAwait, Optional.of(completion));
+    ExecutionRecord<Object, Object> succeeded = withStatus(claimed, ExecutionStatus.SUCCEEDED, 1L);
+    when(executionStateStore.claimLease(eq("tenant-1"), eq(claimed.executionId()), any(), anyLong(), eq(1000L)))
+        .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
+    if (resumesFromAwait) {
+      when(awaitCoordinator.loadResumePayload("tenant-1", "unit-terminal-page"))
+          .thenReturn(Uni.createFrom().item(List.of("canonical-await-output")));
+    }
+    List<?> outputs = resumesFromAwait ? List.of("canonical-await-output") : List.of();
+    when(objectPublishCompletionService.publishIfConfigured(any(), eq(claimed.executionId()),
+        eq(claimed.pagingState().orElseThrow()))).thenReturn(Uni.createFrom().voidItem());
+    CompletableFuture<Void> composition = new CompletableFuture<>();
+    when(objectPublishCompletionService.completePagedIfConfigured(claimed.executionId(), 0))
+        .thenReturn(Uni.createFrom().completionStage(composition));
+    when(executionStateStore.markSucceeded(eq("tenant-1"), eq(claimed.executionId()), eq(0L),
+        eq("exec-terminal-page:page:0:5:0"), eq(outputs), anyLong()))
+        .thenReturn(Uni.createFrom().item(Optional.of(succeeded)));
+    payloadCodec = org.mockito.Mockito.spy(payloadCodec);
+
+    CompletableFuture<Void> processing = pipeline(transitionWorkerExecutor, objectPublishCompletionService, () -> 5)
+        .process(new ExecutionWorkItem("tenant-1", claimed.executionId()),
+            command -> Uni.createFrom().failure(new AssertionError("terminal page must stay at coordinator")),
+            AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER)
+        .subscribeAsCompletionStage().toCompletableFuture();
+
+    assertFalse(processing.isDone());
+    verify(executionStateStore, never()).markSucceeded(any(), any(), anyLong(), any(), any(), anyLong());
+    composition.complete(null);
+    processing.join();
+
+    InOrder order = inOrder(objectPublishCompletionService, executionStateStore);
+    order.verify(objectPublishCompletionService).publishIfConfigured(any(), eq(claimed.executionId()),
+        eq(claimed.pagingState().orElseThrow()));
+    order.verify(objectPublishCompletionService).completePagedIfConfigured(claimed.executionId(), 0);
+    order.verify(executionStateStore).markSucceeded(eq("tenant-1"), eq(claimed.executionId()), eq(0L),
+        eq("exec-terminal-page:page:0:5:0"), eq(outputs), anyLong());
+    verify(payloadCodec, never()).encode(any());
+    verify(executionFailureHandler, never()).handleExecutionFailure(any(), any(), any(), any(), any(), any());
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void terminalPagedMaterializationAdvancesNonExhaustedPageWithoutSuccess(boolean resumesFromAwait) {
+    PagedTransitionCompletion completion = new PagedTransitionCompletion(1, Optional.of("next-page"), false);
+    ExecutionRecord<Object, Object> claimed = terminalPagedRecord(resumesFromAwait, Optional.of(completion));
+    when(executionStateStore.claimLease(eq("tenant-1"), eq(claimed.executionId()), any(), anyLong(), eq(1000L)))
+        .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
+    if (resumesFromAwait) {
+      when(awaitCoordinator.loadResumePayload("tenant-1", "unit-terminal-page"))
+          .thenReturn(Uni.createFrom().item(List.of("canonical-await-output")));
+    }
+    when(objectPublishCompletionService.publishIfConfigured(any(), eq(claimed.executionId()),
+        eq(claimed.pagingState().orElseThrow()))).thenReturn(Uni.createFrom().voidItem());
+    PagedExecutionState successor = claimed.pagingState().orElseThrow().successor("next-page");
+    when(executionStateStore.advancePage(eq("tenant-1"), eq(claimed.executionId()), eq(0L),
+        eq("exec-terminal-page:page:0:5:0"), eq(successor), anyLong()))
+        .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
+
+    pipeline(transitionWorkerExecutor, objectPublishCompletionService, () -> 5)
+        .process(new ExecutionWorkItem("tenant-1", claimed.executionId()),
+            command -> Uni.createFrom().failure(new AssertionError("terminal page must stay at coordinator")),
+            AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER).await().indefinitely();
+
+    verify(executionStateStore).advancePage(eq("tenant-1"), eq(claimed.executionId()), eq(0L),
+        eq("exec-terminal-page:page:0:5:0"), eq(successor), anyLong());
+    verify(workDispatcher).enqueueNow(new ExecutionWorkItem("tenant-1", claimed.executionId()));
+    verify(objectPublishCompletionService, never()).completePagedIfConfigured(any(), anyInt());
+    verify(executionStateStore, never()).markSucceeded(any(), any(), anyLong(), any(), any(), anyLong());
+    verify(executionFailureHandler, never()).handleExecutionFailure(any(), any(), any(), any(), any(), any());
+  }
+
+  @Test
+  void terminalPagedMaterializationRejectsMissingRetainedCompletion() {
+    ExecutionRecord<Object, Object> claimed = terminalPagedRecord(false, Optional.empty());
+    when(executionStateStore.claimLease(eq("tenant-1"), eq(claimed.executionId()), any(), anyLong(), eq(1000L)))
+        .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
+
+    pipeline(transitionWorkerExecutor, objectPublishCompletionService, () -> 5)
+        .process(new ExecutionWorkItem("tenant-1", claimed.executionId()),
+            command -> Uni.createFrom().failure(new AssertionError("terminal page must stay at coordinator")),
+            AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER).await().indefinitely();
+
+    ArgumentCaptor<Throwable> failure = ArgumentCaptor.forClass(Throwable.class);
+    verify(executionFailureHandler).handleExecutionFailure(same(claimed), any(), failure.capture(),
+        same(executionStateStore), same(workDispatcher), same(deadLetterPublisher));
+    assertTrue(failure.getValue().getMessage().contains("retained page completion"));
+    verify(executionStateStore, never()).markSucceeded(any(), any(), anyLong(), any(), any(), anyLong());
+    verify(executionStateStore, never()).advancePage(any(), any(), anyLong(), any(), any(), anyLong());
+    verify(objectPublishCompletionService, never()).completePagedIfConfigured(any(), anyInt());
+  }
+
   @Test
   void ordinarySegmentDoesNotResolveTerminalStepCount() {
     ExecutionRecord<Object, Object> claimed = record("exec-ordinary", ExecutionResultShape.SINGLE);
@@ -812,6 +910,15 @@ class QueueAsyncSegmentPipelineTest {
         ExecutionResultShape.SINGLE, status, version, 0, 0, null, 0L, 0L, lastTransitionKey,
         "input-" + executionId, null, null, null, null, 1L, 1L, 99999999L,
         Optional.of(new PagedExecutionState(pageIndex, "source-identity", checkpoint, 100)));
+  }
+
+  private static ExecutionRecord<Object, Object> terminalPagedRecord(
+      boolean resumesFromAwait, Optional<PagedTransitionCompletion> completion) {
+    return new ExecutionRecord<>(
+        "tenant-1", "exec-terminal-page", "key-terminal-page", "pipeline-a", "contract-a", "release-a",
+        ExecutionResultShape.MATERIALIZED_MULTI, ExecutionStatus.QUEUED, 0L, 5, 0, null, 0L, 0L, null,
+        List.of(), resumesFromAwait ? "unit-terminal-page" : null, null, null, null, 1L, 1L, 99999999L,
+        Optional.of(new PagedExecutionState(0, "source-identity", Optional.empty(), 1000, completion)));
   }
 
   private static ExecutionRecord<Object, Object> withStatus(
