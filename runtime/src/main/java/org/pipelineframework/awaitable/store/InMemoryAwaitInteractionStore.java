@@ -455,20 +455,25 @@ public class InMemoryAwaitInteractionStore implements
             current.ttlEpochS(),
             current.transportOutputType());
         String scopedId = scopedInteractionId(completed.tenantId(), completed.interactionId());
+        retainCompletionAdmission(completed);
+        interactionsByScopedId.put(scopedId, completed);
+        projectItemContinuation(completed, command.nowEpochMs());
+        return new AwaitCompletionResult(completed, false);
+    }
+
+    private void retainCompletionAdmission(AwaitInteractionRecord completed) {
+        String scopedId = scopedInteractionId(completed.tenantId(), completed.interactionId());
         // Construct and validate the fact before changing semantic state. The lock is the completion CAS boundary.
         AwaitCompletionAdmission admission = new AwaitCompletionAdmission(
             AwaitCompletionAdmission.CURRENT_SCHEMA_VERSION, completed.tenantId(), completed.executionId(),
             completed.interactionId(), Optional.ofNullable(completed.unitId()), completed.stepId(), completed.stepIndex(),
             completed.itemIndex() == null ? OptionalInt.empty() : OptionalInt.of(completed.itemIndex()),
-            Optional.ofNullable(completed.causationId()), command.nowEpochMs(), completed.ttlEpochS());
+            Optional.ofNullable(completed.causationId()), completed.updatedAtEpochMs(), completed.ttlEpochS());
         if (!completionAdmissions.containsKey(scopedId)) {
             completionAdmissions.put(scopedId, admission);
             openCompletionsByTenant.computeIfAbsent(admission.tenantId(), ignored -> new java.util.TreeMap<>())
                 .put(admission.interactionId(), admission);
         }
-        interactionsByScopedId.put(scopedId, completed);
-        projectItemContinuation(completed, command.nowEpochMs());
-        return new AwaitCompletionResult(completed, false);
     }
 
     @Override
@@ -807,6 +812,24 @@ public class InMemoryAwaitInteractionStore implements
             expected.status(), current -> current.settleCommandDispatch(settlement, nowEpochMs));
     }
 
+    @Override
+    public Uni<Optional<AwaitInteractionRecord>> compareAndSetCommandCompletion(
+        AwaitInteractionRecord expected, AwaitInteractionRecord replacement) {
+        if (!expected.permitsCommandCompletionReplacement(replacement)) {
+            return Uni.createFrom().failure(new IllegalArgumentException("Invalid Command completion transition"));
+        }
+        return transition(expected.tenantId(), expected.interactionId(), expected.version(),
+            replacement.updatedAtEpochMs(), expected.status(), current -> {
+                if (!current.equals(expected) || !current.permitsCommandCompletionReplacement(replacement)) {
+                    throw new IllegalArgumentException("Command completion CAS expected state differs from durable state");
+                }
+                if (replacement.status() == AwaitInteractionStatus.COMPLETED) {
+                    retainCompletionAdmission(replacement);
+                }
+                return replacement;
+            });
+    }
+
     private Optional<AwaitInteractionRecord> resolveForCompletion(AwaitCompletionCommand command) {
         if (command.interactionId() != null && !command.interactionId().isBlank()) {
             return Optional.ofNullable(interactionsByScopedId.get(scopedInteractionId(command.tenantId(), command.interactionId())));
@@ -858,7 +881,7 @@ public class InMemoryAwaitInteractionStore implements
             current.createdAtEpochMs(),
             nowEpochMs,
             current.ttlEpochS(),
-            current.transportOutputType());
+            current.transportOutputType(), current.commandAcknowledgement(), current.stagedCompletionPayload());
     }
 
     private void purgeExpired(long nowEpochMs) {

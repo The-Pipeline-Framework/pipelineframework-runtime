@@ -9,6 +9,7 @@ import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
+import org.pipelineframework.awaitable.AwaitCompletionDescriptor;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.AwaitUnitRecord;
 import org.pipelineframework.awaitable.AwaitUnitStatus;
@@ -57,6 +58,16 @@ class SegmentBoundaryFactFactoryTest {
         assertEquals(2, built.size());
         assertInstanceOf(ControlPlaneFact.SegmentSuspended.class, built.get(0));
         assertInstanceOf(ControlPlaneFact.BoundaryInteractionDispatched.class, built.get(1));
+    }
+
+    @Test
+    void waitingExternalCommandCallbackProducesNonblankBoundaryTransportFact() {
+        List<ControlPlaneFact> built = facts.segmentSuspended(record("run-1"), "run-1:2:0",
+            new TransitionAwaitSuspension("tenant", "run-1", "unit-1", 2, unit(false, 1),
+                List.of(interaction(0, AwaitCompletionDescriptor.CONNECTOR_CALLBACK_TRANSPORT))));
+
+        var dispatched = assertInstanceOf(ControlPlaneFact.BoundaryInteractionDispatched.class, built.get(1));
+        assertEquals(AwaitCompletionDescriptor.CONNECTOR_CALLBACK_TRANSPORT, dispatched.transportType());
     }
 
     @Test
@@ -162,6 +173,10 @@ class SegmentBoundaryFactFactoryTest {
     }
 
     private static AwaitInteractionRecord interaction(int itemIndex) {
+        return interaction(itemIndex, "kafka");
+    }
+
+    private static AwaitInteractionRecord interaction(int itemIndex, String transportType) {
         return new AwaitInteractionRecord(
             "tenant",
             "run-1",
@@ -181,7 +196,7 @@ class SegmentBoundaryFactFactoryTest {
             "user-1",
             null,
             null,
-            "kafka",
+            transportType,
             Map.of(),
             999999L,
             1L,

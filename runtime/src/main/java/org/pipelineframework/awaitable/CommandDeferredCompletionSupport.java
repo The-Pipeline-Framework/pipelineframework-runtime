@@ -80,10 +80,16 @@ public class CommandDeferredCompletionSupport {
                         return suspended(record, context);
                     }
                     return invoke(execution, command, callback)
-                        .onItem().transform(ignored -> new DispatchResult(CommandDispatchSettlement.SUCCEEDED, Optional.empty()))
+                        .onItem().transform(acknowledgement -> descriptor.acknowledgementAwareCommandCompletion()
+                            && acknowledgement == null
+                            ? new DispatchResult(CommandDispatchSettlement.AMBIGUOUS, Optional.empty(), Optional.empty())
+                            : new DispatchResult(CommandDispatchSettlement.SUCCEEDED, Optional.empty(),
+                                descriptor.acknowledgementAwareCommandCompletion()
+                                    ? Optional.ofNullable(acknowledgement) : Optional.empty()))
                         .onFailure(failure -> !(failure instanceof org.pipelineframework.command.CommandInProgressException))
-                        .recoverWithItem(failure -> new DispatchResult(classify(failure), Optional.of(failure)))
-                        .chain(result -> coordinator.settleCommandDispatch(claim.orElseThrow(), result.settlement())
+                        .recoverWithItem(failure -> new DispatchResult(classify(failure), Optional.of(failure), Optional.empty()))
+                        .chain(result -> coordinator.settleCommandDispatch(claim.orElseThrow(), result.settlement(),
+                                result.acknowledgement())
                             .chain(settled -> {
                                 if (settled.record().status() == AwaitInteractionStatus.WAITING) {
                                     return Uni.createFrom().<O>failure(result.failure().orElseThrow());
@@ -145,5 +151,6 @@ public class CommandDeferredCompletionSupport {
             record.unitId(), context.currentStepIndex()));
     }
 
-    private record DispatchResult(CommandDispatchSettlement settlement, Optional<Throwable> failure) { }
+    private record DispatchResult(CommandDispatchSettlement settlement, Optional<Throwable> failure,
+        Optional<Object> acknowledgement) { }
 }

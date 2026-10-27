@@ -7,6 +7,7 @@ import static org.mockito.Mockito.when;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.*;
@@ -15,6 +16,7 @@ import org.pipelineframework.awaitable.spi.AwaitUnitStore;
 import org.pipelineframework.awaitable.store.DynamoAwaitLifecycleTestStores;
 import org.pipelineframework.awaitable.store.InMemoryAwaitInteractionStore;
 import org.pipelineframework.awaitable.store.InMemoryAwaitUnitStore;
+import org.pipelineframework.connector.*;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.*;
 import org.pipelineframework.orchestrator.release.*;
@@ -70,11 +72,17 @@ class DynamoTypedAwaitImportIT {
             List.of(new PipelineBundleStepDescriptor(2, "await", "internal", "ONE_TO_ONE",
                 "Request", "Decision", null, null, Map.of("transportType", "kafka")),
                 new PipelineBundleStepDescriptor(3, "projected-await", "internal", "ONE_TO_ONE",
-                    "Request", "ProjectedDecision", null, null, Map.of("transportType", "kafka"))),
+                    "Request", "ProjectedDecision", null, null, Map.of("transportType", "kafka")),
+                new PipelineBundleStepDescriptor(4, "acknowledged-command", "command", "ONE_TO_ONE",
+                    "Request", "AcknowledgedDecision", null, null, Map.of("transportType", "connector-callback"))),
             PipelineBundleCapabilities.defaults(),
             Map.of("Request", binding(Request.class, "request-fingerprint"),
                 "Decision", binding(Decision.class, "decision-fingerprint"),
-                "ProjectedDecision", binding(ProjectedDecision.class, "projected-fingerprint")), "catalog-fingerprint");
+                "ProjectedDecision", binding(ProjectedDecision.class, "projected-fingerprint"),
+                "Acknowledgement", binding(Acknowledgement.class, "acknowledgement-fingerprint"),
+                "Callback", binding(Callback.class, "callback-fingerprint"),
+                "AcknowledgedDecision", binding(AcknowledgedDecision.class, "acknowledged-decision-fingerprint")),
+            "catalog-fingerprint");
         releases = new InMemoryPipelineReleaseRegistry();
         var descriptor = new PipelineReleaseDescriptor(1, "org.example.await", "contract", "release-1", "application",
             List.of(new PipelineReleaseArtifactDescriptor("application", "application-archive", "file:/fixture",
@@ -131,14 +139,205 @@ class DynamoTypedAwaitImportIT {
         assertEquals(1, projections.get(), "durable canonical replay must not project twice");
     }
 
+    @Test
+    void acknowledgedCommandStagesAndRemovesInvalidEarlyCallbackThenRestoresTypedCompletion() throws Exception {
+        var descriptor = commandDescriptor("test.AcknowledgedProjector", Acknowledgement.class.getName(), true);
+        descriptors.register(descriptor);
+        var first = completionCoordinator();
+        var imported = commandInteraction(descriptor);
+        store().importRecord(imported).await().indefinitely();
+        var token = new AwaitResumeTokenService("test-only-resume-token-secret")
+            .sign(imported, imported.createdAtEpochMs());
+
+        var observed = first.complete(callbackCommand(imported, token, "different-run"))
+            .await().indefinitely().record();
+        assertEquals(AwaitInteractionStatus.COMPLETION_OBSERVED, observed.status());
+        assertEquals(Optional.of(new Callback("different-run")), observed.stagedCompletionPayload());
+        assertTrue(row(imported.interactionId()).containsKey("staged_completion_json"));
+        var stale = store().markDispatched("tenant", imported.interactionId(), imported.version(),
+            Map.of(), System.currentTimeMillis()).await().indefinitely();
+        assertTrue(stale.isEmpty(), "Dynamo conditional version must reject stale dispatch");
+
+        var rejected = first.settleCommandDispatch(observed, CommandDispatchSettlement.SUCCEEDED,
+            Optional.of(new Acknowledgement("trusted-run"))).await().indefinitely().record();
+        assertEquals(AwaitInteractionStatus.DISPATCHED, rejected.status());
+        assertEquals(Optional.of(new Acknowledgement("trusted-run")), rejected.commandAcknowledgement());
+        assertTrue(rejected.stagedCompletionPayload().isEmpty());
+        assertFalse(row(imported.interactionId()).containsKey("staged_completion_json"),
+            "the rejected early callback must be removed by a real Dynamo update");
+        assertTrue(row(imported.interactionId()).containsKey("command_acknowledgement_json"));
+
+        var completed = first.complete(callbackCommand(imported, token, "trusted-run"))
+            .await().indefinitely().record();
+        assertEquals(AwaitInteractionStatus.COMPLETED, completed.status());
+        assertEquals(new AcknowledgedDecision("r-1", "trusted-run"), completed.responsePayload());
+        var admission = store().getCompletionAdmission("tenant", imported.interactionId())
+            .await().indefinitely().orElseThrow();
+        assertEquals(completed.updatedAtEpochMs(), admission.firstAdmittedAtEpochMs());
+        assertTrue(store().findOpenCompletions("tenant", 100, Optional.empty()).await().indefinitely()
+            .admissions().contains(admission));
+        store().retireCompletionAdmission(admission).await().indefinitely();
+        assertFalse(store().findOpenCompletions("tenant", 100, Optional.empty()).await().indefinitely()
+            .admissions().contains(admission));
+        assertEquals(Optional.of(admission), store().getCompletionAdmission("tenant", imported.interactionId())
+            .await().indefinitely());
+        assertTrue(first.complete(callbackCommand(imported, token, "trusted-run"))
+            .await().indefinitely().duplicate());
+        var stored = row(imported.interactionId());
+        for (var field : List.of("request_payload_json", "command_acknowledgement_json",
+            "staged_completion_json", "response_payload_json")) {
+            assertTrue(stored.get(field).s().contains("catalog-fingerprint"), field);
+        }
+
+        var stable = new AwaitCompletionDescriptorRegistry();
+        stable.register(commandDescriptor("test.AcknowledgedProjector", Acknowledgement.class.getName(), true));
+        var restarted = completionCoordinator(stable);
+        var fresh = store(stable).get("tenant", imported.interactionId()).await().indefinitely().orElseThrow();
+        assertInstanceOf(Request.class, fresh.requestPayload());
+        assertInstanceOf(Acknowledgement.class, fresh.commandAcknowledgement().orElseThrow());
+        assertInstanceOf(Callback.class, fresh.stagedCompletionPayload().orElseThrow());
+        assertEquals(new AcknowledgedDecision("r-1", "trusted-run"), restarted.resumePayload(fresh));
+        var previousLoader = Thread.currentThread().getContextClassLoader();
+        var releaseLoader = new RecordingReleaseLoader(previousLoader);
+        Thread.currentThread().setContextClassLoader(releaseLoader);
+        try {
+            var newResolver = resolver(stable);
+            assertInstanceOf(Request.class, newResolver.decode(imported, AwaitDurablePayloadResolver.Slot.REQUEST,
+                stored.get("request_payload_json").s()));
+            assertInstanceOf(Acknowledgement.class, newResolver.decode(imported,
+                AwaitDurablePayloadResolver.Slot.COMMAND_ACKNOWLEDGEMENT,
+                stored.get("command_acknowledgement_json").s()));
+            assertInstanceOf(Callback.class, newResolver.decode(imported,
+                AwaitDurablePayloadResolver.Slot.STAGED_COMPLETION,
+                stored.get("staged_completion_json").s()));
+            assertInstanceOf(AcknowledgedDecision.class, newResolver.decode(imported,
+                AwaitDurablePayloadResolver.Slot.RESPONSE,
+                stored.get("response_payload_json").s()));
+            for (var type : List.of(Request.class, Acknowledgement.class, Callback.class,
+                AcknowledgedDecision.class)) {
+                assertTrue(releaseLoader.loaded.contains(type.getName()), type.getName());
+            }
+        } finally {
+            Thread.currentThread().setContextClassLoader(previousLoader);
+        }
+        for (var incompatible : List.of(
+            commandDescriptor("test.OtherProjector", Acknowledgement.class.getName(), true),
+            commandDescriptor("test.AcknowledgedProjector", Decision.class.getName(), true),
+            commandDescriptor("test.AcknowledgedProjector", Acknowledgement.class.getName(), false))) {
+            var changed = new AwaitCompletionDescriptorRegistry();
+            changed.register(incompatible);
+            assertThrows(IllegalStateException.class, () -> completionCoordinator(changed).callbackDescriptor(fresh));
+        }
+    }
+
+    @Test
+    void expiredAcknowledgedCommandCannotBeMutatedByDynamoStore() {
+        var descriptor = commandDescriptor("test.AcknowledgedProjector", Acknowledgement.class.getName(), true);
+        descriptors.register(descriptor);
+        var imported = commandInteraction(descriptor);
+        store().importRecord(imported).await().indefinitely();
+        dynamo.updateItem(UpdateItemRequest.builder().tableName(PREFIX + "_interaction")
+            .key(Map.of("tenant_id", AttributeValue.builder().s("tenant").build(),
+                "interaction_id", AttributeValue.builder().s(imported.interactionId()).build()))
+            .updateExpression("SET ttl_epoch_s = :expired")
+            .expressionAttributeValues(Map.of(":expired", AttributeValue.builder()
+                .n(Long.toString(System.currentTimeMillis() / 1000 - 1)).build()))
+            .build());
+        var before = row(imported.interactionId());
+        var next = new AwaitInteractionRecord(imported.tenantId(), imported.executionId(), imported.stepId(),
+            imported.stepIndex(), imported.outputType(), imported.interactionId(), imported.correlationId(),
+            imported.causationId(), imported.idempotencyKey(), imported.version() + 1,
+            AwaitInteractionStatus.COMPLETION_OBSERVED, imported.requestPayload(), imported.responsePayload(),
+            imported.unitId(), imported.itemIndex(), imported.actor(), imported.assignee(), imported.group(),
+            imported.transportType(), imported.transportMetadata(), imported.deadlineEpochMs(),
+            imported.createdAtEpochMs(), System.currentTimeMillis(), imported.ttlEpochS(),
+            imported.transportOutputType(), Optional.empty(), Optional.of(new Callback("trusted-run")));
+        assertTrue(store().compareAndSetCommandCompletion(imported, next).await().indefinitely().isEmpty());
+        assertEquals(before, row(imported.interactionId()));
+    }
+
     private AwaitCoordinator completionCoordinator() {
+        return completionCoordinator(descriptors);
+    }
+
+    private AwaitCoordinator completionCoordinator(AwaitCompletionDescriptorRegistry registry) {
         var coordinator = new AwaitCoordinator();
-        coordinator.interactionStores = instances(store());
+        coordinator.interactionStores = instances(store(registry));
         coordinator.unitStores = instances(new InMemoryAwaitUnitStore());
-        coordinator.descriptorFactory = descriptors;
-        coordinator.durablePayloadResolver = resolver();
+        coordinator.descriptorFactory = registry;
+        coordinator.durablePayloadResolver = resolver(registry);
         coordinator.resumeTokenService = new AwaitResumeTokenService("test-only-resume-token-secret");
         return coordinator;
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value = CommandDispatchSettlement.class,
+        names = {"TERMINAL", "USER_ACTION_REQUIRED"})
+    void ordinaryAcknowledgedCommandFailurePreservesLegacyReason(CommandDispatchSettlement settlement) {
+        var descriptor = commandDescriptor("test.AcknowledgedProjector", Acknowledgement.class.getName(), true);
+        descriptors.register(descriptor);
+        var imported = commandInteraction(descriptor);
+        store().importRecord(imported).await().indefinitely();
+        var failed = completionCoordinator().settleCommandDispatch(imported, settlement, Optional.empty())
+            .await().indefinitely().record();
+        var expected = imported.settleCommandDispatch(settlement, failed.updatedAtEpochMs());
+        assertEquals(expected.status(), failed.status());
+        assertEquals(expected.transportMetadata().get("completionFailure"),
+            failed.transportMetadata().get("completionFailure"));
+        assertTrue(store().getCompletionAdmission("tenant", imported.interactionId()).await().indefinitely().isEmpty());
+    }
+
+    private AwaitCompletionDescriptor commandDescriptor(String projectorId, String acknowledgementType,
+        boolean acknowledgementAware) {
+        var operation = new ConnectorOperationIdentity(ConnectorProviderId.of("test.jobs"), "start",
+            ConnectorOperationKind.COMMAND, 1);
+        var callback = new ConnectorCallbackSelection(ConnectorBindingName.of("jobs"), operation, 1,
+            new ConnectorOperationCallbackDescriptor("completed",
+                new ConnectorOperationTypeContract(Callback.class.getName(), Optional.empty()), true),
+            "test.EndpointResolver", "test.Authenticator");
+        if (!acknowledgementAware) {
+            return new AwaitCompletionDescriptor("acknowledged-command", Request.class.getName(),
+                AcknowledgedDecision.class.getName(), "ONE_TO_ONE", Duration.ofMinutes(10),
+                "signedResumeToken", "", Map.of(), List.of(), Request.class.getName(), Callback.class.getName(),
+                java.util.function.Function.identity(), java.util.function.Function.identity(), projectorId,
+                (request, completion, metadata) -> new AcknowledgedDecision(((Request) request).id(),
+                    ((Callback) completion).runId()), true, Optional.of(callback));
+        }
+        return new AwaitCompletionDescriptor("acknowledged-command", Request.class.getName(),
+            AcknowledgedDecision.class.getName(), "ONE_TO_ONE", Duration.ofMinutes(10),
+            "signedResumeToken", "", Map.of(), List.of(), Request.class.getName(), Callback.class.getName(),
+            java.util.function.Function.identity(), java.util.function.Function.identity(), projectorId,
+            null, true, Optional.of(callback), acknowledgementType,
+            (request, acknowledgement, completion, metadata) -> {
+                var accepted = (Acknowledgement) acknowledgement;
+                var observed = (Callback) completion;
+                if (!accepted.runId().equals(observed.runId())) {
+                    throw new CommandCompletionRejectedException("callback run does not match Command acknowledgement");
+                }
+                return new AcknowledgedDecision(((Request) request).id(), accepted.runId());
+            });
+    }
+
+    private AwaitInteractionRecord commandInteraction(AwaitCompletionDescriptor descriptor) {
+        var id = UUID.randomUUID().toString();
+        long now = System.currentTimeMillis();
+        var metadata = new java.util.HashMap<String, Object>();
+        metadata.put("completionMode", "CONNECTOR_CALLBACK");
+        metadata.put("callbackSelection", descriptor.callback().orElseThrow().contractMetadata());
+        metadata.put("commandCompletionMode", "ACKNOWLEDGEMENT_REQUIRED");
+        metadata.put("commandAcknowledgementType", descriptor.commandAcknowledgementType().orElseThrow());
+        metadata.put("tpf.await.completion.projector", descriptor.completionProjectorId());
+        return new AwaitInteractionRecord("tenant", executionId, descriptor.stepId(), 4,
+            descriptor.outputType(), id, "correlation-" + id, "cause-" + id, "idem-" + id,
+            0L, AwaitInteractionStatus.DISPATCHING, new Request("r-1"), null, "unit-" + id,
+            null, null, null, null, descriptor.transportType(), metadata,
+            now + 600_000, now, now, now / 1000 + 3600,
+            descriptor.transportOutputType(), Optional.empty(), Optional.empty());
+    }
+
+    private AwaitCompletionCommand callbackCommand(AwaitInteractionRecord interaction, String token, String runId) {
+        return new AwaitCompletionCommand("tenant", interaction.interactionId(), interaction.correlationId(), token,
+            "completion-" + runId, new Callback(runId), "provider", System.currentTimeMillis());
     }
 
     private record DecisionProjector(java.util.concurrent.atomic.AtomicInteger projections)
@@ -286,14 +485,22 @@ class DynamoTypedAwaitImportIT {
     }
 
     private AwaitInteractionStore store() {
-        return DynamoAwaitLifecycleTestStores.interactionStore(dynamo, PREFIX, resolver());
+        return store(descriptors);
+    }
+
+    private AwaitInteractionStore store(AwaitCompletionDescriptorRegistry registry) {
+        return DynamoAwaitLifecycleTestStores.interactionStore(dynamo, PREFIX, resolver(registry));
     }
 
     private AwaitDurablePayloadResolver resolver() {
+        return resolver(descriptors);
+    }
+
+    private AwaitDurablePayloadResolver resolver(AwaitCompletionDescriptorRegistry registry) {
         var resolver = new AwaitDurablePayloadResolver();
         resolver.executionStateStore = executions;
         resolver.releaseRegistry = releases;
-        resolver.descriptors = descriptors;
+        resolver.descriptors = registry;
         resolver.codec = new JsonDurablePayloadCodec();
         return resolver;
     }
@@ -365,4 +572,16 @@ class DynamoTypedAwaitImportIT {
     public record Decision(String status) {}
     public record CanonicalChoice(String status) {}
     public record ProjectedDecision(String requestId, String decision) {}
+    public record Acknowledgement(String runId) {}
+    public record Callback(String runId) {}
+    public record AcknowledgedDecision(String requestId, String runId) {}
+
+    private static final class RecordingReleaseLoader extends ClassLoader {
+        private final java.util.Set<String> loaded = new java.util.HashSet<>();
+        private RecordingReleaseLoader(ClassLoader parent) { super(parent); }
+        @Override protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            loaded.add(name);
+            return super.loadClass(name, resolve);
+        }
+    }
 }

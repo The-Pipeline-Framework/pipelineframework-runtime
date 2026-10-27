@@ -3,6 +3,7 @@ package org.pipelineframework.awaitable;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.Function;
 
 /**
@@ -42,8 +43,43 @@ public record AwaitCompletionDescriptor(
     String completionProjectorId,
     AwaitCompletionProjector<Object, Object, Object> completionProjector,
     boolean requestAwareCompletion,
-    java.util.Optional<ConnectorCallbackSelection> callback
+    java.util.Optional<ConnectorCallbackSelection> callback,
+    Optional<String> commandAcknowledgementType,
+    Optional<CommandCompletionProjector<Object, Object, Object, Object>> commandCompletionProjector
 ) {
+    public static final String CONNECTOR_CALLBACK_TRANSPORT = "connector-callback";
+
+    public AwaitCompletionDescriptor(String stepId, String inputType, String outputType, String cardinality,
+        Duration timeout, String correlationStrategy, String transportType, Map<String, Object> transportConfig,
+        List<String> idempotencyKeyFields, String transportInputType, String transportOutputType,
+        Function<Object, Object> inputToTransport, Function<Object, Object> outputFromTransport,
+        String completionProjectorId, AwaitCompletionProjector<Object, Object, Object> completionProjector,
+        boolean requestAwareCompletion, java.util.Optional<ConnectorCallbackSelection> callback) {
+        this(stepId, inputType, outputType, cardinality, timeout, correlationStrategy, transportType,
+            transportConfig, idempotencyKeyFields, transportInputType, transportOutputType,
+            inputToTransport, outputFromTransport, completionProjectorId, completionProjector,
+            requestAwareCompletion, callback, Optional.empty(), Optional.empty());
+    }
+
+    public AwaitCompletionDescriptor(String stepId, String inputType, String outputType, String cardinality,
+        Duration timeout, String correlationStrategy, String transportType, Map<String, Object> transportConfig,
+        List<String> idempotencyKeyFields, String transportInputType, String transportOutputType,
+        Function<Object, Object> inputToTransport, Function<Object, Object> outputFromTransport,
+        String completionProjectorId, AwaitCompletionProjector<Object, Object, Object> completionProjector,
+        boolean requestAwareCompletion, Optional<ConnectorCallbackSelection> callback,
+        String commandAcknowledgementType,
+        CommandCompletionProjector<Object, Object, Object, Object> commandCompletionProjector) {
+        this(stepId, inputType, outputType, cardinality, timeout, correlationStrategy, transportType,
+            transportConfig, idempotencyKeyFields, transportInputType, transportOutputType,
+            inputToTransport, outputFromTransport, completionProjectorId, completionProjector,
+            requestAwareCompletion, callback, Optional.ofNullable(commandAcknowledgementType),
+            Optional.ofNullable(commandCompletionProjector));
+    }
+
+    public boolean acknowledgementAwareCommandCompletion() {
+        return commandCompletionProjector.isPresent();
+    }
+
     public AwaitCompletionDescriptor(String stepId, String inputType, String outputType, String cardinality,
         Duration timeout, String correlationStrategy, String transportType, Map<String, Object> transportConfig,
         List<String> idempotencyKeyFields, String transportInputType, String transportOutputType,
@@ -146,6 +182,10 @@ public record AwaitCompletionDescriptor(
 
     public AwaitCompletionDescriptor {
         callback = java.util.Objects.requireNonNull(callback, "callback");
+        commandAcknowledgementType = java.util.Objects.requireNonNull(commandAcknowledgementType,
+            "commandAcknowledgementType");
+        commandCompletionProjector = java.util.Objects.requireNonNull(commandCompletionProjector,
+            "commandCompletionProjector");
         if (stepId == null || stepId.isBlank()) {
             throw new IllegalArgumentException("stepId must not be blank");
         }
@@ -180,10 +220,14 @@ public record AwaitCompletionDescriptor(
             transportConfig = Map.copyOf(transportConfig);
         }
         idempotencyKeyFields = idempotencyKeyFields == null ? List.of() : List.copyOf(idempotencyKeyFields);
-        if (callback.isPresent() && (!"".equals(transportType) || !transportConfig.isEmpty()
+        if (callback.isPresent() && (!(transportType == null || transportType.isBlank()
+            || CONNECTOR_CALLBACK_TRANSPORT.equals(transportType)) || !transportConfig.isEmpty()
             || !idempotencyKeyFields.isEmpty() || !"signedResumeToken".equals(correlationStrategy)
             || !"ONE_TO_ONE".equals(cardinality) || !requestAwareCompletion)) {
             throw new IllegalArgumentException("callback completion requires unary signed-token projection without Await transport or idempotency fields");
+        }
+        if (callback.isPresent()) {
+            transportType = CONNECTOR_CALLBACK_TRANSPORT;
         }
         transportInputType = transportInputType == null || transportInputType.isBlank() ? inputType : transportInputType;
         transportOutputType = transportOutputType == null || transportOutputType.isBlank() ? outputType : transportOutputType;
@@ -194,7 +238,7 @@ public record AwaitCompletionDescriptor(
         completionProjectorId = completionProjectorId == null || completionProjectorId.isBlank()
             ? null
             : completionProjectorId.trim();
-        if (requestAwareCompletion && completionProjector == null) {
+        if (requestAwareCompletion && completionProjector == null && commandCompletionProjector.isEmpty()) {
             throw new IllegalArgumentException("request-aware completion requires a completion projector");
         }
         if (requestAwareCompletion && completionProjectorId == null) {
@@ -202,6 +246,14 @@ public record AwaitCompletionDescriptor(
         }
         if (!requestAwareCompletion) {
             completionProjectorId = null;
+        }
+        if (commandCompletionProjector.isPresent() && (callback.isEmpty()
+            || completionProjector != null || commandAcknowledgementType.isEmpty()
+            || commandAcknowledgementType.orElseThrow().isBlank())) {
+            throw new IllegalArgumentException("acknowledgement-aware completion requires a callback, Command output type and distinct projector");
+        }
+        if (commandCompletionProjector.isEmpty() && commandAcknowledgementType.isPresent()) {
+            throw new IllegalArgumentException("Command acknowledgement type requires its projector");
         }
         completionProjector = completionProjector == null
             ? defaultCompletionProjector(normalizedOutputFromTransport)

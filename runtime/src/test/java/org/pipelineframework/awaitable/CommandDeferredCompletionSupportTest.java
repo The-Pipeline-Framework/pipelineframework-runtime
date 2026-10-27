@@ -15,6 +15,7 @@ import java.util.function.Function;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.api.Test;
 import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
 import org.pipelineframework.awaitable.spi.AwaitUnitStore;
 import org.pipelineframework.awaitable.store.InMemoryAwaitInteractionStore;
@@ -129,6 +130,161 @@ public class CommandDeferredCompletionSupportTest {
             ignored -> { throw new AssertionError("completed interaction must not resolve a fresh URI"); },
             ignored -> { throw new AssertionError("completed interaction must not invoke Command again"); })
             .await().atMost(Duration.ofSeconds(5)));
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"false,false,false", "true,false,false", "true,true,false", "true,false,true"})
+    void acknowledgedCompletionJoinsBothOrdersAndRejectsMismatchedCallback(boolean callbackFirst,
+        boolean projectionUnavailableOnce, boolean acknowledgeAfterDeadline) throws Exception {
+        when(config.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        var bindings = ConnectorBindingRegistry.fromProviders(List.of(new ConnectorBindingDefinition(
+            ConnectorBindingName.of("jobs"), ConnectorProviderId.of("test.jobs"), 1, ConnectorConfigurationDocument.empty())),
+            List.of(new JobProvider()));
+        bindings.start(ConnectorRuntimeContext.empty()).toCompletableFuture().get(5, TimeUnit.SECONDS);
+        var provider = (JobProvider) bindings.providerInstances().getFirst();
+        var commands = new CommandStepSupport(new ConnectorRegistry(List.of()), bindings, List.of(effects), config);
+        var identity = new ConnectorOperationIdentity(ConnectorProviderId.of("test.jobs"), "start", ConnectorOperationKind.COMMAND, 1);
+        var command = CommandDescriptor.nativeCommand("StartJob", new NativeCommandSelector(
+            Optional.of(ConnectorBindingName.of("jobs")), identity, 1, CommandPolicy.none()), String.class.getName(),
+            String.class.getName(), "test-id", CommandDuplicatePolicy.RETURN_RECORDED, Map.of());
+        var selection = new ConnectorCallbackSelection(ConnectorBindingName.of("jobs"), identity, 1,
+            provider.operation.callbacks().getFirst(), "test.EndpointResolver", "test.Authenticator");
+        var failProjection = new java.util.concurrent.atomic.AtomicBoolean(projectionUnavailableOnce);
+        var descriptor = new AwaitCompletionDescriptor("StartJob", String.class.getName(), String.class.getName(), "ONE_TO_ONE",
+            Duration.ofMinutes(1),
+            "signedResumeToken", "", Map.of(), List.of(), String.class.getName(), String.class.getName(),
+            Function.identity(), Function.identity(), "test.AckProjector", null,
+            true, Optional.of(selection), String.class.getName(),
+            (input, acknowledgement, completion, metadata) -> {
+                if (failProjection.getAndSet(false)) {
+                    throw new IllegalStateException("projector temporarily unavailable");
+                }
+                if (!completion.equals(acknowledgement)) {
+                    throw new CommandCompletionRejectedException("callback does not match acknowledgement");
+                }
+                return input + ":" + acknowledgement;
+            });
+        AwaitCoordinator coordinator = coordinator();
+        CommandDeferredCompletionSupport support = support(coordinator);
+        AtomicReference<AwaitInteractionRecord> registered = new AtomicReference<>();
+        PipelineExecutionContextHolder.set(new PipelineExecutionContext("tenant", "execution", 0));
+        CompletableFuture<String> result = support.<String, String>execute(descriptor, "input", record -> {
+            registered.set(interactions.get(record.tenantId(), record.interactionId()).await().indefinitely().orElseThrow());
+            return URI.create("https://app.test/");
+        }, callback -> commands.<String, String>execute(command, (ignored, input) -> "effect", "input", callback))
+            .subscribeAsCompletionStage().toCompletableFuture();
+        assertTrue(provider.operation.entered.await(5, TimeUnit.SECONDS));
+        var record = registered.get();
+        assertEquals(AwaitCompletionDescriptor.CONNECTOR_CALLBACK_TRANSPORT, record.transportType());
+        String token = provider.operation.callback.orElseThrow().callbackUri().getPath()
+            .substring(("/" + CommandDeferredCompletionSupport.CALLBACK_PATH).length());
+        if (callbackFirst) {
+            var staged = coordinator.complete(new AwaitCompletionCommand("tenant", record.interactionId(),
+                record.correlationId(), token, "early", "accepted", "provider", System.currentTimeMillis()))
+                .await().indefinitely();
+            assertEquals(AwaitInteractionStatus.COMPLETION_OBSERVED, staged.record().status());
+            assertTrue(staged.record().commandAcknowledgement().isEmpty());
+            assertEquals(Optional.of("accepted"), staged.record().stagedCompletionPayload());
+            assertFalse(result.isDone());
+        }
+        if (acknowledgeAfterDeadline) {
+            expireStoredDeadlineAfterStaging(record.interactionId());
+        }
+        provider.operation.response.complete(new CommandOutcome.Succeeded<>("accepted", CommandConfirmation.none(), List.of()));
+        if (acknowledgeAfterDeadline) {
+            var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> result.get(5, TimeUnit.SECONDS));
+            assertInstanceOf(AwaitInteractionTerminalException.class, failure.getCause());
+            var timedOut = interactions.get("tenant", record.interactionId()).await().indefinitely().orElseThrow();
+            assertEquals(AwaitInteractionStatus.TIMED_OUT, timedOut.status());
+            assertEquals(Optional.of("accepted"), timedOut.commandAcknowledgement());
+            assertEquals(Optional.of("accepted"), timedOut.stagedCompletionPayload());
+            assertEquals(1, provider.operation.dispatches.get());
+            return;
+        }
+        if (callbackFirst && projectionUnavailableOnce) {
+            var suspended = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> result.get(5, TimeUnit.SECONDS));
+            assertInstanceOf(AwaitSuspendedException.class, suspended.getCause());
+            var pending = interactions.get("tenant", record.interactionId()).await().indefinitely().orElseThrow();
+            assertEquals(AwaitInteractionStatus.COMPLETION_OBSERVED, pending.status());
+            assertEquals(Optional.of("accepted"), pending.commandAcknowledgement());
+            assertEquals(Optional.of("accepted"), pending.stagedCompletionPayload());
+            assertEquals(Boolean.TRUE, pending.transportMetadata().get("completionProjectionPending"));
+            assertEquals("input:accepted", support(coordinator()).<String, String>execute(descriptor, "input",
+                ignored -> URI.create("https://app.test/"),
+                callback -> commands.<String, String>execute(command, (ignored, input) -> "effect", "input", callback))
+                .await().atMost(Duration.ofSeconds(5)));
+        } else if (callbackFirst) {
+            assertEquals("input:accepted", result.get(5, TimeUnit.SECONDS));
+        } else {
+            var suspended = assertThrows(java.util.concurrent.ExecutionException.class, () -> result.get(5, TimeUnit.SECONDS));
+            assertInstanceOf(AwaitSuspendedException.class, suspended.getCause());
+            var dispatched = interactions.get("tenant", record.interactionId()).await().indefinitely().orElseThrow();
+            assertEquals(Optional.of("accepted"), dispatched.commandAcknowledgement());
+            assertEquals(AwaitInteractionStatus.DISPATCHED, dispatched.status());
+            assertThrows(CommandCompletionRejectedException.class, () -> coordinator.complete(new AwaitCompletionCommand(
+                "tenant", record.interactionId(), record.correlationId(), token, "bad", "wrong", "provider",
+                System.currentTimeMillis())).await().indefinitely());
+            assertEquals(AwaitInteractionStatus.DISPATCHED, interactions.get("tenant", record.interactionId())
+                .await().indefinitely().orElseThrow().status());
+            var legacyRecovery = coordinator();
+            legacyRecovery.descriptorFactory.register(new AwaitCompletionDescriptor("StartJob",
+                String.class.getName(), String.class.getName(), "ONE_TO_ONE", Duration.ofMinutes(1),
+                "signedResumeToken", "", Map.of(), List.of(), String.class.getName(), String.class.getName(),
+                Function.identity(), Function.identity(), "test.AckProjector",
+                (input, completion, metadata) -> input + ":" + completion, true, Optional.of(selection)));
+            var incompatibleRelease = assertThrows(IllegalStateException.class,
+                () -> legacyRecovery.complete(new AwaitCompletionCommand("tenant", record.interactionId(),
+                    record.correlationId(), token, "good", "accepted", "provider", System.currentTimeMillis()))
+                    .await().indefinitely());
+            assertTrue(incompatibleRelease.getMessage().contains("Command completion mode"));
+            var completed = coordinator.complete(new AwaitCompletionCommand("tenant", record.interactionId(),
+                record.correlationId(), token, "good", "accepted", "provider", System.currentTimeMillis()))
+                .await().indefinitely();
+            assertEquals("input:accepted", coordinator.resumePayload(completed.record()));
+            assertTrue(coordinator.complete(new AwaitCompletionCommand("tenant", record.interactionId(),
+                record.correlationId(), token, "good", "accepted", "provider", System.currentTimeMillis()))
+                .await().indefinitely().duplicate());
+        }
+        assertEquals(1, provider.operation.dispatches.get());
+        assertEquals(Optional.of("accepted"), interactions.get("tenant", record.interactionId())
+            .await().indefinitely().orElseThrow().commandAcknowledgement());
+        var completedRecord = interactions.get("tenant", record.interactionId()).await().indefinitely().orElseThrow();
+        var admission = interactions.getCompletionAdmission("tenant", record.interactionId())
+            .await().indefinitely().orElseThrow();
+        assertEquals(completedRecord.updatedAtEpochMs(), admission.firstAdmittedAtEpochMs());
+        assertTrue(interactions.findOpenCompletions("tenant", 100, Optional.empty()).await().indefinitely()
+            .admissions().contains(admission));
+        interactions.retireCompletionAdmission(admission).await().indefinitely();
+        assertFalse(interactions.findOpenCompletions("tenant", 100, Optional.empty()).await().indefinitely()
+            .admissions().contains(admission));
+        assertEquals(Optional.of(admission), interactions.getCompletionAdmission("tenant", record.interactionId())
+            .await().indefinitely());
+    }
+
+    private void expireStoredDeadlineAfterStaging(String interactionId) throws ReflectiveOperationException {
+        var lockField = InMemoryAwaitInteractionStore.class.getDeclaredField("lock");
+        var recordsField = InMemoryAwaitInteractionStore.class.getDeclaredField("interactionsByScopedId");
+        lockField.setAccessible(true);
+        recordsField.setAccessible(true);
+        synchronized (lockField.get(interactions)) {
+            @SuppressWarnings("unchecked")
+            var records = (Map<String, AwaitInteractionRecord>) recordsField.get(interactions);
+            var entry = records.entrySet().stream()
+                .filter(candidate -> candidate.getValue().interactionId().equals(interactionId))
+                .findFirst().orElseThrow();
+            var current = entry.getValue();
+            assertEquals(AwaitInteractionStatus.COMPLETION_OBSERVED, current.status());
+            entry.setValue(new AwaitInteractionRecord(current.tenantId(), current.executionId(), current.stepId(),
+                current.stepIndex(), current.outputType(), current.interactionId(), current.correlationId(),
+                current.causationId(), current.idempotencyKey(), current.version(), current.status(),
+                current.requestPayload(), current.responsePayload(), current.unitId(), current.itemIndex(),
+                current.actor(), current.assignee(), current.group(), current.transportType(),
+                current.transportMetadata(), System.currentTimeMillis() - 1L, current.createdAtEpochMs(),
+                current.updatedAtEpochMs(), current.ttlEpochS(), current.transportOutputType(),
+                current.commandAcknowledgement(), current.stagedCompletionPayload()));
+        }
     }
 
     private AwaitCoordinator coordinator() {

@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
 
@@ -57,6 +58,25 @@ class AwaitCompletionDescriptorTest {
             (request, completion, metadata) -> completion, true));
 
         assertEquals("request-aware completion requires a stable completion projector id", failure.getMessage());
+    }
+
+    @Test
+    void acknowledgementConstructorReportsDomainErrorsForMissingParts() {
+        var callback = Optional.of(org.mockito.Mockito.mock(ConnectorCallbackSelection.class));
+        var missingType = assertThrows(IllegalArgumentException.class, () -> new AwaitCompletionDescriptor(
+            "start", String.class.getName(), String.class.getName(), "ONE_TO_ONE", Duration.ofMinutes(1),
+            "signedResumeToken", "", Map.of(), List.of(), String.class.getName(), String.class.getName(),
+            java.util.function.Function.identity(), java.util.function.Function.identity(), "test.Projector",
+            null, true, callback, null, (request, acknowledgement, completion, metadata) -> completion));
+        assertEquals("acknowledgement-aware completion requires a callback, Command output type and distinct projector",
+            missingType.getMessage());
+
+        var missingProjector = assertThrows(IllegalArgumentException.class, () -> new AwaitCompletionDescriptor(
+            "start", String.class.getName(), String.class.getName(), "ONE_TO_ONE", Duration.ofMinutes(1),
+            "signedResumeToken", "", Map.of(), List.of(), String.class.getName(), String.class.getName(),
+            java.util.function.Function.identity(), java.util.function.Function.identity(), "test.Projector",
+            null, true, callback, String.class.getName(), null));
+        assertEquals("request-aware completion requires a completion projector", missingProjector.getMessage());
     }
 
     @Test
