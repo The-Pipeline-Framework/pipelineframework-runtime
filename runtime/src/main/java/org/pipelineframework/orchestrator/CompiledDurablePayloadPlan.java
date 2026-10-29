@@ -1,5 +1,6 @@
 package org.pipelineframework.orchestrator;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
 import com.fasterxml.jackson.databind.ObjectWriter;
 import java.lang.invoke.MethodHandle;
@@ -8,7 +9,6 @@ import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
-import org.pipelineframework.config.pipeline.PipelineJson;
 
 /** Immutable release-bound encoder/decoder plan; construction is not a steady-state payload operation. */
 public record CompiledDurablePayloadPlan(
@@ -22,11 +22,13 @@ public record CompiledDurablePayloadPlan(
     }
 
     public static CompiledDurablePayloadPlan compile(CanonicalPayloadBinding binding) {
-        Map<String, UnionCasePlan> unionCases = unionCases(binding.runtimeClass());
+        ObjectMapper mapper = CanonicalUnionJson.mapper();
+        Map<String, UnionCasePlan> unionCases = unionCases(binding.runtimeClass(), mapper);
         return new CompiledDurablePayloadPlan(
             binding,
-            PipelineJson.mapper().writerFor(binding.runtimeType()),
-            PipelineJson.mapper().readerFor(binding.runtimeType()),
+            mapper.writerFor(binding.runtimeType()),
+            mapper.readerFor(binding.runtimeType())
+                .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS),
             unionCases,
             discriminator(binding.runtimeClass(), unionCases));
     }
@@ -35,16 +37,16 @@ public record CompiledDurablePayloadPlan(
         return !unionCases.isEmpty();
     }
 
-    private static Map<String, UnionCasePlan> unionCases(Class<?> runtimeClass) {
-        if (!runtimeClass.isSealed()) {
+    private static Map<String, UnionCasePlan> unionCases(Class<?> runtimeClass, ObjectMapper mapper) {
+        if (!runtimeClass.isSealed() || runtimeClass.isEnum()) {
             return Map.of();
         }
         Map<String, UnionCasePlan> cases = new TreeMap<>();
         for (Class<?> candidate : runtimeClass.getPermittedSubclasses()) {
             cases.put(candidate.getSimpleName(), new UnionCasePlan(
                 candidate,
-                PipelineJson.mapper().writerFor(candidate),
-                PipelineJson.mapper().readerFor(candidate)));
+                mapper.writerFor(candidate),
+                mapper.readerFor(candidate)));
         }
         return Map.copyOf(cases);
     }
@@ -56,7 +58,9 @@ public record CompiledDurablePayloadPlan(
         try {
             Method method = runtimeClass.getMethod("discriminator");
             return Optional.of(MethodHandles.privateLookupIn(runtimeClass, MethodHandles.lookup()).unreflect(method));
-        } catch (ReflectiveOperationException e) {
+        } catch (NoSuchMethodException e) {
+            return Optional.empty();
+        } catch (IllegalAccessException e) {
             throw new IllegalArgumentException("Canonical union " + runtimeClass.getName()
                 + " does not expose its authored discriminator", e);
         }
