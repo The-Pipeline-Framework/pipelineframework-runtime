@@ -6,7 +6,7 @@
     <parent>
         <groupId>org.pipelineframework</groupId>
         <artifactId>pipelineframework-runtime-parent</artifactId>
-        <version>26.10.1</version>
+        <version>26.11.1-SNAPSHOT</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
     <artifactId>pipelineframework-aws-durable-coordination-parent</artifactId>
