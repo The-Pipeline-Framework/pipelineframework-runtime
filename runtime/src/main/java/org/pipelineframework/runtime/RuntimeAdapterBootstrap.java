@@ -54,6 +54,18 @@ import org.pipelineframework.runtime.core.WorkDispatcher;
  */
 @ApplicationScoped
 public class RuntimeAdapterBootstrap {
+    /**
+     * Captures the originating host context for asynchronous HTTP response delivery.
+     * The supplied executor restores request thread state after returning to that context.
+     * Without a host context, it remains the caller's execution policy.
+     */
+    public static Executor captureRequestExecutor(Executor threadContext) {
+        java.util.Objects.requireNonNull(threadContext, "threadContext");
+        Context requestContext = Vertx.currentContext();
+        return requestContext == null ? threadContext
+            : task -> requestContext.runOnContext(ignored -> threadContext.execute(task));
+    }
+
     private static final Logger LOG = Logger.getLogger(RuntimeAdapterBootstrap.class);
     private static final String EXECUTOR_THREAD_NAME = "quarkus-virtual-thread-runtime";
 

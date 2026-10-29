@@ -110,12 +110,11 @@ public class RestTransitionWorkerResource {
         // Provider completions may carry another, already terminated CDI request context.
         // Restore this HTTP request for response filters without blocking or replacing its lifecycle.
         java.util.concurrent.Executor threadContext = requestThreadContext.currentContextExecutor();
-        io.vertx.core.Context requestContext = io.vertx.core.Vertx.currentContext();
         // CDI restoration alone does not restore Vert.x's request-local context.
         // Response processing must also return to this request's context instead
         // of inheriting the provider callback's (possibly terminated) context.
-        java.util.concurrent.Executor responseContext = requestContext == null ? threadContext
-            : task -> requestContext.runOnContext(ignored -> threadContext.execute(task));
+        java.util.concurrent.Executor responseContext =
+            org.pipelineframework.runtime.RuntimeAdapterBootstrap.captureRequestExecutor(threadContext);
         return executionService.executePortableTransition(envelope)
             .emitOn(responseContext)
             .onItem().transform(result -> Response.ok(result.toWireResult()).build());

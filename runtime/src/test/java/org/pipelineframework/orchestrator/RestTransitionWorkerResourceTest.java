@@ -237,6 +237,7 @@ class RestTransitionWorkerResourceTest {
             org.junit.jupiter.api.Assertions.assertNotSame(origin, provider);
             var completed = new java.util.concurrent.CompletableFuture<TransitionResultEnvelope>();
             var observed = new java.util.concurrent.CompletableFuture<io.vertx.core.Context>();
+            var outcome = new java.util.concurrent.CompletableFuture<Boolean>();
             var subscribed = new java.util.concurrent.CompletableFuture<Void>();
             var command = envelope();
             when(restConfig.serverEnabled()).thenReturn(true);
@@ -246,8 +247,14 @@ class RestTransitionWorkerResourceTest {
             origin.runOnContext(ignored -> {
                 resource.execute(request.timestamp(), request.nonce(), request.signature(), request.body())
                     .subscribe().with(
-                        response -> observed.complete(io.vertx.core.Vertx.currentContext()),
-                        failure -> observed.complete(io.vertx.core.Vertx.currentContext()));
+                        response -> {
+                            outcome.complete(false);
+                            observed.complete(io.vertx.core.Vertx.currentContext());
+                        },
+                        failure -> {
+                            outcome.complete(true);
+                            observed.complete(io.vertx.core.Vertx.currentContext());
+                        });
                 subscribed.complete(null);
             });
             subscribed.get(10, java.util.concurrent.TimeUnit.SECONDS);
@@ -256,6 +263,7 @@ class RestTransitionWorkerResourceTest {
                 else completed.complete(TransitionResultEnvelope.completed(payloadCodec, List.of("ok")));
             });
             assertEquals(origin, observed.get(10, java.util.concurrent.TimeUnit.SECONDS));
+            assertEquals(failed, outcome.get(10, java.util.concurrent.TimeUnit.SECONDS));
         } finally {
             vertx.close().toCompletionStage().toCompletableFuture().get(10, java.util.concurrent.TimeUnit.SECONDS);
         }
