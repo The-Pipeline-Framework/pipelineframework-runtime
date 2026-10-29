@@ -8,7 +8,8 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-VERSION = ET.parse(ROOT / "pom.xml").getroot().findtext("{http://maven.apache.org/POM/4.0.0}version").removesuffix("-SNAPSHOT")
+SOURCE_VERSION = ET.parse(ROOT / "pom.xml").getroot().findtext("{http://maven.apache.org/POM/4.0.0}version")
+VERSION = SOURCE_VERSION.removesuffix("-SNAPSHOT")
 COORDS = [
     ("org.pipelineframework", "pipelineframework-runtime-parent", "pom"),
     ("org.pipelineframework", "pipelineframework", "jar"),
@@ -26,7 +27,7 @@ COORDS = [
 ]
 
 # Exercise the real collection boundary, including its POM-only AWS parent.
-snapshot = VERSION + "-SNAPSHOT"
+snapshot = SOURCE_VERSION
 with tempfile.TemporaryDirectory(prefix="tpf-candidate-collection-") as temp:
     installed = pathlib.Path(temp) / "installed"
     expected = set()
