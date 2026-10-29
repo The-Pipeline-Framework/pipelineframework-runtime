@@ -226,6 +226,49 @@ class RestTransitionWorkerResourceTest {
     }
 
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void responseReturnsToOriginatingVertxContext(boolean failed) throws Exception {
+        var vertx = io.vertx.core.Vertx.vertx();
+        try {
+            var base = (io.vertx.core.impl.ContextInternal) vertx.getOrCreateContext();
+            var origin = base.duplicate();
+            var provider = base.duplicate();
+            org.junit.jupiter.api.Assertions.assertNotSame(origin, provider);
+            var completed = new java.util.concurrent.CompletableFuture<TransitionResultEnvelope>();
+            var observed = new java.util.concurrent.CompletableFuture<io.vertx.core.Context>();
+            var outcome = new java.util.concurrent.CompletableFuture<Boolean>();
+            var subscribed = new java.util.concurrent.CompletableFuture<Void>();
+            var command = envelope();
+            when(restConfig.serverEnabled()).thenReturn(true);
+            when(executionService.executePortableTransition(command))
+                .thenReturn(Uni.createFrom().completionStage(completed));
+            SignedRequest request = signed(command);
+            origin.runOnContext(ignored -> {
+                resource.execute(request.timestamp(), request.nonce(), request.signature(), request.body())
+                    .subscribe().with(
+                        response -> {
+                            outcome.complete(false);
+                            observed.complete(io.vertx.core.Vertx.currentContext());
+                        },
+                        failure -> {
+                            outcome.complete(true);
+                            observed.complete(io.vertx.core.Vertx.currentContext());
+                        });
+                subscribed.complete(null);
+            });
+            subscribed.get(10, java.util.concurrent.TimeUnit.SECONDS);
+            provider.runOnContext(ignored -> {
+                if (failed) completed.completeExceptionally(new IllegalStateException("provider-failure"));
+                else completed.complete(TransitionResultEnvelope.completed(payloadCodec, List.of("ok")));
+            });
+            assertEquals(origin, observed.get(10, java.util.concurrent.TimeUnit.SECONDS));
+            assertEquals(failed, outcome.get(10, java.util.concurrent.TimeUnit.SECONDS));
+        } finally {
+            vertx.close().toCompletionStage().toCompletableFuture().get(10, java.util.concurrent.TimeUnit.SECONDS);
+        }
+    }
+
     @Test
     void responseContextRestorationPreservesCancellation() throws Exception {
         var cancelled = new java.util.concurrent.atomic.AtomicBoolean();
