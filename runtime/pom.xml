@@ -21,13 +21,13 @@
     <parent>
         <groupId>org.pipelineframework</groupId>
         <artifactId>pipelineframework-runtime-parent</artifactId>
-        <version>26.10.1-SNAPSHOT</version>
+        <version>26.10.1</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
     <groupId>org.pipelineframework</groupId>
     <artifactId>pipelineframework</artifactId>
-    <version>26.10.1-SNAPSHOT</version>
+    <version>26.10.1</version>
     <!-- version is not needed as it is automatically inherited from the parent-->
 
     <properties>
@@ -57,7 +57,7 @@
         <connection>scm:git:https://github.com/The-Pipeline-Framework/pipelineframework-runtime.git</connection>
         <developerConnection>scm:git:git@github.com:The-Pipeline-Framework/pipelineframework-runtime.git</developerConnection>
         <url>https://github.com/The-Pipeline-Framework/pipelineframework-runtime</url>
-        <tag>v26.9.2</tag>
+        <tag>v26.10.1</tag>
     </scm>
 
     <dependencies>
