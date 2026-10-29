@@ -101,6 +101,8 @@ final class CanonicalUnionJson {
                     throw new IllegalArgumentException("Canonical union discriminator must not be blank");
                 }
                 return result;
+            } catch (Error e) {
+                throw e;
             } catch (Throwable e) {
                 throw new IOException("Failed resolving canonical union discriminator for " + type, e);
             }
