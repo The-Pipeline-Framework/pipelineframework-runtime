@@ -101,6 +101,13 @@ class GeneratedSpringGrpcClientIT {
     }
 
     @Test
+    void deadlineStartsForEachCallRatherThanWhenTheStubIsCreated() throws Exception {
+        Thread.sleep(5200);
+        assertEquals(new FinalReply("wire:late|prepared|remote|mapped|final"),
+            run("late", "v", "r", "c").get(5, TimeUnit.SECONDS));
+    }
+
+    @Test
     void startupRejectsMissingBlankUnresolvedAndMalformedTargets() {
         for (String value : List.of("", "=", "=${MISSING_GRPC_SMOKE_TARGET}", "=bad target with spaces")) {
             RuntimeException failure = assertThrows(RuntimeException.class, () -> {
@@ -144,7 +151,13 @@ class GeneratedSpringGrpcClientIT {
             return new BeanPostProcessor() {
                 @Override public Object postProcessAfterInitialization(Object bean, String name) {
                     if (bean instanceof ProcessRemoteServiceGrpc.ProcessRemoteServiceFutureStub stub)
-                        return stub.withDeadlineAfter(5, TimeUnit.SECONDS);
+                        return stub.withInterceptors(new io.grpc.ClientInterceptor() {
+                            @Override public <Req, Resp> io.grpc.ClientCall<Req, Resp> interceptCall(
+                                    io.grpc.MethodDescriptor<Req, Resp> method, io.grpc.CallOptions options,
+                                    io.grpc.Channel channel) {
+                                return channel.newCall(method, options.withDeadlineAfter(5, TimeUnit.SECONDS));
+                            }
+                        });
                     return bean;
                 }
             };
