@@ -5,6 +5,7 @@ import com.example.grpcclient.domain.Input;
 import com.example.grpcclient.domain.Prepared;
 import com.example.grpcclient.domain.RemoteReply;
 import com.example.grpcclient.grpc.ProcessRemoteServiceGrpc;
+import com.example.grpcclient.service.PrepareService;
 import com.example.grpcpeer.PeerApplication;
 import io.grpc.Status;
 import java.util.List;
@@ -54,8 +55,19 @@ class GeneratedSpringGrpcClientIT {
 
     @Test
     void runsMixedPipelineAndPropagatesContextAcrossAsyncLocalStep() throws Exception {
-        var first = run("one", "v1", "r1", "c1");
-        var second = run("two", "v2", "r2", "c2");
+        var preparation = caller.getBean(PrepareService.class);
+        preparation.hold();
+        CompletableFuture<Object> first;
+        CompletableFuture<Object> second;
+        try {
+            first = run("one", "v1", "r1", "c1");
+            second = run("two", "v2", "r2", "c2");
+            assertFalse(first.isDone());
+            assertFalse(second.isDone());
+            assertTrue(TpfExecutionContext.versionTag().isEmpty());
+        } finally {
+            preparation.release().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
         assertEquals(new FinalReply("wire:one|prepared|remote|mapped|final"), first.get(5, TimeUnit.SECONDS));
         assertEquals(new FinalReply("wire:two|prepared|remote|mapped|final"), second.get(5, TimeUnit.SECONDS));
         var seen = peer.getBean(PeerApplication.PeerService.class).seen;
