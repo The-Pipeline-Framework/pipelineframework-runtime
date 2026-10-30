@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package com.example.grpcsmoke;
+
+option java_package = "com.example.grpcsmoke.grpc";
+
+option java_outer_classname = "PipelineTypes";
+
+message PaymentReceipt {
+  optional string paymentId = 1;
+  optional string status = 2;
+}
+
+message PaymentRequest {
+  optional int32 cents = 1;
+  optional string paymentId = 2;
+}
+
+message ValidatedPayment {
+  optional int32 cents = 1;
+  optional string paymentId = 2;
+}

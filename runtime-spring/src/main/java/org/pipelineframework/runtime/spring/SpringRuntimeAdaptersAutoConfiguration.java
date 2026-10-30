@@ -72,7 +72,10 @@ public class SpringRuntimeAdaptersAutoConfiguration {
         ObjectProvider<TaskExecutor> taskExecutor,
         ObjectProvider<PlatformTransactionManager> transactionManager
     ) {
-        Executor executor = taskExecutor.getIfAvailable();
+        Executor executor = taskExecutor.orderedStream()
+            .<Executor>map(value -> value)
+            .findFirst()
+            .orElse(task -> Thread.startVirtualThread(task));
         return new SpringRuntimeAdapterBootstrap(
             applicationContext,
             eventPublisher,
