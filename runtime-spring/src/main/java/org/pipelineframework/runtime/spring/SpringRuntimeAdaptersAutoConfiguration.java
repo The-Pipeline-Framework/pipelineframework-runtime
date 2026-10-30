@@ -52,10 +52,7 @@ public class SpringRuntimeAdaptersAutoConfiguration {
         ObjectProvider<ConnectionResolver> connectionResolvers,
         ObjectProvider<SecretResolver> secretResolvers
     ) {
-        Executor executor = taskExecutors.orderedStream()
-            .<Executor>map(value -> value)
-            .findFirst()
-            .orElse(Runnable::run);
+        Executor executor = selectTaskExecutor(taskExecutors).orElse(Runnable::run);
         return ConnectorRuntimeContext.of(
             "spring",
             executor,
@@ -72,8 +69,8 @@ public class SpringRuntimeAdaptersAutoConfiguration {
         ObjectProvider<TaskExecutor> taskExecutor,
         ObjectProvider<PlatformTransactionManager> transactionManager
     ) {
-        Executor executor = taskExecutor.getIfAvailable();
-        return new SpringRuntimeAdapterBootstrap(
+        Optional<Executor> executor = selectTaskExecutor(taskExecutor);
+        return SpringRuntimeAdapterBootstrap.withExecutorSelection(
             applicationContext,
             eventPublisher,
             executor,
@@ -93,6 +90,14 @@ public class SpringRuntimeAdaptersAutoConfiguration {
         List<PipelineUnaryStep<?, ?>> pipelineSteps
     ) {
         return new SpringPipelineRunner(pipelineRunnerCore, pipelineSteps);
+    }
+
+    private static Optional<Executor> selectTaskExecutor(ObjectProvider<TaskExecutor> candidates) {
+        return Optional.ofNullable(candidates.getIfUnique())
+            .<Executor>map(value -> value)
+            .or(() -> candidates.orderedStream()
+                .<Executor>map(value -> value)
+                .findFirst());
     }
 
     private static <T> Optional<T> exactlyOne(ObjectProvider<T> candidates, String label) {

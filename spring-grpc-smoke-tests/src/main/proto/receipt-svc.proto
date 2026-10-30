@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package com.example.grpcsmoke;
+
+option java_package = "com.example.grpcsmoke.grpc";
+
+import "pipeline-types.proto";
+
+service ProcessReceiptService {
+  rpc remoteProcess(ValidatedPayment) returns (PaymentReceipt);
+}

@@ -69,12 +69,30 @@ public class SpringRuntimeAdapterBootstrap implements InitializingBean, Disposab
         Executor executor,
         PlatformTransactionManager transactionManager
     ) {
+        this(applicationContext, eventPublisher, Optional.ofNullable(executor), transactionManager);
+    }
+
+    static SpringRuntimeAdapterBootstrap withExecutorSelection(
+        ApplicationContext applicationContext,
+        ApplicationEventPublisher eventPublisher,
+        Optional<Executor> executor,
+        PlatformTransactionManager transactionManager
+    ) {
+        return new SpringRuntimeAdapterBootstrap(applicationContext, eventPublisher, executor, transactionManager);
+    }
+
+    private SpringRuntimeAdapterBootstrap(
+        ApplicationContext applicationContext,
+        ApplicationEventPublisher eventPublisher,
+        Optional<Executor> executor,
+        PlatformTransactionManager transactionManager
+    ) {
         this.applicationContext = Objects.requireNonNull(applicationContext, "applicationContext");
         this.eventPublisher = Objects.requireNonNull(eventPublisher, "eventPublisher");
         this.transactionManager = transactionManager;
         this.ownedVirtualThreadExecutor = Executors.newThreadPerTaskExecutor(
             Thread.ofVirtual().name(EXECUTOR_THREAD_NAME, 0).factory());
-        this.executor = executor == null ? ownedVirtualThreadExecutor : executor;
+        this.executor = executor.orElse(ownedVirtualThreadExecutor);
     }
 
     @Override
