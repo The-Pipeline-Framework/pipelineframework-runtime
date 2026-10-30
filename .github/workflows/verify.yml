@@ -30,6 +30,27 @@ jobs:
             echo "Spring gRPC smoke has a forbidden runtime dependency" >&2
             exit 1
           fi
+  spring-grpc-client-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-path: ${{ github.workspace }}/.m2/repository
+      - name: Run generated Spring gRPC client across services
+        run: ./mvnw -pl spring-grpc-client-smoke-tests -am verify --no-transfer-progress -Dmaven.repo.local="$PWD/.m2/repository"
+      - name: Check smoke runtime dependency graph
+        run: |
+          ./mvnw -pl spring-grpc-client-smoke-tests -am dependency:tree -Dscope=runtime -DoutputFile=target/spring-grpc-client-dependencies.txt --no-transfer-progress -Dmaven.repo.local="$PWD/.m2/repository"
+          if grep -E 'io\.quarkus:|javax\.enterprise:|jakarta\.enterprise:|io\.smallrye\.reactive:mutiny|org\.eclipse\.microprofile:|javax\.ws\.rs:|jakarta\.ws\.rs:' spring-grpc-client-smoke-tests/target/spring-grpc-client-dependencies.txt; then
+            echo "Spring gRPC client smoke has a forbidden runtime dependency" >&2
+            exit 1
+          fi
   verify:
     runs-on: ubuntu-latest
     steps:

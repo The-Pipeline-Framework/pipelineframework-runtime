@@ -91,6 +91,7 @@
     <modules>
         <module>runtime-spring</module>
         <module>spring-grpc-smoke-tests</module>
+        <module>spring-grpc-client-smoke-tests</module>
         <module>runtime</module>
         <module>deployment</module>
         <module>release-producer</module>

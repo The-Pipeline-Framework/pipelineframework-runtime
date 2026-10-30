@@ -1,0 +1,41 @@
+version: 2
+appName: Spring gRPC Client Smoke
+basePackage: com.example.grpcclient
+transport: GRPC
+platform: COMPUTE
+types:
+  Input:
+    fields:
+      - [value, string]
+  Prepared:
+    fields:
+      - [value, string]
+  RemoteReply:
+    fields:
+      - [value, string]
+  FinalReply:
+    fields:
+      - [value, string]
+steps:
+  - name: prepare
+    cardinality: ONE_TO_ONE
+    service: com.example.grpcclient.service.PrepareService
+    input: Input
+    output: Prepared
+    inboundMapper: com.example.grpcclient.mapper.InputMapper
+  - name: remote
+    cardinality: ONE_TO_ONE
+    service: com.example.grpcclient.remote.RemoteService
+    input: Prepared
+    output: RemoteReply
+    java:
+      input: com.example.grpcclient.domain.Prepared
+      output: com.example.grpcclient.domain.RemoteReply
+    inboundMapper: com.example.grpcclient.mapper.PreparedMapper
+    outboundMapper: com.example.grpcclient.mapper.RemoteReplyMapper
+  - name: finish
+    cardinality: ONE_TO_ONE
+    service: com.example.grpcclient.service.FinishService
+    input: RemoteReply
+    output: FinalReply
+    outboundMapper: com.example.grpcclient.mapper.FinalReplyMapper

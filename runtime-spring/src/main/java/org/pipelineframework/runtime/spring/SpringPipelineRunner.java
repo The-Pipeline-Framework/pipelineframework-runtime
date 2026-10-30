@@ -22,6 +22,7 @@ import java.util.concurrent.CompletionStage;
 
 import org.pipelineframework.runtime.core.PipelineRunnerCore;
 import org.pipelineframework.runtime.core.PipelineUnaryStep;
+import org.pipelineframework.runtime.core.TpfExecutionContext;
 
 /**
  * Spring adapter for the framework-neutral pipeline runner core.
@@ -42,7 +43,9 @@ public class SpringPipelineRunner {
      * @return stage that completes with the final step output
      */
     public CompletionStage<Object> run(Object input) {
-        return runnerCore.runAsync(input, steps, this::applyUntyped);
+        TpfExecutionContext.Snapshot context = TpfExecutionContext.capture();
+        return runnerCore.runAsync(input, steps,
+            (step, value, index) -> applyInContext(step, value, context));
     }
 
     public int stepCount() {
@@ -50,8 +53,15 @@ public class SpringPipelineRunner {
     }
 
     @SuppressWarnings("unchecked")
-    private CompletionStage<Object> applyUntyped(PipelineUnaryStep<?, ?> step, Object input, int stepIndex) {
-        PipelineUnaryStep<Object, Object> typedStep = (PipelineUnaryStep<Object, Object>) step;
-        return typedStep.apply(input);
+    private CompletionStage<Object> applyInContext(
+            PipelineUnaryStep<?, ?> step, Object input, TpfExecutionContext.Snapshot context) {
+        TpfExecutionContext.Snapshot previous = TpfExecutionContext.capture();
+        try {
+            TpfExecutionContext.restore(context);
+            PipelineUnaryStep<Object, Object> typedStep = (PipelineUnaryStep<Object, Object>) step;
+            return typedStep.apply(input);
+        } finally {
+            TpfExecutionContext.restore(previous);
+        }
     }
 }

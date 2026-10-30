@@ -1,0 +1,10 @@
+syntax = "proto3";
+package com.example.grpcclient;
+option java_package = "com.example.grpcclient.grpc";
+option java_outer_classname = "PipelineTypes";
+message Input { string value = 1; }
+message Prepared { string value = 1; }
+message RemoteReply { string value = 1; }
+message FinalReply { string value = 1; }
+service PipelineService { rpc Run(Input) returns (FinalReply); }
+service ProcessRemoteService { rpc remoteProcess(Prepared) returns (RemoteReply); }
