@@ -39,6 +39,8 @@ import org.springframework.context.annotation.AnnotationConfigApplicationContext
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+import org.springframework.core.annotation.Order;
+import org.springframework.core.task.TaskExecutor;
 import org.springframework.context.event.EventListener;
 import org.springframework.http.MediaType;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -83,6 +85,21 @@ class SpringRuntimeAdaptersAutoConfigurationTest {
             assertEquals(TestConnectionResolver.class,
                 runtimeContext.connectionResolver().orElseThrow().getClass());
             assertTrue(runtimeContext.secretResolver().isEmpty());
+        });
+    }
+
+    @Test
+    void primaryTaskExecutorWinsOverHigherOrderedExecutor() {
+        contextRunner.withUserConfiguration(ExecutorPreferenceConfig.class).run(context -> {
+            RecordingExecutor primary = context.getBean("primaryTaskExecutor", RecordingExecutor.class);
+            ConnectorRuntimeContext runtimeContext = context.getBean(ConnectorRuntimeContext.class);
+            assertSame(primary, runtimeContext.executor());
+
+            String caller = Thread.currentThread().getName();
+            String worker = RuntimeAdapters.schedule(() -> Thread.currentThread().getName())
+                .toCompletableFuture().get(5, TimeUnit.SECONDS);
+            assertNotEquals(caller, worker);
+            assertEquals(1, primary.invocations.get());
         });
     }
 
@@ -316,6 +333,31 @@ class SpringRuntimeAdaptersAutoConfigurationTest {
         @Bean
         ConnectionResolver secondConnectionResolver() {
             return new TestConnectionResolver();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class ExecutorPreferenceConfig {
+        @Bean
+        @Primary
+        RecordingExecutor primaryTaskExecutor() {
+            return new RecordingExecutor();
+        }
+
+        @Bean
+        @Order(-100)
+        TaskExecutor higherOrderedSynchronousExecutor() {
+            return Runnable::run;
+        }
+    }
+
+    static final class RecordingExecutor implements TaskExecutor {
+        private final AtomicInteger invocations = new AtomicInteger();
+
+        @Override
+        public void execute(Runnable task) {
+            invocations.incrementAndGet();
+            Thread.startVirtualThread(task);
         }
     }
 

@@ -25,7 +25,7 @@ jobs:
         run: ./mvnw -pl spring-grpc-smoke-tests -am verify --no-transfer-progress -Dmaven.repo.local="$PWD/.m2/repository"
       - name: Check smoke runtime dependency graph
         run: |
-          ./mvnw -pl spring-grpc-smoke-tests dependency:tree -Dscope=runtime -DoutputFile=target/spring-grpc-dependencies.txt --no-transfer-progress -Dmaven.repo.local="$PWD/.m2/repository"
+          ./mvnw -pl spring-grpc-smoke-tests -am dependency:tree -Dscope=runtime -DoutputFile=target/spring-grpc-dependencies.txt --no-transfer-progress -Dmaven.repo.local="$PWD/.m2/repository"
           if grep -E 'io\.quarkus:|jakarta\.enterprise:|io\.smallrye\.reactive:mutiny|org\.eclipse\.microprofile:|jakarta\.ws\.rs:' spring-grpc-smoke-tests/target/spring-grpc-dependencies.txt; then
             echo "Spring gRPC smoke has a forbidden runtime dependency" >&2
             exit 1

@@ -6,6 +6,7 @@ import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.grpc.test.autoconfigure.LocalGrpcServerPort;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -24,7 +25,8 @@ class GeneratedSpringGrpcSmokeTest {
         try {
             var request = PipelineTypes.PaymentRequest.newBuilder()
                 .setPaymentId("payment-1").setCents(125).build();
-            PipelineTypes.PaymentReceipt response = PipelineServiceGrpc.newBlockingStub(channel).run(request);
+            PipelineTypes.PaymentReceipt response = PipelineServiceGrpc.newBlockingStub(channel)
+                .withDeadlineAfter(5, TimeUnit.SECONDS).run(request);
             assertEquals("payment-1", response.getPaymentId());
             assertEquals("accepted", response.getStatus());
         } finally {
@@ -39,7 +41,8 @@ class GeneratedSpringGrpcSmokeTest {
             var request = PipelineTypes.PaymentRequest.newBuilder()
                 .setPaymentId("payment-2").setCents(0).build();
             StatusRuntimeException failure = assertThrows(StatusRuntimeException.class,
-                () -> PipelineServiceGrpc.newBlockingStub(channel).run(request));
+                () -> PipelineServiceGrpc.newBlockingStub(channel)
+                    .withDeadlineAfter(5, TimeUnit.SECONDS).run(request));
             assertEquals(Status.Code.INTERNAL, failure.getStatus().getCode());
         } finally {
             channel.shutdownNow();
