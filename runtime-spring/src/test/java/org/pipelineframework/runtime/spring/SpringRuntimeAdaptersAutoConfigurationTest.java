@@ -160,6 +160,10 @@ class SpringRuntimeAdaptersAutoConfigurationTest {
             assertEquals("scheduled", RuntimeAdapters.schedule(() -> "scheduled")
                 .toCompletableFuture()
                 .get(5, TimeUnit.SECONDS));
+            String scheduledWorker = RuntimeAdapters.schedule(() -> Thread.currentThread().getName())
+                .toCompletableFuture()
+                .get(5, TimeUnit.SECONDS);
+            assertTrue(scheduledWorker.startsWith("tpf-spring-runtime-"));
             String worker = RuntimeAdapters.executeBlocking(() -> Thread.currentThread().getName(), false)
                 .toCompletableFuture()
                 .get(5, TimeUnit.SECONDS);
