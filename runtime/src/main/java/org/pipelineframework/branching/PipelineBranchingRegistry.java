@@ -19,6 +19,7 @@ import org.pipelineframework.config.pipeline.PipelineBranchingResourceLoader;
 public class PipelineBranchingRegistry {
 
     private final Map<DescriptorKey, StepBranchingDescriptor> descriptors;
+    private final Map<String, StepBranchingDescriptor> definitionCompletions;
 
     public PipelineBranchingRegistry() {
         this(PipelineBranchingResourceLoader.load());
@@ -30,6 +31,44 @@ public class PipelineBranchingRegistry {
 
     private PipelineBranchingRegistry(Optional<PipelineBranchingResourceLoader.BranchingResource> resource) {
         this.descriptors = resource.map(this::buildDescriptors).orElseGet(Map::of);
+        this.definitionCompletions = resource.map(this::buildDefinitionCompletions).orElseGet(Map::of);
+    }
+
+    /** Adapts a completed definition's surviving branch to its declared canonical output. */
+    public Object completeDefinition(String definitionId, Object item) {
+        StepBranchingDescriptor descriptor = definitionCompletions.get(definitionId);
+        if (descriptor == null) {
+            return item;
+        }
+        if (descriptor.inputRuntimeType().isInstance(item)) {
+            return item;
+        }
+        Object result = descriptor.applicableItem(item);
+        if (!descriptor.inputRuntimeType().isInstance(result)) {
+            throw new PipelineBranchRoutingException("Pipeline definition '" + definitionId
+                + "' cannot complete as '" + descriptor.inputRuntimeClassName()
+                + "' from " + (item == null ? "null" : item.getClass().getName()));
+        }
+        return result;
+    }
+
+    private Map<String, StepBranchingDescriptor> buildDefinitionCompletions(
+        PipelineBranchingResourceLoader.BranchingResource resource) {
+        ClassLoader loader = Thread.currentThread().getContextClassLoader();
+        Map<String, StepBranchingDescriptor> completed = new LinkedHashMap<>();
+        for (var completion : resource.definitionCompletions()) {
+            Class<?> output = resolveClass(completion.outputRuntimeClass(), loader, completion.definitionId());
+            List<Class<?>> accepted = completion.acceptedRuntimeClasses().stream()
+                .<Class<?>>map(name -> resolveClass(name, loader, completion.definitionId())).toList();
+            StepBranchingDescriptor descriptor = new StepBranchingDescriptor(-1, "$return",
+                completion.outputRuntimeClass(), completion.outputRuntimeClass(), output,
+                completion.acceptedContracts(), completion.acceptedRuntimeClasses(), accepted,
+                completion.variants(), completion.variants(), completion.variants(), false);
+            if (completed.putIfAbsent(completion.definitionId(), descriptor) != null) {
+                throw new IllegalStateException("Duplicate definition completion: " + completion.definitionId());
+            }
+        }
+        return Map.copyOf(completed);
     }
 
     public Optional<StepBranchingDescriptor> descriptorFor(Class<?> stepClass) {
