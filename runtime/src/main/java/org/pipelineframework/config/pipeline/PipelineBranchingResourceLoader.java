@@ -61,7 +61,18 @@ public final class PipelineBranchingResourceLoader {
             .map(Map.class::cast)
             .map(PipelineBranchingResourceLoader::parseStep)
             .toList();
-        return new BranchingResource(terminalStepIndex, steps);
+        List<DefinitionCompletion> completions = data.get("definitionCompletions") instanceof List<?> definitions
+            ? definitions.stream().map(raw -> {
+                if (!(raw instanceof Map<?, ?> definition)) {
+                    throw new IllegalStateException("Definition completion metadata must be an object");
+                }
+                return new DefinitionCompletion(stringValue(definition.get("definitionId")),
+                    stringValue(definition.get("outputRuntimeClass")),
+                    stringList(definition.get("acceptedContracts")),
+                    stringList(definition.get("acceptedRuntimeClasses")),
+                    variantList(definition.get("variants")));
+            }).toList() : List.of();
+        return new BranchingResource(terminalStepIndex, steps, completions);
     }
 
     private static BranchingStep parseStep(Map<?, ?> raw) {
@@ -119,7 +130,7 @@ public final class PipelineBranchingResourceLoader {
             List<BranchingStep> filtered = best.steps().stream()
                 .filter(step -> isStepFullyLoadable(step, classLoader))
                 .toList();
-            return new BranchingResource(best.terminalStepIndex(), filtered);
+            return new BranchingResource(best.terminalStepIndex(), filtered, best.definitionCompletions());
         }
         return best;
     }
@@ -236,8 +247,34 @@ public final class PipelineBranchingResourceLoader {
 
     public record BranchingResource(
         int terminalStepIndex,
-        List<BranchingStep> steps
+        List<BranchingStep> steps,
+        List<DefinitionCompletion> definitionCompletions
     ) {
+        public BranchingResource {
+            steps = List.copyOf(steps);
+            definitionCompletions = List.copyOf(definitionCompletions);
+        }
+
+        public BranchingResource(int terminalStepIndex, List<BranchingStep> steps) {
+            this(terminalStepIndex, steps, List.of());
+        }
+    }
+
+    public record DefinitionCompletion(String definitionId, String outputRuntimeClass,
+        List<String> acceptedContracts, List<String> acceptedRuntimeClasses,
+        List<BranchVariantIdentity> variants) {
+        public DefinitionCompletion {
+            if (definitionId == null || definitionId.isBlank()
+                || outputRuntimeClass == null || outputRuntimeClass.isBlank()) {
+                throw new IllegalArgumentException("Definition completion requires definitionId and outputRuntimeClass");
+            }
+            acceptedContracts = List.copyOf(acceptedContracts);
+            acceptedRuntimeClasses = List.copyOf(acceptedRuntimeClasses);
+            variants = List.copyOf(variants);
+            if (acceptedContracts.isEmpty() || acceptedContracts.size() != acceptedRuntimeClasses.size()) {
+                throw new IllegalArgumentException("Definition completion requires paired accepted contracts and classes");
+            }
+        }
     }
 
     public record BranchingStep(
