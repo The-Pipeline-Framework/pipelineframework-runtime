@@ -103,11 +103,19 @@ public final class PipelineBranchingResourceLoader {
     }
 
     private static BranchingResource selectBestCandidate(List<BranchingResource> candidates, ClassLoader classLoader) {
-        BranchingResource best = candidates.getFirst();
+        List<BranchingResource> compatible = candidates.stream()
+            .filter(candidate -> candidate.definitionCompletions().stream().allMatch(completion ->
+                isLoadable(completion.outputRuntimeClass(), classLoader)
+                    && completion.acceptedRuntimeClasses().stream().allMatch(type -> isLoadable(type, classLoader))))
+            .toList();
+        if (compatible.isEmpty()) {
+            throw new IllegalStateException("No pipeline branching resource has loadable definition completion types.");
+        }
+        BranchingResource best = compatible.getFirst();
         int bestLoadable = countLoadableSteps(best, classLoader);
         boolean bestAllLoadable = bestLoadable == best.steps().size();
-        for (int i = 1; i < candidates.size(); i++) {
-            BranchingResource candidate = candidates.get(i);
+        for (int i = 1; i < compatible.size(); i++) {
+            BranchingResource candidate = compatible.get(i);
             int loadable = countLoadableSteps(candidate, classLoader);
             boolean allLoadable = loadable == candidate.steps().size();
             if (allLoadable && !bestAllLoadable) {

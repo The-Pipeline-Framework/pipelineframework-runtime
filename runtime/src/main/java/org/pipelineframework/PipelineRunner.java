@@ -379,7 +379,8 @@ public class PipelineRunner implements AutoCloseable {
 
         // Terminal object publish only runs after a full pipeline execution, not for partial/early-stop runs.
         Object terminal = current;
-        if (stopBeforeStepIndex == orderedSteps.size() && branchingRegistry != null) {
+        if (stopBeforeStepIndex == orderedSteps.size() && branchingRegistry != null
+            && (rootInvocation || !"$root".equals(definitionId))) {
             if (current instanceof Uni<?> uni) {
                 terminal = uni.map(item -> branchingRegistry.completeDefinition(definitionId, item));
             } else if (current instanceof Multi<?> multi) {

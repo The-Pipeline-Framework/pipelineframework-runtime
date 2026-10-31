@@ -128,6 +128,19 @@ class PipelineRunnerObjectPublishTest {
     }
 
     @Test
+    void legacyNestedDefinitionSentinelDoesNotCompleteRootContract() throws Exception {
+        setObjectPublishRunner(runner, ObjectPublishRunner.disabled());
+        runner.branchingRegistry = mock(org.pipelineframework.branching.PipelineBranchingRegistry.class);
+
+        assertEquals("branch", ((Uni<?>) runner.runNestedWithContext(
+            Uni.createFrom().item("branch"), List.of(), "$root", -1).result()).await().indefinitely());
+        assertEquals(List.of("branch"), ((Multi<?>) runner.runNestedWithContext(
+            Multi.createFrom().item("branch"), List.of(), "$root", -1).result())
+            .collect().asList().await().indefinitely());
+        verifyNoInteractions(runner.branchingRegistry);
+    }
+
+    @Test
     void completesOnlyAtTheEndOfRootAndNestedDefinitionRanges() throws Exception {
         setObjectPublishRunner(runner, ObjectPublishRunner.disabled());
         runner.branchingRegistry = mock(org.pipelineframework.branching.PipelineBranchingRegistry.class);
