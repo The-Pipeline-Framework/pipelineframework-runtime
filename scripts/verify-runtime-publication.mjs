@@ -17,6 +17,8 @@ export const expectedDeployability = new Map([
   ['persistence-plugin', true],
   ['cache-plugin', true],
   ['repository-plugin', true],
+  ['pipelineframework-spring-grpc-smoke-tests', false],
+  ['pipelineframework-spring-grpc-client-smoke-tests', false],
   ['framework-plugins', false],
   ['framework-foundational-plugins', false],
 ]);
