@@ -36,6 +36,23 @@ for (const artifactId of coordination) {
   });
 }
 
+for (const artifactId of ['pipelineframework-spring-grpc-smoke-tests',
+  'pipelineframework-spring-grpc-client-smoke-tests']) {
+  test(`keeps ${artifactId} internal and rejects accidental deployment`, () => {
+    assert.equal(expectedDeployability.get(artifactId), false);
+    assert.doesNotThrow(() => assertEffectivePublication(effectivePom()));
+    assert.throws(() => assertEffectivePublication(effectivePom(new Map([[artifactId, true]]))),
+      /effective deployability drift/);
+  });
+
+  test(`rejects Central publication for ${artifactId}`, () => {
+    const xml = effectivePom().replace(
+      new RegExp(`(<artifactId>${artifactId}</artifactId>[\\s\\S]*?<skipPublishing>)true(</skipPublishing>)`),
+      '$1false$2');
+    assert.throws(() => assertEffectivePublication(xml), /internal artifact is not skipped/);
+  });
+}
+
 test('still rejects undeclared reactor projects', () => {
   const xml = effectivePom().replace('</projects>', `<project>
     <groupId>org.pipelineframework</groupId><artifactId>undeclared-module</artifactId>

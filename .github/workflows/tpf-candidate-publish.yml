@@ -74,8 +74,8 @@ jobs:
           distribution: temurin
           java-version: '21'
           server-id: github-candidates
-          server-username: GITHUB_ACTOR
-          server-password: GITHUB_TOKEN
+          server-username-env-var: GITHUB_ACTOR
+          server-password-env-var: GITHUB_TOKEN
       - name: Publish validated Maven files with deploy-file
         env:
           GITHUB_ACTOR: ${{ github.actor }}
