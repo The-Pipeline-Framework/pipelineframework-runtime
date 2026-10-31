@@ -6,6 +6,8 @@ import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.jboss.logging.Logger;
 import org.pipelineframework.branching.BranchVariantIdentity;
@@ -103,13 +105,20 @@ public final class PipelineBranchingResourceLoader {
     }
 
     private static BranchingResource selectBestCandidate(List<BranchingResource> candidates, ClassLoader classLoader) {
+        Set<String> requiredCompletions = candidates.stream()
+            .flatMap(candidate -> candidate.definitionCompletions().stream())
+            .map(DefinitionCompletion::definitionId)
+            .collect(Collectors.toSet());
         List<BranchingResource> compatible = candidates.stream()
+            .filter(candidate -> candidate.definitionCompletions().stream()
+                .map(DefinitionCompletion::definitionId).collect(Collectors.toSet()).containsAll(requiredCompletions))
             .filter(candidate -> candidate.definitionCompletions().stream().allMatch(completion ->
                 isLoadable(completion.outputRuntimeClass(), classLoader)
                     && completion.acceptedRuntimeClasses().stream().allMatch(type -> isLoadable(type, classLoader))))
             .toList();
         if (compatible.isEmpty()) {
-            throw new IllegalStateException("No pipeline branching resource has loadable definition completion types.");
+            throw new IllegalStateException("No pipeline branching resource preserves all definition completions "
+                + "with loadable types: " + requiredCompletions);
         }
         BranchingResource best = compatible.getFirst();
         int bestLoadable = countLoadableSteps(best, classLoader);

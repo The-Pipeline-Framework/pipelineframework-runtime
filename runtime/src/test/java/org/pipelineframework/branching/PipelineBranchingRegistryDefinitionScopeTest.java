@@ -129,6 +129,41 @@ class PipelineBranchingRegistryDefinitionScopeTest {
     }
 
     @Test
+    void legacyDuplicatesCannotReplaceTypedCompletionContracts() throws Exception {
+        Path legacy = tempDir.resolve("legacy");
+        Path typed = tempDir.resolve("typed");
+        String step = """
+            {"runtimeStepClass":"%s","step":"shared","index":0,
+             "inputRuntimeClass":"java.lang.Object","acceptedContracts":["Object"],
+             "acceptedRuntimeClasses":["java.lang.Object"]}
+            """.formatted(SharedStep.class.getName());
+        writeMetadata(legacy, "{\"steps\":[" + step + "," + step + "]}");
+        for (String invalid : List.of("none", "output", "accepted")) {
+            writeMetadata(typed, """
+                {"steps":[%s],"definitionCompletions":[
+                  {"definitionId":"$root","outputRuntimeClass":"%s",
+                   "acceptedContracts":["Approved"],"acceptedRuntimeClasses":["%s"],
+                   "variants":[{"unionName":"Outcome","discriminator":"approved","payloadContract":"Approved"}]}]}
+                """.formatted(step, invalid.equals("output") ? "missing.Output" : Outcome.class.getName(),
+                    invalid.equals("accepted") ? "missing.Accepted" : Approved.class.getName()));
+            for (List<Path> order : List.of(List.of(legacy, typed), List.of(typed, legacy))) {
+                if (invalid.equals("none")) {
+                    var selected = loadMetadata(order);
+                    assertEquals(1, selected.steps().size());
+                    assertEquals(1, selected.definitionCompletions().size());
+                    Approved value = new Approved("yes");
+                    assertEquals(new Outcome.Approved(value), new PipelineBranchingRegistry(selected)
+                        .completeDefinition("$root", value));
+                } else {
+                    var error = assertThrows(IllegalStateException.class, () -> loadMetadata(order));
+                    assertTrue(error.getCause().getMessage().contains("all definition completions"),
+                        error.getMessage());
+                }
+            }
+        }
+    }
+
+    @Test
     void rejectsResourcesWhenNoDefinitionCompletionTypesAreLoadable() {
         var error = assertThrows(IllegalStateException.class, () -> loadMetadata("""
             {"steps":[],"definitionCompletions":[
@@ -140,8 +175,16 @@ class PipelineBranchingRegistryDefinitionScopeTest {
 
     private PipelineBranchingResourceLoader.BranchingResource loadMetadata(String json) throws Exception {
         writeMetadata(tempDir, json);
+        return loadMetadata(List.of(tempDir));
+    }
+
+    private PipelineBranchingResourceLoader.BranchingResource loadMetadata(List<Path> directories) throws Exception {
+        java.net.URL[] urls = new java.net.URL[directories.size()];
+        for (int index = 0; index < directories.size(); index++) {
+            urls[index] = directories.get(index).toUri().toURL();
+        }
         ClassLoader previous = Thread.currentThread().getContextClassLoader();
-        try (URLClassLoader loader = new URLClassLoader(new java.net.URL[]{tempDir.toUri().toURL()}, previous)) {
+        try (URLClassLoader loader = new URLClassLoader(urls, previous)) {
             Thread.currentThread().setContextClassLoader(loader);
             return PipelineBranchingResourceLoader.load().orElseThrow();
         } finally {
