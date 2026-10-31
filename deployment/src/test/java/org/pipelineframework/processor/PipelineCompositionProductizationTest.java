@@ -529,7 +529,9 @@ class PipelineCompositionProductizationTest {
             """), diagnosticSources()).compilation();
 
         assertThat(compilation).failed();
-        assertThat(compilation).hadErrorContaining("exactly one step with terminal: true");
+        assertThat(compilation).hadErrorContaining(
+            "Pipeline output contract 'A' does not cover reachable branch-end types: [C].");
+        assertThat(compilation).hadErrorContaining("Invalid v3 routing in pipeline definition 'inner'.");
     }
 
     @Test

@@ -38,6 +38,7 @@ import org.pipelineframework.context.PipelineContext;
 import org.pipelineframework.context.PipelineContextHolder;
 import org.pipelineframework.awaitable.AwaitExecutionContext;
 import org.pipelineframework.branching.BranchExecutionTracker;
+import org.pipelineframework.branching.PipelineBranchingRegistry;
 import org.pipelineframework.awaitable.AwaitExecutionContextHolder;
 import org.pipelineframework.awaitable.TerminalOutputOwnership;
 import org.pipelineframework.objectpublish.ObjectPublishRunner;
@@ -63,6 +64,9 @@ import org.pipelineframework.telemetry.PipelineTracingSupport;
 @ApplicationScoped
 @Unremovable
 public class PipelineRunner implements AutoCloseable {
+
+    @Inject
+    PipelineBranchingRegistry branchingRegistry;
 
     private static final Logger logger = Logger.getLogger(PipelineRunner.class);
     private static final int DEFAULT_MAX_CONCURRENCY = PipelineParallelismPolicyResolver.DEFAULT_MAX_CONCURRENCY;
@@ -375,6 +379,14 @@ public class PipelineRunner implements AutoCloseable {
 
         // Terminal object publish only runs after a full pipeline execution, not for partial/early-stop runs.
         Object terminal = current;
+        if (stopBeforeStepIndex == orderedSteps.size() && branchingRegistry != null
+            && (rootInvocation || !"$root".equals(definitionId))) {
+            if (current instanceof Uni<?> uni) {
+                terminal = uni.map(item -> branchingRegistry.completeDefinition(definitionId, item));
+            } else if (current instanceof Multi<?> multi) {
+                terminal = multi.map(item -> branchingRegistry.completeDefinition(definitionId, item));
+            }
+        }
         boolean terminalOutputPublished = false;
         if (rootInvocation
             && stopBeforeStepIndex == orderedSteps.size()
@@ -382,7 +394,7 @@ public class PipelineRunner implements AutoCloseable {
                 || awaitContext.terminalOutputOwnership() == TerminalOutputOwnership.TRANSITION_WORKER)) {
             ObjectPublishRunner publishRunner = objectPublishRunner();
             if (publishRunner.enabled()) {
-                terminal = publishRunner.publish(current);
+                terminal = publishRunner.publish(terminal);
                 terminalOutputPublished = true;
             }
         }

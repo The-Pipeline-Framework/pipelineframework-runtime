@@ -61,7 +61,18 @@ public final class PipelineBranchingResourceLoader {
             .map(Map.class::cast)
             .map(PipelineBranchingResourceLoader::parseStep)
             .toList();
-        return new BranchingResource(terminalStepIndex, steps);
+        List<DefinitionCompletion> completions = data.get("definitionCompletions") instanceof List<?> definitions
+            ? definitions.stream().map(raw -> {
+                if (!(raw instanceof Map<?, ?> definition)) {
+                    throw new IllegalStateException("Definition completion metadata must be an object");
+                }
+                return new DefinitionCompletion(stringValue(definition.get("definitionId")),
+                    stringValue(definition.get("outputRuntimeClass")),
+                    stringList(definition.get("acceptedContracts")),
+                    stringList(definition.get("acceptedRuntimeClasses")),
+                    variantList(definition.get("variants")));
+            }).toList() : List.of();
+        return new BranchingResource(terminalStepIndex, steps, completions);
     }
 
     private static BranchingStep parseStep(Map<?, ?> raw) {
@@ -92,11 +103,19 @@ public final class PipelineBranchingResourceLoader {
     }
 
     private static BranchingResource selectBestCandidate(List<BranchingResource> candidates, ClassLoader classLoader) {
-        BranchingResource best = candidates.getFirst();
+        List<BranchingResource> compatible = candidates.stream()
+            .filter(candidate -> candidate.definitionCompletions().stream().allMatch(completion ->
+                isLoadable(completion.outputRuntimeClass(), classLoader)
+                    && completion.acceptedRuntimeClasses().stream().allMatch(type -> isLoadable(type, classLoader))))
+            .toList();
+        if (compatible.isEmpty()) {
+            throw new IllegalStateException("No pipeline branching resource has loadable definition completion types.");
+        }
+        BranchingResource best = compatible.getFirst();
         int bestLoadable = countLoadableSteps(best, classLoader);
         boolean bestAllLoadable = bestLoadable == best.steps().size();
-        for (int i = 1; i < candidates.size(); i++) {
-            BranchingResource candidate = candidates.get(i);
+        for (int i = 1; i < compatible.size(); i++) {
+            BranchingResource candidate = compatible.get(i);
             int loadable = countLoadableSteps(candidate, classLoader);
             boolean allLoadable = loadable == candidate.steps().size();
             if (allLoadable && !bestAllLoadable) {
@@ -119,7 +138,7 @@ public final class PipelineBranchingResourceLoader {
             List<BranchingStep> filtered = best.steps().stream()
                 .filter(step -> isStepFullyLoadable(step, classLoader))
                 .toList();
-            return new BranchingResource(best.terminalStepIndex(), filtered);
+            return new BranchingResource(best.terminalStepIndex(), filtered, best.definitionCompletions());
         }
         return best;
     }
@@ -236,8 +255,34 @@ public final class PipelineBranchingResourceLoader {
 
     public record BranchingResource(
         int terminalStepIndex,
-        List<BranchingStep> steps
+        List<BranchingStep> steps,
+        List<DefinitionCompletion> definitionCompletions
     ) {
+        public BranchingResource {
+            steps = List.copyOf(steps);
+            definitionCompletions = List.copyOf(definitionCompletions);
+        }
+
+        public BranchingResource(int terminalStepIndex, List<BranchingStep> steps) {
+            this(terminalStepIndex, steps, List.of());
+        }
+    }
+
+    public record DefinitionCompletion(String definitionId, String outputRuntimeClass,
+        List<String> acceptedContracts, List<String> acceptedRuntimeClasses,
+        List<BranchVariantIdentity> variants) {
+        public DefinitionCompletion {
+            if (definitionId == null || definitionId.isBlank()
+                || outputRuntimeClass == null || outputRuntimeClass.isBlank()) {
+                throw new IllegalArgumentException("Definition completion requires definitionId and outputRuntimeClass");
+            }
+            acceptedContracts = List.copyOf(acceptedContracts);
+            acceptedRuntimeClasses = List.copyOf(acceptedRuntimeClasses);
+            variants = List.copyOf(variants);
+            if (acceptedContracts.isEmpty() || acceptedContracts.size() != acceptedRuntimeClasses.size()) {
+                throw new IllegalArgumentException("Definition completion requires paired accepted contracts and classes");
+            }
+        }
     }
 
     public record BranchingStep(

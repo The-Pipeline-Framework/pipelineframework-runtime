@@ -56,6 +56,8 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 @ExtendWith(MockitoExtension.class)
 class PipelineRunnerObjectPublishTest {
@@ -123,6 +125,39 @@ class PipelineRunnerObjectPublishTest {
     void clearAwaitContext() {
         AwaitExecutionContextHolder.clear();
         PipelineRunContextHolder.clear();
+    }
+
+    @Test
+    void legacyNestedDefinitionSentinelDoesNotCompleteRootContract() throws Exception {
+        setObjectPublishRunner(runner, ObjectPublishRunner.disabled());
+        runner.branchingRegistry = mock(org.pipelineframework.branching.PipelineBranchingRegistry.class);
+
+        assertEquals("branch", ((Uni<?>) runner.runNestedWithContext(
+            Uni.createFrom().item("branch"), List.of(), "$root", -1).result()).await().indefinitely());
+        assertEquals(List.of("branch"), ((Multi<?>) runner.runNestedWithContext(
+            Multi.createFrom().item("branch"), List.of(), "$root", -1).result())
+            .collect().asList().await().indefinitely());
+        verifyNoInteractions(runner.branchingRegistry);
+    }
+
+    @Test
+    void completesOnlyAtTheEndOfRootAndNestedDefinitionRanges() throws Exception {
+        setObjectPublishRunner(runner, ObjectPublishRunner.disabled());
+        runner.branchingRegistry = mock(org.pipelineframework.branching.PipelineBranchingRegistry.class);
+        when(runner.branchingRegistry.completeDefinition("$root", "branch")).thenReturn("root-result");
+        when(runner.branchingRegistry.completeDefinition("child", "branch")).thenReturn("child-result");
+        List<Object> steps = List.of(new IdentityStep());
+        Object partial = ((Uni<?>) runner.runFromStepUntilWithContext(
+            Uni.createFrom().item("branch"), steps, 0, 0).result()).await().indefinitely();
+        assertEquals("branch", partial);
+        verifyNoInteractions(runner.branchingRegistry);
+        // A resumed final range can contain no remaining authored steps.
+        assertEquals("root-result", ((Uni<?>) runner.runFromStepUntilWithContext(
+            Uni.createFrom().item("branch"), steps, 1, 1).result()).await().indefinitely());
+        assertEquals("child-result", ((Uni<?>) runner.runNestedWithContext(
+            Uni.createFrom().item("branch"), List.of(), "child", -1).result()).await().indefinitely());
+        assertEquals(List.of("root-result"), ((Multi<?>) runner.runFromStepUntilWithContext(
+            Multi.createFrom().item("branch"), steps, 1, 1).result()).collect().asList().await().indefinitely());
     }
 
     @Test
