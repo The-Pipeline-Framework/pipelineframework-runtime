@@ -53,7 +53,7 @@ class PipelineRecursionProductizationTest {
     private static final PipelineReference AGENT = new PipelineReference("agent");
     private static final String ROOT_INVOCATION = invocationName(List.of(), ROOT, "Call agent");
     private static final String RECURSIVE_INVOCATION = invocationName(
-        List.of(new DefinitionLocalLocation(ROOT, "Call agent")), AGENT, "Recur");
+        List.of(new DefinitionLocalLocation(ROOT, "Call agent")), AGENT, "$recur");
 
     @TempDir
     Path tempDir;
@@ -79,7 +79,7 @@ class PipelineRecursionProductizationTest {
         String recursiveSource = Files.readString(
             fixture.generatedClass(RECURSIVE_INVOCATION));
         assertTrue(recursiveSource.contains("Provider<" + RECURSIVE_INVOCATION + ">"));
-        assertTrue(recursiveSource.contains("recursiveOneToOne(runner, \"agent\", \"Recur\""));
+        assertTrue(recursiveSource.contains("recursiveOneToOne(runner, \"agent\", \"$recur\""));
         assertTrue(recursiveSource.contains("effectiveConfig()).applyOneToOne(input)"));
         assertFalse(recursiveSource.contains("ExecutionRecord"));
         assertFalse(recursiveSource.contains("PipelineTelemetry.RunContext"));
@@ -139,12 +139,12 @@ class PipelineRecursionProductizationTest {
         Object result = run(loader, harness.runner(), root, 3);
 
         assertEquals("Result[value=done]", result.toString());
-        assertEquals(4, staticInt(loader, "com.example.recursion.UnwindService", "calls"),
-            "Each recursive invocation must return through its caller suffix exactly once");
+        assertEquals(1, staticInt(loader, "com.example.recursion.UnwindService", "calls"),
+            "Definition-owned recurrence completes the terminal business operation once");
 
         Object repeated = run(loader, harness.runner(), root, 1);
         assertEquals("Result[value=done]", repeated.toString());
-        assertEquals(6, staticInt(loader, "com.example.recursion.UnwindService", "calls"),
+        assertEquals(2, staticInt(loader, "com.example.recursion.UnwindService", "calls"),
             "A generated recursive bean must not retain the prior root invocation path");
     }
 
@@ -159,7 +159,7 @@ class PipelineRecursionProductizationTest {
         assertEquals(3, limit.attemptedDepth());
         assertEquals(2, limit.maximumDepth());
         assertEquals("agent", limit.definitionId());
-        assertEquals("Recur", limit.callsiteId());
+        assertEquals("$recur", limit.callsiteId());
     }
 
     private void verifyStackSafety(ClassLoader loader) throws Exception {
@@ -170,7 +170,7 @@ class PipelineRecursionProductizationTest {
         Object result = run(loader, harness.runner(), invocationGraph(loader, harness.runner()), supportedDepth);
 
         assertEquals("Result[value=done]", result.toString());
-        assertEquals(supportedDepth + 1, staticInt(loader, "com.example.recursion.UnwindService", "calls"));
+        assertEquals(1, staticInt(loader, "com.example.recursion.UnwindService", "calls"));
     }
 
     private void verifyFailurePropagation(ClassLoader loader) throws Exception {
@@ -215,17 +215,17 @@ class PipelineRecursionProductizationTest {
         set(recursive, "runner", runner);
         set(recursive, "child0", client(loader, "ProcessDecideLocalClientStep", "DecideService"));
         Provider<Object> self = () -> recursive;
-        set(recursive, "child1", self);
-        set(recursive, "child2", client(loader, "ProcessCompleteLocalClientStep", "CompleteService"));
-        set(recursive, "child3", client(loader, "ProcessUnwindLocalClientStep", "UnwindService"));
+        set(recursive, "child1", client(loader, "ProcessCompleteLocalClientStep", "CompleteService"));
+        set(recursive, "child2", client(loader, "ProcessUnwindLocalClientStep", "UnwindService"));
+        set(recursive, "child3", self);
 
         Object root = loader.loadClass("com.example.recursion.pipeline." + ROOT_INVOCATION)
             .getConstructor().newInstance();
         set(root, "runner", runner);
         set(root, "child0", client(loader, "ProcessDecideLocalClientStep", "DecideService"));
-        set(root, "child1", recursive);
-        set(root, "child2", client(loader, "ProcessCompleteLocalClientStep", "CompleteService"));
-        set(root, "child3", client(loader, "ProcessUnwindLocalClientStep", "UnwindService"));
+        set(root, "child1", client(loader, "ProcessCompleteLocalClientStep", "CompleteService"));
+        set(root, "child2", client(loader, "ProcessUnwindLocalClientStep", "UnwindService"));
+        set(root, "child3", recursive);
         return root;
     }
 
@@ -342,11 +342,11 @@ class PipelineRecursionProductizationTest {
               agent:
                 input: State
                 output: Result
+                recur: [Continue]
                 steps:
-                  - { name: Decide, service: com.example.recursion.DecideService, cardinality: ONE_TO_ONE, input: State, output: State, java: { input: com.example.recursion.domain.State, output: com.example.recursion.domain.State } }
-                  - { name: Recur, pipeline: agent, cardinality: ONE_TO_ONE, input: State, output: Result, accepts: [Continue], java: { input: com.example.recursion.domain.Continue, output: com.example.recursion.domain.Result } }
+                  - { name: Decide, service: com.example.recursion.DecideService, cardinality: ONE_TO_ONE, input: State, output: State, accepts: [Continue], java: { input: com.example.recursion.domain.State, output: com.example.recursion.domain.State } }
                   - { name: Complete, service: com.example.recursion.CompleteService, cardinality: ONE_TO_ONE, input: State, output: Result, accepts: [Complete], java: { input: com.example.recursion.domain.Complete, output: com.example.recursion.domain.Result } }
-                  - { name: Unwind, service: com.example.recursion.UnwindService, cardinality: ONE_TO_ONE, input: Result, output: Result, terminal: true, java: { input: com.example.recursion.domain.Result, output: com.example.recursion.domain.Result } }
+                  - { name: Unwind, service: com.example.recursion.UnwindService, cardinality: ONE_TO_ONE, input: Result, output: Result, java: { input: com.example.recursion.domain.Result, output: com.example.recursion.domain.Result } }
             steps:
               - { name: Call agent, pipeline: agent, cardinality: ONE_TO_ONE, input: State, output: Result, terminal: true, java: { input: com.example.recursion.domain.State, output: com.example.recursion.domain.Result } }
             """;
