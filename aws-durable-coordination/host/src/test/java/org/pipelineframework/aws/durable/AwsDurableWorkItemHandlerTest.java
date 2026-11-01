@@ -14,9 +14,9 @@ import org.pipelineframework.orchestrator.SqsWorkItemAction;
 
 class AwsDurableWorkItemHandlerTest {
     @Test
-    void invocationScopedWorkSelectsPortableActionAndPreservesPerMessageRetry() {
+    void nativeBatchPreservesPerMessageRetry() {
         var action = mock(SqsWorkItemAction.class);
-        when(action.handlePortable(any())).thenReturn(Uni.createFrom().item(SqsMessageDisposition.ACKNOWLEDGE),
+        when(action.handle(any())).thenReturn(Uni.createFrom().item(SqsMessageDisposition.ACKNOWLEDGE),
             Uni.createFrom().item(SqsMessageDisposition.RETRY));
         var handler = new AwsDurableWorkItemHandler();
         handler.action = action;
@@ -29,7 +29,6 @@ class AwsDurableWorkItemHandlerTest {
         var result = handler.handleRequest(event, mock(Context.class));
 
         assertThat(result.getBatchItemFailures()).extracting(failure -> failure.getItemIdentifier()).containsExactly("second");
-        verify(action, times(2)).handlePortable(any());
-        verify(action, never()).handle(any());
+        verify(action, times(2)).handle(any());
     }
 }

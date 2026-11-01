@@ -2,7 +2,6 @@ package org.pipelineframework.orchestrator;
 
 import java.time.Duration;
 import java.util.Objects;
-import java.util.function.Function;
 
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -39,16 +38,6 @@ public class SqsWorkItemAction {
     }
 
     public Uni<SqsMessageDisposition> handle(SqsInboundMessage message) {
-        return handle(message, pipelineExecutionService::processExecutionWorkItem);
-    }
-
-    /** Invocation-scoped delivery must release the host while durable Await remains pending. */
-    public Uni<SqsMessageDisposition> handlePortable(SqsInboundMessage message) {
-        return handle(message, pipelineExecutionService::processPortableExecutionWorkItem);
-    }
-
-    private Uni<SqsMessageDisposition> handle(SqsInboundMessage message,
-        Function<ExecutionWorkItem, Uni<Void>> processing) {
         Objects.requireNonNull(message, "message");
         if (message.body().isEmpty()) {
             LOG.warnf("Dropping SQS work message with null body id=%s", message.messageId().orElse("<missing>"));
@@ -63,7 +52,7 @@ public class SqsWorkItemAction {
             return Uni.createFrom().item(SqsMessageDisposition.ACKNOWLEDGE);
         }
 
-        return processing.apply(workItem)
+        return pipelineExecutionService.processExecutionWorkItem(workItem)
             .ifNoItem().after(processTimeout).fail()
             .replaceWith(SqsMessageDisposition.ACKNOWLEDGE)
             .onFailure().invoke(failure -> LOG.errorf(

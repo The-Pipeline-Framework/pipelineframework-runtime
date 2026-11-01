@@ -408,20 +408,7 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
    * Processes one execution work item and advances lifecycle state.
    */
   public Uni<Void> processExecutionWorkItem(ExecutionWorkItem workItem) {
-    return processExecutionWorkItem(workItem, this);
-  }
-
-  /**
-   * Processes invocation-scoped work using portable local transitions. Deferred completion
-   * hands ownership back to durable coordination instead of retaining a live invocation.
-   * Configured remote transition workers retain their normal selection and semantics.
-   */
-  public Uni<Void> processPortableExecutionWorkItem(ExecutionWorkItem workItem) {
-    return processExecutionWorkItem(workItem, this::executePortableTransition);
-  }
-
-  private Uni<Void> processExecutionWorkItem(ExecutionWorkItem workItem, PipelineTransitionWorker localWorker) {
-    PipelineTransitionWorker selectedWorker = transitionWorkerSelector.select(localWorker);
+    PipelineTransitionWorker selectedWorker = transitionWorkerSelector.select(this);
     return controlPlane.processExecutionWorkItem(workItem, selectedWorker, awaitItemContinuationHandler(selectedWorker));
   }
 
