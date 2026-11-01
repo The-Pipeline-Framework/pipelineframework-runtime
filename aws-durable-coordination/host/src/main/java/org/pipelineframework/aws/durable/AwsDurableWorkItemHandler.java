@@ -20,6 +20,6 @@ public final class AwsDurableWorkItemHandler implements RequestHandler<SQSEvent,
 
     @Override
     public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
-        return new AwsDurableSqsBatchAdapter().handle(event, action::handle, Duration.ofMinutes(5));
+        return new AwsDurableSqsBatchAdapter().handle(event, action::handlePortable, Duration.ofMinutes(5));
     }
 }
