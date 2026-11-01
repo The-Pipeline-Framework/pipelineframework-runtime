@@ -149,7 +149,7 @@ public class AwaitCompletionSupport {
             context.terminalOutputOwnership(),
             context.traceMetadata(),
             context.pageContext(),
-            context.awaitOccurrenceCause());
+            context.awaitOccurrenceCause(), context.invocationPath());
     }
 
     @SuppressWarnings("unchecked")
@@ -358,8 +358,9 @@ public class AwaitCompletionSupport {
 
     private static String streamUnitId(AwaitCompletionDescriptor descriptor, AwaitExecutionContext context, int stepIndex) {
         if (context.awaitOccurrenceCause().isPresent()) {
-            return new AwaitUnitOccurrence(context.tenantId(), context.executionId(), context.identityScope(),
-                descriptor.stepId(), stepIndex, context.awaitOccurrenceCause().orElseThrow()).unitId();
+            var occurrence = new AwaitUnitOccurrence(context.tenantId(), context.executionId(), context.identityScope(),
+                descriptor.stepId(), stepIndex, context.awaitOccurrenceCause().orElseThrow());
+            return context.invocationPath().map(occurrence::withInvocationPath).orElse(occurrence).unitId();
         }
         return UUID.nameUUIDFromBytes((context.tenantId() + ":" + context.identityScope() + ":"
             + descriptor.stepId() + ":" + stepIndex).getBytes(StandardCharsets.UTF_8)).toString();

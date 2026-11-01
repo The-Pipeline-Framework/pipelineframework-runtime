@@ -334,6 +334,47 @@ class DynamoExecutionStateStoreTest {
     }
 
     @Test
+    void qualifiedRecurrentAwaitReleaseRetainsTheInvocationScopeInItsAcknowledgement() {
+        for (boolean itemized : java.util.List.of(false, true)) {
+            var client = mock(DynamoDbClient.class);
+            var store = new DynamoExecutionStateStore(client, mockConfig("tpf_execution", "tpf_execution_key"));
+            long now = System.currentTimeMillis();
+            var occurrence = new org.pipelineframework.awaitable.AwaitUnitOccurrence("tenant-a", "execution-a",
+                "execution-a", "Review", 2, "initial-v1").withInvocationPath(
+                    org.pipelineframework.invocation.PipelineInvocationContext.root(3).enterRecursive("$root", "$recur").path());
+            var waiting = new HashMap<>(executionItem("tenant-a", "execution-a", "execution-key",
+                now / 1000 + 3600, ExecutionStatus.WAITING_EXTERNAL));
+            waiting.put("await_unit_id", AttributeValue.builder().s(occurrence.unitId()).build());
+            waiting.put("current_step_index", AttributeValue.builder().n("2").build());
+            waiting.put("await_occurrence_cause", AttributeValue.builder().s("initial-v1").build());
+            var queued = new HashMap<>(waiting);
+            queued.put("status", AttributeValue.builder().s(ExecutionStatus.QUEUED.name()).build());
+            queued.put("version", AttributeValue.builder().n("1").build());
+            queued.put("current_step_index", AttributeValue.builder().n("3").build());
+            if (itemized) queued.remove("await_unit_id");
+            var reads = new AtomicInteger();
+            when(client.getItem(any(GetItemRequest.class))).thenAnswer(invocation -> {
+                GetItemRequest request = invocation.getArgument(0);
+                return "tpf_execution".equals(request.tableName())
+                    ? GetItemResponse.builder().item(reads.getAndIncrement() == 0 ? waiting : queued).build()
+                    : GetItemResponse.builder().build();
+            });
+            when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
+                .thenReturn(TransactWriteItemsResponse.builder().build());
+            var released = (itemized
+                ? store.markAwaitItemContinuationsCompleted("tenant-a", "execution-a", occurrence.unitId(), 3,
+                    "completed", now)
+                : store.markAwaitCompleted("tenant-a", "execution-a", occurrence.unitId(), 3, now))
+                .await().indefinitely().orElseThrow();
+            assertEquals(occurrence.occurrenceCause(), released.awaitOccurrenceCause().orElseThrow());
+            var transaction = ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+            verify(client).transactWriteItems(transaction.capture());
+            assertEquals(2, transaction.getValue().transactItems().size());
+            assertEquals(occurrence.unitId(), transaction.getValue().transactItems().get(1).put().item().get("unit_id").s());
+        }
+    }
+
+    @Test
     void markAwaitCompletedClearsRedriveIntent() {
         DynamoDbClient client = mock(DynamoDbClient.class);
         DynamoExecutionStateStore store = new DynamoExecutionStateStore(

@@ -25,7 +25,7 @@ class PipelineInvocationContextTest {
         assertEquals(0, root.recursiveDepth());
         assertEquals(2, second.recursiveDepth());
         assertEquals(List.of("agent:continue#1", "agent:continue#2"),
-            second.recursivePath().stream().map(PipelineInvocationContext.Frame::display).toList());
+            second.recursivePath().stream().map(PipelineInvocationPath.Frame::display).toList());
     }
 
     @Test

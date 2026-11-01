@@ -692,7 +692,7 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
               terminalOutputOwnership,
               java.util.Map.of(),
               command.pageContext(),
-              command.awaitOccurrenceCause()));
+              command.awaitOccurrenceCause(), rehydratedInput.invocationPath()));
           PipelineExecutionContextHolder.set(executionContext);
           rehydratedInput.pipelineContext().ifPresentOrElse(
               PipelineContextHolder::set,

@@ -817,7 +817,7 @@ public class DynamoAwaitInteractionStore implements
             command.nowEpochMs(),
             command.nowEpochMs(),
             command.ttlEpochS(),
-            command.transportOutputType());
+            command.transportOutputType()).withInvocationPath(command.invocationPath());
 
         try {
             dynamoClient().transactWriteItems(TransactWriteItemsRequest.builder()
@@ -1493,6 +1493,7 @@ public class DynamoAwaitInteractionStore implements
         item.put(EXECUTION_ID, avS(record.executionId()));
         item.put(STEP_ID, avS(record.stepId()));
         item.put(STEP_INDEX, avN(record.stepIndex()));
+        record.invocationPath().ifPresent(path -> item.put("invocationPathJson", avS(toJson(path))));
         item.put(OUTPUT_TYPE, avS(record.outputType()));
         item.put(TRANSPORT_OUTPUT_TYPE, avS(record.transportOutputType()));
         item.put(CORRELATION_ID, avS(record.correlationId()));
@@ -1573,7 +1574,9 @@ public class DynamoAwaitInteractionStore implements
             readLong(item, CREATED_AT_EPOCH_MS),
             readLong(item, UPDATED_AT_EPOCH_MS),
             readLong(item, TTL_EPOCH_S),
-            readString(item, TRANSPORT_OUTPUT_TYPE));
+            readString(item, TRANSPORT_OUTPUT_TYPE)).withInvocationPath(Optional.ofNullable(readString(item, "invocationPathJson"))
+                .map(value -> PipelineJson.mapper().convertValue(fromJson(value),
+                    org.pipelineframework.invocation.PipelineInvocationPath.class)));
     }
 
     private AwaitInteractionRecord withPayloads(AwaitInteractionRecord stored, Object requestPayload,
@@ -1585,7 +1588,7 @@ public class DynamoAwaitInteractionStore implements
             stored.version(), stored.status(), requestPayload, responsePayload, stored.unitId(), stored.itemIndex(),
             stored.actor(), stored.assignee(), stored.group(), stored.transportType(), stored.transportMetadata(),
             stored.deadlineEpochMs(), stored.createdAtEpochMs(), stored.updatedAtEpochMs(), stored.ttlEpochS(),
-            stored.transportOutputType(), commandAcknowledgement, stagedCompletionPayload);
+            stored.transportOutputType(), commandAcknowledgement, stagedCompletionPayload).withInvocationPath(stored.invocationPath());
     }
 
     private String serializePayload(AwaitInteractionRecord interaction, AwaitDurablePayloadResolver.Slot slot, Object payload) {

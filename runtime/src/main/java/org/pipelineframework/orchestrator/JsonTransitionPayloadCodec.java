@@ -1,6 +1,7 @@
 package org.pipelineframework.orchestrator;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.Map;
 import java.util.Set;
 import java.util.Collections;
@@ -153,10 +154,10 @@ public class JsonTransitionPayloadCodec implements TransitionPayloadCodec {
                     snapshot.shape(),
                     null,
                     multiPayload.stream().map(this::encode).toList(),
-                    snapshot.pipelineContext().orElse(null))
+                    snapshot.pipelineContext(), snapshot.invocationPath())
                 : new EncodedExecutionInputSnapshot(
                     snapshot.shape(), encode(snapshot.payload()), List.of(),
-                    snapshot.pipelineContext().orElse(null));
+                    snapshot.pipelineContext(), snapshot.invocationPath());
             return new SerializedTransitionPayload(
                 ExecutionInputSnapshot.class.getName(),
                 ENCODING,
@@ -177,7 +178,7 @@ public class JsonTransitionPayloadCodec implements TransitionPayloadCodec {
             Object decodedPayload = encoded.shape() == ExecutionInputShape.MULTI
                 ? encoded.items().stream().map(this::decode).toList()
                 : decode(encoded.payload());
-            return new ExecutionInputSnapshot(encoded.shape(), decodedPayload, encoded.pipelineContext());
+            return new ExecutionInputSnapshot(encoded.shape(), decodedPayload, encoded.pipelineContext(), encoded.invocationPath());
         } catch (Exception e) {
             throw new IllegalArgumentException(
                 "Failed to decode transition input snapshot " + snapshotTypeSummary(encoded),
@@ -337,8 +338,11 @@ public class JsonTransitionPayloadCodec implements TransitionPayloadCodec {
         ExecutionInputShape shape,
         SerializedTransitionPayload payload,
         List<SerializedTransitionPayload> items,
-        org.pipelineframework.context.PipelineContext pipelineContext) {
+        Optional<org.pipelineframework.context.PipelineContext> pipelineContext,
+        Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath) {
         private EncodedExecutionInputSnapshot {
+            pipelineContext = Optional.ofNullable(pipelineContext).orElseGet(Optional::empty);
+            invocationPath = Optional.ofNullable(invocationPath).orElseGet(Optional::empty);
             items = items == null ? List.of() : List.copyOf(items);
         }
     }

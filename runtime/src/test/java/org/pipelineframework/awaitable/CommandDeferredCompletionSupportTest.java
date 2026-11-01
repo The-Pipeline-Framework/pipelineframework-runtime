@@ -37,6 +37,7 @@ public class CommandDeferredCompletionSupportTest {
 
     @AfterEach
     void clearContext() {
+        AwaitExecutionContextHolder.clear();
         PipelineExecutionContextHolder.clear();
     }
 
@@ -71,12 +72,18 @@ public class CommandDeferredCompletionSupportTest {
             registered.set(interactions.get(record.tenantId(), record.interactionId()).await().indefinitely().orElseThrow());
             return URI.create("https://app.test/");
         };
+        var invocationPath = org.pipelineframework.invocation.PipelineInvocationContext.root(4)
+            .enterRecursive("$root", "$recur").path();
+        AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant", "execution", 0,
+            AwaitContinuationMode.DURABLE_HANDOFF, TerminalOutputOwnership.TRANSITION_WORKER,
+            Map.of(), Optional.empty(), Optional.empty(), Optional.of(invocationPath)));
         PipelineExecutionContextHolder.set(new PipelineExecutionContext("tenant", "execution", 0));
         CompletableFuture<String> result = support.<String, String>execute(descriptor, "input", endpoint,
             callback -> commands.<String, String>execute(command, (ignored, input) -> "effect", "input", callback))
             .subscribeAsCompletionStage().toCompletableFuture();
         assertTrue(provider.operation.entered.await(5, TimeUnit.SECONDS));
         var record = registered.get();
+        assertEquals(Optional.of(invocationPath), record.invocationPath());
         var callbackUri = provider.operation.callback.orElseThrow().callbackUri();
         token.set(callbackUri.getPath().substring(("/" + CommandDeferredCompletionSupport.CALLBACK_PATH).length()));
         assertEquals("https://app.test/pipeline/callbacks/" + token.get(), callbackUri.toString());

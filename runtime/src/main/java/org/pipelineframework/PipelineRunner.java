@@ -319,7 +319,7 @@ public class PipelineRunner implements AutoCloseable {
             startStepIndex,
             stopBeforeStepIndex,
             (step, value, index) -> {
-                int executionStepIndex = rootInvocation || awaitContext == null
+                int executionStepIndex = rootInvocation || isRootRecurrence(definitionId, invocationContext) || awaitContext == null
                     ? index
                     : awaitContext.currentStepIndex();
                 AwaitExecutionContext awaitContextSnapshot = awaitContext == null
@@ -335,7 +335,7 @@ public class PipelineRunner implements AutoCloseable {
                                 ? io.opentelemetry.api.trace.SpanContext.getInvalid()
                                 : telemetryContext.span().getSpanContext()),
                         awaitContext.pageContext(),
-                        awaitContext.awaitOccurrenceCause());
+                        awaitContext.awaitOccurrenceCause(), Optional.of(invocationContext.path()));
 
                 if (step instanceof Configurable configurable) {
                     configurable.initialiseWithConfig(configFactory.buildConfig(step.getClass(), pipelineConfig));
@@ -380,7 +380,7 @@ public class PipelineRunner implements AutoCloseable {
         // Terminal object publish only runs after a full pipeline execution, not for partial/early-stop runs.
         Object terminal = current;
         if (stopBeforeStepIndex == orderedSteps.size() && branchingRegistry != null
-            && (rootInvocation || !"$root".equals(definitionId))) {
+            && (rootInvocation || !"$root".equals(definitionId) || isRootRecurrence(definitionId, invocationContext))) {
             if (current instanceof Uni<?> uni) {
                 terminal = uni.map(item -> branchingRegistry.completeDefinition(definitionId, item));
             } else if (current instanceof Multi<?> multi) {
@@ -405,9 +405,26 @@ public class PipelineRunner implements AutoCloseable {
             terminalOutputPublished);
     }
 
+    private boolean isRootRecurrence(String definitionId, PipelineInvocationContext context) {
+        return "$root".equals(definitionId) && !context.recursivePath().isEmpty()
+            && context.recursivePath().stream().allMatch(frame ->
+                "$root".equals(frame.definitionId()) && "$recur".equals(frame.callsiteId()));
+    }
+
     private PipelineInvocationContext rootInvocationContext() {
         int maximumDepth = pipelineConfig == null ? 64 : pipelineConfig.maxRecursiveDepth();
-        return PipelineInvocationContext.root(maximumDepth);
+        return Optional.ofNullable(AwaitExecutionContextHolder.get())
+            .flatMap(AwaitExecutionContext::invocationPath)
+            .map(path -> {
+                if (!path.frames().stream().allMatch(frame ->
+                    "$root".equals(frame.definitionId()) && "$recur".equals(frame.callsiteId()))) {
+                    throw new IllegalArgumentException("Only root definition recurrence can resume at a root step");
+                }
+                if (path.frames().size() > maximumDepth) {
+                    throw new IllegalStateException("Retained root recurrence exceeds pipeline.max-recursive-depth");
+                }
+                return new PipelineInvocationContext(path, maximumDepth);
+            }).orElseGet(() -> PipelineInvocationContext.root(maximumDepth));
     }
 
     public record ExecutionResult(

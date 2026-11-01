@@ -13,6 +13,7 @@ public final class AwaitExecutionContext {
     private final Map<String, Object> traceMetadata;
     private final Optional<PagedTransitionContext> pageContext;
     private final Optional<String> awaitOccurrenceCause;
+    private final Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath;
     private int currentStepIndex;
 
     public AwaitExecutionContext(String tenantId, String executionId, int currentStepIndex) {
@@ -66,6 +67,20 @@ public final class AwaitExecutionContext {
         Optional<PagedTransitionContext> pageContext,
         Optional<String> awaitOccurrenceCause
     ) {
+        this(tenantId, executionId, currentStepIndex, continuationMode, terminalOutputOwnership, traceMetadata, pageContext, awaitOccurrenceCause, Optional.empty());
+    }
+
+    public AwaitExecutionContext(
+        String tenantId,
+        String executionId,
+        int currentStepIndex,
+        AwaitContinuationMode continuationMode,
+        TerminalOutputOwnership terminalOutputOwnership,
+        Map<String, Object> traceMetadata,
+        Optional<PagedTransitionContext> pageContext,
+        Optional<String> awaitOccurrenceCause,
+        Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath
+    ) {
         if (tenantId == null || tenantId.isBlank()) {
             throw new IllegalArgumentException("tenantId must not be blank");
         }
@@ -75,6 +90,7 @@ public final class AwaitExecutionContext {
         if (currentStepIndex < 0) {
             throw new IllegalArgumentException("currentStepIndex must be non-negative");
         }
+        this.invocationPath = java.util.Objects.requireNonNull(invocationPath, "invocationPath");
         this.tenantId = tenantId;
         this.executionId = executionId;
         this.currentStepIndex = currentStepIndex;
@@ -89,6 +105,8 @@ public final class AwaitExecutionContext {
             if (value.isBlank()) throw new IllegalArgumentException("awaitOccurrenceCause must not be blank");
         });
     }
+
+    public Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath() { return invocationPath; }
 
     public String tenantId() { return tenantId; }
 

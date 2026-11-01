@@ -115,7 +115,7 @@ public class InMemoryAwaitInteractionStore implements
                     command.nowEpochMs(),
                     command.nowEpochMs(),
                     command.ttlEpochS(),
-                    command.transportOutputType());
+                    command.transportOutputType()).withInvocationPath(command.invocationPath());
                 requireAvailableLookup(interactionIdByScopedCorrelation.get(
                     scopedCorrelation(created.tenantId(), created.correlationId())), created);
                 interactionsByScopedId.put(scopedInteractionId(created.tenantId(), created.interactionId()), created);
@@ -396,7 +396,7 @@ public class InMemoryAwaitInteractionStore implements
             current.createdAtEpochMs(),
             nowEpochMs,
             current.ttlEpochS(),
-            current.transportOutputType()));
+            current.transportOutputType()).withInvocationPath(current.invocationPath()));
     }
 
     @Override
@@ -453,7 +453,7 @@ public class InMemoryAwaitInteractionStore implements
             current.createdAtEpochMs(),
             command.nowEpochMs(),
             current.ttlEpochS(),
-            current.transportOutputType());
+            current.transportOutputType()).withInvocationPath(current.invocationPath());
         String scopedId = scopedInteractionId(completed.tenantId(), completed.interactionId());
         retainCompletionAdmission(completed);
         interactionsByScopedId.put(scopedId, completed);
@@ -881,7 +881,7 @@ public class InMemoryAwaitInteractionStore implements
             current.createdAtEpochMs(),
             nowEpochMs,
             current.ttlEpochS(),
-            current.transportOutputType(), current.commandAcknowledgement(), current.stagedCompletionPayload());
+            current.transportOutputType(), current.commandAcknowledgement(), current.stagedCompletionPayload()).withInvocationPath(current.invocationPath());
     }
 
     private void purgeExpired(long nowEpochMs) {

@@ -213,7 +213,8 @@ class QueueAsyncSegmentPipeline {
     if (isCoordinatorTerminalMaterialization(segment)) {
       // Keep terminal inputs at the coordinator instead of re-encoding them through a no-op worker.
       Uni<TransitionResultEnvelope> completed = segment.resumesFromAwait()
-          ? inputPayload(segment).onItem().transform(payload ->
+          ? awaitCoordinator.loadResumePayload(segment.record().tenantId(), segment.record().awaitUnitId())
+              .onItem().transform(payload ->
               TransitionResultEnvelope.completedInProcess(terminalOutputItems(segment, payload)))
           : Uni.createFrom().item(TransitionResultEnvelope.completedTerminalInputPassthrough());
       return completed.onItem().transform(result -> segment.record().pagingState()
@@ -248,13 +249,7 @@ class QueueAsyncSegmentPipeline {
     if (!segment.resumesFromAwait()) {
       return Uni.createFrom().item(segment.record().inputPayload());
     }
-    String awaitUnitId = segment.record().awaitUnitId();
-    if (awaitUnitId == null || awaitUnitId.isBlank()) {
-      return Uni.createFrom().failure(new IllegalStateException(
-          "Execution " + segment.record().executionId() + " is resuming from step "
-              + segment.record().currentStepIndex() + " without awaitUnitId"));
-    }
-    return awaitCoordinator.loadResumePayload(segment.record().tenantId(), awaitUnitId);
+    return awaitCoordinator.loadResumeInput(segment.record().tenantId(), segment.record().awaitUnitId());
   }
 
   private Uni<SegmentCommitPlan> suspendedPlan(ClaimedSegment segment, Throwable failure) {
