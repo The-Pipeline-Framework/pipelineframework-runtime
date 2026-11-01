@@ -44,17 +44,20 @@ class PipelineGenerationPhaseIntegrationTest {
             contract: { input: Value, output: Value }
             types:
               Value: { fields: [[id, string]] }
+              BeforeInner: { fields: [[id, string]] }
+              InnerValue: { fields: [[id, string]] }
+              AfterInner: { fields: [[id, string]] }
             pipelines:
               inner:
-                input: Value
-                output: Value
+                input: BeforeInner
+                output: AfterInner
                 steps:
-                  - { name: X, service: com.example.catalog.XService, cardinality: ONE_TO_ONE, input: Value, output: Value, java: { input: com.example.catalog.Value, output: com.example.catalog.Value } }
-                  - { name: Y, service: com.example.catalog.YService, cardinality: ONE_TO_ONE, input: Value, output: Value, java: { input: com.example.catalog.Value, output: com.example.catalog.Value } }
+                  - { name: X, service: com.example.catalog.XService, cardinality: ONE_TO_ONE, input: BeforeInner, output: InnerValue, java: { input: com.example.catalog.BeforeInner, output: com.example.catalog.InnerValue } }
+                  - { name: Y, service: com.example.catalog.YService, cardinality: ONE_TO_ONE, input: InnerValue, output: AfterInner, java: { input: com.example.catalog.InnerValue, output: com.example.catalog.AfterInner } }
             steps:
-              - { name: A, service: com.example.catalog.AService, cardinality: ONE_TO_ONE, input: Value, output: Value, java: { input: com.example.catalog.Value, output: com.example.catalog.Value } }
-              - { name: Call inner, pipeline: inner, cardinality: ONE_TO_ONE, input: Value, output: Value, java: { input: com.example.catalog.Value, output: com.example.catalog.Value } }
-              - { name: C, service: com.example.catalog.CService, cardinality: ONE_TO_ONE, input: Value, output: Value, java: { input: com.example.catalog.Value, output: com.example.catalog.Value } }
+              - { name: A, service: com.example.catalog.AService, cardinality: ONE_TO_ONE, input: Value, output: BeforeInner, java: { input: com.example.catalog.Value, output: com.example.catalog.BeforeInner } }
+              - { name: Call inner, pipeline: inner, cardinality: ONE_TO_ONE, input: BeforeInner, output: AfterInner, java: { input: com.example.catalog.BeforeInner, output: com.example.catalog.AfterInner } }
+              - { name: C, service: com.example.catalog.CService, cardinality: ONE_TO_ONE, input: AfterInner, output: Value, java: { input: com.example.catalog.AfterInner, output: com.example.catalog.Value } }
             """);
 
         Compilation compilation = Compiler.javac().withProcessors(new PipelineStepProcessor()).withOptions(
@@ -63,8 +66,11 @@ class PipelineGenerationPhaseIntegrationTest {
             "-Apipeline.transport=LOCAL")
             .compile(
                 JavaFileObjects.forSourceString("com.example.catalog.Value", "package com.example.catalog; public class Value { }") ,
-                service("com.example.catalog.AService"), service("com.example.catalog.XService"),
-                service("com.example.catalog.YService"), service("com.example.catalog.CService"));
+                JavaFileObjects.forSourceString("com.example.catalog.BeforeInner", "package com.example.catalog; public class BeforeInner { }") ,
+                JavaFileObjects.forSourceString("com.example.catalog.InnerValue", "package com.example.catalog; public class InnerValue { }") ,
+                JavaFileObjects.forSourceString("com.example.catalog.AfterInner", "package com.example.catalog; public class AfterInner { }") ,
+                service("com.example.catalog.AService", "Value", "BeforeInner"), service("com.example.catalog.XService", "BeforeInner", "InnerValue"),
+                service("com.example.catalog.YService", "InnerValue", "AfterInner"), service("com.example.catalog.CService", "AfterInner", "Value"));
 
         assertThat(compilation).succeeded();
         String invocationName = invocationName("Call inner");
@@ -72,7 +78,7 @@ class PipelineGenerationPhaseIntegrationTest {
         assertTrue(Files.exists(invocation), "Expected generated local pipeline invocation source; found "
             + generatedJavaFiles(generatedSourcesDir));
         String source = Files.readString(invocation);
-        assertTrue(source.contains("PipelineInvocationSteps.<Value, Value>oneToOne"));
+        assertTrue(source.contains("PipelineInvocationSteps.<BeforeInner, AfterInner>oneToOne"));
         assertTrue(java.util.regex.Pattern.compile(
             "oneToOne\\(runner,\\s*\\\"inner\\\",\\s*-1,",
             java.util.regex.Pattern.MULTILINE).matcher(source).find(), source);
@@ -88,15 +94,15 @@ class PipelineGenerationPhaseIntegrationTest {
             "Child order must be injected by the invocation bean, not appended to root order.json");
     }
 
-    private static javax.tools.JavaFileObject service(String name) {
+    private static javax.tools.JavaFileObject service(String name, String input, String output) {
         return JavaFileObjects.forSourceString(name, """
             package com.example.catalog;
             import io.smallrye.mutiny.Uni;
             import org.pipelineframework.service.ReactiveService;
-            public class %s implements ReactiveService<Value, Value> {
-              public Uni<Value> process(Value input) { return Uni.createFrom().item(input); }
+            public class %s implements ReactiveService<%s, %s> {
+              public Uni<%s> process(%s input) { return Uni.createFrom().item(new %s()); }
             }
-            """.formatted(name.substring(name.lastIndexOf('.') + 1)));
+            """.formatted(name.substring(name.lastIndexOf('.') + 1), input, output, output, input, output));
     }
 
     @Test

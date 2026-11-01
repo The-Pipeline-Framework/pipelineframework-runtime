@@ -78,6 +78,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -133,6 +136,41 @@ class PipelineExecutionServiceTest {
         service.executionInputPolicy = new ExecutionInputPolicy();
         lenient().when(pipelineStepConfig.health()).thenReturn(healthConfig);
         lenient().when(healthConfig.startupTimeout()).thenReturn(Duration.ofMinutes(5));
+    }
+
+    @Test
+    void itemContinuationEnvelopeRetainsTheCompletedInteractionsInvocationPath() {
+        var worker = mock(PipelineTransitionWorker.class);
+        when(transitionWorkerSelector.select(service)).thenReturn(worker);
+        service.stepOrderer = mock(PipelineStepOrderer.class);
+        when(pipelineStepResolver.loadPipelineSteps()).thenReturn(List.of());
+        when(service.stepOrderer.orderSteps(List.of())).thenReturn(List.of());
+        service.transitionPayloadCodec = new org.pipelineframework.orchestrator.JsonTransitionPayloadCodec();
+        service.transitionWorkerExecutor = mock(org.pipelineframework.orchestrator.TransitionWorkerExecutor.class);
+        var stop = new IllegalStateException("stop after capturing the envelope");
+        when(service.transitionWorkerExecutor.execute(eq(worker), any()))
+            .thenReturn(Uni.createFrom().failure(stop));
+        var interaction = mock(org.pipelineframework.awaitable.AwaitInteractionRecord.class);
+        var unit = mock(org.pipelineframework.awaitable.AwaitUnitRecord.class);
+        when(unit.unitId()).thenReturn("unit");
+        var path = org.pipelineframework.invocation.PipelineInvocationContext.root(3)
+            .enterRecursive("$root", "$recur").path();
+        when(interaction.invocationPath()).thenReturn(Optional.of(path));
+        when(awaitCoordinator.resumePayload(interaction)).thenReturn("answer");
+        long now = System.currentTimeMillis();
+        var parent = new org.pipelineframework.orchestrator.InMemoryExecutionStateStore()
+            .createOrGetExecution(new org.pipelineframework.orchestrator.ExecutionCreateCommand(
+                "tenant", "request", "input", ExecutionResultShape.SINGLE, now, now / 1000 + 600))
+            .await().indefinitely().record();
+        assertSame(stop, assertThrows(IllegalStateException.class, () -> service
+            .awaitItemContinuationHandlerForControlPlane()
+            .continueAwaitItem(interaction, unit, 0, Optional.of(parent), now).await().indefinitely()));
+        var envelope = org.mockito.ArgumentCaptor.forClass(TransitionCommandEnvelope.class);
+        verify(service.transitionWorkerExecutor).execute(eq(worker), envelope.capture());
+        var command = envelope.getValue().toCommand(service.transitionPayloadCodec);
+        var snapshot = assertInstanceOf(org.pipelineframework.orchestrator.ExecutionInputSnapshot.class, command.inputPayload());
+        assertEquals(Optional.of(path), snapshot.invocationPath());
+        assertEquals("answer", snapshot.payload());
     }
 
     @Test

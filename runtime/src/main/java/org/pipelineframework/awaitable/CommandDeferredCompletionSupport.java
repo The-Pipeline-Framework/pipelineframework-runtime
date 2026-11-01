@@ -43,7 +43,7 @@ public class CommandDeferredCompletionSupport {
         AwaitExecutionContext context = Optional.ofNullable(AwaitExecutionContextHolder.get())
             .map(current -> new AwaitExecutionContext(current.tenantId(), current.executionId(),
                 current.currentStepIndex(), current.continuationMode(), current.terminalOutputOwnership(),
-                current.traceMetadata(), current.pageContext(), current.awaitOccurrenceCause()))
+                current.traceMetadata(), current.pageContext(), current.awaitOccurrenceCause(), current.invocationPath()))
             .orElseGet(() -> new AwaitExecutionContext(execution.tenantId(), execution.executionId(),
                 execution.currentStepIndex(), AwaitContinuationMode.LIVE_IF_SUPPORTED,
                 TerminalOutputOwnership.TRANSITION_WORKER, Map.of(), Optional.empty()));

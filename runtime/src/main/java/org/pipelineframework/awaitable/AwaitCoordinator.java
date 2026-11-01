@@ -106,7 +106,25 @@ public class AwaitCoordinator {
         String group,
         Map<String, Object> traceMetadata
     ) {
-        String unitId = unitIdFor(descriptor, tenantId, executionId, identityScope, stepIndex);
+        return createOrGet(descriptor, tenantId, executionId, identityScope, stepIndex, causationId,
+            requestPayload, assignee, group, traceMetadata, Optional.ofNullable(AwaitExecutionContextHolder.get()));
+    }
+
+    Uni<AwaitCreateResult> createOrGet(
+        AwaitCompletionDescriptor descriptor,
+        String tenantId,
+        String executionId,
+        String identityScope,
+        int stepIndex,
+        String causationId,
+        Object requestPayload,
+        String assignee,
+        String group,
+        Map<String, Object> traceMetadata,
+        Optional<AwaitExecutionContext> executionContext
+    ) {
+        var invocationPath = executionContext.flatMap(AwaitExecutionContext::invocationPathForAwait);
+        String unitId = unitIdFor(descriptor, tenantId, executionId, identityScope, stepIndex, executionContext);
         return registerDescriptor(descriptor)
             .onItem().transformToUni(registered -> createOrGetUnit(
                 registered, tenantId, unitId, executionId, stepIndex)
@@ -122,7 +140,7 @@ public class AwaitCoordinator {
                 null,
                 assignee,
                 group,
-                traceMetadata)
+                traceMetadata, invocationPath)
                 .onItem().transformToUni(created -> unitStore().attachPrimaryInteraction(
                         tenantId,
                         unit.unitId(),
@@ -396,7 +414,8 @@ public class AwaitCoordinator {
         }
         return createOrGet(descriptor, context.tenantId(), context.executionId(), context.identityScope(),
             context.currentStepIndex(),
-            context.identityScope() + ":" + context.currentStepIndex(), input, "", "", context.traceMetadata())
+            context.identityScope() + ":" + context.currentStepIndex(), input, "", "", context.traceMetadata(),
+            Optional.of(context))
             .invoke(created -> {
                 validatePinnedCompletionProjector(created.record(), descriptor);
                 if (created.duplicate() && !PipelineJson.mapper().valueToTree(input)
@@ -725,13 +744,29 @@ public class AwaitCoordinator {
     }
 
     public Uni<Object> loadResumePayload(String tenantId, String unitId) {
+        return loadResumePayload(tenantId, unitId, false);
+    }
+
+    /** Restores control data with a scalar completion before constructing the worker envelope. */
+    public Uni<Object> loadResumeInput(String tenantId, String unitId) {
+        return loadResumePayload(tenantId, unitId, true);
+    }
+
+    private Uni<Object> loadResumePayload(String tenantId, String unitId, boolean retainInvocationPath) {
         return getUnit(tenantId, unitId).onItem().transformToUni(unit -> {
             if (unit.primaryInteractionId() != null) {
                 return interactionStore().get(tenantId, unit.primaryInteractionId())
                     .onItem().transform(optional -> optional.orElseThrow(
                         () -> new IllegalStateException("Await interaction not found for primary interaction id "
                             + unit.primaryInteractionId())))
-                    .onItem().transform(this::resumePayload);
+                    .onItem().transform(record -> {
+                        Object result = resumePayload(record);
+                        return retainInvocationPath && record.invocationPath().isPresent()
+                            ? new org.pipelineframework.orchestrator.ExecutionInputSnapshot(
+                                org.pipelineframework.orchestrator.ExecutionInputShape.UNI, result,
+                                Optional.empty(), record.invocationPath())
+                            : result;
+                    });
             }
             return interactionStore().findByUnit(tenantId, unitId)
                 .onItem().transform(records -> {
@@ -1088,6 +1123,25 @@ public class AwaitCoordinator {
         String group,
         Map<String, Object> traceMetadata
     ) {
+        return createInteraction(descriptor, unitId, tenantId, executionId, identityScope, stepIndex, causationId, requestPayload, itemIndex, assignee, group, traceMetadata, Optional.ofNullable(AwaitExecutionContextHolder.get())
+                .flatMap(AwaitExecutionContext::invocationPathForAwait));
+    }
+
+    private Uni<AwaitCreateResult> createInteraction(
+        AwaitCompletionDescriptor descriptor,
+        String unitId,
+        String tenantId,
+        String executionId,
+        String identityScope,
+        int stepIndex,
+        String causationId,
+        Object requestPayload,
+        Integer itemIndex,
+        String assignee,
+        String group,
+        Map<String, Object> traceMetadata,
+        Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath
+    ) {
         Object canonicalRequestPayload = restoreCanonicalRequestPayload(descriptor, requestPayload);
         long now = System.currentTimeMillis();
         long deadline = now + descriptor.timeout().toMillis();
@@ -1109,18 +1163,19 @@ public class AwaitCoordinator {
                 }
                 return createInteractionInOpenUnit(descriptor, unitId, tenantId, executionId, stepIndex,
                     causationId, canonicalRequestPayload, itemIndex, assignee, group, traceMetadata,
-                    now, deadline, ttl, idempotencyKey, correlationId);
+                    now, deadline, ttl, idempotencyKey, correlationId, invocationPath);
             });
         }
         return createInteractionInOpenUnit(descriptor, unitId, tenantId, executionId, stepIndex,
             causationId, canonicalRequestPayload, itemIndex, assignee, group, traceMetadata,
-            now, deadline, ttl, idempotencyKey, correlationId);
+            now, deadline, ttl, idempotencyKey, correlationId, invocationPath);
     }
 
     private Uni<AwaitCreateResult> createInteractionInOpenUnit(
         AwaitCompletionDescriptor descriptor, String unitId, String tenantId, String executionId, int stepIndex,
         String causationId, Object canonicalRequestPayload, Integer itemIndex, String assignee, String group,
-        Map<String, Object> traceMetadata, long now, long deadline, long ttl, String idempotencyKey, String correlationId
+        Map<String, Object> traceMetadata, long now, long deadline, long ttl, String idempotencyKey, String correlationId,
+        Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath
     ) {
         return acquireAdmission(descriptor, tenantId, unitId, itemIndex, executionId, deadline)
             .onItem().transformToUni(lease -> interactionStore().createOrGet(new AwaitCreateCommand(
@@ -1142,7 +1197,7 @@ public class AwaitCoordinator {
                 completionContractMetadata(descriptor, traceMetadata),
                 now,
                 deadline,
-                ttl))
+                ttl).withInvocationPath(invocationPath))
                 .onItem().transformToUni(created -> bindOrReleaseAdmission(created, lease))
                 .onItem().invoke(created -> {
                     if (!created.duplicate()) {
@@ -1301,6 +1356,7 @@ public class AwaitCoordinator {
         int stepIndex
     ) {
         AwaitExecutionContext context = AwaitExecutionContextHolder.get();
+        Optional.ofNullable(context).ifPresent(AwaitExecutionContext::invocationPathForAwait);
         if (context != null && context.awaitOccurrenceCause().isPresent()
             && !unitId.equals(unitIdFor(descriptor, tenantId, executionId, context.identityScope(), stepIndex))) {
             return Uni.createFrom().failure(new IllegalStateException("Await unit differs from the execution occurrence"));
@@ -1772,16 +1828,21 @@ public class AwaitCoordinator {
 
     static String unitIdFor(AwaitCompletionDescriptor descriptor, String tenantId, String executionId,
         String identityScope, int stepIndex) {
-        AwaitExecutionContext context = AwaitExecutionContextHolder.get();
-        if (context != null && context.awaitOccurrenceCause().isPresent()) {
+        return unitIdFor(descriptor, tenantId, executionId, identityScope, stepIndex,
+            Optional.ofNullable(AwaitExecutionContextHolder.get()));
+    }
+
+    private static String unitIdFor(AwaitCompletionDescriptor descriptor, String tenantId, String executionId,
+        String identityScope, int stepIndex, Optional<AwaitExecutionContext> executionContext) {
+        return executionContext.filter(context -> context.awaitOccurrenceCause().isPresent()).map(context -> {
             if (!tenantId.equals(context.tenantId()) || !executionId.equals(context.executionId())
                 || !identityScope.equals(context.identityScope())) {
                 throw new IllegalStateException("Await creation context differs from its semantic owner");
             }
-            return new AwaitUnitOccurrence(tenantId, executionId, identityScope, descriptor.stepId(),
-                stepIndex, context.awaitOccurrenceCause().orElseThrow()).unitId();
-        }
-        return deriveUnitId(tenantId, identityScope, descriptor.stepId(), stepIndex);
+            var occurrence = new AwaitUnitOccurrence(tenantId, executionId, identityScope, descriptor.stepId(),
+                stepIndex, context.awaitOccurrenceCause().orElseThrow());
+            return context.invocationPath().map(occurrence::withInvocationPath).orElse(occurrence).unitId();
+        }).orElseGet(() -> deriveUnitId(tenantId, identityScope, descriptor.stepId(), stepIndex));
     }
 
     private static String deriveUnitId(String tenantId, String executionId, String stepId, int stepIndex) {
