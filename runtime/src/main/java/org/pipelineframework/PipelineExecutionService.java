@@ -312,7 +312,8 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
         List<Object> orderedSteps = stepOrderer.orderSteps(steps);
         int aggregateStepIndex = firstAggregateStepIndex(orderedSteps, nextStepIndex);
         Object awaitPayload = awaitCoordinator.resumePayload(record);
-        ExecutionInputSnapshot continuationInput = new ExecutionInputSnapshot(ExecutionInputShape.UNI, awaitPayload);
+        ExecutionInputSnapshot continuationInput = new ExecutionInputSnapshot(
+            ExecutionInputShape.UNI, awaitPayload, java.util.Optional.empty(), record.invocationPath());
         String transitionKey = "await-item-continuation:" + unit.unitId() + ":" + record.itemIndex();
         TransitionWorkerCommand workerCommand = new TransitionWorkerCommand(
             parent.get().tenantId(),

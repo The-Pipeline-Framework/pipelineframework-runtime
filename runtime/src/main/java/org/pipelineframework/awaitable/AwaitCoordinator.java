@@ -123,8 +123,7 @@ public class AwaitCoordinator {
         Map<String, Object> traceMetadata,
         Optional<AwaitExecutionContext> executionContext
     ) {
-        var invocationPath = executionContext.flatMap(AwaitExecutionContext::invocationPath)
-            .filter(path -> !path.frames().isEmpty());
+        var invocationPath = executionContext.flatMap(AwaitExecutionContext::invocationPathForAwait);
         String unitId = unitIdFor(descriptor, tenantId, executionId, identityScope, stepIndex, executionContext);
         return registerDescriptor(descriptor)
             .onItem().transformToUni(registered -> createOrGetUnit(
@@ -1124,7 +1123,8 @@ public class AwaitCoordinator {
         String group,
         Map<String, Object> traceMetadata
     ) {
-        return createInteraction(descriptor, unitId, tenantId, executionId, identityScope, stepIndex, causationId, requestPayload, itemIndex, assignee, group, traceMetadata, Optional.empty());
+        return createInteraction(descriptor, unitId, tenantId, executionId, identityScope, stepIndex, causationId, requestPayload, itemIndex, assignee, group, traceMetadata, Optional.ofNullable(AwaitExecutionContextHolder.get())
+                .flatMap(AwaitExecutionContext::invocationPathForAwait));
     }
 
     private Uni<AwaitCreateResult> createInteraction(
@@ -1356,6 +1356,7 @@ public class AwaitCoordinator {
         int stepIndex
     ) {
         AwaitExecutionContext context = AwaitExecutionContextHolder.get();
+        Optional.ofNullable(context).ifPresent(AwaitExecutionContext::invocationPathForAwait);
         if (context != null && context.awaitOccurrenceCause().isPresent()
             && !unitId.equals(unitIdFor(descriptor, tenantId, executionId, context.identityScope(), stepIndex))) {
             return Uni.createFrom().failure(new IllegalStateException("Await unit differs from the execution occurrence"));

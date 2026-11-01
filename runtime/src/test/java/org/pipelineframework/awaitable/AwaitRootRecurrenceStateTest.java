@@ -50,6 +50,26 @@ class AwaitRootRecurrenceStateTest {
     }
 
     @Test
+    void rejectsNestedInvocationBeforeCreatingAwaitState() {
+        var interactions = mock(InMemoryAwaitInteractionStore.class);
+        var units = mock(InMemoryAwaitUnitStore.class);
+        var descriptor = new AwaitCompletionDescriptor("Review", Map.class.getName(), Map.class.getName(),
+            Duration.ofMinutes(5), "interactionId", "interaction-api", Map.of(), List.of("id"));
+        var coordinator = coordinator(interactions, units, descriptor);
+        var path = PipelineInvocationContext.root(3).enterRecursive("nested", "repeat").path();
+        var context = new AwaitExecutionContext("tenant", "execution", 1,
+            AwaitContinuationMode.LIVE_IF_SUPPORTED, TerminalOutputOwnership.TRANSITION_WORKER,
+            Map.of(), Optional.empty(), Optional.of("initial-v1"), Optional.of(path));
+        assertThrows(IllegalStateException.class, () -> coordinator.createOrGet(descriptor,
+            "tenant", "execution", "execution", 1, "request", Map.of("id", "request"),
+            "owner", "owners", Map.of(), Optional.of(context)).await().indefinitely());
+        AwaitExecutionContextHolder.set(context);
+        assertThrows(IllegalStateException.class, () -> coordinator.prepareLiveItemizedUnit(
+            descriptor, "tenant", "unit", "execution", 1).await().indefinitely());
+        verifyNoInteractions(interactions, units);
+    }
+
+    @Test
     void completionRetainsTheInvocationPathThroughStoreAndWorkerEnvelope() {
         var interactions = new InMemoryAwaitInteractionStore();
         var units = new InMemoryAwaitUnitStore();

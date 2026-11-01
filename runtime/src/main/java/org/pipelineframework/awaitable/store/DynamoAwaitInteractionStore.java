@@ -106,6 +106,7 @@ public class DynamoAwaitInteractionStore implements
     private static final String ASSIGNEE = "assignee";
     private static final String GROUP = "group_name";
     private static final String TRANSPORT_TYPE = "transport_type";
+    private static final String INVOCATION_PATH_JSON = "invocation_path_json";
     private static final String TRANSPORT_METADATA_JSON = "transport_metadata_json";
     private static final String DEADLINE_EPOCH_MS = "deadline_epoch_ms";
     private static final String CREATED_AT_EPOCH_MS = "created_at_epoch_ms";
@@ -1493,7 +1494,7 @@ public class DynamoAwaitInteractionStore implements
         item.put(EXECUTION_ID, avS(record.executionId()));
         item.put(STEP_ID, avS(record.stepId()));
         item.put(STEP_INDEX, avN(record.stepIndex()));
-        record.invocationPath().ifPresent(path -> item.put("invocationPathJson", avS(toJson(path))));
+        record.invocationPath().ifPresent(path -> item.put(INVOCATION_PATH_JSON, avS(toJson(path))));
         item.put(OUTPUT_TYPE, avS(record.outputType()));
         item.put(TRANSPORT_OUTPUT_TYPE, avS(record.transportOutputType()));
         item.put(CORRELATION_ID, avS(record.correlationId()));
@@ -1574,7 +1575,7 @@ public class DynamoAwaitInteractionStore implements
             readLong(item, CREATED_AT_EPOCH_MS),
             readLong(item, UPDATED_AT_EPOCH_MS),
             readLong(item, TTL_EPOCH_S),
-            readString(item, TRANSPORT_OUTPUT_TYPE)).withInvocationPath(Optional.ofNullable(readString(item, "invocationPathJson"))
+            readString(item, TRANSPORT_OUTPUT_TYPE)).withInvocationPath(Optional.ofNullable(readString(item, INVOCATION_PATH_JSON))
                 .map(value -> PipelineJson.mapper().convertValue(fromJson(value),
                     org.pipelineframework.invocation.PipelineInvocationPath.class)));
     }
