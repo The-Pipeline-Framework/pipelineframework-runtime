@@ -30,7 +30,7 @@ class RootRecurrenceInteractionStoreTest {
         when(client.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder().build());
         when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
             .thenReturn(TransactWriteItemsResponse.builder().build());
-        var path = new PipelineInvocationPath(List.of(new PipelineInvocationPath.Frame("$root", "$recur", 2)));
+        var path = new PipelineInvocationPath(List.of(new PipelineInvocationPath.Frame("$root", "Continue", 2)));
         long now = System.currentTimeMillis();
         var command = new AwaitCreateCommand("tenant", "execution", "Review", 4,
             String.class.getName(), "cause", "idempotency", "correlation", "approved prompt", "owner", "owners",

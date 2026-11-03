@@ -37,9 +37,17 @@ public record PipelineInvocationContext(PipelineInvocationPath path, int maxRecu
     }
 
     public PipelineInvocationContext enterRecursive(String definitionId, String callsiteId) {
+        return enter(definitionId, callsiteId, true);
+    }
+
+    public PipelineInvocationContext atStep(int index) {
+        return new PipelineInvocationContext(path.atStep(index), maxRecursiveDepth);
+    }
+
+    public PipelineInvocationContext enter(String definitionId, String callsiteId, boolean recursive) {
         String definition = required(definitionId, "definitionId");
         String callsite = required(callsiteId, "callsiteId");
-        int nextDepth = recursivePath().size() + 1;
+        int nextDepth = recursiveDepth() + (recursive ? 1 : 0);
         if (nextDepth > maxRecursiveDepth) {
             throw new PipelineRecursionLimitExceededException(
                 definition, callsite, nextDepth, maxRecursiveDepth, recursivePath());
@@ -48,12 +56,12 @@ public record PipelineInvocationContext(PipelineInvocationPath path, int maxRecu
             .filter(frame -> frame.definitionId().equals(definition) && frame.callsiteId().equals(callsite))
             .count() + 1;
         List<Frame> childPath = new ArrayList<>(recursivePath());
-        childPath.add(new Frame(definition, callsite, occurrence));
+        childPath.add(new Frame(definition, callsite, occurrence, path.stepIndex(), recursive));
         return new PipelineInvocationContext(childPath, maxRecursiveDepth);
     }
 
     public int recursiveDepth() {
-        return recursivePath().size();
+        return (int) recursivePath().stream().filter(Frame::recursive).count();
     }
 
     private static String required(String value, String field) {

@@ -341,7 +341,7 @@ class DynamoExecutionStateStoreTest {
             long now = System.currentTimeMillis();
             var occurrence = new org.pipelineframework.awaitable.AwaitUnitOccurrence("tenant-a", "execution-a",
                 "execution-a", "Review", 2, "initial-v1").withInvocationPath(
-                    org.pipelineframework.invocation.PipelineInvocationContext.root(3).enterRecursive("$root", "$recur").path());
+                    org.pipelineframework.invocation.PipelineInvocationContext.root(3).atStep(0).enterRecursive("$root", "Continue").atStep(1).path());
             var waiting = new HashMap<>(executionItem("tenant-a", "execution-a", "execution-key",
                 now / 1000 + 3600, ExecutionStatus.WAITING_EXTERNAL));
             waiting.put("await_unit_id", AttributeValue.builder().s(occurrence.unitId()).build());

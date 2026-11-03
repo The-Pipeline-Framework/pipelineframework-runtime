@@ -18,7 +18,7 @@ class ClaimedSegmentRecurrenceTest {
     long now = System.currentTimeMillis();
     var record = store.createOrGetExecution(new ExecutionCreateCommand("tenant", "request", original,
         ExecutionResultShape.SINGLE, now, now / 1000 + 600)).await().indefinitely().record();
-    var path = PipelineInvocationContext.root(3).enterRecursive("$root", "$recur").path();
+    var path = PipelineInvocationContext.root(3).atStep(0).enterRecursive("$root", "Continue").atStep(1).path();
     var unit = new AwaitUnitOccurrence("tenant", record.executionId(), record.executionId(), "Review", 4,
         record.awaitOccurrenceCause().orElseThrow()).withInvocationPath(path);
     store.markWaitingExternal("tenant", record.executionId(), record.version(), "await", unit.unitId(), 4, ++now)

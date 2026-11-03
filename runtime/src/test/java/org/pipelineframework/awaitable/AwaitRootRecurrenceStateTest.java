@@ -31,7 +31,7 @@ class AwaitRootRecurrenceStateTest {
         var invocation = PipelineInvocationContext.root(3);
         var seen = new java.util.HashSet<String>();
         for (int turn = 0; turn < 3; turn++) {
-            invocation = invocation.enterRecursive("$root", "$recur");
+            invocation = invocation.atStep(0).enterRecursive("$root", "Continue").atStep(1);
             var context = new AwaitExecutionContext("tenant", "execution", 1,
                 AwaitContinuationMode.LIVE_IF_SUPPORTED, TerminalOutputOwnership.TRANSITION_WORKER,
                 Map.of(), Optional.empty(), Optional.of("initial-v1"), Optional.of(invocation.path()));
@@ -50,7 +50,7 @@ class AwaitRootRecurrenceStateTest {
     }
 
     @Test
-    void rejectsNestedInvocationBeforeCreatingAwaitState() {
+    void rejectsIncompleteContinuationBeforeCreatingAwaitState() {
         var interactions = mock(InMemoryAwaitInteractionStore.class);
         var units = mock(InMemoryAwaitUnitStore.class);
         var descriptor = new AwaitCompletionDescriptor("Review", Map.class.getName(), Map.class.getName(),
@@ -76,7 +76,7 @@ class AwaitRootRecurrenceStateTest {
         var descriptor = new AwaitCompletionDescriptor("Review", Map.class.getName(), Map.class.getName(),
             Duration.ofMinutes(5), "interactionId", "interaction-api", Map.of(), List.of("id"));
         var coordinator = coordinator(interactions, units, descriptor);
-        var path = PipelineInvocationContext.root(3).enterRecursive("$root", "$recur").path();
+        var path = PipelineInvocationContext.root(3).atStep(0).enterRecursive("$root", "Continue").atStep(1).path();
         AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant", "execution", 1,
             AwaitContinuationMode.DURABLE_HANDOFF, TerminalOutputOwnership.TRANSITION_WORKER,
             Map.of(), Optional.empty(), Optional.empty(), Optional.of(path)));

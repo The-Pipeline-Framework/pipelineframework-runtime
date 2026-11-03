@@ -17,7 +17,7 @@ class AwaitCycleAdvanceTest {
         var previousUnits = new HashSet<String>();
         var invocation = org.pipelineframework.invocation.PipelineInvocationContext.root(3);
         for (int cycle = 0; cycle < 3; cycle++) {
-            invocation = invocation.enterRecursive("$root", "$recur");
+            invocation = invocation.atStep(0).enterRecursive("$root", "Continue").atStep(1);
             var occurrence = new AwaitUnitOccurrence("tenant", record.executionId(), record.executionId(),
                 "Review", 4, record.awaitOccurrenceCause().orElseThrow()).withInvocationPath(invocation.path());
             var waiting = store.markWaitingExternal("tenant", record.executionId(), record.version(),

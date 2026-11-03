@@ -54,23 +54,32 @@ class PipelineRootRecurrenceAwaitTest {
             return Uni.createFrom().item(value);
         }) { };
         var body = new AtomicReference<List<Object>>();
-        StepOneToOne<Integer, Integer> recur = new IntegerStep(value -> PipelineInvocationSteps.<Integer, Integer>recursiveOneToOne(
-            runner, "$root", "$recur", -1, body.get()).applyOneToOne(value)) { };
+        class Continue extends IntegerStep implements PipelineInvocationSteps.LinkedInvocation {
+            Continue() {
+                super(value -> PipelineInvocationSteps.<Integer, Integer>recursiveOneToOne(
+                    runner, "$root", "Continue", -1, body.get()).applyOneToOne(value));
+            }
+            @Override public PipelineInvocationSteps.LinkedDefinition linkedDefinition() {
+                return new PipelineInvocationSteps.LinkedDefinition("$root", "Continue", true, -1, body.get());
+            }
+        }
+        var recur = new Continue();
         body.set(List.of(advance, suspend, recur));
         AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant", "execution", 0));
         assertInstanceOf(Suspended.class, rootCause(assertThrows(RuntimeException.class,
             () -> ((Uni<?>) runner.run(Uni.createFrom().item(0), body.get())).await().atMost(Duration.ofSeconds(5)))));
         assertEquals(2, effects.get());
-        assertEquals(1, captured.get().currentStepIndex());
+        assertEquals(2, captured.get().currentStepIndex());
+        assertEquals(1, captured.get().invocationPath().orElseThrow().stepIndex());
         var codec = new JsonTransitionPayloadCodec();
         var snapshot = new ExecutionInputSnapshot(ExecutionInputShape.UNI, 2, Optional.empty(),
             captured.get().invocationPath());
         var restored = assertInstanceOf(ExecutionInputSnapshot.class, codec.decode(codec.encode(snapshot)));
-        AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant", "execution", 2,
+        AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant", "execution", 3,
             AwaitContinuationMode.DURABLE_HANDOFF, TerminalOutputOwnership.TRANSITION_WORKER,
             Map.of(), Optional.empty(), Optional.empty(), restored.invocationPath()));
         assertInstanceOf(PipelineRecursionLimitExceededException.class, rootCause(assertThrows(RuntimeException.class,
-            () -> ((Uni<?>) runner.runFromStep(Uni.createFrom().item(restored.payload()), body.get(), 2))
+            () -> ((Uni<?>) runner.runFromStep(Uni.createFrom().item(restored.payload()), body.get(), 3))
                 .await().atMost(Duration.ofSeconds(5)))));
         assertEquals(2, effects.get());
     }

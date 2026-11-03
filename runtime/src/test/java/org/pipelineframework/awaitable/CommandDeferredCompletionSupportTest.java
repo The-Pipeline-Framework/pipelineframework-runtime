@@ -73,7 +73,7 @@ public class CommandDeferredCompletionSupportTest {
             return URI.create("https://app.test/");
         };
         var invocationPath = org.pipelineframework.invocation.PipelineInvocationContext.root(4)
-            .enterRecursive("$root", "$recur").path();
+            .atStep(0).enterRecursive("$root", "Continue").atStep(1).path();
         AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant", "execution", 0,
             AwaitContinuationMode.DURABLE_HANDOFF, TerminalOutputOwnership.TRANSITION_WORKER,
             Map.of(), Optional.empty(), Optional.empty(), Optional.of(invocationPath)));

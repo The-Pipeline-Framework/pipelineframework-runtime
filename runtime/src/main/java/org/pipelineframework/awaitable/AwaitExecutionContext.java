@@ -110,12 +110,7 @@ public final class AwaitExecutionContext {
 
     /** Validates durable resume support before an Await creates state or dispatches. */
     public Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPathForAwait() {
-        invocationPath.ifPresent(path -> {
-            if (path.frames().stream().anyMatch(frame ->
-                !"$root".equals(frame.definitionId()) || !"$recur".equals(frame.callsiteId()))) {
-                throw new IllegalStateException("Await supports only root recurrence invocation paths");
-            }
-        });
+        invocationPath.ifPresent(org.pipelineframework.invocation.PipelineInvocationPath::requireResumable);
         return invocationPath.filter(path -> !path.frames().isEmpty());
     }
 

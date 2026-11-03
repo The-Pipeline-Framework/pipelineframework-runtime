@@ -154,7 +154,7 @@ class PipelineExecutionServiceTest {
         var unit = mock(org.pipelineframework.awaitable.AwaitUnitRecord.class);
         when(unit.unitId()).thenReturn("unit");
         var path = org.pipelineframework.invocation.PipelineInvocationContext.root(3)
-            .enterRecursive("$root", "$recur").path();
+            .atStep(0).enterRecursive("$root", "Continue").atStep(1).path();
         when(interaction.invocationPath()).thenReturn(Optional.of(path));
         when(awaitCoordinator.resumePayload(interaction)).thenReturn("answer");
         long now = System.currentTimeMillis();
