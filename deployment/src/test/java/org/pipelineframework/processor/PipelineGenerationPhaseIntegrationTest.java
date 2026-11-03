@@ -80,7 +80,7 @@ class PipelineGenerationPhaseIntegrationTest {
         String source = Files.readString(invocation);
         assertTrue(source.contains("PipelineInvocationSteps.<BeforeInner, AfterInner>oneToOne"));
         assertTrue(java.util.regex.Pattern.compile(
-            "oneToOne\\(runner,\\s*\\\"inner\\\",\\s*-1,",
+            "oneToOne\\(runner,\\s*\\\"inner\\\",\\s*\\\"Call inner\\\",\\s*-1,",
             java.util.regex.Pattern.MULTILINE).matcher(source).find(), source);
         assertTrue(source.contains("java.util.List.of(child0, child1)"));
         assertTrue(source.contains("ProcessXLocalClientStep child0"));

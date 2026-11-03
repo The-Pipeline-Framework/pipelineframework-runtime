@@ -552,8 +552,18 @@ class PipelineCompositionProductizationTest {
     }
 
     @Test
-    void rejectsNestedAwaitAsExplicitSliceTwoBoundary() throws Exception {
-        Compilation compilation = compile("nested-await", diagnosticYaml("""
+    void generatesAwaitInsideTheNestedDefinition() throws Exception {
+        var sources = new LinkedHashMap<>(diagnosticSources());
+        sources.put("com.example.diagnostic.WaitService", """
+            package com.example.diagnostic;
+            import com.example.diagnostic.domain.A;
+            public class WaitService implements org.pipelineframework.service.ReactiveService<A, A> {
+                public io.smallrye.mutiny.Uni<A> process(A input) {
+                    return io.smallrye.mutiny.Uni.createFrom().item(input);
+                }
+            }
+            """);
+        var fixture = compile("nested-await", diagnosticYaml("""
             inner:
               input: A
               output: A
@@ -571,11 +581,11 @@ class PipelineCompositionProductizationTest {
                     transport: { type: interaction-api }
             """, """
             - { name: Call inner, pipeline: inner, cardinality: ONE_TO_ONE, input: A, output: A, java: { input: com.example.diagnostic.A, output: com.example.diagnostic.A } }
-            """), diagnosticSources()).compilation();
+            """), sources);
 
-        assertThat(compilation).failed();
-        assertThat(compilation).hadErrorContaining(
-            "nested pipeline definitions do not support await: yet");
+        assertThat(fixture.compilation()).succeeded();
+        assertTrue(Files.readString(fixture.generatedClass("ProcessWaitDeferredCompletionStep"))
+            .contains("AwaitCompletionSupport"));
     }
 
     private Object instantiateGeneratedInvocation(
