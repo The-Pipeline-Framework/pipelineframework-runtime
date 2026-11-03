@@ -81,6 +81,31 @@ class PipelineReleaseProducerTest {
     }
 
     @Test
+    void derivesAssociationsForOneWholePipelineWorker() throws Exception {
+        var placed = new PipelineContractDescriptor(
+            contract.schemaVersion(), contract.pipelineId(), contract.contractVersion(), contract.contractHash(),
+            "COMPUTE", "REST", contract.module(), false, "PIPELINE_RUNTIME", contract.steps(), contract.capabilities());
+        writeMetadata(placed);
+        Path ingress = jar("ingress.zip", placed, "ingress");
+        Path worker = jar("worker.zip", placed, "worker");
+        var ingressInput = new ReleaseArtifactInput("ingress", "lambda-zip", ingress, ingress.toUri().toString(),
+            List.of(), List.of(), ReleaseArtifactInput.Role.INGRESS);
+        var workerInput = new ReleaseArtifactInput("worker", "lambda-zip", worker, worker.toUri().toString(),
+            List.of(), List.of(), ReleaseArtifactInput.Role.PIPELINE_WORKER);
+        var descriptor = generator.generate(placed, "release-1", "worker", metadataDirectory,
+            List.of(ingressInput, workerInput), true);
+
+        assertEquals(List.of(), descriptor.artifacts().getFirst().stepIds());
+        assertEquals(List.of(), descriptor.artifacts().getFirst().capabilities());
+        assertEquals(List.of("Validate", "Store"), descriptor.artifacts().getLast().stepIds());
+        assertEquals(List.of("local", "rest", "grpc"), descriptor.artifacts().getLast().capabilities());
+        assertThrows(IllegalArgumentException.class, () -> generator.generate(
+            placed, "release-1", "worker", metadataDirectory, List.of(workerInput, workerInput), true));
+        assertThrows(IllegalArgumentException.class, () -> generator.generate(
+            contract, "release-1", "worker", metadataDirectory, List.of(workerInput), true));
+    }
+
+    @Test
     void writesDeterministicContentAndAllowsIdenticalRegeneration() throws Exception {
         Path jar = jar("orders.jar", contract, "payload");
         var descriptor = descriptor(jar, "release-1");

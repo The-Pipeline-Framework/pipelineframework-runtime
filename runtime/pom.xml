@@ -64,7 +64,7 @@
         <dependency>
             <groupId>org.pipelineframework</groupId>
             <artifactId>tpf-release-resolver</artifactId>
-            <version>${tpf.release-resolver.version}</version>
+            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>org.pipelineframework</groupId>

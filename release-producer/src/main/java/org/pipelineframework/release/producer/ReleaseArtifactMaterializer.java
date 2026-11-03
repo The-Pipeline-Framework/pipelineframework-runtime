@@ -53,7 +53,7 @@ final class ReleaseArtifactMaterializer {
                 ? archive.toAbsolutePath().normalize().toUri().toASCIIString()
                 : input.uri();
             materialized.add(new ReleaseArtifactInput(
-                input.artifactId(), input.kind(), archive, uri, input.stepIds(), input.capabilities()));
+                input.artifactId(), input.kind(), archive, uri, input.stepIds(), input.capabilities(), input.role()));
         }
         return List.copyOf(materialized);
     }

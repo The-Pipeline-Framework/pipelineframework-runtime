@@ -27,6 +27,7 @@ coords = [
     ("org.pipelineframework", "pipelineframework-runtime-spring", "jar"),
     ("org.pipelineframework", "pipelineframework-release-maven-plugin", "jar"),
     ("org.pipelineframework", "pipelineframework-release-producer", "jar"),
+    ("org.pipelineframework", "tpf-release-resolver", "jar"),
     ("org.pipelineframework", "pipelineframework-aws-durable-coordination-parent", "pom"),
     ("org.pipelineframework", "pipelineframework-aws-durable-coordination-model", "jar"),
     ("org.pipelineframework", "pipelineframework-aws-durable-coordination-host", "jar"),

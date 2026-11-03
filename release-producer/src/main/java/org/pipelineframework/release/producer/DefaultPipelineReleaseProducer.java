@@ -106,6 +106,7 @@ public final class DefaultPipelineReleaseProducer implements PipelineReleaseProd
             throw new IllegalArgumentException("At least one release artifact is required");
         }
 
+        validateArtifactRoles(contract, artifacts);
         Set<String> knownStepIds = new HashSet<>();
         for (PipelineBundleStepDescriptor step : contract.steps()) {
             knownStepIds.add(step.authoredName());
@@ -129,8 +130,10 @@ public final class DefaultPipelineReleaseProducer implements PipelineReleaseProd
             if (kind == PipelineReleaseArtifactKind.JAR) {
                 validateEmbeddedContract(artifact.file(), contract);
             }
-            List<String> stepIds = validatedStepIds(artifact.stepIds(), knownStepIds, artifactId);
-            List<String> capabilities = validatedValues(artifact.capabilities(), "capability", artifactId);
+            List<String> stepIds = validatedStepIds(artifact.role() == ReleaseArtifactInput.Role.PIPELINE_WORKER
+                ? defaultStepIds(contract) : artifact.stepIds(), knownStepIds, artifactId);
+            List<String> capabilities = validatedValues(artifact.role() == ReleaseArtifactInput.Role.PIPELINE_WORKER
+                ? defaultCapabilities(contract) : artifact.capabilities(), "capability", artifactId);
             descriptors.add(new PipelineReleaseArtifactDescriptor(
                 artifactId,
                 kindValue,
@@ -158,6 +161,31 @@ public final class DefaultPipelineReleaseProducer implements PipelineReleaseProd
                 "compiledTruthArtifactId does not reference a configured artifact: " + carrierId));
         validateCompiledTruthCarrier(carrier.file(), metadataDirectory);
         return descriptor;
+    }
+
+    private static void validateArtifactRoles(
+        PipelineContractDescriptor contract, List<ReleaseArtifactInput> artifacts
+    ) {
+        long workerCount = artifacts.stream()
+            .filter(artifact -> artifact.role() == ReleaseArtifactInput.Role.PIPELINE_WORKER)
+            .count();
+        if (workerCount > 1) {
+            throw new IllegalArgumentException("Only one artifact can own the whole pipeline; use explicit associations for split placement");
+        }
+        if (workerCount == 1 && !"PIPELINE_RUNTIME".equals(contract.runtimeLayout())) {
+            throw new IllegalArgumentException("Whole-pipeline worker derivation requires PIPELINE_RUNTIME placement");
+        }
+        for (ReleaseArtifactInput artifact : artifacts) {
+            boolean hasAssociations = !artifact.stepIds().isEmpty() || !artifact.capabilities().isEmpty();
+            if (hasAssociations && (artifact.role() != ReleaseArtifactInput.Role.EXPLICIT || workerCount == 1)) {
+                throw new IllegalArgumentException(
+                    "Explicit associations conflict with role-based pipeline ownership for artifact " + artifact.artifactId());
+            }
+            if (artifact.role() != ReleaseArtifactInput.Role.EXPLICIT
+                && !"lambda-zip".equalsIgnoreCase(requireText(artifact.kind(), "kind"))) {
+                throw new IllegalArgumentException("Ingress and pipeline worker roles require lambda-zip: " + artifact.artifactId());
+            }
+        }
     }
 
     public byte[] serialize(PipelineReleaseDescriptor descriptor) {
