@@ -43,20 +43,34 @@ public final class MavenArtifactResolverProvider implements ArtifactResolverProv
                 system.newLocalRepositoryManager(session, new LocalRepository(localRepository.toFile())));
         List<RemoteRepository> repositories = new ArrayList<>();
         for (int index = 0; index < configuration.repositories().size(); index++) {
-            repositories.add(new RemoteRepository.Builder(
-                "configured-" + index, "default", configuration.repositories().get(index).toASCIIString()).build());
+            var url = configuration.repositories().get(index);
+            var matchingIds = settings.repositories().stream()
+                .filter(repository -> repository.url().equals(url) && !repository.id().isBlank())
+                .map(MavenSettingsReader.Repository::id)
+                .distinct().toList();
+            repositories.add(matchingIds.size() == 1
+                ? configuredRepository(new MavenSettingsReader.Repository(matchingIds.getFirst(), url), settings)
+                : new RemoteRepository.Builder("configured-" + index, "default", url.toASCIIString()).build());
         }
         for (MavenSettingsReader.Repository repository : settings.repositories()) {
-            RemoteRepository.Builder builder = new RemoteRepository.Builder(
-                repository.id(), "default", repository.url().toASCIIString());
-            MavenSettingsReader.Server server = settings.servers().get(repository.id());
-            if (server != null) {
-                builder.setAuthentication(new AuthenticationBuilder()
-                    .addUsername(server.username()).addPassword(server.password()).build());
+            if (repositories.stream().noneMatch(configured ->
+                configured.getId().equals(repository.id()) && configured.getUrl().equals(repository.url().toASCIIString()))) {
+                repositories.add(configuredRepository(repository, settings));
             }
-            repositories.add(builder.build());
         }
         return artifact -> open(system, session, repositories, artifact);
+    }
+
+    private static RemoteRepository configuredRepository(
+        MavenSettingsReader.Repository repository, MavenSettingsReader.Settings settings
+    ) {
+        var builder = new RemoteRepository.Builder(repository.id(), "default", repository.url().toASCIIString());
+        MavenSettingsReader.Server server = settings.servers().get(repository.id());
+        if (server != null) {
+            builder.setAuthentication(new AuthenticationBuilder()
+                .addUsername(server.username()).addPassword(server.password()).build());
+        }
+        return builder.build();
     }
 
     private static RepositorySystem repositorySystem() {

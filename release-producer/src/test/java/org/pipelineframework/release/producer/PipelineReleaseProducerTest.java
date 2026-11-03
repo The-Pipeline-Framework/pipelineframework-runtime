@@ -99,8 +99,11 @@ class PipelineReleaseProducerTest {
         assertEquals(List.of(), descriptor.artifacts().getFirst().capabilities());
         assertEquals(List.of("Validate", "Store"), descriptor.artifacts().getLast().stepIds());
         assertEquals(List.of("local", "rest", "grpc"), descriptor.artifacts().getLast().capabilities());
-        assertThrows(IllegalArgumentException.class, () -> generator.generate(
-            placed, "release-1", "worker", metadataDirectory, List.of(workerInput, workerInput), true));
+        var secondWorker = new ReleaseArtifactInput("other-worker", "lambda-zip", worker, worker.toUri().toString(),
+            List.of(), List.of(), ReleaseArtifactInput.Role.PIPELINE_WORKER);
+        var failure = assertThrows(IllegalArgumentException.class, () -> generator.generate(
+            placed, "release-1", "worker", metadataDirectory, List.of(workerInput, secondWorker), true));
+        assertTrue(failure.getMessage().contains("Only one artifact can own the whole pipeline"));
         assertThrows(IllegalArgumentException.class, () -> generator.generate(
             contract, "release-1", "worker", metadataDirectory, List.of(workerInput), true));
     }

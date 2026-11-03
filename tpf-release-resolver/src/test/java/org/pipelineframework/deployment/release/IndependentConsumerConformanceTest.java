@@ -3,6 +3,7 @@ package org.pipelineframework.deployment.release;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
@@ -70,6 +71,23 @@ class IndependentConsumerConformanceTest {
     }
 
     @Test
+    void rejectsTamperedPublishedArtifact() throws Exception {
+        Path metadata = metadata();
+        var contract = PipelineJson.mapper().readValue(
+            metadata.resolve("pipeline-contract.json").toFile(), PipelineContractDescriptor.class);
+        var scenario = singleJar(contract, metadata);
+        Path repository = temporaryDirectory.resolve("tampered-repository");
+        publish(scenario, repository);
+        var coordinates = PipelineReleaseArtifactUri.parse(scenario.artifacts().getFirst().uri()).maven().orElseThrow();
+        Files.writeString(repository.resolve(coordinates.repositoryPath()), "tampered");
+        var profile = new ResolverProfile(false,
+            Optional.of(new MavenResolverConfiguration(null, repository, List.of())), Optional.empty());
+        var failure = assertThrows(ReleaseVerificationException.class, () -> new ReleaseVerifier().verify(
+            scenario.descriptor(), temporaryDirectory.resolve("tampered-output"), profile, CredentialResolver.NONE));
+        assertTrue(failure.getMessage().toLowerCase(java.util.Locale.ROOT).contains("digest"), failure.getMessage());
+    }
+
+    @Test
     void resolvesDigestQualifiedOciManifestWithoutChangingReleaseSemantics() throws Exception {
         byte[] manifest = "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\"}".getBytes();
         String digest = "sha256:" + HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(manifest));
@@ -110,6 +128,74 @@ class IndependentConsumerConformanceTest {
         } finally {
             registry.stop(0);
         }
+    }
+
+    @Test
+    void retriesOciManifestWithScopedBearerToken() throws Exception {
+        HttpServer registry = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String host = "127.0.0.1:" + registry.getAddress().getPort();
+        registry.createContext("/token", exchange -> {
+            try (exchange) {
+                String query = java.net.URLDecoder.decode(exchange.getRequestURI().getRawQuery(), java.nio.charset.StandardCharsets.UTF_8);
+                if (!query.equals("service=fixture&scope=repository:example/orders:pull")) {
+                    exchange.sendResponseHeaders(400, -1);
+                    return;
+                }
+                byte[] token = "{\"access_token\":\"fixture-token\"}".getBytes();
+                exchange.sendResponseHeaders(200, token.length);
+                exchange.getResponseBody().write(token);
+            }
+        });
+        registry.createContext("/v2/", exchange -> {
+            try (exchange) {
+                if (!"Bearer fixture-token".equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
+                    exchange.getResponseHeaders().set("WWW-Authenticate",
+                        "Bearer realm=\"http://" + host + "/token\",service=\"fixture\",scope=\"repository:example/orders:pull\"");
+                    exchange.sendResponseHeaders(401, -1);
+                    return;
+                }
+                exchange.sendResponseHeaders(200, 2);
+                exchange.getResponseBody().write("{}".getBytes());
+            }
+        });
+        registry.start();
+        try (var result = ociResolver(host).open(ociArtifact(host))) {
+            assertArrayEquals("{}".getBytes(), result.readAllBytes());
+        } finally {
+            registry.stop(0);
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void rejectsOversizedOciManifestWithOrWithoutContentLength(boolean fixedLength) throws Exception {
+        HttpServer registry = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String host = "127.0.0.1:" + registry.getAddress().getPort();
+        registry.createContext("/v2/", exchange -> {
+            try (exchange) {
+                int bytes = 4 * 1024 * 1024 + 1;
+                exchange.sendResponseHeaders(200, fixedLength ? bytes : 0);
+                if (!fixedLength) exchange.getResponseBody().write(new byte[bytes]);
+            }
+        });
+        registry.start();
+        try {
+            var failure = assertThrows(IOException.class, () -> ociResolver(host).open(ociArtifact(host)));
+            assertTrue(failure.getMessage().contains("OCI response exceeds"), failure.getMessage());
+        } finally {
+            registry.stop(0);
+        }
+    }
+
+    private static org.pipelineframework.orchestrator.release.PipelineReleaseArtifactResolver ociResolver(String host) {
+        return new OciArtifactResolverProvider().create(
+            new OciResolverConfiguration("", Map.of(), Set.of(host)), CredentialResolver.NONE);
+    }
+
+    private static PipelineReleaseArtifactDescriptor ociArtifact(String host) {
+        String digest = "sha256:" + "a".repeat(64);
+        return new PipelineReleaseArtifactDescriptor("image", "container-image",
+            "oci://" + host + "/example/orders@" + digest, digest, List.of(), List.of());
     }
 
     private Scenario singleJar(PipelineContractDescriptor contract, Path metadata) throws Exception {

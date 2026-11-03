@@ -28,24 +28,33 @@ final class DockerConfigCredentialResolver implements CredentialResolver {
         if (!Files.isRegularFile(configFile)) return Optional.empty();
         try {
             JsonNode root = JSON.readTree(configFile.toFile());
-            JsonNode registry = root.path("auths").path(reference.name());
+            String registryKey = switch (reference.name()) {
+                case "docker.io", "index.docker.io", "registry-1.docker.io" -> "https://index.docker.io/v1/";
+                default -> reference.name();
+            };
+            JsonNode registry = root.path("auths").path(registryKey);
             if (!registry.isMissingNode() && registry.hasNonNull("auth")) {
                 String decoded = new String(Base64.getDecoder().decode(registry.path("auth").asText()), StandardCharsets.UTF_8);
                 int separator = decoded.indexOf(':');
                 if (separator >= 0) return Optional.of(new Credential.Basic(
                     decoded.substring(0, separator), decoded.substring(separator + 1)));
             }
-            String helper = root.path("credHelpers").path(reference.name()).asText(root.path("credsStore").asText(""));
-            return helper.isBlank() ? Optional.empty() : helperCredential(helper, reference.name());
+            String helper = root.path("credHelpers").path(registryKey).asText(root.path("credsStore").asText(""));
+            return helper.isBlank() ? Optional.empty() : helperCredential(helper, registryKey);
         } catch (IOException | IllegalArgumentException e) {
             throw new IllegalArgumentException("Failed to resolve Docker credential for " + reference.name(), e);
         }
     }
 
     private static Optional<Credential> helperCredential(String helper, String registry) throws IOException {
-        Process process = new ProcessBuilder("docker-credential-" + helper, "get").start();
+        Process process = new ProcessBuilder("docker-credential-" + helper, "get")
+            .redirectError(ProcessBuilder.Redirect.DISCARD).start();
         try (var input = process.getOutputStream()) {
             input.write(registry.getBytes(StandardCharsets.UTF_8));
+        }
+        byte[] output;
+        try (var stdout = process.getInputStream()) {
+            output = stdout.readAllBytes();
         }
         try {
             if (process.waitFor() != 0) return Optional.empty();
@@ -53,7 +62,7 @@ final class DockerConfigCredentialResolver implements CredentialResolver {
             Thread.currentThread().interrupt();
             throw new IOException("Interrupted while reading Docker credential helper", e);
         }
-        JsonNode response = JSON.readTree(process.getInputStream());
+        JsonNode response = JSON.readTree(output);
         String username = response.path("Username").asText();
         String secret = response.path("Secret").asText();
         if (secret.isBlank()) return Optional.empty();
