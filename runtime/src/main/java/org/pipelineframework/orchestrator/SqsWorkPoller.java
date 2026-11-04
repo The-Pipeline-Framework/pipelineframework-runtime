@@ -23,6 +23,7 @@ import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityRequest;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
 import software.amazon.awssdk.services.sqs.model.Message;
+import software.amazon.awssdk.services.sqs.model.MessageSystemAttributeName;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 
 /**
@@ -32,6 +33,7 @@ import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 public class SqsWorkPoller {
 
     private static final Logger LOG = Logger.getLogger(SqsWorkPoller.class);
+    private static final Logger QUEUE_TRACE = Logger.getLogger("org.pipelineframework.diagnostics.queue");
     private static final int MAX_MESSAGES_PER_POLL = 1;
     private static final int WAIT_TIME_SECONDS = 1;
     private static final Duration INITIAL_FAILURE_BACKOFF = Duration.ofSeconds(1);
@@ -120,6 +122,7 @@ public class SqsWorkPoller {
 
         ReceiveMessageRequest request = ReceiveMessageRequest.builder()
             .queueUrl(queueUrl)
+            .messageSystemAttributeNames(MessageSystemAttributeName.APPROXIMATE_RECEIVE_COUNT)
             .maxNumberOfMessages(MAX_MESSAGES_PER_POLL)
             .waitTimeSeconds(WAIT_TIME_SECONDS)
             .visibilityTimeout(VISIBILITY_EXTENSION_SECONDS)
@@ -156,12 +159,17 @@ public class SqsWorkPoller {
         if (message == null || message.receiptHandle() == null) {
             return;
         }
-        ScheduledFuture<?> visibilityExtension = startVisibilityExtension(queueUrl, message.receiptHandle());
+        String messageId = message.messageId();
+        QUEUE_TRACE.debugf("event=sqs_work_received messageId=%s receiveCount=%s visibilitySeconds=%d",
+            messageId, message.attributes().get(MessageSystemAttributeName.APPROXIMATE_RECEIVE_COUNT),
+            VISIBILITY_EXTENSION_SECONDS);
+        ScheduledFuture<?> visibilityExtension = startVisibilityExtension(queueUrl, messageId, message.receiptHandle());
         try {
             SqsMessageDisposition disposition = workItemAction.handle(SqsInboundMessage.from(message))
                 .await().indefinitely();
+            QUEUE_TRACE.debugf("event=sqs_work_disposition messageId=%s disposition=%s", messageId, disposition);
             if (disposition == SqsMessageDisposition.ACKNOWLEDGE) {
-                deleteMessage(queueUrl, message.receiptHandle());
+                deleteMessage(queueUrl, messageId, message.receiptHandle());
             }
         } catch (RuntimeException e) {
             LOG.errorf(e, "Failed invoking SQS work-item action id=%s", message.messageId());
@@ -170,7 +178,7 @@ public class SqsWorkPoller {
         }
     }
 
-    private void deleteMessage(String queueUrl, String receiptHandle) {
+    private void deleteMessage(String queueUrl, String messageId, String receiptHandle) {
         DeleteMessageRequest request = DeleteMessageRequest.builder()
             .queueUrl(queueUrl)
             .receiptHandle(receiptHandle)
@@ -178,6 +186,7 @@ public class SqsWorkPoller {
         for (int attempt = 1; attempt <= DELETE_MAX_ATTEMPTS; attempt++) {
             try {
                 sqsClient().deleteMessage(request);
+                QUEUE_TRACE.debugf("event=sqs_work_deleted messageId=%s", messageId);
                 return;
             } catch (RuntimeException e) {
                 if (attempt == DELETE_MAX_ATTEMPTS) {
@@ -237,7 +246,7 @@ public class SqsWorkPoller {
         sleep(Duration.ofMillis(delayMillis));
     }
 
-    private ScheduledFuture<?> startVisibilityExtension(String queueUrl, String receiptHandle) {
+    private ScheduledFuture<?> startVisibilityExtension(String queueUrl, String messageId, String receiptHandle) {
         ScheduledExecutorService activeVisibilityExecutor = visibilityExecutor;
         if (activeVisibilityExecutor == null) {
             return null;
@@ -249,11 +258,10 @@ public class SqsWorkPoller {
                     .receiptHandle(receiptHandle)
                     .visibilityTimeout(VISIBILITY_EXTENSION_SECONDS)
                     .build());
+                QUEUE_TRACE.debugf("event=sqs_work_visibility_extended messageId=%s visibilitySeconds=%d",
+                    messageId, VISIBILITY_EXTENSION_SECONDS);
             } catch (RuntimeException e) {
-                LOG.warnf(e,
-                    "Failed extending SQS work message visibility queueUrl=%s receiptHandle=%s",
-                    queueUrl,
-                    receiptHandle);
+                LOG.warnf(e, "Failed extending SQS work message visibility messageId=%s", messageId);
             }
         }, VISIBILITY_EXTENSION_PERIOD_SECONDS, VISIBILITY_EXTENSION_PERIOD_SECONDS, TimeUnit.SECONDS);
     }

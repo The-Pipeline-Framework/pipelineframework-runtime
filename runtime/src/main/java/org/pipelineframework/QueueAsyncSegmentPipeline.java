@@ -36,6 +36,7 @@ import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 class QueueAsyncSegmentPipeline {
 
   private static final Logger LOG = Logger.getLogger(QueueAsyncSegmentPipeline.class);
+  private static final Logger QUEUE_TRACE = Logger.getLogger("org.pipelineframework.diagnostics.queue");
 
   private final PipelineOrchestratorConfig orchestratorConfig;
   private final ExecutionStateStore executionStateStore;
@@ -129,6 +130,8 @@ class QueueAsyncSegmentPipeline {
         .onItem().transformToUni(claimed -> claimed
             .map(record -> {
               ClaimedSegment segment = ClaimedSegment.from(record);
+              QUEUE_TRACE.debugf("event=execution_lease_claimed executionId=%s transition=%s version=%d expiresEpochMs=%d",
+                  record.executionId(), segment.transitionKey(), record.version(), record.leaseExpiresEpochMs());
               return keepLeaseAlive(segment, runClaimed(segment, worker, itemContinuationHandler, now));
             })
             .orElseGet(() -> Uni.createFrom().voidItem()));
@@ -153,6 +156,13 @@ class QueueAsyncSegmentPipeline {
                   queueWorkerId,
                   nowEpochMs,
                   orchestratorConfig.leaseMs())
+              .onFailure().invoke(failure -> QUEUE_TRACE.debugf(failure,
+                  "event=execution_lease_renewal_error executionId=%s transition=%s version=%d",
+                  record.executionId(), segment.transitionKey(), record.version()))
+              .onItem().invoke(renewed -> QUEUE_TRACE.debugf(
+                  "event=execution_lease_renewal executionId=%s transition=%s version=%d renewed=%s elapsedMs=%d",
+                  record.executionId(), segment.transitionKey(), record.version(), renewed.isPresent(),
+                  System.currentTimeMillis() - nowEpochMs))
               .onItem().transformToUni(renewed -> renewed.isPresent()
                   ? renewLeaseUntilLost(segment, renewalInterval)
                   : continueAfterCommittedTransitionOrFail(segment));
@@ -163,7 +173,10 @@ class QueueAsyncSegmentPipeline {
     ExecutionRecord<Object, Object> claimed = segment.record();
     return executionStateStore.getExecution(claimed.tenantId(), claimed.executionId())
         .onItem().transformToUni(current -> {
-          if (current.isPresent() && transitionWasCommitted(segment, current.orElseThrow())) {
+          boolean committed = current.filter(record -> transitionWasCommitted(segment, record)).isPresent();
+          QUEUE_TRACE.debugf("event=execution_lease_renewal_reconciled executionId=%s transition=%s committed=%s",
+              claimed.executionId(), segment.transitionKey(), committed);
+          if (committed) {
             // The state commit legitimately fences subsequent renewals. Keep this branch pending so
             // post-commit ledger work can finish and the actual work branch determines the outcome.
             return Uni.createFrom().nothing();
