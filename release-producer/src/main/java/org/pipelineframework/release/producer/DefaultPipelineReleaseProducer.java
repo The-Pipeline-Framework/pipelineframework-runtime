@@ -380,7 +380,7 @@ public final class DefaultPipelineReleaseProducer implements PipelineReleaseProd
         return List.copyOf(result);
     }
 
-    private static String sha256(Path file) {
+    static String sha256(Path file) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             try (InputStream input = Files.newInputStream(file)) {

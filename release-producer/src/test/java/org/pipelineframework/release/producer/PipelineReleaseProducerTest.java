@@ -109,6 +109,23 @@ class PipelineReleaseProducerTest {
     }
 
     @Test
+    void preservesEarlierCompiledTruthWhenMetadataChanges() throws Exception {
+        var input = new ReleaseArtifactInput("truth", "compiled-truth", metadataDirectory,
+            temporaryDirectory.resolve("truth.zip").toUri().toASCIIString(), List.of(), List.of());
+        Path build = temporaryDirectory.resolve("build");
+        var first = generator.materialize(List.of(input), "truth", metadataDirectory, build).getFirst();
+        byte[] original = Files.readAllBytes(first.file());
+        assertEquals(sha256(first.file()) + ".zip", first.file().getFileName().toString());
+        assertEquals(first, generator.materialize(List.of(input), "truth", metadataDirectory, build).getFirst());
+
+        Files.writeString(metadataDirectory.resolve("new-metadata.json"), "{}");
+        var second = generator.materialize(List.of(input), "truth", metadataDirectory, build).getFirst();
+        assertTrue(!first.uri().equals(second.uri()));
+        assertEquals(sha256(second.file()) + ".zip", second.file().getFileName().toString());
+        assertArrayEquals(original, Files.readAllBytes(first.file()));
+    }
+
+    @Test
     void writesDeterministicContentAndAllowsIdenticalRegeneration() throws Exception {
         Path jar = jar("orders.jar", contract, "payload");
         var descriptor = descriptor(jar, "release-1");
