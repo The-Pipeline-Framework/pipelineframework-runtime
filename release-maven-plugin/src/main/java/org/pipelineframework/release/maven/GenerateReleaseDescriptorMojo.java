@@ -89,7 +89,8 @@ public final class GenerateReleaseDescriptorMojo extends AbstractMojo {
                     artifact.file() == null ? null : artifact.file().toPath(),
                     artifact.uri(),
                     artifact.stepIds(),
-                    artifact.capabilities()))
+                    artifact.capabilities(),
+                    artifact.role()))
                 .toList();
         }
 

@@ -1,6 +1,7 @@
 package org.pipelineframework.release.producer;
 
 import java.io.IOException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -48,14 +49,44 @@ final class ReleaseArtifactMaterializer {
                         + " map to the same archive: " + archive);
             }
             boolean carrier = input.artifactId().equals(compiledTruthArtifactId);
-            createArchive(source, kind, carrier, metadataDirectory, archive);
+            if (carrier || kind == PipelineReleaseArtifactKind.COMPILED_TRUTH) {
+                archive = createImmutableArchive(source, kind, carrier, metadataDirectory, archive);
+            } else {
+                createArchive(source, kind, false, metadataDirectory, archive);
+            }
             String uri = PipelineReleaseArtifactUri.parse(input.uri()).scheme() == PipelineReleaseArtifactUri.Scheme.FILE
                 ? archive.toAbsolutePath().normalize().toUri().toASCIIString()
                 : input.uri();
             materialized.add(new ReleaseArtifactInput(
-                input.artifactId(), input.kind(), archive, uri, input.stepIds(), input.capabilities()));
+                input.artifactId(), input.kind(), archive, uri, input.stepIds(), input.capabilities(), input.role()));
         }
         return List.copyOf(materialized);
+    }
+
+    private static Path createImmutableArchive(
+        Path source, PipelineReleaseArtifactKind kind, boolean carrier, Path metadataDirectory, Path archive
+    ) {
+        try {
+            Files.createDirectories(archive.getParent());
+            Path temporary = Files.createTempFile(archive.getParent(), ".release-", ".zip");
+            try {
+                createArchive(source, kind, carrier, metadataDirectory, temporary);
+                String digest = DefaultPipelineReleaseProducer.sha256(temporary);
+                Path immutable = archive.resolveSibling(digest + ".zip");
+                try {
+                    Files.move(temporary, immutable);
+                } catch (FileAlreadyExistsException e) {
+                    if (Files.mismatch(temporary, immutable) != -1) {
+                        throw new IOException("Existing release archive does not match its digest: " + immutable, e);
+                    }
+                }
+                return immutable;
+            } finally {
+                Files.deleteIfExists(temporary);
+            }
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Failed to materialize immutable release archive " + source, e);
+        }
     }
 
     private static void createArchive(

@@ -3,6 +3,7 @@ package org.pipelineframework.release.maven;
 import java.io.File;
 import java.util.List;
 import org.apache.maven.plugins.annotations.Parameter;
+import org.pipelineframework.release.producer.ReleaseArtifactInput.Role;
 
 /** Maven configuration for one build-produced release artifact. */
 public final class ReleaseArtifactConfiguration {
@@ -23,6 +24,14 @@ public final class ReleaseArtifactConfiguration {
 
     @Parameter
     private List<String> capabilities;
+
+    @Parameter
+    private String role;
+
+    Role role() {
+        return role == null ? Role.EXPLICIT
+            : Role.valueOf(role.trim());
+    }
 
     String artifactId() {
         return artifactId;

@@ -59,3 +59,7 @@ test('still rejects undeclared reactor projects', () => {
     <properties><maven.deploy.skip>false</maven.deploy.skip></properties></project></projects>`);
   assert.throws(() => assertEffectivePublication(xml), /unexpected org.pipelineframework reactor project/);
 });
+
+test("publishes the Runtime-owned release resolver", () => {
+  assert.equal(expectedDeployability.get("tpf-release-resolver"), true);
+});
