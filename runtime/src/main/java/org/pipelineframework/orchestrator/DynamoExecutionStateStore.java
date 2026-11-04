@@ -60,6 +60,7 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
 @ApplicationScoped
 public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExecutionAdmissionStore {
     private static final Logger LOG = Logger.getLogger(DynamoExecutionStateStore.class);
+    private static final Logger QUEUE_TRACE = Logger.getLogger("org.pipelineframework.diagnostics.queue");
 
     static final String TENANT_ID = "tenant_id";
     static final String EXECUTION_ID = "execution_id";
@@ -444,7 +445,10 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         PagedExecutionState nextPage,
         long nowEpochMs) {
         return blocking(() -> advancePageBlocking(
-            tenantId, executionId, expectedVersion, transitionKey, nextPage, nowEpochMs));
+            tenantId, executionId, expectedVersion, transitionKey, nextPage, nowEpochMs))
+            .onItem().invoke(updated -> QUEUE_TRACE.debugf(
+                "event=execution_page_advance executionId=%s transition=%s version=%d nextPage=%d committed=%s",
+                executionId, transitionKey, expectedVersion, nextPage.pageIndex(), updated.isPresent()));
     }
 
     @Override

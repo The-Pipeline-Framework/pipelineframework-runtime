@@ -24,7 +24,6 @@ import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
 class SegmentCommitEffects {
 
   private static final Logger LOG = Logger.getLogger(SegmentCommitEffects.class);
-  private static final Logger QUEUE_TRACE = Logger.getLogger("org.pipelineframework.diagnostics.queue");
 
   private final ExecutionStateStore executionStateStore;
   private final WorkDispatcher workDispatcher;
@@ -128,9 +127,6 @@ class SegmentCommitEffects {
             segment.transitionKey(),
             successor,
             nowEpochMs)
-        .onItem().invoke(updated -> QUEUE_TRACE.debugf(
-            "event=execution_page_advance executionId=%s transition=%s nextPage=%d committed=%s",
-            segment.record().executionId(), segment.transitionKey(), successor.pageIndex(), updated.isPresent()))
         .onItem().transformToUni(updated -> updated
             .map(queued -> workDispatcher.enqueueNow(new ExecutionWorkItem(
                 queued.tenantId(), queued.executionId())))
