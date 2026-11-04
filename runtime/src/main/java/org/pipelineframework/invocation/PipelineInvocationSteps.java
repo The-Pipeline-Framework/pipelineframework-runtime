@@ -51,6 +51,15 @@ public final class PipelineInvocationSteps {
             callsiteId = required(callsiteId, "callsiteId");
             steps = List.copyOf(Objects.requireNonNull(steps, "steps"));
         }
+
+        /** Validates retained identity against this release's compiler-linked callsite. */
+        public void requireMatchingFrame(PipelineInvocationPath.Frame frame) {
+            Objects.requireNonNull(frame, "frame");
+            if (!definitionId.equals(frame.definitionId()) || !callsiteId.equals(frame.callsiteId())
+                || recursive != frame.recursive()) {
+                throw new IllegalStateException("Retained invocation does not match its pinned pipeline callsite");
+            }
+        }
     }
 
     public static <I, O> StepOneToOne<I, O> oneToOne(

@@ -150,7 +150,11 @@ public class PipelineRunner implements AutoCloseable {
         int stopBeforeStepIndex) {
         PipelineInvocationContext invocation = rootInvocationContext();
         if (!invocation.path().frames().isEmpty()) {
-            return resumeInvocation(input, steps, startStepIndex, stopBeforeStepIndex, invocation);
+            // The public runner accepts both reactive shapes; durable nested execution is unary.
+            if (!(input instanceof Uni<?> unaryInput)) {
+                throw new IllegalArgumentException("Nested Await continuation requires scalar input");
+            }
+            return resumeInvocation(unaryInput, steps, startStepIndex, stopBeforeStepIndex, invocation);
         }
         return runFromStepUntilWithContext(
             input,
@@ -424,11 +428,8 @@ public class PipelineRunner implements AutoCloseable {
             }).orElseGet(() -> PipelineInvocationContext.root(maximumDepth));
     }
 
-    private ExecutionResult resumeInvocation(Object input, List<Object> rootSteps, int startStepIndex,
+    private ExecutionResult resumeInvocation(Uni<?> input, List<Object> rootSteps, int startStepIndex,
         int stopBeforeStepIndex, PipelineInvocationContext invocation) {
-        if (!(input instanceof Uni<?>)) {
-            throw new IllegalArgumentException("Nested Await continuation requires scalar input");
-        }
         var orderedRoot = stepOrderer.orderSteps(rootSteps);
         var path = invocation.path();
         var frames = path.frames();
@@ -438,17 +439,15 @@ public class PipelineRunner implements AutoCloseable {
         var definitions = new ArrayList<org.pipelineframework.invocation.PipelineInvocationSteps.LinkedDefinition>();
         List<Object> currentSteps = orderedRoot;
         for (var frame : frames) {
+            // Step lists also contain ordinary operations. This is the single capability check
+            // at that heterogeneous boundary; subsequent traversal uses the linked definition.
             if (frame.callerStepIndex() >= currentSteps.size()
                 || !(currentSteps.get(frame.callerStepIndex()) instanceof
                     org.pipelineframework.invocation.PipelineInvocationSteps.LinkedInvocation linked)) {
                 throw new IllegalStateException("Retained invocation callsite is absent from the pinned pipeline definition");
             }
             var definition = linked.linkedDefinition();
-            if (!definition.definitionId().equals(frame.definitionId())
-                || !definition.callsiteId().equals(frame.callsiteId())
-                || definition.recursive() != frame.recursive()) {
-                throw new IllegalStateException("Retained invocation does not match its pinned pipeline callsite");
-            }
+            definition.requireMatchingFrame(frame);
             definitions.add(definition);
             currentSteps = definition.steps();
         }
