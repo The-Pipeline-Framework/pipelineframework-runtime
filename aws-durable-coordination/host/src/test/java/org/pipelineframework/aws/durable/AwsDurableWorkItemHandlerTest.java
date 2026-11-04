@@ -8,7 +8,10 @@ import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.events.SQSEvent;
 import io.smallrye.mutiny.Uni;
 import java.util.List;
+import java.util.Optional;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.pipelineframework.orchestrator.SqsInboundMessage;
 import org.pipelineframework.orchestrator.SqsMessageDisposition;
 import org.pipelineframework.orchestrator.SqsWorkItemAction;
 
@@ -29,6 +32,10 @@ class AwsDurableWorkItemHandlerTest {
         var result = handler.handleRequest(event, mock(Context.class));
 
         assertThat(result.getBatchItemFailures()).extracting(failure -> failure.getItemIdentifier()).containsExactly("second");
-        verify(action, times(2)).handle(any());
+        var messages = ArgumentCaptor.forClass(SqsInboundMessage.class);
+        verify(action, times(2)).handle(messages.capture());
+        assertThat(messages.getAllValues()).containsExactly(
+            new SqsInboundMessage(Optional.of("first"), Optional.of("first-body")),
+            new SqsInboundMessage(Optional.of("second"), Optional.of("second-body")));
     }
 }
