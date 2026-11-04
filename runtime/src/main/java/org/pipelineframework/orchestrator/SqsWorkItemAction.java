@@ -18,6 +18,7 @@ import org.pipelineframework.config.pipeline.PipelineJson;
 public class SqsWorkItemAction {
 
     private static final Logger LOG = Logger.getLogger(SqsWorkItemAction.class);
+    private static final Logger QUEUE_TRACE = Logger.getLogger("org.pipelineframework.diagnostics.queue");
     private static final Duration PROCESS_TIMEOUT = Duration.ofMinutes(5);
 
     @Inject
@@ -52,6 +53,8 @@ public class SqsWorkItemAction {
             return Uni.createFrom().item(SqsMessageDisposition.ACKNOWLEDGE);
         }
 
+        QUEUE_TRACE.debugf("event=sqs_work_execution messageId=%s executionId=%s",
+            message.messageId().orElse("<missing>"), workItem.executionId());
         return pipelineExecutionService.processExecutionWorkItem(workItem)
             .ifNoItem().after(processTimeout).fail()
             .replaceWith(SqsMessageDisposition.ACKNOWLEDGE)

@@ -19,7 +19,6 @@ import org.pipelineframework.orchestrator.ControlPlaneTransitionAdmission;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
-import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.PipelineTransitionWorker;
@@ -37,8 +36,7 @@ class QueueAsyncSegmentPipeline {
 
   private static final Logger LOG = Logger.getLogger(QueueAsyncSegmentPipeline.class);
 
-  private final PipelineOrchestratorConfig orchestratorConfig;
-  private final ExecutionStateStore executionStateStore;
+  private final QueueAsyncExecutionLease executionLease;
   private final WorkDispatcher workDispatcher;
   private final AwaitCoordinator awaitCoordinator;
   private final TransitionWorkerExecutor transitionWorkerExecutor;
@@ -48,7 +46,6 @@ class QueueAsyncSegmentPipeline {
   private final Supplier<Duration> saturatedDelay;
   private final IntSupplier pipelineStepCount;
   private final SegmentCommitEffects segmentCommitEffects;
-  private final String queueWorkerId;
 
   QueueAsyncSegmentPipeline(
       PipelineOrchestratorConfig orchestratorConfig,
@@ -63,8 +60,7 @@ class QueueAsyncSegmentPipeline {
       IntSupplier pipelineStepCount,
       SegmentCommitEffects segmentCommitEffects,
       String queueWorkerId) {
-    this.orchestratorConfig = Objects.requireNonNull(orchestratorConfig, "orchestratorConfig must not be null");
-    this.executionStateStore = Objects.requireNonNull(executionStateStore, "executionStateStore must not be null");
+    this.executionLease = new QueueAsyncExecutionLease(executionStateStore, orchestratorConfig, queueWorkerId);
     this.workDispatcher = Objects.requireNonNull(workDispatcher, "workDispatcher must not be null");
     this.awaitCoordinator = Objects.requireNonNull(awaitCoordinator, "awaitCoordinator must not be null");
     this.transitionWorkerExecutor = Objects.requireNonNull(transitionWorkerExecutor, "transitionWorkerExecutor must not be null");
@@ -74,7 +70,6 @@ class QueueAsyncSegmentPipeline {
     this.saturatedDelay = Objects.requireNonNull(saturatedDelay, "saturatedDelay must not be null");
     this.pipelineStepCount = Objects.requireNonNull(pipelineStepCount, "pipelineStepCount must not be null");
     this.segmentCommitEffects = Objects.requireNonNull(segmentCommitEffects, "segmentCommitEffects must not be null");
-    this.queueWorkerId = queueWorkerId == null || queueWorkerId.isBlank() ? "worker-local" : queueWorkerId;
   }
 
   Uni<Void> process(
@@ -92,7 +87,8 @@ class QueueAsyncSegmentPipeline {
         transitionPermit.close();
         return handleDeniedAdmission(workItem, tenantAdmission);
       }
-      return claimAndRun(workItem, worker, itemContinuationHandler)
+      return executionLease.run(workItem,
+          (segment, claimedAt) -> runClaimed(segment, worker, itemContinuationHandler, claimedAt))
           .onTermination().invoke(() -> {
             transitionPermit.close();
             tenantAdmission.permit().close();
@@ -113,73 +109,6 @@ class QueueAsyncSegmentPipeline {
         workItem.executionId(),
         tenantAdmission.decision().reason());
     return Uni.createFrom().voidItem();
-  }
-
-  private Uni<Void> claimAndRun(
-      ExecutionWorkItem workItem,
-      PipelineTransitionWorker worker,
-      AwaitItemContinuationHandler itemContinuationHandler) {
-    long now = System.currentTimeMillis();
-    return executionStateStore.claimLease(
-            workItem.tenantId(),
-            workItem.executionId(),
-            queueWorkerId,
-            now,
-            orchestratorConfig.leaseMs())
-        .onItem().transformToUni(claimed -> claimed
-            .map(record -> {
-              ClaimedSegment segment = ClaimedSegment.from(record);
-              return keepLeaseAlive(segment, runClaimed(segment, worker, itemContinuationHandler, now));
-            })
-            .orElseGet(() -> Uni.createFrom().voidItem()));
-  }
-
-  private Uni<Void> keepLeaseAlive(ClaimedSegment segment, Uni<Void> work) {
-    long leaseMs = orchestratorConfig.leaseMs();
-    Duration renewalInterval = Duration.ofMillis(Math.max(1L, leaseMs / 3L));
-    return Uni.join().first(work, renewLeaseUntilLost(segment, renewalInterval)).toTerminate();
-  }
-
-  private Uni<Void> renewLeaseUntilLost(ClaimedSegment segment, Duration renewalInterval) {
-    return Uni.createFrom().voidItem()
-        .onItem().delayIt().by(renewalInterval)
-        .onItem().transformToUni(ignored -> {
-          ExecutionRecord<Object, Object> record = segment.record();
-          long nowEpochMs = System.currentTimeMillis();
-          return executionStateStore.renewLease(
-                  record.tenantId(),
-                  record.executionId(),
-                  record.version(),
-                  queueWorkerId,
-                  nowEpochMs,
-                  orchestratorConfig.leaseMs())
-              .onItem().transformToUni(renewed -> renewed.isPresent()
-                  ? renewLeaseUntilLost(segment, renewalInterval)
-                  : continueAfterCommittedTransitionOrFail(segment));
-        });
-  }
-
-  private Uni<Void> continueAfterCommittedTransitionOrFail(ClaimedSegment segment) {
-    ExecutionRecord<Object, Object> claimed = segment.record();
-    return executionStateStore.getExecution(claimed.tenantId(), claimed.executionId())
-        .onItem().transformToUni(current -> {
-          if (current.isPresent() && transitionWasCommitted(segment, current.orElseThrow())) {
-            // The state commit legitimately fences subsequent renewals. Keep this branch pending so
-            // post-commit ledger work can finish and the actual work branch determines the outcome.
-            return Uni.createFrom().nothing();
-          }
-          return Uni.createFrom().failure(new IllegalStateException(
-              "Execution lease ownership was lost for execution " + claimed.executionId()));
-        });
-  }
-
-  private static boolean transitionWasCommitted(
-      ClaimedSegment segment,
-      ExecutionRecord<Object, Object> current) {
-    ExecutionRecord<Object, Object> claimed = segment.record();
-    return current.version() > claimed.version()
-        && current.status() != ExecutionStatus.RUNNING
-        && segment.transitionKey().equals(current.lastTransitionKey());
   }
 
   private Uni<Void> runClaimed(
