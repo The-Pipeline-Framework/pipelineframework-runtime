@@ -37,7 +37,7 @@ workflow package token; it uses no Maven Central credentials or GPG key.
 ## Coordinator Maven Release admission
 
 The existing private, default-disabled release admin registration endpoint accepts canonical `maven:`
-application-archive Releases through the public `tpf-release-resolver`. Admission verifies the closure
+application-archive Releases through the public `pipelineframework-release-resolver`. Admission verifies the closure
 before storage, preserves the descriptor and retains native immutable registration and primary-artifact
 activation verification. Legacy local file/JAR registration remains supported; admission does not deploy
 or execute customer code.

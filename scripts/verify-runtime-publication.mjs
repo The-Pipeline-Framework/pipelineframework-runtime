@@ -10,7 +10,7 @@ export const expectedDeployability = new Map([
   ['pipelineframework-runtime-spring', true],
   ['pipelineframework-release-maven-plugin', true],
   ['pipelineframework-release-producer', true],
-  ['tpf-release-resolver', true],
+  ['pipelineframework-release-resolver', true],
   ['pipelineframework-aws-durable-coordination-parent', true],
   ['pipelineframework-aws-durable-coordination-model', true],
   ['pipelineframework-aws-durable-coordination-host', true],

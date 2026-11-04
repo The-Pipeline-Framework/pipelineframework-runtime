@@ -61,5 +61,5 @@ test('still rejects undeclared reactor projects', () => {
 });
 
 test("publishes the Runtime-owned release resolver", () => {
-  assert.equal(expectedDeployability.get("tpf-release-resolver"), true);
+  assert.equal(expectedDeployability.get("pipelineframework-release-resolver"), true);
 });

@@ -63,7 +63,7 @@
     <dependencies>
         <dependency>
             <groupId>org.pipelineframework</groupId>
-            <artifactId>tpf-release-resolver</artifactId>
+            <artifactId>pipelineframework-release-resolver</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>
@@ -325,7 +325,7 @@
                                     <include>org.pipelineframework:pipelineframework-runtime-protocol</include>
                                     <include>org.pipelineframework:pipelineframework-api</include>
                                     <include>org.pipelineframework:pipelineframework-runtime-core</include>
-                                    <include>org.pipelineframework:tpf-release-resolver</include>
+                                    <include>org.pipelineframework:pipelineframework-release-resolver</include>
                                     <include>org.pipelineframework:pipelineframework-runtime-spi</include>
                                     <include>org.pipelineframework:pipelineframework-dsl</include>
                                     <include>org.pipelineframework:pipelineframework-semantic-model</include>
