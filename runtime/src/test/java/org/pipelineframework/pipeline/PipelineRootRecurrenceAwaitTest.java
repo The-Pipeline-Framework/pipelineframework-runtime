@@ -29,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.*;
 @TestProfile(PipelineRootRecurrenceAwaitTest.LimitOne.class)
 class PipelineRootRecurrenceAwaitTest {
     @Inject PipelineRunner runner;
+    @Inject org.pipelineframework.config.PipelineConfig pipelineConfig;
 
     public static class LimitOne implements QuarkusTestProfile {
         @Override public Map<String, String> getConfigOverrides() {
@@ -56,7 +57,8 @@ class PipelineRootRecurrenceAwaitTest {
         var body = new AtomicReference<List<Object>>();
         class Continue extends IntegerStep implements PipelineInvocationSteps.LinkedInvocation {
             Continue() {
-                super(value -> PipelineInvocationSteps.<Integer, Integer>recursiveOneToOne(
+                super(value -> value >= 3 ? Uni.createFrom().item(value)
+                    : PipelineInvocationSteps.<Integer, Integer>recursiveOneToOne(
                     runner, "$root", "Continue", -1, body.get()).applyOneToOne(value));
             }
             @Override public PipelineInvocationSteps.LinkedDefinition linkedDefinition() {
@@ -64,7 +66,8 @@ class PipelineRootRecurrenceAwaitTest {
             }
         }
         var recur = new Continue();
-        body.set(List.of(advance, suspend, recur));
+        body.set(List.of(advance, suspend, recur,
+            new IntegerStep(value -> Uni.createFrom().item(value + 10))));
         AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant", "execution", 0));
         assertInstanceOf(Suspended.class, rootCause(assertThrows(RuntimeException.class,
             () -> ((Uni<?>) runner.run(Uni.createFrom().item(0), body.get())).await().atMost(Duration.ofSeconds(5)))));
@@ -82,6 +85,16 @@ class PipelineRootRecurrenceAwaitTest {
             () -> ((Uni<?>) runner.runFromStep(Uni.createFrom().item(restored.payload()), body.get(), 3))
                 .await().atMost(Duration.ofSeconds(5)))));
         assertEquals(2, effects.get());
+        int originalLimit = pipelineConfig.maxRecursiveDepth();
+        try {
+            pipelineConfig.maxRecursiveDepth(3);
+            assertEquals(33, ((Uni<?>) runner.runFromStep(
+                Uni.createFrom().item(restored.payload()), body.get(), 3))
+                .await().atMost(Duration.ofSeconds(5)));
+            assertEquals(3, effects.get());
+        } finally {
+            pipelineConfig.maxRecursiveDepth(originalLimit);
+        }
     }
 
     private Throwable rootCause(Throwable failure) {

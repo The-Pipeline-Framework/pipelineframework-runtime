@@ -738,7 +738,8 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
             int stopBeforeStepIndex = requestedStopBeforeStepIndex < 0
                 ? steps.size()
                 : requestedStopBeforeStepIndex;
-            if (stopBeforeStepIndex == command.currentStepIndex()) {
+            if (stopBeforeStepIndex == command.currentStepIndex()
+                && rehydratedInput.invocationPath().filter(path -> !path.frames().isEmpty()).isEmpty()) {
               if (terminalOutputOwnership == TerminalOutputOwnership.COORDINATOR
                   && command.currentStepIndex() == steps.size()) {
                 terminalInputPassthrough.set(true);

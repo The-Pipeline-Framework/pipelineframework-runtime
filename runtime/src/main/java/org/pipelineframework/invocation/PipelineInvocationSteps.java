@@ -56,8 +56,8 @@ public final class PipelineInvocationSteps {
     public static <I, O> StepOneToOne<I, O> oneToOne(
         PipelineRunner runner, String definitionId, String callsiteId,
         int definitionTerminalStepIndex, List<Object> linkedChildSteps) {
-        return new OneToOneInvocationStep<>(runner, definitionId, definitionTerminalStepIndex,
-            linkedChildSteps, Optional.empty(), Optional.of(required(callsiteId, "callsiteId")));
+        return new LinkedOneToOneInvocationStep<>(runner, definitionId, callsiteId,
+            definitionTerminalStepIndex, linkedChildSteps);
     }
 
     private PipelineInvocationSteps() {
@@ -171,7 +171,21 @@ public final class PipelineInvocationSteps {
         return new ManyToManyInvocationStep<>(runner, definitionId, definitionTerminalStepIndex, linkedChildSteps);
     }
 
-    private static final class OneToOneInvocationStep<I, O> extends ConfigurableStep
+    private static final class LinkedOneToOneInvocationStep<I, O> extends OneToOneInvocationStep<I, O>
+        implements LinkedInvocation {
+        private LinkedOneToOneInvocationStep(PipelineRunner runner, String definitionId, String callsiteId,
+                int terminalStepIndex, List<Object> steps) {
+            super(runner, definitionId, terminalStepIndex, steps, Optional.empty(),
+                Optional.of(required(callsiteId, "callsiteId")));
+        }
+
+        @Override
+        public LinkedDefinition linkedDefinition() {
+            return ordinaryDefinition();
+        }
+    }
+
+    private static class OneToOneInvocationStep<I, O> extends ConfigurableStep
         implements StepOneToOne<I, O> {
 
         private final PipelineRunner runner;
@@ -201,6 +215,11 @@ public final class PipelineInvocationSteps {
                 linkedChildSteps,
                 "linkedChildSteps must not be null"));
             this.recursiveCall = Objects.requireNonNull(recursiveCall, "recursiveCall must not be null");
+        }
+
+        final LinkedDefinition ordinaryDefinition() {
+            return new LinkedDefinition(definitionId, ordinaryCallsite.orElseThrow(), false,
+                definitionTerminalStepIndex, linkedChildSteps);
         }
 
         @Override

@@ -52,6 +52,31 @@ class PipelineNestedAwaitResumeTest {
     }
 
     @Test
+    void callsiteBoundAdapterResumesChildWithAnEmptyRootRange() {
+        var captured = new AtomicReference<AwaitExecutionContext>();
+        List<Object> child = List.of(suspend(captured), plus(10));
+        var call = PipelineInvocationSteps.<Integer, Integer>oneToOne(runner, "child", "Ask", -1, child);
+        var linkage = assertInstanceOf(PipelineInvocationSteps.LinkedInvocation.class, call).linkedDefinition();
+        assertEquals("child", linkage.definitionId());
+        assertEquals("Ask", linkage.callsiteId());
+        assertFalse(linkage.recursive());
+        assertFalse(PipelineInvocationSteps.oneToOne(runner, child)
+            instanceof PipelineInvocationSteps.LinkedInvocation);
+        assertFalse(PipelineInvocationSteps.oneToOne(runner, "child", -1, child)
+            instanceof PipelineInvocationSteps.LinkedInvocation);
+        var recursiveAdapter = org.pipelineframework.invocation.PipelineInvocationContextHolder.call(
+            org.pipelineframework.invocation.PipelineInvocationContext.root(3),
+            () -> PipelineInvocationSteps.recursiveOneToOne(runner, "child", "Again", -1, child));
+        assertFalse(recursiveAdapter instanceof PipelineInvocationSteps.LinkedInvocation);
+        List<Object> root = List.of(call);
+        AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant", "execution", 0));
+        assertSuspended(() -> run(1, root, 0));
+        restore(captured.get(), 1);
+        var resumed = runner.runFromStepUntilWithContext(Uni.createFrom().item(1), root, 1, 1);
+        assertEquals(11, ((Uni<?>) resumed.result()).await().atMost(Duration.ofSeconds(5)));
+    }
+
+    @Test
     void canSuspendAgainWhileReturningThroughTheParent() {
         var first = new AtomicReference<AwaitExecutionContext>();
         var second = new AtomicReference<AwaitExecutionContext>();

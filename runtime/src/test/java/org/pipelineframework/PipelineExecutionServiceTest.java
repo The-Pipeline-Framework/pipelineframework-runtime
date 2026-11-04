@@ -602,6 +602,29 @@ class PipelineExecutionServiceTest {
     }
 
     @Test
+    void terminalPortableNestedResumeExecutesChildInsteadOfPassingThroughInput() throws Exception {
+        markStartupHealthy(service);
+        var codec = new JsonTransitionPayloadCodec();
+        service.transitionPayloadCodec = codec;
+        List<Object> steps = List.of(new Object());
+        when(releaseIdentityResolver.validateCommandIdentity(any(), isNull())).thenReturn(Optional.empty());
+        when(pipelineStepResolver.loadPipelineSteps()).thenReturn(steps);
+        when(pipelineRunner.runFromStepUntilWithContext(any(), eq(steps), eq(1), eq(1)))
+            .thenReturn(new PipelineRunner.ExecutionResult(Uni.createFrom().item("child-completed"), telemetryContext));
+        var path = new org.pipelineframework.invocation.PipelineInvocationPath(List.of(
+            new org.pipelineframework.invocation.PipelineInvocationPath.Frame("child", "Ask", 1, 0, false)))
+            .atStep(0);
+        var snapshot = new org.pipelineframework.orchestrator.ExecutionInputSnapshot(
+            org.pipelineframework.orchestrator.ExecutionInputShape.UNI, "input", Optional.empty(), Optional.of(path));
+        var envelope = service.executePortableTransition(
+            transitionCommand(codec, 1, 1, Optional.empty(), snapshot)).await().indefinitely();
+        assertEquals(TransitionWorkerOutcome.COMPLETED, envelope.outcome());
+        assertFalse(envelope.terminalInputPassthrough());
+        assertEquals(List.of("child-completed"), envelope.decodeOutputItems(codec));
+        verify(pipelineRunner).runFromStepUntilWithContext(any(), eq(steps), eq(1), eq(1));
+    }
+
+    @Test
     void terminalPortableTransitionRetainsMaterializedInputAtCoordinator() throws Exception {
         markStartupHealthy(service);
         JsonTransitionPayloadCodec codec = new JsonTransitionPayloadCodec();
@@ -810,7 +833,14 @@ class PipelineExecutionServiceTest {
         int stopBeforeStepIndex,
         Optional<String> awaitOccurrenceCause
     ) {
-        var payload = codec.encode("input");
+        return transitionCommand(codec, currentStepIndex, stopBeforeStepIndex, awaitOccurrenceCause, "input");
+    }
+
+    private static TransitionCommandEnvelope transitionCommand(
+        JsonTransitionPayloadCodec codec, int currentStepIndex, int stopBeforeStepIndex,
+        Optional<String> awaitOccurrenceCause, Object input
+    ) {
+        var payload = codec.encode(input);
         return new TransitionCommandEnvelope(
             "tenant-1",
             "exec-stream",
