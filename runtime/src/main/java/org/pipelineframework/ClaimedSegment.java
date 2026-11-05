@@ -4,6 +4,7 @@ import java.util.Objects;
 import java.util.Optional;
 
 import org.pipelineframework.orchestrator.ExecutionRecord;
+import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
 import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 import org.pipelineframework.orchestrator.TransitionCommandEnvelope;
@@ -42,6 +43,10 @@ record ClaimedSegment(
     // A resumed segment after the failed root must not receive that root's already-consumed retry authority.
     boolean retryCompleted = record.redriveIntent() == ExecutionRedriveIntent.RETRY_FAILED_COMMAND
         && record.failedStepIndex() < record.currentStepIndex();
+    Object workerInput = payload instanceof ExecutionInputSnapshot resumed
+        && record.inputPayload() instanceof ExecutionInputSnapshot original
+        ? new ExecutionInputSnapshot(resumed.shape(), resumed.payload(), original.pipelineContext(), resumed.invocationPath())
+        : payload;
     TransitionWorkerCommand command = new TransitionWorkerCommand(
         record.tenantId(),
         record.executionId(),
@@ -51,7 +56,7 @@ record ClaimedSegment(
         record.resultShape(),
         record.version(),
         transitionKey,
-        payload,
+        workerInput,
         retryCompleted ? ExecutionRedriveIntent.REPLAY : record.redriveIntent(),
         retryCompleted ? -1 : record.failedStepIndex(),
         retryCompleted ? Optional.empty() : record.redriveIntent() == ExecutionRedriveIntent.REISSUE_COMMAND
@@ -60,7 +65,7 @@ record ClaimedSegment(
         retryCompleted ? Optional.empty() : record.redriveReason(),
         record.pagingState().map(org.pipelineframework.orchestrator.PagedExecutionState::toTransitionContext),
         record.awaitOccurrenceCause());
-    SerializedTransitionPayload encodedPayload = payloadCodec.encode(payload);
+    SerializedTransitionPayload encodedPayload = payloadCodec.encode(workerInput);
     return TransitionCommandEnvelope.from(
         command,
         record.pipelineId(),

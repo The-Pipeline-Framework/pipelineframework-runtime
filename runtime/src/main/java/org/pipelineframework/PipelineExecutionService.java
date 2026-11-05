@@ -312,7 +312,8 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
         List<Object> orderedSteps = stepOrderer.orderSteps(steps);
         int aggregateStepIndex = firstAggregateStepIndex(orderedSteps, nextStepIndex);
         Object awaitPayload = awaitCoordinator.resumePayload(record);
-        ExecutionInputSnapshot continuationInput = new ExecutionInputSnapshot(ExecutionInputShape.UNI, awaitPayload);
+        ExecutionInputSnapshot continuationInput = new ExecutionInputSnapshot(
+            ExecutionInputShape.UNI, awaitPayload, java.util.Optional.empty(), record.invocationPath());
         String transitionKey = "await-item-continuation:" + unit.unitId() + ":" + record.itemIndex();
         TransitionWorkerCommand workerCommand = new TransitionWorkerCommand(
             parent.get().tenantId(),
@@ -692,7 +693,7 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
               terminalOutputOwnership,
               java.util.Map.of(),
               command.pageContext(),
-              command.awaitOccurrenceCause()));
+              command.awaitOccurrenceCause(), rehydratedInput.invocationPath()));
           PipelineExecutionContextHolder.set(executionContext);
           rehydratedInput.pipelineContext().ifPresentOrElse(
               PipelineContextHolder::set,
@@ -737,7 +738,8 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
             int stopBeforeStepIndex = requestedStopBeforeStepIndex < 0
                 ? steps.size()
                 : requestedStopBeforeStepIndex;
-            if (stopBeforeStepIndex == command.currentStepIndex()) {
+            if (stopBeforeStepIndex == command.currentStepIndex()
+                && rehydratedInput.invocationPath().filter(path -> !path.frames().isEmpty()).isEmpty()) {
               if (terminalOutputOwnership == TerminalOutputOwnership.COORDINATOR
                   && command.currentStepIndex() == steps.size()) {
                 terminalInputPassthrough.set(true);

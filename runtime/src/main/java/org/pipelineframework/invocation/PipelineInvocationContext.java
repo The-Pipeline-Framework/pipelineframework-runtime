@@ -12,16 +12,24 @@ package org.pipelineframework.invocation;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import org.pipelineframework.invocation.PipelineInvocationPath.Frame;
 
-/** Immutable runtime-local identity and bound for structured recursive invocation. */
-public record PipelineInvocationContext(List<Frame> recursivePath, int maxRecursiveDepth) {
+/** Immutable framework-neutral identity and bound for structured recursive invocation. */
+public record PipelineInvocationContext(PipelineInvocationPath path, int maxRecursiveDepth) {
 
     public PipelineInvocationContext {
-        recursivePath = List.copyOf(Objects.requireNonNull(recursivePath, "recursivePath must not be null"));
-        recursivePath.forEach(frame -> Objects.requireNonNull(frame, "recursivePath must not contain null"));
+        Objects.requireNonNull(path, "path");
         if (maxRecursiveDepth < 0) {
             throw new IllegalArgumentException("maxRecursiveDepth must be non-negative");
         }
+    }
+
+    public PipelineInvocationContext(List<Frame> recursivePath, int maxRecursiveDepth) {
+        this(new PipelineInvocationPath(recursivePath), maxRecursiveDepth);
+    }
+
+    public List<Frame> recursivePath() {
+        return path.frames();
     }
 
     public static PipelineInvocationContext root(int maxRecursiveDepth) {
@@ -29,37 +37,31 @@ public record PipelineInvocationContext(List<Frame> recursivePath, int maxRecurs
     }
 
     public PipelineInvocationContext enterRecursive(String definitionId, String callsiteId) {
+        return enter(definitionId, callsiteId, true);
+    }
+
+    public PipelineInvocationContext atStep(int index) {
+        return new PipelineInvocationContext(path.atStep(index), maxRecursiveDepth);
+    }
+
+    public PipelineInvocationContext enter(String definitionId, String callsiteId, boolean recursive) {
         String definition = required(definitionId, "definitionId");
         String callsite = required(callsiteId, "callsiteId");
-        int nextDepth = recursivePath.size() + 1;
+        int nextDepth = recursiveDepth() + (recursive ? 1 : 0);
         if (nextDepth > maxRecursiveDepth) {
             throw new PipelineRecursionLimitExceededException(
-                definition, callsite, nextDepth, maxRecursiveDepth, recursivePath);
+                definition, callsite, nextDepth, maxRecursiveDepth, recursivePath());
         }
-        long occurrence = recursivePath.stream()
+        long occurrence = recursivePath().stream()
             .filter(frame -> frame.definitionId().equals(definition) && frame.callsiteId().equals(callsite))
             .count() + 1;
-        List<Frame> childPath = new ArrayList<>(recursivePath);
-        childPath.add(new Frame(definition, callsite, occurrence));
+        List<Frame> childPath = new ArrayList<>(recursivePath());
+        childPath.add(new Frame(definition, callsite, occurrence, path.stepIndex(), recursive));
         return new PipelineInvocationContext(childPath, maxRecursiveDepth);
     }
 
     public int recursiveDepth() {
-        return recursivePath.size();
-    }
-
-    public record Frame(String definitionId, String callsiteId, long occurrence) {
-        public Frame {
-            definitionId = required(definitionId, "definitionId");
-            callsiteId = required(callsiteId, "callsiteId");
-            if (occurrence < 1) {
-                throw new IllegalArgumentException("occurrence must be positive");
-            }
-        }
-
-        public String display() {
-            return definitionId + ":" + callsiteId + "#" + occurrence;
-        }
+        return (int) recursivePath().stream().filter(Frame::recursive).count();
     }
 
     private static String required(String value, String field) {

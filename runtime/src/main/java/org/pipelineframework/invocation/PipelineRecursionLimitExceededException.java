@@ -18,14 +18,14 @@ public final class PipelineRecursionLimitExceededException extends NonRetryableE
     private final String callsiteId;
     private final int attemptedDepth;
     private final int maximumDepth;
-    private final List<PipelineInvocationContext.Frame> parentPath;
+    private final List<PipelineInvocationPath.Frame> parentPath;
 
     PipelineRecursionLimitExceededException(
         String definitionId,
         String callsiteId,
         int attemptedDepth,
         int maximumDepth,
-        List<PipelineInvocationContext.Frame> parentPath
+        List<PipelineInvocationPath.Frame> parentPath
     ) {
         super("Recursive pipeline invocation limit exceeded at " + definitionId + ":" + callsiteId
             + ": attempted depth " + attemptedDepth + ", configured maximum " + maximumDepth);
@@ -52,7 +52,7 @@ public final class PipelineRecursionLimitExceededException extends NonRetryableE
         return maximumDepth;
     }
 
-    public List<PipelineInvocationContext.Frame> parentPath() {
+    public List<PipelineInvocationPath.Frame> parentPath() {
         return parentPath;
     }
 }

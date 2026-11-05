@@ -148,6 +148,14 @@ public class PipelineRunner implements AutoCloseable {
         List<Object> steps,
         int startStepIndex,
         int stopBeforeStepIndex) {
+        PipelineInvocationContext invocation = rootInvocationContext();
+        if (!invocation.path().frames().isEmpty()) {
+            // The public runner accepts both reactive shapes; durable nested execution is unary.
+            if (!(input instanceof Uni<?> unaryInput)) {
+                throw new IllegalArgumentException("Nested Await continuation requires scalar input");
+            }
+            return resumeInvocation(unaryInput, steps, startStepIndex, stopBeforeStepIndex, invocation);
+        }
         return runFromStepUntilWithContext(
             input,
             steps,
@@ -157,7 +165,7 @@ public class PipelineRunner implements AutoCloseable {
             Optional.empty(),
             "$root",
             -1,
-            rootInvocationContext());
+            invocation);
     }
 
     /**
@@ -293,9 +301,9 @@ public class PipelineRunner implements AutoCloseable {
         ParallelismPolicy parallelismPolicy = parallelismPolicyResolver.resolveParallelismPolicy(pipelineConfig);
         int maxConcurrency = parallelismPolicyResolver.resolveMaxConcurrency(pipelineConfig);
         PipelineRunContext telemetryContext = rootInvocation
-            ? Objects.requireNonNull(
+            ? owningRunContext.orElseGet(() -> Objects.requireNonNull(
                 runTelemetry.startRun(input, orderedSteps.size(), parallelismPolicy, maxConcurrency),
-                "PipelineRunTelemetry.startRun must not return null")
+                "PipelineRunTelemetry.startRun must not return null"))
             : owningRunContext.orElseGet(PipelineRunTelemetry::nonOwningContext);
         Object instrumentedInput = rootInvocation ? runTelemetry.instrumentInput(input, telemetryContext) : input;
         PipelineStepTelemetry executionStepTelemetry = rootInvocation || owningRunContext.isPresent()
@@ -319,9 +327,10 @@ public class PipelineRunner implements AutoCloseable {
             startStepIndex,
             stopBeforeStepIndex,
             (step, value, index) -> {
-                int executionStepIndex = rootInvocation || awaitContext == null
-                    ? index
-                    : awaitContext.currentStepIndex();
+                int executionStepIndex = rootInvocation || awaitContext == null ? index : awaitContext.currentStepIndex();
+                if (!invocationContext.path().frames().isEmpty()) {
+                    executionStepIndex = invocationContext.path().frames().getFirst().callerStepIndex();
+                }
                 AwaitExecutionContext awaitContextSnapshot = awaitContext == null
                     ? null
                     : new AwaitExecutionContext(
@@ -335,7 +344,7 @@ public class PipelineRunner implements AutoCloseable {
                                 ? io.opentelemetry.api.trace.SpanContext.getInvalid()
                                 : telemetryContext.span().getSpanContext()),
                         awaitContext.pageContext(),
-                        awaitContext.awaitOccurrenceCause());
+                        awaitContext.awaitOccurrenceCause(), Optional.of(invocationContext.path().atStep(index)));
 
                 if (step instanceof Configurable configurable) {
                     configurable.initialiseWithConfig(configFactory.buildConfig(step.getClass(), pipelineConfig));
@@ -358,7 +367,7 @@ public class PipelineRunner implements AutoCloseable {
                     awaitContextSnapshot,
                     definitionId,
                     definitionTerminalStepIndex,
-                    java.util.Optional.of(invocationContext),
+                    java.util.Optional.of(invocationContext.atStep(index)),
                     branchExecutionTracker);
                 if (awaitContextSnapshot == null) {
                     return applied;
@@ -380,7 +389,7 @@ public class PipelineRunner implements AutoCloseable {
         // Terminal object publish only runs after a full pipeline execution, not for partial/early-stop runs.
         Object terminal = current;
         if (stopBeforeStepIndex == orderedSteps.size() && branchingRegistry != null
-            && (rootInvocation || !"$root".equals(definitionId))) {
+            && (rootInvocation || !"$root".equals(definitionId) || !invocationContext.path().frames().isEmpty())) {
             if (current instanceof Uni<?> uni) {
                 terminal = uni.map(item -> branchingRegistry.completeDefinition(definitionId, item));
             } else if (current instanceof Multi<?> multi) {
@@ -407,7 +416,58 @@ public class PipelineRunner implements AutoCloseable {
 
     private PipelineInvocationContext rootInvocationContext() {
         int maximumDepth = pipelineConfig == null ? 64 : pipelineConfig.maxRecursiveDepth();
-        return PipelineInvocationContext.root(maximumDepth);
+        return Optional.ofNullable(AwaitExecutionContextHolder.get())
+            .flatMap(AwaitExecutionContext::invocationPath)
+            .map(path -> {
+                path.requireResumable();
+                var context = new PipelineInvocationContext(path, maximumDepth);
+                if (context.recursiveDepth() > maximumDepth) {
+                    throw new IllegalStateException("Retained invocation exceeds pipeline.max-recursive-depth");
+                }
+                return context;
+            }).orElseGet(() -> PipelineInvocationContext.root(maximumDepth));
+    }
+
+    private ExecutionResult resumeInvocation(Uni<?> input, List<Object> rootSteps, int startStepIndex,
+        int stopBeforeStepIndex, PipelineInvocationContext invocation) {
+        var orderedRoot = stepOrderer.orderSteps(rootSteps);
+        var path = invocation.path();
+        var frames = path.frames();
+        if (startStepIndex != frames.getFirst().callerStepIndex() + 1) {
+            throw new IllegalArgumentException("Await resume position does not match its root invocation callsite");
+        }
+        var definitions = new ArrayList<org.pipelineframework.invocation.PipelineInvocationSteps.LinkedDefinition>();
+        List<Object> currentSteps = orderedRoot;
+        for (var frame : frames) {
+            // Step lists also contain ordinary operations. This is the single capability check
+            // at that heterogeneous boundary; subsequent traversal uses the linked definition.
+            if (frame.callerStepIndex() >= currentSteps.size()
+                || !(currentSteps.get(frame.callerStepIndex()) instanceof
+                    org.pipelineframework.invocation.PipelineInvocationSteps.LinkedInvocation linked)) {
+                throw new IllegalStateException("Retained invocation callsite is absent from the pinned pipeline definition");
+            }
+            var definition = linked.linkedDefinition();
+            definition.requireMatchingFrame(frame);
+            definitions.add(definition);
+            currentSteps = definition.steps();
+        }
+        ParallelismPolicy policy = parallelismPolicyResolver.resolveParallelismPolicy(pipelineConfig);
+        int concurrency = parallelismPolicyResolver.resolveMaxConcurrency(pipelineConfig);
+        var telemetry = Objects.requireNonNull(runTelemetry.startRun(input, orderedRoot.size(), policy, concurrency));
+        Object resumed = input;
+        for (int level = definitions.size() - 1; level >= 0; level--) {
+            var definition = definitions.get(level);
+            int next = level == definitions.size() - 1 ? path.stepIndex() + 1
+                : frames.get(level + 1).callerStepIndex() + 1;
+            var parentPath = new org.pipelineframework.invocation.PipelineInvocationPath(
+                frames.subList(0, level + 1));
+            resumed = runFromStepUntilWithContext(resumed, definition.steps(), next, definition.steps().size(),
+                false, Optional.of(telemetry), definition.definitionId(), definition.terminalStepIndex(),
+                new PipelineInvocationContext(parentPath, invocation.maxRecursiveDepth())).result();
+        }
+        return runFromStepUntilWithContext(resumed, rootSteps, startStepIndex, stopBeforeStepIndex,
+            true, Optional.of(telemetry), "$root", -1,
+            PipelineInvocationContext.root(invocation.maxRecursiveDepth()));
     }
 
     public record ExecutionResult(

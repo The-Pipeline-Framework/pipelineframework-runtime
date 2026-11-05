@@ -39,6 +39,36 @@ import org.pipelineframework.telemetry.PipelineRunContextHolder;
  */
 public final class PipelineInvocationSteps {
 
+    /** Compiler-linked definition exposed by an invocation step for durable return traversal. */
+    public interface LinkedInvocation {
+        LinkedDefinition linkedDefinition();
+    }
+
+    public record LinkedDefinition(String definitionId, String callsiteId, boolean recursive,
+        int terminalStepIndex, List<Object> steps) {
+        public LinkedDefinition {
+            definitionId = required(definitionId, "definitionId");
+            callsiteId = required(callsiteId, "callsiteId");
+            steps = List.copyOf(Objects.requireNonNull(steps, "steps"));
+        }
+
+        /** Validates retained identity against this release's compiler-linked callsite. */
+        public void requireMatchingFrame(PipelineInvocationPath.Frame frame) {
+            Objects.requireNonNull(frame, "frame");
+            if (!definitionId.equals(frame.definitionId()) || !callsiteId.equals(frame.callsiteId())
+                || recursive != frame.recursive()) {
+                throw new IllegalStateException("Retained invocation does not match its pinned pipeline callsite");
+            }
+        }
+    }
+
+    public static <I, O> StepOneToOne<I, O> oneToOne(
+        PipelineRunner runner, String definitionId, String callsiteId,
+        int definitionTerminalStepIndex, List<Object> linkedChildSteps) {
+        return new LinkedOneToOneInvocationStep<>(runner, definitionId, callsiteId,
+            definitionTerminalStepIndex, linkedChildSteps);
+    }
+
     private PipelineInvocationSteps() {
     }
 
@@ -150,7 +180,21 @@ public final class PipelineInvocationSteps {
         return new ManyToManyInvocationStep<>(runner, definitionId, definitionTerminalStepIndex, linkedChildSteps);
     }
 
-    private static final class OneToOneInvocationStep<I, O> extends ConfigurableStep
+    private static final class LinkedOneToOneInvocationStep<I, O> extends OneToOneInvocationStep<I, O>
+        implements LinkedInvocation {
+        private LinkedOneToOneInvocationStep(PipelineRunner runner, String definitionId, String callsiteId,
+                int terminalStepIndex, List<Object> steps) {
+            super(runner, definitionId, terminalStepIndex, steps, Optional.empty(),
+                Optional.of(required(callsiteId, "callsiteId")));
+        }
+
+        @Override
+        public LinkedDefinition linkedDefinition() {
+            return ordinaryDefinition();
+        }
+    }
+
+    private static class OneToOneInvocationStep<I, O> extends ConfigurableStep
         implements StepOneToOne<I, O> {
 
         private final PipelineRunner runner;
@@ -158,6 +202,7 @@ public final class PipelineInvocationSteps {
         private final int definitionTerminalStepIndex;
         private final List<Object> linkedChildSteps;
         private final Optional<RecursiveCall> recursiveCall;
+        private final Optional<String> ordinaryCallsite;
 
         private OneToOneInvocationStep(PipelineRunner runner, String definitionId, int definitionTerminalStepIndex,
                 List<Object> linkedChildSteps) {
@@ -166,6 +211,12 @@ public final class PipelineInvocationSteps {
 
         private OneToOneInvocationStep(PipelineRunner runner, String definitionId, int definitionTerminalStepIndex,
                 List<Object> linkedChildSteps, Optional<RecursiveCall> recursiveCall) {
+            this(runner, definitionId, definitionTerminalStepIndex, linkedChildSteps, recursiveCall, Optional.empty());
+        }
+
+        private OneToOneInvocationStep(PipelineRunner runner, String definitionId, int definitionTerminalStepIndex,
+                List<Object> linkedChildSteps, Optional<RecursiveCall> recursiveCall, Optional<String> ordinaryCallsite) {
+            this.ordinaryCallsite = Objects.requireNonNull(ordinaryCallsite, "ordinaryCallsite");
             this.runner = Objects.requireNonNull(runner, "runner must not be null");
             this.definitionId = definitionId(definitionId);
             this.definitionTerminalStepIndex = definitionTerminalStepIndex;
@@ -173,6 +224,11 @@ public final class PipelineInvocationSteps {
                 linkedChildSteps,
                 "linkedChildSteps must not be null"));
             this.recursiveCall = Objects.requireNonNull(recursiveCall, "recursiveCall must not be null");
+        }
+
+        final LinkedDefinition ordinaryDefinition() {
+            return new LinkedDefinition(definitionId, ordinaryCallsite.orElseThrow(), false,
+                definitionTerminalStepIndex, linkedChildSteps);
         }
 
         @Override
@@ -207,7 +263,9 @@ public final class PipelineInvocationSteps {
         @SuppressWarnings("unchecked")
         private Uni<O> invokeOneToOne(I input, Optional<PipelineInvocationContext> parentContext) {
             Optional<PipelineInvocationContext> childContext = recursiveCall.map(call ->
-                parentContext.orElseThrow().enterRecursive(definitionId, call.callsiteId()));
+                parentContext.orElseThrow().enterRecursive(definitionId, call.callsiteId()))
+                .or(() -> ordinaryCallsite.flatMap(callsite -> PipelineInvocationContextHolder.get()
+                    .map(parent -> parent.enter(definitionId, callsite, false))));
             Object result = nestedResult(runner, definitionId, definitionTerminalStepIndex, linkedChildSteps,
                 Uni.createFrom().item(input), childContext);
             if (result instanceof Uni<?> uni) {

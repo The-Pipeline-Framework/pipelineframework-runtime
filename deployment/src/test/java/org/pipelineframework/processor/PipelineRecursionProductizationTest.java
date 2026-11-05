@@ -343,8 +343,8 @@ class PipelineRecursionProductizationTest {
                 input: State
                 output: Result
                 steps:
-                  - { name: Decide, service: com.example.recursion.DecideService, cardinality: ONE_TO_ONE, input: State, output: State, java: { input: com.example.recursion.domain.State, output: com.example.recursion.domain.State } }
-                  - { name: Recur, pipeline: agent, cardinality: ONE_TO_ONE, input: State, output: Result, accepts: [Continue], java: { input: com.example.recursion.domain.Continue, output: com.example.recursion.domain.Result } }
+                  - { name: Decide, service: com.example.recursion.DecideService, cardinality: ONE_TO_ONE, input: State, output: State, accepts: [Continue], java: { input: com.example.recursion.domain.State, output: com.example.recursion.domain.State } }
+                  - { name: Recur, pipeline: self, cardinality: ONE_TO_ONE, input: State, output: Result, accepts: [Continue], java: { input: com.example.recursion.domain.Continue, output: com.example.recursion.domain.Result } }
                   - { name: Complete, service: com.example.recursion.CompleteService, cardinality: ONE_TO_ONE, input: State, output: Result, accepts: [Complete], java: { input: com.example.recursion.domain.Complete, output: com.example.recursion.domain.Result } }
                   - { name: Unwind, service: com.example.recursion.UnwindService, cardinality: ONE_TO_ONE, input: Result, output: Result, terminal: true, java: { input: com.example.recursion.domain.Result, output: com.example.recursion.domain.Result } }
             steps:

@@ -15,8 +15,13 @@ import org.pipelineframework.context.PipelineContext;
 public record ExecutionInputSnapshot(
     ExecutionInputShape shape,
     Object payload,
-    Optional<PipelineContext> pipelineContext
+    Optional<PipelineContext> pipelineContext,
+    Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath
 ) {
+    public ExecutionInputSnapshot(ExecutionInputShape shape, Object payload, Optional<PipelineContext> pipelineContext) {
+        this(shape, payload, pipelineContext, Optional.empty());
+    }
+
     public ExecutionInputSnapshot(ExecutionInputShape shape, Object payload) {
         this(shape, payload, Optional.empty());
     }
@@ -26,6 +31,7 @@ public record ExecutionInputSnapshot(
     }
 
     public ExecutionInputSnapshot {
+        invocationPath = Optional.ofNullable(invocationPath).orElseGet(Optional::empty);
         Objects.requireNonNull(shape, "ExecutionInputSnapshot.shape must not be null");
         pipelineContext = Optional.ofNullable(pipelineContext)
             .orElseGet(Optional::empty)

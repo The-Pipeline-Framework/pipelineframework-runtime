@@ -1360,9 +1360,12 @@ class AwsShapedCoordinatorActionsIT {
                     ExecutionStatus status = controlPlane.getExecutionStatus(
                             workItem.tenantId(), workItem.executionId())
                         .await().atMost(Duration.ofSeconds(10)).status();
+                    var failed = executionStore.getExecution(workItem.tenantId(), workItem.executionId())
+                        .await().atMost(Duration.ofSeconds(10)).orElseThrow();
                     throw new AssertionError(
                         "work action did not invoke the transition worker: disposition="
-                            + handled.disposition() + ", status=" + status);
+                            + handled.disposition() + ", status=" + status
+                            + ", errorCode=" + failed.errorCode() + ", errorMessage=" + failed.errorMessage());
                 }
                 assertEquals(SqsMessageDisposition.ACKNOWLEDGE,
                     worker.get(15, TimeUnit.SECONDS).disposition());
@@ -1580,11 +1583,23 @@ class AwsShapedCoordinatorActionsIT {
 
         @Override
         public Uni<Object> loadResumePayload(String tenantId, String unitId) {
+            return resumeInteraction(tenantId, unitId).map(AwaitInteractionRecord::responsePayload);
+        }
+
+        @Override
+        public Uni<Object> loadResumeInput(String tenantId, String unitId) {
+            return resumeInteraction(tenantId, unitId).map(record -> record.invocationPath().isPresent()
+                ? new org.pipelineframework.orchestrator.ExecutionInputSnapshot(
+                    org.pipelineframework.orchestrator.ExecutionInputShape.UNI,
+                    record.responsePayload(), Optional.empty(), record.invocationPath())
+                : record.responsePayload());
+        }
+
+        private Uni<AwaitInteractionRecord> resumeInteraction(String tenantId, String unitId) {
             return getUnit(tenantId, unitId)
                 .onItem().transformToUni(unit -> interactions.get(tenantId, unit.primaryInteractionId()))
                 .map(record -> record.orElseThrow(() ->
-                    new IllegalStateException("Await interaction not found for unit " + unitId)))
-                .map(AwaitInteractionRecord::responsePayload);
+                    new IllegalStateException("Await interaction not found for unit " + unitId)));
         }
 
         @Override

@@ -100,16 +100,16 @@ class ExecutionInputPolicy {
       if (snapshot.shape() == ExecutionInputShape.MULTI) {
         Object payload = snapshot.payload();
         if (payload == null) {
-          return new RehydratedExecutionInput(Multi.createFrom().empty(), snapshot.pipelineContext());
+          return new RehydratedExecutionInput(Multi.createFrom().empty(), snapshot.pipelineContext(), snapshot.invocationPath());
         }
         if (payload instanceof Iterable<?> iterable) {
           return new RehydratedExecutionInput(
-              Multi.createFrom().iterable(iterable), snapshot.pipelineContext());
+              Multi.createFrom().iterable(iterable), snapshot.pipelineContext(), snapshot.invocationPath());
         }
-        return new RehydratedExecutionInput(Multi.createFrom().item(payload), snapshot.pipelineContext());
+        return new RehydratedExecutionInput(Multi.createFrom().item(payload), snapshot.pipelineContext(), snapshot.invocationPath());
       }
       return new RehydratedExecutionInput(
-          Uni.createFrom().item(snapshot.payload()), snapshot.pipelineContext());
+          Uni.createFrom().item(snapshot.payload()), snapshot.pipelineContext(), snapshot.invocationPath());
     }
     // Backward-compatible replay for records persisted before shape metadata.
     if (inputPayload instanceof List<?> list) {
@@ -118,7 +118,11 @@ class ExecutionInputPolicy {
     return new RehydratedExecutionInput(Uni.createFrom().item(inputPayload), Optional.empty());
   }
 
-  record RehydratedExecutionInput(Object reactiveInput, Optional<PipelineContext> pipelineContext) {
+  record RehydratedExecutionInput(Object reactiveInput, Optional<PipelineContext> pipelineContext,
+      Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath) {
+    RehydratedExecutionInput(Object reactiveInput, Optional<PipelineContext> pipelineContext) {
+      this(reactiveInput, pipelineContext, Optional.empty());
+    }
     RehydratedExecutionInput {
       java.util.Objects.requireNonNull(reactiveInput, "reactiveInput must not be null");
       pipelineContext = Optional.ofNullable(pipelineContext).orElseGet(Optional::empty);

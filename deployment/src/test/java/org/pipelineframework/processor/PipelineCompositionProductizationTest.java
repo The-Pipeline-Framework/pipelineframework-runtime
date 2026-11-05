@@ -308,9 +308,26 @@ class PipelineCompositionProductizationTest {
 
     @Test
     void generatedInvocationSelectsAllStreamingCardinalityAdapters() throws Exception {
-        String yaml = cardinalityYaml();
+        String yaml = cardinalityYaml("Pointwise", "ONE_TO_ONE");
         Map<String, String> sources = cardinalitySources();
         Fixture fixture = compile("cardinalities", yaml, sources);
+        assertThat(fixture.compilation()).succeeded();
+        Path generatedPackage = fixture.generatedClass(invocationName("Pointwise")).getParent();
+        // Each cardinality has its own definition scope and retains the same canonical Value contract.
+        for (var entry : Map.of("Expand", "ONE_TO_MANY", "Reduce", "MANY_TO_ONE", "Transform", "MANY_TO_MANY").entrySet()) {
+            Fixture other = compile("cardinalities-" + entry.getKey(), cardinalityYaml(entry.getKey(), entry.getValue()), sources);
+            assertThat(other.compilation()).succeeded();
+            String child = switch (entry.getKey()) {
+                case "Expand" -> "ProcessSplitLocalClientStep";
+                case "Reduce" -> "ProcessJoinLocalClientStep";
+                case "Transform" -> "ProcessMapStreamLocalClientStep";
+                default -> throw new IllegalArgumentException(entry.getKey());
+            };
+            for (String generated : List.of(invocationName(entry.getKey()), child)) {
+                Files.copy(other.generatedClass(generated), generatedPackage.resolve(generated + ".java"),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
         String pointwiseName = invocationName("Pointwise");
         String expandName = invocationName("Expand");
         String reduceName = invocationName("Reduce");
@@ -535,8 +552,18 @@ class PipelineCompositionProductizationTest {
     }
 
     @Test
-    void rejectsNestedAwaitAsExplicitSliceTwoBoundary() throws Exception {
-        Compilation compilation = compile("nested-await", diagnosticYaml("""
+    void generatesAwaitInsideTheNestedDefinition() throws Exception {
+        var sources = new LinkedHashMap<>(diagnosticSources());
+        sources.put("com.example.diagnostic.WaitService", """
+            package com.example.diagnostic;
+            import com.example.diagnostic.domain.A;
+            public class WaitService implements org.pipelineframework.service.ReactiveService<A, A> {
+                public io.smallrye.mutiny.Uni<A> process(A input) {
+                    return io.smallrye.mutiny.Uni.createFrom().item(input);
+                }
+            }
+            """);
+        var fixture = compile("nested-await", diagnosticYaml("""
             inner:
               input: A
               output: A
@@ -554,11 +581,11 @@ class PipelineCompositionProductizationTest {
                     transport: { type: interaction-api }
             """, """
             - { name: Call inner, pipeline: inner, cardinality: ONE_TO_ONE, input: A, output: A, java: { input: com.example.diagnostic.A, output: com.example.diagnostic.A } }
-            """), diagnosticSources()).compilation();
+            """), sources);
 
-        assertThat(compilation).failed();
-        assertThat(compilation).hadErrorContaining(
-            "nested pipeline definitions do not support await: yet");
+        assertThat(fixture.compilation()).succeeded();
+        assertTrue(Files.readString(fixture.generatedClass("ProcessWaitDeferredCompletionStep"))
+            .contains("AwaitCompletionSupport"));
     }
 
     private Object instantiateGeneratedInvocation(
@@ -699,7 +726,7 @@ class PipelineCompositionProductizationTest {
             """.formatted(name, input, output, output, input, counter ? "calls++;" : "", expression);
     }
 
-    private String cardinalityYaml() {
+    private String cardinalityYaml(String entryName, String cardinality) {
         return """
             version: 3
             appName: Cardinalities
@@ -725,11 +752,8 @@ class PipelineCompositionProductizationTest {
                 output: Value
                 steps: [{ name: Map stream, service: com.example.cardinality.TransformService, cardinality: MANY_TO_MANY, input: Value, output: Value, java: { input: com.example.cardinality.Value, output: com.example.cardinality.Value } }]
             steps:
-              - { name: Pointwise, pipeline: pointwise, cardinality: ONE_TO_ONE, input: Value, output: Value, java: { input: com.example.cardinality.Value, output: com.example.cardinality.Value } }
-              - { name: Expand, pipeline: expand, cardinality: ONE_TO_MANY, input: Value, output: Value, java: { input: com.example.cardinality.Value, output: com.example.cardinality.Value } }
-              - { name: Reduce, pipeline: reduce, cardinality: MANY_TO_ONE, input: Value, output: Value, java: { input: com.example.cardinality.Value, output: com.example.cardinality.Value } }
-              - { name: Transform, pipeline: transform, cardinality: MANY_TO_MANY, input: Value, output: Value, java: { input: com.example.cardinality.Value, output: com.example.cardinality.Value } }
-            """;
+              - { name: %s, pipeline: %s, cardinality: %s, input: Value, output: Value, java: { input: com.example.cardinality.Value, output: com.example.cardinality.Value } }
+            """.formatted(entryName, entryName.toLowerCase(java.util.Locale.ROOT), cardinality);
     }
 
     private Map<String, String> cardinalitySources() {
