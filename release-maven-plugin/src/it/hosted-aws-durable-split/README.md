@@ -4,8 +4,12 @@ The original Release producer emits one schema2 Release containing both artifact
 
 Run from the runtime root with the current exact local dependency set:
 
+Use Java 21 or newer. Invoker filters the version placeholders in the source POM into `release-maven-plugin/target/it/` before building.
+
 ```sh
-JAVA_HOME=/Library/Java/JavaVirtualMachines/openjdk-21.jdk/Contents/Home ./mvnw -o -f release-maven-plugin/src/it/hosted-aws-durable-split/pom.xml clean verify -Dmaven.repo.local="$PWD/.m2/repository"
+./mvnw -o -pl release-maven-plugin invoker:install invoker:run -Dinvoker.test=hosted-aws-durable-split -Dmaven.repo.local="$PWD/.m2/repository"
 ```
 
 This proves compiler/package/producer compatibility. It does not qualify Cloud delivery, AWS execution, HTTP UI hosting, external connectors or live retained updates.
+
+Filtered build outputs are under `release-maven-plugin/target/it/hosted-aws-durable-split/target/`: `pipeline-release.json`, `driver.zip` and `function.zip`.

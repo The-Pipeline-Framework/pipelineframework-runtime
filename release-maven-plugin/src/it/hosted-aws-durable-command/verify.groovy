@@ -11,6 +11,7 @@ assert release.artifacts*.artifactId.toSet() == ['driver', 'actions'].toSet()
 assert release.artifacts.find { it.artifactId == 'driver' }.stepIds.empty
 assert release.artifacts.find { it.artifactId == 'actions' }.stepIds == ['Echo']
 assert release.deployment.entries.findAll { it.trigger in ['AWS_DURABLE_COORDINATOR','AWS_DURABLE_INGRESS'] }.every { it.artifactId == 'driver' }
+assert release.deployment.entries.findAll { it.artifactId == 'driver' }*.trigger.toSet().containsAll(['AWS_DURABLE_COORDINATOR', 'AWS_DURABLE_INGRESS'])
 assert release.deployment.entries.findAll { !(it.trigger in ['AWS_DURABLE_COORDINATOR','AWS_DURABLE_INGRESS']) }.every { it.artifactId == 'actions' }
 assert release.artifacts*.digest.toSet().size() == 2
 for (artifact in release.artifacts) {
@@ -19,7 +20,19 @@ for (artifact in release.artifacts) {
   new ZipFile(file).withCloseable { zip ->
     assert zip.getEntry('META-INF/pipeline/pipeline-contract.json')
     assert release.deployment.entries.findAll { it.artifactId == artifact.artifactId }.every {
-      it.entryPackagePath == '.' ? zip.getEntry(it.entryClass.replace('.', '/') + '.class') : zip.getEntry(it.entryPackagePath)
+      entry ->
+      def classPath = entry.entryClass.replace('.', '/') + '.class'
+      if (entry.entryPackagePath == '.') return zip.getEntry(classPath) != null
+      def jar = zip.getEntry(entry.entryPackagePath)
+      assert jar : "Missing entry package ${entry.entryPackagePath}"
+      def found = false
+      new java.util.zip.ZipInputStream(zip.getInputStream(jar)).withCloseable { nested ->
+        java.util.zip.ZipEntry member
+        while ((member = nested.nextEntry) != null) {
+          if (member.name == classPath) found = true
+        }
+      }
+      return found
     }
     if (artifact.artifactId == 'driver') {
       assert !zip.getEntry('com/example/echo/EchoService.class')

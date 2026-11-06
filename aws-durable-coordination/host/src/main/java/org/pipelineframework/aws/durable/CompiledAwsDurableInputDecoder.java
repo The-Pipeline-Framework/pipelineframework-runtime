@@ -14,6 +14,7 @@ import org.pipelineframework.orchestrator.release.PipelineContractDescriptorLoad
 public class CompiledAwsDurableInputDecoder implements AwsDurableInputDecoder {
     @Inject PipelineContractDescriptorLoader contracts;
     @Inject TransitionPayloadCodec codec;
+    /** Decodes a typed payload only when it matches the compiled pipeline entry contract. */
     @Override public Object decode(String inputJson) {
         var contract = contracts.load().orElseThrow(() -> new IllegalStateException("Compiled input Contract is unavailable"));
         if (contract.steps().isEmpty()) throw new IllegalStateException("Compiled input entry is unavailable");

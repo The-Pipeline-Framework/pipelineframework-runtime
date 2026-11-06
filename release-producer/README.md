@@ -23,8 +23,9 @@ Schema 2 carries packaging facts:
   not execute it or establish runtime readiness.
 
 The Maven plugin accepts these facts under its existing configuration's
-`<deployment>` element through `ReleaseDeploymentConfiguration`. The independent producer tests cover two different pipeline shapes. Their
-`TEST` trigger and `java-archive-test-v1` profile are packaging-test fixtures.
+`<deployment>` element through `ReleaseDeploymentConfiguration`. The independent producer tests cover two named contracts with the same
+single-step shape. Their `HTTP` and `SQS` triggers and
+`aws-durable-java-zip-v1` profile are packaging-test fixtures.
 AWS host qualification is owned by the runtime host integration suite.
 
 Producer and independent closure consumer both compare the complete packaged

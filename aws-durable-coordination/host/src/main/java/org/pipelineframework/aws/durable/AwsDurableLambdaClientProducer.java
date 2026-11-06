@@ -10,10 +10,12 @@ import software.amazon.awssdk.services.lambda.LambdaClient;
 /** Existing host transport uses the standard AWS execution-role and region configuration. */
 @ApplicationScoped
 public class AwsDurableLambdaClientProducer {
+    /** Supplies the host client unless the application provides its own qualified replacement. */
     @Produces
     @Singleton
     @DefaultBean
     LambdaClient client() { return LambdaClient.builder().build(); }
 
+    /** Releases only the client owned by this producer. */
     void close(@Disposes LambdaClient client) { client.close(); }
 }
