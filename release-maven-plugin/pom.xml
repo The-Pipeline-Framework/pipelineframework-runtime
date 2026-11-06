@@ -55,6 +55,13 @@
             <version>${project.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- Quarkus discovers this companion through extension metadata, outside the runtime POM graph. -->
+        <dependency>
+            <groupId>org.pipelineframework</groupId>
+            <artifactId>pipelineframework-deployment</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
         <!-- Hosted Invoker fixtures must receive the host under test, even from a cold repository. -->
         <dependency>
             <groupId>org.pipelineframework</groupId>
