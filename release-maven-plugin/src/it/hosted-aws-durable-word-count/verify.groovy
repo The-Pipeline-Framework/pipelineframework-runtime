@@ -22,18 +22,21 @@ new ZipFile(new File(basedir, 'target/function.zip')).withCloseable { zip ->
     }
   }
   assert handlerPresent
-  assert release.deployment.entries.every { entry ->
+  release.deployment.entries.each { entry ->
       def classPath = entry.entryClass.replace('.', '/') + '.class'
-      if (entry.entryPackagePath == '.') return zip.getEntry(classPath) != null
+      if (entry.entryPackagePath == '.') {
+        assert zip.getEntry(classPath) != null : "Missing ${classPath} for entry ${entry.entryId}"
+        return
+      }
       def jar = zip.getEntry(entry.entryPackagePath)
       assert jar : "Missing entry package ${entry.entryPackagePath}"
       def found = false
       new java.util.zip.ZipInputStream(zip.getInputStream(jar)).withCloseable { nested ->
         java.util.zip.ZipEntry member
         while ((member = nested.nextEntry) != null) {
-          if (member.name == classPath) found = true
+          if (member.name == classPath) { found = true; break }
         }
       }
-      return found }
+      assert found : "Missing ${classPath} for entry ${entry.entryId}" }
 }
 return true

@@ -35,8 +35,11 @@ public final class HostCommandProof {
                 "pipeline.orchestrator.pipeline-id", contract.pipelineId(),
                 "pipeline.orchestrator.release-version", "native-command-release-5",
                 "pipeline.orchestrator.worker.sqs.shared-secret", SECRET,
+                "pipeline.orchestrator.worker.allowed-payload-prefixes", "org.pipelineframework.,com.example.echo.",
                 "pipeline.orchestrator.worker.sqs.response-queue-url", "http://localhost/response"), "proof", 300))
             .build().getConfigMapping(PipelineOrchestratorConfig.class);
+        var codec = new JsonTransitionPayloadCodec();
+        set(codec, "orchestratorConfig", config);
         try (var dynamo = DynamoDbClient.builder().endpointOverride(URI.create(args[0])).region(Region.US_EAST_1)
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"))).build()) {
             String table = "command-proof-" + UUID.randomUUID();
@@ -87,7 +90,7 @@ public final class HostCommandProof {
                     var response = PipelineJson.mapper().readValue(captured, SqsTransitionWorkerResponse.class);
                     var wire = PipelineJson.mapper().readValue(response.resultEnvelope(), TransitionWireResult.class);
                     if (wire.outcome() != TransitionWorkerOutcome.COMPLETED) throw new AssertionError(response.resultEnvelope());
-                    var actual = TransitionResultEnvelope.fromWireResult(wire).decodeOutputItems(new JsonTransitionPayloadCodec());
+                    var actual = TransitionResultEnvelope.fromWireResult(wire).decodeOutputItems(codec);
                     if (!actual.equals(List.of(new EchoOutput("hello")))) throw new AssertionError(actual);
                     if (EchoProvider.CALLS.get() != (attempt < 2 ? 1 : 2)) throw new AssertionError("Command dispatched again on replay");
                 }

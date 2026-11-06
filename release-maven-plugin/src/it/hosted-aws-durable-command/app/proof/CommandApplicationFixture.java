@@ -47,6 +47,9 @@ public final class CommandApplicationFixture {
         service.executionInputPolicy = new ExecutionInputPolicy();
         service.executionHooks = new ExecutionHooks();
         service.orchestratorConfig = config;
+        var codec = new org.pipelineframework.orchestrator.JsonTransitionPayloadCodec();
+        set(codec, "orchestratorConfig", config);
+        service.transitionPayloadCodec = codec;
         service.releaseIdentityResolver = new PipelineReleaseIdentityResolver();
         set(service.releaseIdentityResolver, "cachedContract", Optional.of(contract));
         Field health = PipelineExecutionService.class.getDeclaredField("startupHealthState");

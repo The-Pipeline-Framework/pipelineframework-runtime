@@ -19,20 +19,22 @@ for (artifact in release.artifacts) {
   assert artifact.digest == 'sha256:' + MessageDigest.getInstance('SHA-256').digest(file.bytes).encodeHex().toString()
   new ZipFile(file).withCloseable { zip ->
     assert zip.getEntry('META-INF/pipeline/pipeline-contract.json')
-    assert release.deployment.entries.findAll { it.artifactId == artifact.artifactId }.every {
-      entry ->
+    release.deployment.entries.findAll { it.artifactId == artifact.artifactId }.each { entry ->
       def classPath = entry.entryClass.replace('.', '/') + '.class'
-      if (entry.entryPackagePath == '.') return zip.getEntry(classPath) != null
+      if (entry.entryPackagePath == '.') {
+        assert zip.getEntry(classPath) != null : "Missing ${classPath} for entry ${entry.entryId}"
+        return
+      }
       def jar = zip.getEntry(entry.entryPackagePath)
       assert jar : "Missing entry package ${entry.entryPackagePath}"
       def found = false
       new java.util.zip.ZipInputStream(zip.getInputStream(jar)).withCloseable { nested ->
         java.util.zip.ZipEntry member
         while ((member = nested.nextEntry) != null) {
-          if (member.name == classPath) found = true
+          if (member.name == classPath) { found = true; break }
         }
       }
-      return found
+      assert found : "Missing ${classPath} for entry ${entry.entryId}"
     }
     if (artifact.artifactId == 'driver') {
       assert !zip.getEntry('com/example/echo/EchoService.class')
