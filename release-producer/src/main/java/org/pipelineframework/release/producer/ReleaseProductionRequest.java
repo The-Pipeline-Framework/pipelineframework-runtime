@@ -13,8 +13,14 @@ public record ReleaseProductionRequest(
     String compiledTruthArtifactId,
     Path compiledTruthDirectory,
     List<ReleaseArtifactInput> artifacts,
-    boolean allowLocalUris
+    boolean allowLocalUris,
+    org.pipelineframework.orchestrator.release.PipelineReleaseDeployment deployment
 ) {
+    public ReleaseProductionRequest(PipelineContractDescriptor contract, String releaseVersion,
+        String compiledTruthArtifactId, Path compiledTruthDirectory, List<ReleaseArtifactInput> artifacts, boolean allowLocalUris) {
+        this(contract, releaseVersion, compiledTruthArtifactId, compiledTruthDirectory, artifacts, allowLocalUris, null);
+    }
+
     public ReleaseProductionRequest {
         artifacts = artifacts == null ? List.of() : Collections.unmodifiableList(new ArrayList<>(artifacts));
     }

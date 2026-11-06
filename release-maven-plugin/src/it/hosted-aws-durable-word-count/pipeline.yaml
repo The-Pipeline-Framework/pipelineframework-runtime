@@ -1,0 +1,33 @@
+version: 2
+appName: hosted-word-count-packaging-it
+basePackage: org.pipelineframework.release.count
+transport: LOCAL
+platform: COMPUTE
+types:
+  Document:
+    java: org.pipelineframework.release.count.Document
+    fields: [[content, string]]
+  NormalizedDocument:
+    java: org.pipelineframework.release.count.NormalizedDocument
+    fields: [[content, string]]
+  WordCount:
+    java: org.pipelineframework.release.count.WordCount
+    fields: [[count, int64]]
+steps:
+  - name: Normalize
+    service: org.pipelineframework.release.count.NormalizeService
+    cardinality: ONE_TO_ONE
+    input: Document
+    output: NormalizedDocument
+    java:
+      input: org.pipelineframework.release.count.Document
+      output: org.pipelineframework.release.count.NormalizedDocument
+  - name: Count
+    service: org.pipelineframework.release.count.CountService
+    cardinality: ONE_TO_ONE
+    input: NormalizedDocument
+    output: WordCount
+    java:
+      input: org.pipelineframework.release.count.NormalizedDocument
+      output: org.pipelineframework.release.count.WordCount
+    terminal: true

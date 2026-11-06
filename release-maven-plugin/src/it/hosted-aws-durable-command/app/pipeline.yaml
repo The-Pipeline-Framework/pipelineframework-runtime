@@ -1,0 +1,31 @@
+version: 3
+appName: hosted-release-packaging-it
+basePackage: com.example.echo
+transport: LOCAL
+platform: COMPUTE
+connectors:
+  store:
+    provider: fixture.echo
+    version: 1
+types:
+  EchoInput:
+    java: com.example.echo.EchoInput
+    fields: [[value, string]]
+  EchoOutput:
+    java: com.example.echo.EchoOutput
+    fields: [[value, string]]
+steps:
+  - name: Echo
+    kind: command
+    using: store
+    operation: echo
+    operationVersion: 1
+    commandIdGenerator: com.example.echo.StableId
+    duplicatePolicy: RETURN_RECORDED
+    cardinality: ONE_TO_ONE
+    input: EchoInput
+    output: EchoOutput
+    java:
+      input: com.example.echo.EchoInput
+      output: com.example.echo.EchoOutput
+    terminal: true
