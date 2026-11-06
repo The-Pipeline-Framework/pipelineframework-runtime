@@ -16,6 +16,11 @@
     <name>The Pipeline Framework - Release Maven Plugin</name>
     <description>Produces immutable TPF release descriptors from packaged application artifacts.</description>
 
+    <properties>
+        <!-- Invoker defaults to runtime scope; hosted fixtures also need the declared test closure. -->
+        <invoker.install.scope>test</invoker.install.scope>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>org.pipelineframework</groupId>
@@ -50,6 +55,20 @@
             <version>${project.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- Quarkus discovers this companion through extension metadata, outside the runtime POM graph. -->
+        <dependency>
+            <groupId>org.pipelineframework</groupId>
+            <artifactId>pipelineframework-deployment</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- Hosted Invoker fixtures must receive the host under test, even from a cold repository. -->
+        <dependency>
+            <groupId>org.pipelineframework</groupId>
+            <artifactId>pipelineframework-aws-durable-coordination-host</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -68,6 +87,7 @@
                     <postBuildHookScript>verify</postBuildHookScript>
                     <projectsDirectory>src/it</projectsDirectory>
                     <streamLogs>true</streamLogs>
+                    <streamLogsOnFailures>true</streamLogsOnFailures>
                 </configuration>
                 <executions>
                     <execution>

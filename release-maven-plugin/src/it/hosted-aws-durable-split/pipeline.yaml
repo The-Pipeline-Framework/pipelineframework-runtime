@@ -1,0 +1,22 @@
+version: 2
+appName: hosted-release-packaging-it
+basePackage: com.example.echo
+transport: LOCAL
+platform: COMPUTE
+types:
+  EchoInput:
+    java: com.example.echo.EchoInput
+    fields: [[value, string]]
+  EchoOutput:
+    java: com.example.echo.EchoOutput
+    fields: [[value, string]]
+steps:
+  - name: Echo
+    service: com.example.echo.EchoService
+    cardinality: ONE_TO_ONE
+    input: EchoInput
+    output: EchoOutput
+    java:
+      input: com.example.echo.EchoInput
+      output: com.example.echo.EchoOutput
+    terminal: true

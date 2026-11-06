@@ -52,6 +52,10 @@ public final class GenerateReleaseDescriptorMojo extends AbstractMojo {
     @Parameter
     private List<ReleaseArtifactConfiguration> artifacts;
 
+    /** Packaging facts are build configuration; output remains the one immutable Release. */
+    @Parameter
+    private ReleaseDeploymentConfiguration deployment;
+
     @Override
     public void execute() throws MojoExecutionException {
         if (skip) {
@@ -72,7 +76,8 @@ public final class GenerateReleaseDescriptorMojo extends AbstractMojo {
             List<ReleaseArtifactInput> inputs = producer.materialize(
                 configured, carrierId, metadataDirectory, outputFile.toPath().toAbsolutePath().normalize().getParent());
             var descriptor = producer.produce(new ReleaseProductionRequest(
-                contract, releaseVersion, carrierId, metadataDirectory, inputs, allowLocalUris));
+                contract, releaseVersion, carrierId, metadataDirectory, inputs, allowLocalUris,
+                deployment == null ? null : deployment.toDescriptor()));
             producer.write(outputFile.toPath(), descriptor);
             getLog().info("Produced Pipeline Release Descriptor " + outputFile.toPath().toAbsolutePath().normalize());
         } catch (IllegalArgumentException | IllegalStateException e) {

@@ -83,7 +83,6 @@
             <groupId>org.pipelineframework</groupId>
             <artifactId>pipelineframework-runtime-core</artifactId>
             <version>${tpf.contracts.version}</version>
-            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.pipelineframework</groupId>
