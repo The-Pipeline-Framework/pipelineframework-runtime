@@ -8,12 +8,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import com.fasterxml.jackson.databind.JavaType;
 import com.fasterxml.jackson.databind.type.TypeFactory;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.pipelineframework.config.pipeline.PipelineJson;
+import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
 import org.pipelineframework.orchestrator.release.PipelineReleaseRecord;
 import org.pipelineframework.orchestrator.release.PipelineReleaseRegistry;
 
@@ -96,7 +98,7 @@ public class ExecutionDurablePayloadResolver {
         if (steps.isEmpty()) {
             throw new IllegalStateException("pinned release has no pipeline steps");
         }
-        return resolve(release, execution, canonicalTypeId(steps, execution, slot), collection);
+        return resolve(release, execution, canonicalTypeId(release.contract(), execution, slot), collection);
     }
 
     /**
@@ -110,7 +112,7 @@ public class ExecutionDurablePayloadResolver {
         TypedDurablePayload payload) {
         PipelineReleaseRecord release = pinnedRelease(execution);
         StoredExpression stored = StoredExpression.parse(payload.canonicalTypeId());
-        validatePermitted(release.contract().steps(), release.contract().canonicalTypes(), slot, stored.elementTypeId());
+        validatePermitted(release.contract(), slot, stored.elementTypeId());
         return resolve(release, execution, stored.elementTypeId(), stored.collection());
     }
 
@@ -178,14 +180,22 @@ public class ExecutionDurablePayloadResolver {
     }
 
     private static void validatePermitted(
-        List<PipelineBundleStepDescriptor> steps,
-        Map<String, Map<String, Object>> definitions,
+        PipelineContractDescriptor contract,
         Slot slot,
         String canonicalTypeId) {
+        List<PipelineBundleStepDescriptor> steps = contract.steps();
+        Map<String, Map<String, Object>> definitions = contract.canonicalTypes();
         if (steps.isEmpty()) {
             throw new IllegalStateException("pinned release has no pipeline steps");
         }
-        Set<String> permitted = switch (slot) {
+        // Composition names are the boundary authority. The flat leaf catalog can use Java
+        // identities that are shared by several aliases; those must not authorize another name.
+        Set<String> permitted = contract.composition().present()
+            ? contract.composition().definitions().stream().flatMap(definition -> Stream.concat(
+                Stream.of(definition.inputContractId(), definition.outputContractId()),
+                definition.nodes().stream().flatMap(node -> Stream.of(node.inputContractId(), node.outputContractId()))))
+                .collect(Collectors.toUnmodifiableSet())
+            : switch (slot) {
             case INPUT, CONTINUATION_INPUT -> java.util.stream.Stream.concat(
                 java.util.stream.Stream.of(steps.getFirst().inputTypeId()),
                 steps.stream().map(PipelineBundleStepDescriptor::outputTypeId))
@@ -227,7 +237,12 @@ public class ExecutionDurablePayloadResolver {
     private record ReleaseCacheKey(String tenantId, DurablePayloadReleaseCoordinate coordinate) {
     }
 
-    private static String canonicalTypeId(List<PipelineBundleStepDescriptor> steps, ExecutionRecord<?, ?> execution, Slot slot) {
+    private static String canonicalTypeId(PipelineContractDescriptor contract, ExecutionRecord<?, ?> execution, Slot slot) {
+        if (contract.composition().present() && slot != Slot.CONTINUATION_INPUT) {
+            var root = contract.composition().definition(contract.composition().rootDefinitionId());
+            return slot == Slot.INPUT ? root.inputContractId() : root.outputContractId();
+        }
+        List<PipelineBundleStepDescriptor> steps = contract.steps();
         if (slot == Slot.INPUT) {
             // Execution input is immutable across retries, awaits, and later pipeline steps. Its
             // identity is the pipeline entry contract, never the currently resumed step.
