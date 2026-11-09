@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class HostedReleaseProducerTest {
     @TempDir Path directory;
 
+    /** Verifies that the independent consumer accepts the producer's package associations for both named contracts. */
     @Test void originalProducerReleaseIsAcceptedByIndependentConsumerForUnrelatedContracts() throws Exception {
         for (String name : List.of("document-index", "temperature-conversion")) {
             Path root = Files.createDirectories(directory.resolve(name));
@@ -62,6 +63,7 @@ class HostedReleaseProducerTest {
         try (var files = Files.list(directory.resolve("rejected"))) { assertEquals(0, files.count()); }
     }
 
+    /** Checks that a matching contract cannot compensate for changed or missing execution order. */
     @Test void producerRejectsChangedOrMissingOrderDespiteUnchangedContract() throws Exception {
         for (var order : List.of(Optional.of("[\"Other\"]"), Optional.<String>empty())) {
             Path root = Files.createTempDirectory(directory, "producer-order-");
@@ -72,6 +74,7 @@ class HostedReleaseProducerTest {
         }
     }
 
+    /** Rehashes modified packages so the consumer must detect order drift during resource verification. */
     @Test void consumerRejectsChangedOrMissingOrderAfterArtifactHashIsUpdated() throws Exception {
         for (var order : List.of(Optional.of("[\"Other\"]"), Optional.<String>empty())) {
             Path root = Files.createTempDirectory(directory, "consumer-order-");

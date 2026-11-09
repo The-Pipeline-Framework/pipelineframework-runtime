@@ -21,6 +21,7 @@ import org.pipelineframework.telemetry.PipelineTelemetry;
 
 /** Test wiring for actual generated steps; execution service, runner and step executor remain production code. */
 public final class CommandApplicationFixture {
+    /** Wires the generated steps from the executing package into the production execution service. */
     public static PipelineExecutionService application(PipelineOrchestratorConfig config,
         PipelineContractDescriptor contract, String release, List<Object> authored) throws Exception {
         // The caller supplies generated step instances loaded from the exact executing package.

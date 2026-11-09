@@ -60,6 +60,7 @@ public final class DefaultPipelineReleaseProducer implements PipelineReleaseProd
         }
     }
 
+    /** Produces a Release and verifies the executing packages against the compiled contract when deployment is declared. */
     @Override
     public PipelineReleaseDescriptor produce(ReleaseProductionRequest request) {
         if (request == null) {

@@ -22,6 +22,7 @@ import org.pipelineframework.query.QueryCaptureStore;
 /** Seals actual retained CDI selection after build conditions and unused-bean removal. */
 public class CommandStoreCapabilityBuildStep {
     /** Writes package facts from the stores eligible for unqualified runtime lookup. */
+    /** Records the capabilities of the stores selected by CDI for Command and Query execution. */
     @BuildStep
     GeneratedResourceBuildItem selectedStores(ValidationPhaseBuildItem validation) {
         var commands = selectedBeans(validation, CommandEffectStore.class);

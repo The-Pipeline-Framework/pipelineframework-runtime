@@ -56,6 +56,7 @@ public final class GenerateReleaseDescriptorMojo extends AbstractMojo {
     @Parameter
     private ReleaseDeploymentConfiguration deployment;
 
+    /** Materializes the configured artifacts and writes the validated Release descriptor. */
     @Override
     public void execute() throws MojoExecutionException {
         if (skip) {
