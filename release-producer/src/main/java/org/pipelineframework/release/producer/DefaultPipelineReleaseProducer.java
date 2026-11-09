@@ -60,18 +60,33 @@ public final class DefaultPipelineReleaseProducer implements PipelineReleaseProd
         }
     }
 
+    /** Produces a Release and verifies the executing packages against the compiled contract when deployment is declared. */
     @Override
     public PipelineReleaseDescriptor produce(ReleaseProductionRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("Release production request is required");
         }
-        return generate(
+        var descriptor = generate(
             request.contract(),
             request.releaseVersion(),
             request.compiledTruthArtifactId(),
             request.compiledTruthDirectory(),
             request.artifacts(),
             request.allowLocalUris());
+        if (request.deployment() == null) return descriptor;
+        var hosted = new PipelineReleaseDescriptor(PipelineReleaseDescriptor.DEPLOYMENT_SCHEMA_VERSION,
+            descriptor.pipelineId(), descriptor.contractVersion(), descriptor.releaseVersion(),
+            descriptor.compiledTruthArtifactId(), descriptor.artifacts(), request.deployment());
+        new PipelineReleaseDescriptorValidator().validate(hosted, request.contract());
+        Map<String,Path> packages = new java.util.HashMap<>();
+        for (var artifact : request.artifacts()) packages.put(artifact.artifactId(), artifact.file());
+        try {
+            new org.pipelineframework.orchestrator.release.PipelineReleasePackageVerifier()
+                .verify(hosted, packages, request.compiledTruthDirectory());
+        } catch (IOException failure) {
+            throw new IllegalArgumentException("Could not verify executing-package association", failure);
+        }
+        return hosted;
     }
 
     public List<ReleaseArtifactInput> materialize(

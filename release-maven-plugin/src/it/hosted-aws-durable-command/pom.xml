@@ -1,0 +1,1 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion><groupId>org.pipelineframework.it</groupId><artifactId>hosted-command-package-test</artifactId><version>1.0.0</version><packaging>pom</packaging><modules><module>provider</module><module>app</module></modules></project>
