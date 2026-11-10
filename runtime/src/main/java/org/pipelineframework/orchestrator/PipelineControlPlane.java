@@ -23,6 +23,11 @@ public interface PipelineControlPlane {
      */
     void initializeQueueMode();
 
+    /** Observes the loaded runtime and its registered Release without changing execution state. */
+    default Uni<PipelineRuntimeIdentityObservation> runtimeIdentity(String tenantId) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Runtime identity observation is unsupported"));
+    }
+
     Uni<RunAsyncAcceptedDto> executePipelineAsync(
         Object input,
         String tenantId,

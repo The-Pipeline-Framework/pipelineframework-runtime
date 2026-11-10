@@ -1,6 +1,7 @@
 package org.pipelineframework.aws.durable;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -19,10 +20,35 @@ import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.aws.durable.model.AwsDurableActionRequest;
 import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
 import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
+import org.pipelineframework.aws.durable.model.AwsDurableOperation;
 import org.pipelineframework.orchestrator.AwaitSemanticCheckpoint;
 import org.pipelineframework.orchestrator.PipelineControlPlane;
+import org.pipelineframework.orchestrator.PipelineRuntimeIdentityObservation;
 
 class AwsDurableControlPlaneActionsTest {
+
+    @Test
+    void identityReportsActualRuntimeOnlyForTheExactRequestedRelease() throws Exception {
+        var controlPlane = mock(PipelineControlPlane.class);
+        var actual = new PipelineRuntimeIdentityObservation("pipeline-1", "contract-1", "release-1", true, 3, null,
+            "dynamo", true, "command-effects", "dynamo", "query-captures");
+        when(controlPlane.runtimeIdentity("tenant-1")).thenReturn(Uni.createFrom().item(actual));
+        var actions = actions(controlPlane);
+        var response = actions.invoke(identityRequest("release-1"));
+        var parsed = new ObjectMapper().readValue(response.resultJson().orElseThrow(), PipelineRuntimeIdentityObservation.class);
+        assertThat(parsed).isEqualTo(actual);
+        assertThatThrownBy(() -> actions.invoke(identityRequest("foreign-release")))
+            .isInstanceOf(IllegalStateException.class).hasMessageContaining("requested Release");
+        assertThatThrownBy(() -> actions.invoke(identityRequest(null)))
+            .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("releaseVersion");
+    }
+
+    private static AwsDurableActionRequest identityRequest(String release) {
+        return new AwsDurableActionRequest(AwsDurableOperation.READ_RUNTIME_IDENTITY, "tenant-1",
+            Optional.empty(), Optional.empty(), Optional.of("pipeline-1"), Optional.of("contract-1"),
+            Optional.ofNullable(release), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+            Optional.empty(), Optional.empty(), Optional.empty(), 1);
+    }
 
     @Test
     void currentAwaitUsesSemanticLocatorInsteadOfHistoricalOrdering() {

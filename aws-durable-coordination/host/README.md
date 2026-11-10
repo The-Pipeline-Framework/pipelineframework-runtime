@@ -26,6 +26,19 @@ Publication and immutable candidate validation follow the repository's normal
 runtime workflow. This module does not provision parameters or attest their tier,
 permissions, retention, deployment provenance or real-AWS conformance.
 
+### Hosted Release verification
+
+The coordination model exposes the packaged function roles and artifact groups
+for the queue and in-process Hosted profiles. Consumers use these facts to
+validate a Release against its compiled contract and numbered functions.
+
+The existing private Lambda action gateway accepts `READ_RUNTIME_IDENTITY` with
+the tenant and exact pipeline, contract and Release pins. After successful
+strict startup it reports the loaded compiled contract and the selected
+Command and Query stores. A missing registration, foreign pin or unhealthy
+runtime fails the read. The action uses the gateway's existing Lambda invoke
+permissions.
+
 ### Queue-only native execution
 
 The native deployment sets `pipeline.orchestrator.sqs.local-loopback=false` (the

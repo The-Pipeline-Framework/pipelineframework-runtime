@@ -23,6 +23,7 @@ import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.ExecutionRedriveResult;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
 import org.pipelineframework.orchestrator.PipelineControlPlane;
+import org.pipelineframework.orchestrator.PipelineRuntimeIdentityObservation;
 import org.pipelineframework.orchestrator.PipelineTransitionWorker;
 import org.pipelineframework.orchestrator.dto.ExecutionStatusDto;
 import org.pipelineframework.orchestrator.dto.RunAsyncAcceptedDto;
@@ -113,6 +114,16 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     @Override
     public Uni<Object> getExecutionResultPayload(String tenantId, String executionId) {
         return queueAsyncCoordinator.getExecutionResultPayload(tenantId, executionId);
+    }
+
+    @Override
+    public Uni<PipelineRuntimeIdentityObservation> runtimeIdentity(String tenantId) {
+        return Uni.createFrom().deferred(() -> {
+            if (pipelineExecutionService.getStartupHealthState() != PipelineExecutionService.StartupHealthState.HEALTHY) {
+                return Uni.createFrom().failure(new IllegalStateException("Runtime startup validation has not passed"));
+            }
+            return queueAsyncCoordinator.runtimeIdentity(tenantId, pipelineExecutionService.loadPipelineSteps().size());
+        });
     }
 
     @Override

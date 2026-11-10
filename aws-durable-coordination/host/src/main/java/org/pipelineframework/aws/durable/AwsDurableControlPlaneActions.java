@@ -66,6 +66,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             case RESULT -> AwsDurableActionResponse.result(json(controlPlane
                 .getExecutionResultPayload(request.tenantId(), required(request.executionId(), "executionId"))
                 .await().atMost(actionTimeout)));
+            case READ_RUNTIME_IDENTITY -> runtimeIdentity(request);
             case REDRIVE -> AwsDurableActionResponse.status(controlPlane.redriveExecution(
                     request.tenantId(),
                     required(request.executionId(), "executionId"),
@@ -84,6 +85,19 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             case REGISTER_CALLBACK -> register(request);
             case BIND_CALLBACK -> bind(request);
         };
+    }
+
+    /** Only report readiness when the observed runtime matches the requested Release pin. */
+    private AwsDurableActionResponse runtimeIdentity(AwsDurableActionRequest request) {
+        String pipeline = required(request.pipelineId(), "pipelineId");
+        String contract = required(request.contractVersion(), "contractVersion");
+        String release = required(request.releaseVersion(), "releaseVersion");
+        var observed = controlPlane.runtimeIdentity(request.tenantId()).await().atMost(actionTimeout);
+        if (!observed.ready() || !pipeline.equals(observed.pipelineId())
+            || !contract.equals(observed.contractVersion()) || !release.equals(observed.releaseVersion())) {
+            throw new IllegalStateException("Runtime identity differs from the requested Release");
+        }
+        return AwsDurableActionResponse.result(json(observed));
     }
 
     private AwsDurableActionResponse completionObservation(AwsDurableActionRequest request) {

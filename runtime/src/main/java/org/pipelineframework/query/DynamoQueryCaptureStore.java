@@ -56,6 +56,11 @@ import software.amazon.awssdk.services.dynamodb.model.WriteRequest;
 @ApplicationScoped
 @IfBuildProperty(name = "pipeline.query.capture-store.provider", stringValue = "dynamo")
 public class DynamoQueryCaptureStore implements QueryCaptureStore {
+
+    /** Returns the table bound to this store instance. */
+    public String tableName() {
+        return tableName;
+    }
     public static final String CAPTURE_KEY = "capture_key";
     public static final String REVISION = "revision";
     public static final String SCHEMA_VERSION = "schema_version";

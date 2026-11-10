@@ -41,6 +41,7 @@ import org.pipelineframework.orchestrator.LoggingDeadLetterPublisher;
 import org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy;
 import org.pipelineframework.orchestrator.OrchestratorMode;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
+import org.pipelineframework.orchestrator.PipelineReleaseIdentityResolver;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
 import org.pipelineframework.orchestrator.LocalControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.SerializedTransitionPayload;
@@ -72,8 +73,12 @@ import org.pipelineframework.awaitable.AwaitUnitRecord;
 import org.pipelineframework.awaitable.AwaitUnitOccurrence;
 import org.pipelineframework.awaitable.AwaitUnitStatus;
 import org.pipelineframework.checkpoint.CheckpointPublicationService;
+import org.pipelineframework.command.CommandEffectStore;
+import org.pipelineframework.command.DynamoCommandEffectStore;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
 import org.pipelineframework.objectpublish.ObjectPublishCompletionService;
+import org.pipelineframework.query.DynamoQueryCaptureStore;
+import org.pipelineframework.query.QueryCaptureStore;
 import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
 import org.pipelineframework.telemetry.PipelineTelemetry;
 
@@ -160,6 +165,12 @@ class QueueAsyncCoordinatorTest {
     @Mock
     private PipelineReleaseRegistry releaseRegistry;
 
+    @Mock
+    private Instance<CommandEffectStore> commandStores;
+
+    @Mock
+    private Instance<QueryCaptureStore> queryStores;
+
     @BeforeEach
     void setUp() {
         inputPolicy = new ExecutionInputPolicy();
@@ -203,6 +214,51 @@ class QueueAsyncCoordinatorTest {
             .thenReturn(Uni.createFrom().voidItem());
         lenient().when(awaitLiveCompletionRegistry.signal(any()))
             .thenReturn(Uni.createFrom().item(false));
+    }
+
+    @Test
+    void runtimeIdentityMatchesLoadedContractAndReportsTheSelectedStores() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        when(orchestratorConfig.strictStartup()).thenReturn(true);
+        var identities = mock(PipelineReleaseIdentityResolver.class);
+        coordinator.releaseIdentityResolver = identities;
+        when(identities.pipelineId(orchestratorConfig)).thenReturn("pipeline");
+        when(identities.releaseVersion(orchestratorConfig)).thenReturn("release");
+        var compiled = mock(PipelineContractDescriptor.class);
+        when(compiled.pipelineId()).thenReturn("pipeline");
+        when(compiled.contractVersion()).thenReturn("contract");
+        when(compiled.steps()).thenReturn(List.of(mock(org.pipelineframework.orchestrator.PipelineBundleStepDescriptor.class)));
+        when(identities.contract()).thenReturn(compiled);
+        var release = mock(PipelineReleaseRecord.class);
+        when(release.tenantId()).thenReturn("tenant");
+        when(release.pipelineId()).thenReturn("pipeline");
+        when(release.contractVersion()).thenReturn("contract");
+        when(release.releaseVersion()).thenReturn("release");
+        when(release.contract()).thenReturn(compiled);
+        when(releaseRegistry.get("tenant", "pipeline", "release")).thenReturn(Uni.createFrom().item(Optional.of(release)));
+        when(releaseRegistry.get("other-tenant", "pipeline", "release")).thenReturn(Uni.createFrom().item(Optional.of(release)));
+        coordinator.commandEffectStores = commandStores;
+        coordinator.queryCaptureStores = queryStores;
+        var command = mock(DynamoCommandEffectStore.class);
+        var query = mock(DynamoQueryCaptureStore.class);
+        when(commandStores.isResolvable()).thenReturn(true);
+        when(commandStores.get()).thenReturn(command);
+        when(command.supportsRecovery()).thenReturn(true);
+        when(command.tableName()).thenReturn("effect-table");
+        when(queryStores.isResolvable()).thenReturn(true);
+        when(queryStores.get()).thenReturn(query);
+        when(query.tableName()).thenReturn("capture-table");
+
+        var identity = coordinator.runtimeIdentity("tenant", 1).await().indefinitely();
+        assertTrue(identity.ready());
+        assertEquals(compiled, identity.compiledContract());
+        assertEquals("release", identity.releaseVersion());
+        assertEquals("dynamo", identity.commandEffectStoreProvider());
+        assertTrue(identity.commandEffectStoreRecoverySupported());
+        assertEquals("effect-table", identity.commandEffectStoreTable());
+        assertEquals("capture-table", identity.queryCaptureStoreTable());
+        assertThrows(IllegalStateException.class, () -> coordinator.runtimeIdentity("tenant", 2));
+        assertThrows(IllegalStateException.class, () -> coordinator.runtimeIdentity("other-tenant", 1).await().indefinitely());
     }
 
     @Test

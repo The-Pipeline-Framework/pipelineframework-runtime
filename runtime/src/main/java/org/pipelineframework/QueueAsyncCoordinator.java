@@ -49,6 +49,7 @@ import org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy;
 import org.pipelineframework.orchestrator.OrchestratorMode;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.PipelineReleaseIdentityResolver;
+import org.pipelineframework.orchestrator.PipelineRuntimeIdentityObservation;
 import org.pipelineframework.orchestrator.PipelineTransitionWorker;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
@@ -60,6 +61,12 @@ import org.pipelineframework.orchestrator.release.PipelineReleaseRegistry;
 import org.pipelineframework.orchestrator.dto.ExecutionStatusDto;
 import org.pipelineframework.orchestrator.dto.RunAsyncAcceptedDto;
 import org.pipelineframework.objectpublish.ObjectPublishCompletionService;
+import org.pipelineframework.command.CommandEffectStore;
+import org.pipelineframework.command.DynamoCommandEffectStore;
+import org.pipelineframework.command.InMemoryCommandEffectStore;
+import org.pipelineframework.query.DynamoQueryCaptureStore;
+import org.pipelineframework.query.InMemoryQueryCaptureStore;
+import org.pipelineframework.query.QueryCaptureStore;
 
 /**
  * Coordinates queue-mode orchestration lifecycle and provider interactions.
@@ -73,6 +80,12 @@ class QueueAsyncCoordinator {
 
   @Inject
   PipelineOrchestratorConfig orchestratorConfig;
+
+  @Inject
+  Instance<CommandEffectStore> commandEffectStores;
+
+  @Inject
+  Instance<QueryCaptureStore> queryCaptureStores;
 
   @Inject
   Instance<ExecutionStateStore> executionStateStores;
@@ -424,6 +437,36 @@ class QueueAsyncCoordinator {
       return Duration.ofSeconds(1);
     }
     return workerConfig.saturatedDelay();
+  }
+
+  Uni<PipelineRuntimeIdentityObservation> runtimeIdentity(String tenantId, int loadedStepCount) {
+    if (!orchestratorConfig.strictStartup() || !ensureQueueModeReady()) {
+      return Uni.createFrom().failure(new IllegalStateException("Runtime identity requires validated strict queue providers"));
+    }
+    var compiled = releaseIdentityResolver().contract();
+    if (compiled.steps().isEmpty() || loadedStepCount != compiled.steps().size()
+        || !compiled.pipelineId().equals(pipelineId())) {
+      throw new IllegalStateException("Loaded application does not match the compiled pipeline layout");
+    }
+    String expectedRelease = releaseVersion();
+    return releaseRegistry.get(tenantId, compiled.pipelineId(), expectedRelease).map(found -> {
+      var release = found.orElseThrow(() -> new IllegalStateException("Runtime Release is not registered"));
+      if (!tenantId.equals(release.tenantId()) || !compiled.pipelineId().equals(release.pipelineId())
+          || !expectedRelease.equals(release.releaseVersion()) || !compiled.contractVersion().equals(release.contractVersion())
+          || !compiled.equals(release.contract())) {
+        throw new IllegalStateException("Registered Release does not match actual loaded compiled Contract");
+      }
+      var commandStore = commandEffectStores.isResolvable() ? commandEffectStores.get() : null;
+      var queryStore = queryCaptureStores.isResolvable() ? queryCaptureStores.get() : null;
+      var commandDynamo = commandStore instanceof DynamoCommandEffectStore store ? store : null;
+      var queryDynamo = queryStore instanceof DynamoQueryCaptureStore store ? store : null;
+      return new PipelineRuntimeIdentityObservation(compiled.pipelineId(), compiled.contractVersion(),
+          expectedRelease, true, loadedStepCount, compiled,
+          commandDynamo != null ? "dynamo" : commandStore instanceof InMemoryCommandEffectStore ? "memory" : "",
+          commandStore != null && commandStore.supportsRecovery(), commandDynamo == null ? "" : commandDynamo.tableName(),
+          queryDynamo != null ? "dynamo" : queryStore instanceof InMemoryQueryCaptureStore ? "memory" : "",
+          queryDynamo == null ? "" : queryDynamo.tableName());
+    });
   }
 
   private TransitionPayloadCodec payloadCodec() {
