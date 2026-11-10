@@ -18,8 +18,36 @@ public class InMemoryPipelineReleaseRegistry implements PipelineReleaseRegistry 
 
     private final Object lock = new Object();
     private final Map<String, PipelineReleaseRecord> releasesByKey = new HashMap<>();
+    private final Map<List<String>, PipelineReleaseEntryBinding> entryBindings = new HashMap<>();
+    private final Map<List<String>, String> activationPreconditions = new HashMap<>();
     private final Map<List<String>, ActivationOperationReceipt> activationOperations = new HashMap<>();
     private final Map<List<String>, List<MemoryActivationEvent>> activationEvents = new HashMap<>();
+
+    @Override
+    public Uni<PipelineReleaseEntryBinding> registerEntryBinding(PipelineReleaseEntryBinding binding) {
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                var release = Optional.ofNullable(releasesByKey.get(key(binding.tenantId(), binding.pipelineId(), binding.releaseVersion())))
+                    .orElseThrow(() -> new IllegalStateException("Entry binding requires a registered Release"));
+                binding.requireRelease(release);
+                var existing = entryBindings.putIfAbsent(binding.key(), binding);
+                if (existing != null && !existing.equals(binding)) {
+                    throw new IllegalStateException("Release entry is already bound to different deployment evidence");
+                }
+                return existing == null ? binding : existing;
+            }
+        });
+    }
+
+    @Override
+    public Uni<Optional<PipelineReleaseEntryBinding>> getEntryBinding(
+        String tenant, String pipeline, String contract, String release, String entry) {
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                return Optional.ofNullable(entryBindings.get(List.of(tenant, pipeline, contract, release, entry)));
+            }
+        });
+    }
 
     @Override
     public boolean supportsCurrentActivationObservation() { return true; }
@@ -62,6 +90,16 @@ public class InMemoryPipelineReleaseRegistry implements PipelineReleaseRegistry 
 
     @Override
     public Uni<ActivationOperationReceipt> activateOnce(ActivationOperationCommand command) {
+        return activateOnce(command, null);
+    }
+
+    @Override
+    public Uni<ActivationOperationReceipt> activateOnceIfCurrent(
+        ActivationOperationCommand command, CurrentActivationObservation expected) {
+        return Uni.createFrom().deferred(() -> activateOnce(command, ActivationPrecondition.from(command, expected)));
+    }
+
+    private Uni<ActivationOperationReceipt> activateOnce(ActivationOperationCommand command, String expected) {
         return Uni.createFrom().item(() -> {
             synchronized (lock) {
                 PipelineReleaseRecord release = command.release();
@@ -69,6 +107,7 @@ public class InMemoryPipelineReleaseRegistry implements PipelineReleaseRegistry 
                 ActivationOperationReceipt existing = activationOperations.get(operation);
                 if (existing != null) {
                     existing.requireIntent(command);
+                    ActivationPrecondition.requireReplay(activationPreconditions.get(operation), expected);
                     return existing;
                 }
                 PipelineReleaseRecord registered = releasesByKey.get(key(release.tenantId(), release.pipelineId(), release.releaseVersion()));
@@ -77,12 +116,18 @@ public class InMemoryPipelineReleaseRegistry implements PipelineReleaseRegistry 
                     || !PipelineReleaseRecordMetadata.sameImmutableMetadata(registered, release)) {
                     throw new IllegalStateException("Activation requires matching registered immutable Release metadata");
                 }
+                var events = activationEvents.getOrDefault(List.of(release.tenantId(), release.pipelineId()), List.of());
+                boolean legacyUnknown = expected != null && events.isEmpty() && releasesByKey.values().stream().anyMatch(record ->
+                    release.tenantId().equals(record.tenantId()) && release.pipelineId().equals(record.pipelineId())
+                        && record.status() == PipelineReleaseStatus.ACTIVE);
+                ActivationPrecondition.requireMatch(expected, events.isEmpty() ? "" : events.getLast().activationId(), legacyUnknown);
                 ActivationOperationReceipt receipt = new ActivationOperationReceipt(1, command.operationKey(),
                     java.util.UUID.randomUUID().toString(), release.tenantId(), release.pipelineId(),
                     release.contractVersion(), release.releaseVersion(), PipelineReleaseEvidence.from(registered), command.activatedAtEpochMs());
                 activateLocked(release.tenantId(), release.pipelineId(), release.releaseVersion(),
                     command.activatedAtEpochMs(), receipt.activationId());
                 activationOperations.put(operation, receipt);
+                activationPreconditions.put(operation, expected);
                 return receipt;
             }
         });

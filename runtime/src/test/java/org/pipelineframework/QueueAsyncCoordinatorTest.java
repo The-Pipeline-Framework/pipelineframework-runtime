@@ -41,6 +41,7 @@ import org.pipelineframework.orchestrator.LoggingDeadLetterPublisher;
 import org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy;
 import org.pipelineframework.orchestrator.OrchestratorMode;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
+import org.pipelineframework.orchestrator.PipelineReleaseIdentityResolver;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
 import org.pipelineframework.orchestrator.LocalControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.SerializedTransitionPayload;
@@ -72,8 +73,12 @@ import org.pipelineframework.awaitable.AwaitUnitRecord;
 import org.pipelineframework.awaitable.AwaitUnitOccurrence;
 import org.pipelineframework.awaitable.AwaitUnitStatus;
 import org.pipelineframework.checkpoint.CheckpointPublicationService;
+import org.pipelineframework.command.CommandEffectStore;
+import org.pipelineframework.command.DynamoCommandEffectStore;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
 import org.pipelineframework.objectpublish.ObjectPublishCompletionService;
+import org.pipelineframework.query.DynamoQueryCaptureStore;
+import org.pipelineframework.query.QueryCaptureStore;
 import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
 import org.pipelineframework.telemetry.PipelineTelemetry;
 
@@ -160,6 +165,12 @@ class QueueAsyncCoordinatorTest {
     @Mock
     private PipelineReleaseRegistry releaseRegistry;
 
+    @Mock
+    private Instance<CommandEffectStore> commandStores;
+
+    @Mock
+    private Instance<QueryCaptureStore> queryStores;
+
     @BeforeEach
     void setUp() {
         inputPolicy = new ExecutionInputPolicy();
@@ -203,6 +214,66 @@ class QueueAsyncCoordinatorTest {
             .thenReturn(Uni.createFrom().voidItem());
         lenient().when(awaitLiveCompletionRegistry.signal(any()))
             .thenReturn(Uni.createFrom().item(false));
+    }
+
+    @Test
+    void runtimeIdentityMatchesLoadedContractAndReportsTheSelectedStores() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        when(orchestratorConfig.strictStartup()).thenReturn(true);
+        var identities = mock(PipelineReleaseIdentityResolver.class);
+        coordinator.releaseIdentityResolver = identities;
+        when(identities.pipelineId(orchestratorConfig)).thenReturn("pipeline");
+        when(identities.releaseVersion(orchestratorConfig)).thenReturn("release");
+        var compiled = mock(PipelineContractDescriptor.class);
+        when(compiled.pipelineId()).thenReturn("pipeline");
+        when(compiled.contractVersion()).thenReturn("contract");
+        when(compiled.steps()).thenReturn(List.of(mock(org.pipelineframework.orchestrator.PipelineBundleStepDescriptor.class)));
+        when(identities.contract()).thenReturn(compiled);
+        var release = mock(PipelineReleaseRecord.class);
+        when(release.tenantId()).thenReturn("tenant");
+        when(release.pipelineId()).thenReturn("pipeline");
+        when(release.contractVersion()).thenReturn("contract");
+        when(release.releaseVersion()).thenReturn("release");
+        when(release.contract()).thenReturn(compiled);
+        when(releaseRegistry.get("tenant", "pipeline", "release")).thenReturn(Uni.createFrom().item(Optional.of(release)));
+        when(releaseRegistry.get("other-tenant", "pipeline", "release")).thenReturn(Uni.createFrom().item(Optional.of(release)));
+        coordinator.commandEffectStores = commandStores;
+        coordinator.queryCaptureStores = queryStores;
+        var command = mock(DynamoCommandEffectStore.class);
+        var query = mock(DynamoQueryCaptureStore.class);
+        when(commandStores.iterator()).thenAnswer(call -> List.<CommandEffectStore>of(command).iterator());
+        when(command.supportsRecovery()).thenReturn(true);
+        when(command.tableName()).thenReturn("effect-table");
+        when(queryStores.iterator()).thenAnswer(call -> List.<QueryCaptureStore>of(query).iterator());
+        when(query.providerName()).thenReturn("dynamo");
+        when(query.tableName()).thenReturn("capture-table");
+
+        var identity = coordinator.runtimeIdentity("tenant", 1).await().indefinitely();
+        assertTrue(identity.ready());
+        assertEquals(compiled, identity.compiledContract());
+        assertEquals("release", identity.releaseVersion());
+        assertEquals("dynamo", identity.commandEffectStoreProvider());
+        assertTrue(identity.commandEffectStoreRecoverySupported());
+        assertEquals("effect-table", identity.commandEffectStoreTable());
+        assertEquals("capture-table", identity.queryCaptureStoreTable());
+        var invalidLayout = assertDoesNotThrow(() -> coordinator.runtimeIdentity("tenant", 2));
+        assertThrows(IllegalStateException.class, () -> invalidLayout.await().indefinitely());
+        assertThrows(IllegalStateException.class, () -> coordinator.runtimeIdentity("other-tenant", 1).await().indefinitely());
+
+        var customQuery = mock(QueryCaptureStore.class);
+        when(customQuery.providerName()).thenReturn("custom-query");
+        when(queryStores.iterator()).thenAnswer(call -> List.of(customQuery).iterator());
+        when(commandStores.iterator()).thenAnswer(call -> List.<CommandEffectStore>of().iterator());
+        var custom = coordinator.runtimeIdentity("tenant", 1).await().indefinitely();
+        assertEquals("custom-query", custom.queryCaptureStoreProvider());
+        assertEquals("", custom.queryCaptureStoreTable());
+        assertEquals("", custom.commandEffectStoreProvider());
+        assertFalse(custom.commandEffectStoreRecoverySupported());
+
+        when(commandStores.iterator()).thenAnswer(call -> List.of(command, mock(CommandEffectStore.class)).iterator());
+        var ambiguous = assertThrows(IllegalStateException.class,
+            () -> coordinator.runtimeIdentity("tenant", 1).await().indefinitely());
+        assertTrue(ambiguous.getMessage().contains("Multiple CommandEffectStore"));
     }
 
     @Test
@@ -416,6 +487,26 @@ class QueueAsyncCoordinatorTest {
     }
 
     @Test
+    void correlationReadReturnsTheAwaitAndItsOriginalExecutionRelease() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        var interaction = itemAwaitRecord(0, AwaitInteractionStatus.COMPLETED, "approved");
+        when(awaitCoordinator.getInteractionByCorrelation("tenant-1", interaction.correlationId()))
+            .thenReturn(Uni.createFrom().item(Optional.of(interaction)));
+        ExecutionRecord<Object, Object> execution = mock(ExecutionRecord.class);
+        when(execution.pipelineId()).thenReturn("pipeline-1");
+        when(execution.contractVersion()).thenReturn("contract-1");
+        when(execution.releaseVersion()).thenReturn("release-1");
+        when(executionStateStore.getExecution("tenant-1", interaction.executionId()))
+            .thenReturn(Uni.createFrom().item(Optional.of(execution)));
+
+        var checkpoint = coordinator.getAwaitSemanticCheckpointByCorrelation("tenant-1", interaction.correlationId())
+            .await().indefinitely().orElseThrow();
+        assertEquals(interaction.interactionId(), checkpoint.interactionId());
+        assertEquals(interaction.correlationId(), checkpoint.correlationId());
+        assertEquals("release-1", checkpoint.releaseVersion());
+    }
+
+    @Test
     void semanticCheckpointReadsApplyTenantAdmissionBeforeStorageAccess() {
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         ControlPlaneAdmissionPolicy policy = mock(ControlPlaneAdmissionPolicy.class);
@@ -428,6 +519,9 @@ class QueueAsyncCoordinatorTest {
             .getAwaitSemanticCheckpoint("tenant-denied", "interaction-1")
             .await().indefinitely());
         assertThrows(ControlPlaneAdmissionException.class, () -> coordinator
+            .getAwaitSemanticCheckpointByCorrelation("tenant-denied", "correlation-1")
+            .await().indefinitely());
+        assertThrows(ControlPlaneAdmissionException.class, () -> coordinator
             .getAwaitSemanticCheckpoints("tenant-denied", "exec-1", 10)
             .await().indefinitely());
 
@@ -437,7 +531,7 @@ class QueueAsyncCoordinatorTest {
             .getCurrentAwaitSemanticCheckpoint("tenant-denied", "exec-1").await().indefinitely());
         assertThrows(ControlPlaneAdmissionException.class, () -> coordinator
             .getCurrentAwaitSemanticCheckpoint("tenant-denied", "exec-1", Optional.empty()).await().indefinitely());
-        verify(policy, times(4)).admit(requests.capture());
+        verify(policy, times(5)).admit(requests.capture());
         assertTrue(requests.getAllValues().stream().allMatch(request ->
             request.operation() == ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT));
         verifyNoInteractions(awaitCoordinator);
@@ -749,6 +843,31 @@ class QueueAsyncCoordinatorTest {
         ArgumentCaptor<ExecutionWorkItem> itemCaptor = ArgumentCaptor.forClass(ExecutionWorkItem.class);
         verify(workDispatcher, times(2)).enqueueNow(itemCaptor.capture());
         assertEquals(new CoordinatorSweepResult(1000L, 100, 0, 2), result);
+    }
+
+    @Test
+    void hostedSweepTraversesRealControlPlaneWithoutResolvingCurrentApplicationContinuation() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        when(orchestratorConfig.sweepLimit()).thenReturn(10);
+        when(awaitCoordinator.findDueTimeoutConsequences(1000L, 10)).thenReturn(Uni.createFrom().item(List.of()));
+        when(awaitCoordinator.findTimedOut(1000L, 10)).thenReturn(Uni.createFrom().item(List.of()));
+        when(executionStateStore.findDueExecutions(1000L, 10)).thenReturn(Uni.createFrom().item(List.of()));
+        var command = new org.pipelineframework.orchestrator.AwaitItemContinuationCommand(
+            "tenant-a", "execution-a", "unit-a", "interaction-a", 0, 1, 1000L);
+        when(awaitCoordinator.findDueItemContinuations(1000L, 10)).thenReturn(Uni.createFrom().item(List.of(command)));
+        var controlPlane = new LocalPipelineControlPlane();
+        controlPlane.queueAsyncCoordinator = coordinator;
+        // No current application execution service is installed: this path must never resolve its local steps.
+        var selected = new java.util.ArrayList<org.pipelineframework.orchestrator.AwaitItemContinuationCommand>();
+        var result = controlPlane.sweepOnce(1000L, due -> {
+            selected.add(due);
+            return Uni.createFrom().item(org.pipelineframework.orchestrator.AwaitItemContinuationResult.completed(due));
+        }).await().indefinitely();
+        assertEquals(List.of(command), selected);
+        assertEquals(new CoordinatorSweepResult(1000L, 10, 0, 0), result);
+        verify(awaitCoordinator, never()).getUnit(any(), any());
+        verify(awaitCoordinator, never()).completeItemContinuation(any());
+        verify(awaitCoordinator, never()).rescheduleItemContinuation(any(), org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.anyLong());
     }
 
     @Test
@@ -2238,6 +2357,73 @@ class QueueAsyncCoordinatorTest {
             throw last;
         }
         assertion.run();
+    }
+
+    @Test
+    void runtimeIdentityRequiresStrictNativeReadiness() {
+        assertThrows(IllegalStateException.class, () -> coordinator.runtimeIdentity("tenant-1", 1).await().indefinitely());
+        verifyNoInteractions(releaseRegistry);
+    }
+
+    @Test
+    void runtimeIdentityUsesClasspathContractAndRegisteredReleaseWithLoadedStepObservation() {
+        byte[] fixtureContract = """
+            {"schemaVersion":1,"pipelineId":"actual.pipeline","contractVersion":"actual-contract","contractHash":"actual-hash","steps":[
+            {"index":0,"authoredName":"one","runtimeClass":"app.One","clientClass":"app.OneClient","cardinality":"ONE_TO_ONE","inputTypeId":"java.lang.String","outputTypeId":"java.lang.String"}]}
+            """.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        ClassLoader previous = Thread.currentThread().getContextClassLoader();
+        Thread.currentThread().setContextClassLoader(new ClassLoader(previous) {
+            @Override public java.io.InputStream getResourceAsStream(String path) {
+                return path.equals(PipelineContractDescriptor.RESOURCE_PATH) ? new java.io.ByteArrayInputStream(fixtureContract) : super.getResourceAsStream(path);
+            }
+        });
+        try {
+            when(orchestratorConfig.strictStartup()).thenReturn(true);
+            when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+            when(orchestratorConfig.idempotencyPolicy()).thenReturn(OrchestratorIdempotencyPolicy.CLIENT_KEY_REQUIRED);
+            when(orchestratorConfig.pipelineId()).thenReturn("actual.pipeline");
+            when(orchestratorConfig.releaseVersion()).thenReturn("registered-release");
+            var actual = new org.pipelineframework.orchestrator.release.PipelineContractDescriptorLoader().load().orElseThrow();
+            var release = mock(PipelineReleaseRecord.class);
+            when(release.tenantId()).thenReturn("tenant-1"); when(release.pipelineId()).thenReturn("actual.pipeline");
+            when(release.contractVersion()).thenReturn("actual-contract"); when(release.contract()).thenReturn(actual);
+            when(release.releaseVersion()).thenReturn("registered-release");
+            when(releaseRegistry.get("tenant-1", "actual.pipeline", "registered-release")).thenReturn(Uni.createFrom().item(Optional.of(release)));
+            coordinator.commandEffectStores = commandStores;
+            coordinator.queryCaptureStores = queryStores;
+            when(commandStores.iterator()).thenAnswer(call -> List.<CommandEffectStore>of().iterator());
+            when(queryStores.iterator()).thenAnswer(call -> List.<QueryCaptureStore>of().iterator());
+            var observation = coordinator.runtimeIdentity("tenant-1", 1).await().indefinitely();
+            assertTrue(observation.ready()); assertEquals(actual, observation.compiledContract());
+            assertEquals("actual-contract", observation.contractVersion()); assertEquals("registered-release", observation.releaseVersion());
+            assertEquals("", observation.commandEffectStoreProvider());
+            assertFalse(observation.commandEffectStoreRecoverySupported());
+            assertEquals("", observation.queryCaptureStoreProvider());
+            assertEquals("", observation.queryCaptureStoreTable());
+            var selected = new org.pipelineframework.command.DynamoCommandEffectStore(
+                mock(software.amazon.awssdk.services.dynamodb.DynamoDbClient.class), "observed-effects");
+            when(commandStores.iterator()).thenAnswer(call -> List.<CommandEffectStore>of(selected).iterator());
+            var queryStore = new org.pipelineframework.query.DynamoQueryCaptureStore(
+                mock(software.amazon.awssdk.services.dynamodb.DynamoDbClient.class), "observed-captures");
+            when(queryStores.iterator()).thenAnswer(call -> List.<QueryCaptureStore>of(queryStore).iterator());
+            var durable = coordinator.runtimeIdentity("tenant-1", 1).await().indefinitely();
+            assertEquals("dynamo", durable.commandEffectStoreProvider());
+            assertTrue(durable.commandEffectStoreRecoverySupported());
+            assertEquals("observed-effects", durable.commandEffectStoreTable());
+            assertEquals("dynamo", durable.queryCaptureStoreProvider());
+            assertEquals("observed-captures", durable.queryCaptureStoreTable());
+            when(commandStores.iterator()).thenAnswer(call -> List.<CommandEffectStore>of(new org.pipelineframework.command.InMemoryCommandEffectStore()).iterator());
+            when(queryStores.iterator()).thenAnswer(call -> List.<QueryCaptureStore>of(new org.pipelineframework.query.InMemoryQueryCaptureStore()).iterator());
+            var memory = coordinator.runtimeIdentity("tenant-1", 1).await().indefinitely();
+            assertEquals("memory", memory.commandEffectStoreProvider());
+            assertTrue(memory.commandEffectStoreRecoverySupported()); // Existing memory SPI supports in-process recovery; provider/table distinguish durability.
+            assertEquals("", memory.commandEffectStoreTable());
+            assertEquals("memory", memory.queryCaptureStoreProvider());
+            assertEquals("", memory.queryCaptureStoreTable());
+            assertThrows(IllegalStateException.class, () -> coordinator.runtimeIdentity("tenant-1", 2).await().indefinitely());
+            when(release.contractVersion()).thenReturn("other-contract");
+            assertThrows(IllegalStateException.class, () -> coordinator.runtimeIdentity("tenant-1", 1).await().indefinitely());
+        } finally { Thread.currentThread().setContextClassLoader(previous); }
     }
 
     private void configureQueueModeDefaults() {

@@ -12,6 +12,8 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Objects;
+import java.util.function.Supplier;
 import java.util.Set;
 import java.util.jar.JarFile;
 
@@ -64,6 +66,31 @@ public class PipelineReleaseRegistrar {
         String pipelineId,
         String releaseDescriptorPath,
         long nowEpochMs) {
+        return validateWithResolver(tenantId, pipelineId, releaseDescriptorPath, nowEpochMs,
+            this::resolverProfile, CredentialResolver.NONE);
+    }
+
+    /** Uses a caller-owned operation resolver; keep its credential lease open through completion. */
+    public PipelineReleaseRecord validate(
+        String tenantId,
+        String pipelineId,
+        String releaseDescriptorPath,
+        long nowEpochMs,
+        ResolverProfile profile,
+        CredentialResolver credentials) {
+        Objects.requireNonNull(profile, "profile");
+        Objects.requireNonNull(credentials, "credentials");
+        return validateWithResolver(tenantId, pipelineId, releaseDescriptorPath, nowEpochMs,
+            () -> profile, credentials);
+    }
+
+    private PipelineReleaseRecord validateWithResolver(
+        String tenantId,
+        String pipelineId,
+        String releaseDescriptorPath,
+        long nowEpochMs,
+        Supplier<ResolverProfile> profile,
+        CredentialResolver credentials) {
         validateRequired("tenantId", tenantId);
         validateRequired("pipelineId", pipelineId);
         validateRequired("releaseDescriptorPath", releaseDescriptorPath);
@@ -74,7 +101,7 @@ public class PipelineReleaseRegistrar {
         PipelineReleaseDescriptor descriptor = loader().load(descriptorPath);
         validateDescriptorIdentity(pipelineId, descriptor);
         ValidatedArtifact primary = descriptor.artifacts().stream().anyMatch(artifact -> artifact.uri().startsWith("maven:"))
-            ? validateResolvedArtifacts(descriptorPath, descriptor)
+            ? validateResolvedArtifacts(descriptorPath, descriptor, profile.get(), credentials)
             : validateArtifacts(descriptor);
         PipelineContractDescriptor contract = primary.contract()
             .orElseThrow(() -> new IllegalArgumentException(
@@ -107,6 +134,19 @@ public class PipelineReleaseRegistrar {
             .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
+    /** Asynchronous operation-scoped validation; the caller retains the credential lease until termination. */
+    public Uni<PipelineReleaseRecord> validateAsync(
+        String tenantId,
+        String pipelineId,
+        String releaseDescriptorPath,
+        long nowEpochMs,
+        ResolverProfile profile,
+        CredentialResolver credentials) {
+        return Uni.createFrom().item(() -> validate(tenantId, pipelineId, releaseDescriptorPath, nowEpochMs,
+                profile, credentials))
+            .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+    }
+
     public void verify(PipelineReleaseRecord record) {
         if (record == null) {
             throw new IllegalArgumentException("Release record is required");
@@ -123,10 +163,20 @@ public class PipelineReleaseRegistrar {
         }
     }
 
-    private ValidatedArtifact validateResolvedArtifacts(Path descriptorPath, PipelineReleaseDescriptor descriptor) {
+    private ValidatedArtifact validateResolvedArtifacts(Path descriptorPath, PipelineReleaseDescriptor descriptor,
+        ResolverProfile profile, CredentialResolver credentials) {
         // Keep legacy file/JAR admission intact. Canonical Maven closures use the shared resolver,
         // including validation of every artifact and the embedded contract before any storage writes.
         descriptor.artifacts().forEach(this::validateArtifactDescriptor);
+        profile.maven().ifPresent(maven -> {
+            Path settings = maven.settings();
+            if (settings != null && (!Files.isRegularFile(settings) || !Files.isReadable(settings))) {
+                throw new IllegalArgumentException("Configured Maven settings file must be readable");
+            }
+            if (maven.repositories().stream().anyMatch(uri -> uri.getUserInfo() != null)) {
+                throw new IllegalArgumentException("Maven repository credentials must be configured through settings servers");
+            }
+        });
         Path workspace;
         try {
             workspace = Files.createTempDirectory("tpf-release-admission-");
@@ -135,7 +185,7 @@ public class PipelineReleaseRegistrar {
         }
         try (var admission = new AdmissionWorkspace(workspace)) {
             var verified = new ReleaseVerifier().verify(
-                descriptorPath, admission.root().resolve("closure"), resolverProfile(), CredentialResolver.NONE);
+                descriptorPath, admission.root().resolve("closure"), profile, credentials);
             var resolved = verified.resolved();
             if (!descriptor.equals(resolved.descriptor())) {
                 throw new IllegalArgumentException("Release descriptor changed during admission");

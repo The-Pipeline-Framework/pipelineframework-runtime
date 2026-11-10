@@ -16,6 +16,8 @@ import java.lang.reflect.Proxy;
 import java.lang.reflect.InvocationTargetException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -122,10 +124,12 @@ class DynamoActivationOperationIT {
         assertEquals(completeRows, rows());
     }
 
-    @Test
-    void sameKeyConcurrentWritersConvergeOnOneImmutableReceiptAndEvent() throws InterruptedException {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void sameKeyConcurrentWritersConvergeOnOneImmutableReceiptAndEvent(boolean conditional) throws InterruptedException {
         PipelineReleaseRecord a = release("release-a");
         fresh().register(a).await().indefinitely();
+        var absent = fresh().currentActivationObservation("tenant", "pipeline").await().indefinitely();
         try (var executor = ownedExecutor(8)) {
             var ready = new java.util.concurrent.CountDownLatch(8);
             var start = new java.util.concurrent.CountDownLatch(1);
@@ -133,7 +137,9 @@ class DynamoActivationOperationIT {
                 ready.countDown();
                 try { assertTrue(start.await(20, java.util.concurrent.TimeUnit.SECONDS)); }
                 catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IllegalStateException(error); }
-                return fresh().activateOnce(new ActivationOperationCommand("same-key", a, 3000 + index)).await().indefinitely();
+                var command = new ActivationOperationCommand("same-key", a, 3000 + index);
+                return (conditional ? fresh().activateOnceIfCurrent(command, absent) : fresh().activateOnce(command))
+                    .await().indefinitely();
             }, executor)).toList();
             try { assertTrue(ready.await(20, java.util.concurrent.TimeUnit.SECONDS)); }
             finally { start.countDown(); }
@@ -144,6 +150,84 @@ class DynamoActivationOperationIT {
             assertEquals(winner, fresh().getActivationOperation("tenant", "pipeline", "same-key").await().indefinitely().orElseThrow());
             assertEquals(completeRows, rows());
         }
+    }
+
+    @Test
+    void conditionalActivationRejectsStaleHeadAndReplaysWithoutMovingAReplacement() {
+        var release = release("release-a");
+        fresh().register(release).await().indefinitely();
+        var absent = fresh().currentActivationObservation("tenant", "pipeline").await().indefinitely();
+        var first = new ActivationOperationCommand("first", release, 2000);
+        var receipt = fresh().activateOnceIfCurrent(first, absent).await().indefinitely();
+        var observed = fresh().currentActivationObservation("tenant", "pipeline").await().indefinitely();
+        var replacement = new ActivationOperationCommand("replacement", release, 3000);
+        var beforeStale = rows();
+        assertThrows(IllegalStateException.class,
+            () -> fresh().activateOnceIfCurrent(replacement, absent).await().indefinitely());
+        assertEquals(beforeStale, rows());
+        var later = fresh().activateOnceIfCurrent(replacement, observed).await().indefinitely();
+        assertEquals(receipt, fresh().activateOnceIfCurrent(first, absent).await().indefinitely());
+        assertThrows(IllegalStateException.class,
+            () -> fresh().activateOnceIfCurrent(first, observed).await().indefinitely());
+        assertEquals(later.activationId(), fresh().currentActivationObservation("tenant", "pipeline").await()
+            .indefinitely().identifiedEvent().orElseThrow().activationId());
+        assertEquals(2, events());
+    }
+
+    @Test
+    void numberedEntryEvidenceIsImmutableScopedAndUsesTheCallerOwnedClient() {
+        var contract = PipelineContractDescriptor.localFallback();
+        var artifact = new PipelineReleaseArtifactDescriptor("archive", "lambda-zip", "s3://releases/archive",
+            "sha256:" + "a".repeat(64), List.of(), List.of());
+        var otherArtifact = new PipelineReleaseArtifactDescriptor("other", "lambda-zip", "s3://releases/other",
+            "sha256:" + "b".repeat(64), List.of(), List.of());
+        var entry = new PipelineReleaseDeployment.Entry("action", "archive", contract.module(), ".",
+            "com.example.Action", "AWS_DURABLE_ACTION", List.of());
+        var otherEntry = new PipelineReleaseDeployment.Entry("ingress", "other", contract.module(), ".",
+            "com.example.Ingress", "AWS_DURABLE_INGRESS", List.of());
+        var deployment = new PipelineReleaseDeployment("aws-durable", List.of(entry, otherEntry), List.of(), null);
+        var descriptor = new PipelineReleaseDescriptor(2, "pipeline", contract.contractVersion(), "release",
+            "archive", List.of(artifact, otherArtifact), deployment);
+        var release = new PipelineReleaseRecord("tenant", "pipeline", contract.contractVersion(), "release",
+            PipelineReleaseStatus.REGISTERED, descriptor, artifact.artifactId(), artifact.digest(), artifact.uri(),
+            10, artifact.digest(), contract, 1, 1, 0);
+        var binding = new PipelineReleaseEntryBinding("tenant", "pipeline", contract.contractVersion(), "release",
+            "action", "archive", artifact.digest(), "aws-lambda", "arn:aws:lambda:eu-west-1:123456789012:function:action:1",
+            "code", "original-attempt");
+        var registry = fresh();
+        assertBindingRejectedWithoutWrites(IllegalStateException.class, binding);
+        registry.register(release).await().indefinitely();
+        assertEquals(binding, registry.registerEntryBinding(binding).await().indefinitely());
+        assertEquals(binding, fresh().registerEntryBinding(binding).await().indefinitely());
+        var conflict = new PipelineReleaseEntryBinding("tenant", "pipeline", contract.contractVersion(), "release",
+            "action", "archive", artifact.digest(), "aws-lambda", "arn:aws:lambda:eu-west-1:123456789012:function:action:2",
+            "other-code", "other-attempt");
+        assertBindingRejectedWithoutWrites(IllegalStateException.class, conflict);
+        var foreignArtifact = new PipelineReleaseEntryBinding("tenant", "pipeline", contract.contractVersion(), "release",
+            "action", "archive", "sha256:foreign", "aws-lambda", binding.resourceId(), "code", "original-attempt");
+        assertBindingRejectedWithoutWrites(IllegalArgumentException.class, foreignArtifact);
+        var undeclaredEntry = new PipelineReleaseEntryBinding("tenant", "pipeline", contract.contractVersion(), "release",
+            "undeclared", "archive", artifact.digest(), "aws-lambda", binding.resourceId(), "code", "original-attempt");
+        assertBindingRejectedWithoutWrites(IllegalArgumentException.class, undeclaredEntry);
+        var wrongEntryArtifact = new PipelineReleaseEntryBinding("tenant", "pipeline", contract.contractVersion(), "release",
+            "action", otherArtifact.artifactId(), otherArtifact.digest(), "aws-lambda", binding.resourceId(),
+            "code", "original-attempt");
+        assertBindingRejectedWithoutWrites(IllegalArgumentException.class, wrongEntryArtifact);
+        registry.closeClient();
+        assertEquals(binding, fresh().getEntryBinding("tenant", "pipeline", contract.contractVersion(), "release", "action")
+            .await().indefinitely().orElseThrow());
+        assertTrue(fresh().getEntryBinding("foreign", "pipeline", contract.contractVersion(), "release", "action")
+            .await().indefinitely().isEmpty());
+        assertTrue(fresh().getEntryBinding("tenant", "pipeline", "foreign-contract", "release", "action")
+            .await().indefinitely().isEmpty());
+        assertEquals(0, events());
+    }
+
+    private void assertBindingRejectedWithoutWrites(Class<? extends RuntimeException> failure,
+        PipelineReleaseEntryBinding binding) {
+        var before = rows();
+        assertThrows(failure, () -> fresh().registerEntryBinding(binding).await().indefinitely());
+        assertEquals(before, rows());
     }
 
     @Test
@@ -315,6 +399,48 @@ class DynamoActivationOperationIT {
         assertTrue(fresh().getActivationOperation("tenant", "pipeline", "new").await().indefinitely().isEmpty());
         assertEquals(original, fresh().getActivationOperation("tenant", "pipeline", "original").await().indefinitely().orElseThrow());
         assertEquals(remainingRows, rows());
+    }
+
+    @Test
+    void conditionalRollbackDoesNotRebaseAfterAConcurrentActivation() {
+        var a = fresh().register(release("A")).await().indefinitely();
+        var b = fresh().register(release("B")).await().indefinitely();
+        var none = fresh().currentActivationObservation("tenant", "pipeline").await().indefinitely();
+        var initial = new ActivationOperationCommand("initial", a, 1000);
+        var initialReceipt = fresh().activateOnceIfCurrent(initial, none).await().indefinitely();
+        var expected = fresh().currentActivationObservation("tenant", "pipeline").await().indefinitely();
+        var raced = new java.util.concurrent.atomic.AtomicBoolean();
+        var racing = new DynamoPipelineReleaseRegistry(boundary(request -> {
+            if (raced.compareAndSet(false, true))
+                fresh().activateOnce(new ActivationOperationCommand("intervening", b, 1000)).await().indefinitely();
+            return client.transactWriteItems(request);
+        }), config);
+        assertThrows(IllegalStateException.class, () -> racing.activateOnceIfCurrent(
+            new ActivationOperationCommand("rollback",a,1000),expected).await().indefinitely());
+        assertEquals("B", fresh().active("tenant","pipeline").await().indefinitely().orElseThrow().releaseVersion());
+        assertEquals(2, events());
+        assertTrue(fresh().getActivationOperation("tenant","pipeline","rollback").await().indefinitely().isEmpty());
+        assertEquals(initialReceipt, fresh().activateOnceIfCurrent(initial,none).await().indefinitely());
+        assertEquals(2,events());
+        assertThrows(IllegalStateException.class, () -> fresh().activateOnceIfCurrent(initial,expected).await().indefinitely());
+    }
+
+    @Test
+    void conditionalActivationRecoversACommittedButLostResponseWithoutReactivation() {
+        var a = fresh().register(release("A")).await().indefinitely();
+        var none = fresh().currentActivationObservation("tenant","pipeline").await().indefinitely();
+        var command = new ActivationOperationCommand("response-lost",a,1000);
+        var lossy = new DynamoPipelineReleaseRegistry(boundary(request -> {
+            client.transactWriteItems(request);
+            throw software.amazon.awssdk.core.exception.SdkClientException.create("injected response loss");
+        }), config);
+        assertThrows(RuntimeException.class, () -> lossy.activateOnceIfCurrent(command,none).await().indefinitely());
+        var receipt = fresh().getActivationOperation("tenant","pipeline",command.operationKey()).await().indefinitely().orElseThrow();
+        fresh().activateOnce(new ActivationOperationCommand("new-head",a,1000)).await().indefinitely();
+        var head = fresh().currentActivationObservation("tenant","pipeline").await().indefinitely();
+        assertEquals(receipt,fresh().activateOnceIfCurrent(command,none).await().indefinitely());
+        assertEquals(head,fresh().currentActivationObservation("tenant","pipeline").await().indefinitely());
+        assertEquals(2,events());
     }
 
     private void deleteRow(Map<String, software.amazon.awssdk.services.dynamodb.model.AttributeValue> row) {

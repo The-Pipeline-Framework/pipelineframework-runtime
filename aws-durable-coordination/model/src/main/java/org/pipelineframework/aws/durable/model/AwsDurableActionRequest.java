@@ -136,6 +136,14 @@ public record AwsDurableActionRequest(
         return forExecution(AwsDurableOperation.STATUS, checkpoint);
     }
 
+    /** Carries the existing canonical item-continuation command unchanged as JSON. */
+    public static AwsDurableActionRequest itemContinuation(AwsDurableExecutionCheckpoint checkpoint, String commandJson) {
+        return new AwsDurableActionRequest(AwsDurableOperation.PROCESS_AWAIT_CONTINUATION, checkpoint.tenantId(),
+            Optional.of(checkpoint.executionId()), Optional.empty(), Optional.of(checkpoint.pipelineId()),
+            Optional.of(checkpoint.contractVersion()), Optional.of(checkpoint.releaseVersion()), Optional.of(commandJson),
+            Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), 1);
+    }
+
     public static AwsDurableActionRequest registerAdmission(AwsDurableExecutionInput input, String name, String arn) {
         return new AwsDurableActionRequest(AwsDurableOperation.REGISTER_EXECUTION, input.tenantId(),
             input.resumeExecutionId(), Optional.of(input.idempotencyKey()), Optional.of(input.pipelineId()),

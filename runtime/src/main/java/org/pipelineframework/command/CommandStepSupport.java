@@ -608,14 +608,43 @@ public class CommandStepSupport {
         return dispatchNative(operation, request, selector, configuration)
             .onFailure(CommandStepSupport::isCancellation)
             .recoverWithItem(new CommandOutcome.Ambiguous<>("provider-dispatch-cancelled", List.of()))
-            .onFailure(failure -> !isNonRetryable(failure))
+            .onFailure(failure -> !isNonRetryable(failure) && !isPendingObservation(failure))
             .transform(failure -> CommandRetryableEffectException.mark(request.commandId(), failure))
             .onItem().<O>transformToUni(outcome -> applyNativeOutcome(store, request, selector, snapshot,
                 operation.capabilities(), selector.policy(), outcome, effectStartNanos))
             .onFailure(CommandRetryableOutcomeException.class)
             .transform(failure -> CommandRetryableEffectException.mark(request.commandId(), failure))
             .onFailure().call(failure -> isTypedOutcomeFailure(failure) || isStoreFailure(failure)
-                ? Uni.createFrom().voidItem() : recordFailure(store, request, failure, System.currentTimeMillis(), effectStartNanos).replaceWithVoid());
+                ? Uni.createFrom().voidItem()
+                : recordNativeDispatchFailure(store, request, selector, snapshot, operation, failure, effectStartNanos));
+    }
+
+    /** A provider's pending observation is retryable work, not authorization to repeat its effect. */
+    private Uni<Void> recordNativeDispatchFailure(CommandEffectStore store, CommandRequest<?> request,
+        NativeCommandSelector selector, ConnectorConfigurationSnapshot snapshot, CommandOperation<?, ?, ?> operation,
+        Throwable failure, long effectStartNanos) {
+        if (isPendingObservation(failure) && !isNonRetryable(failure) && store.supportsRecovery()
+            && operation.capabilities().reconciliationSupported() && request.callbackContext().isEmpty()) {
+            return store.find(request.executionContext().tenantId(), request.commandId()).chain(found -> {
+                if (found.isPresent() && found.orElseThrow().status() == CommandEffectStatus.DISPATCHING
+                    && found.orElseThrow().currentAttempt().recoveryBinding().isPresent()) {
+                    var record = found.orElseThrow();
+                    var retained = record.currentAttempt().recoveryBinding().orElseThrow();
+                    var expected = CommandRecoverySupport.binding(request, selector, snapshot, retained.target());
+                    CommandRecoverySupport.verify(record, request, expected);
+                    return Uni.createFrom().voidItem();
+                }
+                return recordFailure(store, request, CommandRetryableEffectException.mark(request.commandId(), failure),
+                    System.currentTimeMillis(), effectStartNanos).replaceWithVoid();
+            });
+        }
+        if (isPendingObservation(failure) && !isNonRetryable(failure))
+            CommandRetryableEffectException.mark(request.commandId(), failure);
+        return recordFailure(store, request, failure, System.currentTimeMillis(), effectStartNanos).replaceWithVoid();
+    }
+
+    private static boolean isPendingObservation(Throwable failure) {
+        return unwrapTransportFailure(failure) instanceof CommandInProgressException;
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})

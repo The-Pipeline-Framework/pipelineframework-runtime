@@ -17,6 +17,7 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
+import org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
@@ -120,6 +121,45 @@ class ExecutionReadModelTest {
     verify(admissionPolicy, org.mockito.Mockito.times(2)).admit(admitted.capture());
     assertEquals("", admitted.getAllValues().get(0).executionId());
     assertEquals("exec-1", admitted.getAllValues().get(1).executionId());
+  }
+
+  @Test
+  void scopedClientKeyObservesOnlyTheExactReleaseAndOriginalInput() {
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(orchestratorConfig.idempotencyPolicy()).thenReturn(org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy.CLIENT_KEY_REQUIRED);
+    when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.allow());
+    var store = new org.pipelineframework.orchestrator.InMemoryExecutionStateStore();
+    var nativeReads = new ExecutionReadModel(orchestratorConfig, executionInputPolicy, store, awaitCoordinator,
+        admissionPolicy, () -> "pipeline-a", () -> "release-a", () -> payloadCodec);
+    long createdAt = System.currentTimeMillis();
+    String key = PipelineRunSubmissionPlan.scopedRootExecutionKey("pipeline-a", "release-a", "key-1");
+    var created = store.createOrGetExecution(new org.pipelineframework.orchestrator.ExecutionCreateCommand(
+        "tenant-1", key, "pipeline-a", "contract-a", "release-a",
+        new org.pipelineframework.orchestrator.ExecutionInputSnapshot(
+            org.pipelineframework.orchestrator.ExecutionInputShape.UNI, "initial-input"),
+        ExecutionResultShape.SINGLE, createdAt, createdAt / 1000 + 3600)).await().indefinitely();
+    var observed = nativeReads.getExecutionAdmissionByClientKey(" tenant-1 ", " key-1 ", "pipeline-a", "release-a")
+        .await().indefinitely().orElseThrow();
+    assertEquals(created.record().executionId(), observed.checkpoint().executionId());
+    assertEquals(createdAt, observed.submittedAtEpochMs());
+    assertEquals(Optional.of(org.pipelineframework.orchestrator.ExecutionClientAdmission.fingerprint(payloadCodec.encode("initial-input"))),
+        observed.inputFingerprint());
+    assertTrue(nativeReads.getExecutionAdmissionByClientKey("tenant-1", "key-1", "pipeline-a", "release-b")
+        .await().indefinitely().isEmpty());
+  }
+
+  @Test
+  void initialInputFingerprintIgnoresObjectOrderButPreservesDecimalPrecision() {
+    String first = "{\"alpha\":1.12345678901234567890,\"beta\":2}";
+    String reordered = "{\"beta\":2,\"alpha\":1.12345678901234567890}";
+    String different = "{\"alpha\":1.12345678901234567891,\"beta\":2}";
+    assertEquals(initialInputFingerprint(first), initialInputFingerprint(reordered));
+    org.junit.jupiter.api.Assertions.assertNotEquals(initialInputFingerprint(first), initialInputFingerprint(different));
+  }
+
+  private static String initialInputFingerprint(String json) {
+    return org.pipelineframework.orchestrator.ExecutionClientAdmission.fingerprint(
+        new SerializedTransitionPayload("example.Input", JsonTransitionPayloadCodec.ENCODING, json));
   }
 
   @Test
@@ -354,6 +394,26 @@ class ExecutionReadModelTest {
         readModel.getExecutionResult("tenant-1", "exec-dlq", String.class, false).await().indefinitely());
 
     assertTrue(error.getMessage().contains("Execution finished without a successful result: DLQ"));
+  }
+
+  @Test
+  void hostedResultPreservesTheStoredWirePayloadAndRequiresTheExactPin() {
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.allow());
+    var expected = new SerializedTransitionPayload(String.class.getName(), JsonTransitionPayloadCodec.ENCODING, "\"value\"");
+    var stored = succeeded("tenant-1", "exec", ExecutionResultShape.SINGLE, List.of(expected));
+    when(executionStateStore.getExecution("tenant-1", "exec"))
+        .thenReturn(Uni.createFrom().item(Optional.of(stored)));
+    var pin = new ExecutionSemanticCheckpoint("tenant-1", "exec", stored.pipelineId(), stored.contractVersion(),
+        stored.releaseVersion(), ExecutionStatus.SUCCEEDED);
+    assertEquals(expected, readModel.getExecutionTypedResult(pin).await().indefinitely());
+    var foreign = new ExecutionSemanticCheckpoint("tenant-1", "exec", stored.pipelineId(), stored.contractVersion(),
+        "different-release", ExecutionStatus.SUCCEEDED);
+    assertThrows(IllegalStateException.class, () -> readModel.getExecutionTypedResult(foreign).await().indefinitely());
+
+    var materialized = succeeded("tenant-1", "exec", ExecutionResultShape.MATERIALIZED_MULTI, List.of(expected));
+    when(executionStateStore.getExecution("tenant-1", "exec")).thenReturn(Uni.createFrom().item(Optional.of(materialized)));
+    assertThrows(IllegalStateException.class, () -> readModel.getExecutionTypedResult(pin).await().indefinitely());
   }
 
   @Test

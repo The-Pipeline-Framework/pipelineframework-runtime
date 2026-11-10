@@ -19,6 +19,25 @@ class AwsDurableModelTest {
     }
 
     @Test
+    void hostedNamesScopeRetriesToTheSamePipelineAndReleaseWithoutChangingLegacyNames() {
+        var legacy = new AwsDurableExecutionInput("tenant-a", "key", "pipeline-a", "contract", "release-a",
+            "{}", Optional.empty(), 1);
+        var original = hostedInput("pipeline-a", "release-a", "attempt-1");
+        assertThat(AwsDurableExecutionNames.durableExecutionName(legacy))
+            .isEqualTo(AwsDurableExecutionNames.durableExecutionName("tenant-a", "key", 1));
+        assertThat(AwsDurableExecutionNames.durableExecutionName(original))
+            .isEqualTo(AwsDurableExecutionNames.durableExecutionName(hostedInput("pipeline-a", "release-a", "attempt-2")))
+            .isNotEqualTo(AwsDurableExecutionNames.durableExecutionName(hostedInput("pipeline-b", "release-a", "attempt-1")))
+            .isNotEqualTo(AwsDurableExecutionNames.durableExecutionName(hostedInput("pipeline-a", "release-b", "attempt-1")))
+            .isNotEqualTo(AwsDurableExecutionNames.durableExecutionName(legacy));
+    }
+
+    private static AwsDurableExecutionInput hostedInput(String pipeline, String release, String attempt) {
+        return new AwsDurableExecutionInput("tenant-a", "key", pipeline, "contract", release,
+            "{}", Optional.empty(), 1, Optional.of(attempt));
+    }
+
+    @Test
     void actionRequestsRejectMissingOperationDataWithoutNullSentinels() {
         assertThatThrownBy(() -> new AwsDurableActionRequest(
             AwsDurableOperation.STATUS,

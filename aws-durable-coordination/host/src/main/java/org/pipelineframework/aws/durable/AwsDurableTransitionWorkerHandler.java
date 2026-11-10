@@ -17,9 +17,12 @@ import org.pipelineframework.orchestrator.SqsTransitionWorkerAction;
 public final class AwsDurableTransitionWorkerHandler implements RequestHandler<SQSEvent, SQSBatchResponse> {
     @Inject
     SqsTransitionWorkerAction action;
+    @Inject
+    AwsDurableReleaseRouter releases;
 
     @Override
     public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
-        return new AwsDurableSqsBatchAdapter().handle(event, action::handle, Duration.ofMinutes(5));
+        return new AwsDurableSqsBatchAdapter().handle(event, message -> releases == null
+            ? action.handle(message) : releases.transition(message, context, action::handle), Duration.ofMinutes(5));
     }
 }

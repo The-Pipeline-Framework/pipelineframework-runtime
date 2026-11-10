@@ -13,8 +13,8 @@ Parameters:
   RestrictedPilotValidation:
     Type: String
     Default: not-applicable
-    AllowedValues: [not-applicable, validated]
-    Description: Attest supervised admissions, operator failure checks, service-owned encryption and exact external resource metadata; no unattended operations acceptance
+    AllowedValues: [not-applicable, validated, UNRESERVED_SERIAL_SMOKE]
+    Description: Attest supervised admissions, operator failure checks, service-owned encryption and exact external resource metadata; UNRESERVED_SERIAL_SMOKE explicitly shares regional capacity for a fresh single-execution check
   SigningSource:
     Type: String
     Default: SECRETS_MANAGER
@@ -53,16 +53,40 @@ Parameters:
       and profile-specific observation (HARDENED notification delivery or RESTRICTED_PILOT supervised failure checks). This attestation performs no AWS probes or provisioning.
   ReleaseIsolationMode:
     Type: String
-    AllowedValues: [FRESH_RELEASE_ISOLATED_STACK, DRAINED_RELEASE_MIGRATION]
+    AllowedValues: [FRESH_RELEASE_ISOLATED_STACK, DRAINED_RELEASE_MIGRATION, RETAINED_RELEASE_VERSIONS]
     Description: Fresh release uses isolated stack queues, callback table and semantic state namespace; migration requires every old execution and queue/stream/DLQ obligation drained with producers quiesced
   ReleaseIsolationValidation:
     Type: String
     AllowedValues: [validated]
-    Description: Explicitly attest the selected isolation mode; moving shared consumers or coordinator aliases while retained executions need the previous release is forbidden
+    Description: Explicitly attest the selected isolation mode; fresh/drained modes forbid moving shared consumers or aliases while old executions remain; retained mode requires its independent guarded routing validation
+  RetainedReleaseValidation:
+    Type: String
+    Default: not-applicable
+    AllowedValues: [not-applicable, validated]
+    Description: Verify compatible numeric host versions, immutable Release bindings, management-only registry writes, retained signing access, exact routing entries and invocation concurrency budgets; never infer this from package presence
+  WorkEntryId: {Type: String, Default: '', AllowedPattern: '^(|[A-Za-z0-9._-]+)$'}
+  TransitionEntryId: {Type: String, Default: '', AllowedPattern: '^(|[A-Za-z0-9._-]+)$'}
+  AwaitCompletionEntryId: {Type: String, Default: '', AllowedPattern: '^(|[A-Za-z0-9._-]+)$'}
+  ActionEntryId: {Type: String, Default: '', AllowedPattern: '^(|[A-Za-z0-9._-]+)$'}
+  RetainedWorkerVersionArns:
+    Type: CommaDelimitedList
+    Default: ''
+    AllowedPattern: '^$|arn:[a-z-]+:lambda:[a-z0-9-]+:[0-9]{12}:function:[A-Za-z0-9_-]+-(work|transition-worker|await-completion):[1-9][0-9]*'
+    Description: Exact retained numeric versions of this owned host worker family; provider must verify account, region and stack family before setting
+  RetainedActionVersionArns:
+    Type: CommaDelimitedList
+    Default: ''
+    AllowedPattern: '^$|arn:[a-z-]+:lambda:[a-z0-9-]+:[0-9]{12}:function:[A-Za-z0-9_-]+-action:[1-9][0-9]*'
+    Description: Exact retained numeric versions of this owned Action function; provider must verify account, region and stack family before setting
+  RetainedDurableVersionArns:
+    Type: CommaDelimitedList
+    Default: ''
+    AllowedPattern: '^$|arn:[a-z-]+:lambda:[a-z0-9-]+:[0-9]{12}:function:[A-Za-z0-9_-]+-durable:[1-9][0-9]*'
+    Description: Exact retained numeric coordinator versions required by retained ingress versions; provider must verify account, region and stack family and preserve prior grants
   TransitionWorkerPlacement:
     Type: String
-    AllowedValues: [FUNCTION, COMPUTE]
-    Description: COMPUTE disables only transition Lambda consumption; one external consumer must own the signed request queue
+    AllowedValues: [FUNCTION, COMPUTE, IN_PROCESS]
+    Description: FUNCTION uses the transition Lambda; COMPUTE uses an external consumer; IN_PROCESS executes in the Work runtime
   ComputeTransitionConsumerValidation:
     Type: String
     AllowedValues: [not-applicable, validated]
@@ -118,6 +142,8 @@ Parameters:
   AwaitUnitTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
   AwaitAdmissionTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
   ReleaseTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
+  CommandEffectTable: {Type: String, Default: '', AllowedPattern: '^$|[A-Za-z0-9_.-]{3,255}', Description: Optional externally owned append-only Command effect table; selected durable store must be present in the packaged runtime}
+  QueryCaptureTable: {Type: String, Default: '', AllowedPattern: '^$|[A-Za-z0-9_.-]{3,255}', Description: Optional externally owned append-only Query capture table; selected durable store must be present in the packaged runtime}
   WorkerTable: {Type: String, AllowedPattern: '[A-Za-z0-9_.-]{3,255}'}
   DurableArtifactBucket: {Type: String}
   DurableArtifactKey: {Type: String}
@@ -130,6 +156,13 @@ Parameters:
   ActionArtifactUri:
     Type: String
     Description: S3 URI for the generated Quarkus action and worker Lambda package
+  HttpArtifactUri:
+    Type: String
+    Default: s3://tpf-disabled-http-artifact/disabled.zip
+    AllowedPattern: 's3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[A-Za-z0-9._/-]+'
+    Description: Immutable S3 package location from Cloud publication, or the inactive transform placeholder
+  HttpCodeSha256: {Type: String, Default: '', AllowedPattern: '^$|[A-Za-z0-9+/]{43}='}
+  HttpEntryId: {Type: String, Default: '', AllowedPattern: '^(|[A-Za-z0-9._-]+)$'}
   CallbackGenerationMigrationValidation:
     Type: String
     AllowedValues: [validated]
@@ -200,14 +233,60 @@ Parameters:
   ReconciliationHandler: {Type: String, Default: aws-durable-reconcile}
 
 Conditions:
+  HasCommandEffectTable: !Not [!Equals [!Ref CommandEffectTable, '']]
+  HasQueryCaptureTable: !Not [!Equals [!Ref QueryCaptureTable, '']]
+  HttpIngressSelected: !Not [!Equals [!Ref HttpEntryId, '']]
+  RetainedReleaseMode: !Equals [!Ref ReleaseIsolationMode, RETAINED_RELEASE_VERSIONS]
+  HasRetainedWorkerVersions: !Not [!Equals [!Join ['', !Ref RetainedWorkerVersionArns], '']]
+  HasRetainedDurableVersions: !And [!Condition RetainedReleaseMode, !Not [!Equals [!Join ['', !Ref RetainedDurableVersionArns], '']]]
+  HasRetainedActionVersions: !Not [!Equals [!Join ['', !Ref RetainedActionVersionArns], '']]
   RuntimePermissionsBoundarySelected: !Not [!Equals [!Ref RuntimePermissionsBoundaryArn, '']]
   HardenedProfile: !Equals [!Ref DeploymentProfile, HARDENED]
   RestrictedPilotProfile: !Equals [!Ref DeploymentProfile, RESTRICTED_PILOT]
+  UnreservedSerialSmoke: !Equals [!Ref RestrictedPilotValidation, UNRESERVED_SERIAL_SMOKE]
+  HardenedHttpIngress: !And [!Condition HardenedProfile, !Condition HttpIngressSelected]
   HardenedFunctionTransition: !And [!Condition HardenedProfile, !Condition FunctionTransitionConsumer]
   SecretsManagerSigning: !Equals [!Ref SigningSource, SECRETS_MANAGER]
   FunctionTransitionConsumer: !Equals [!Ref TransitionWorkerPlacement, FUNCTION]
+  TransitionQueues: !Not [!Equals [!Ref TransitionWorkerPlacement, IN_PROCESS]]
+  HardenedTransitionQueues: !And [!Condition HardenedProfile, !Condition TransitionQueues]
+  RetainedRemoteTransitions: !And [!Condition RetainedReleaseMode, !Condition FunctionTransitionConsumer]
 
 Rules:
+  PrivateHttpReleasePublication:
+    Assertions:
+      - Assert: !Or
+          - !And
+            - !Equals [!Ref HttpEntryId, '']
+            - !Equals [!Ref HttpCodeSha256, '']
+            - !Equals [!Ref HttpArtifactUri, 's3://tpf-disabled-http-artifact/disabled.zip']
+          - !And
+            - !Not [!Equals [!Ref HttpEntryId, '']]
+            - !Not [!Equals [!Ref HttpCodeSha256, '']]
+            - !Not [!Equals [!Ref HttpArtifactUri, 's3://tpf-disabled-http-artifact/disabled.zip']]
+            - !Equals [!Ref ReleaseIsolationMode, RETAINED_RELEASE_VERSIONS]
+        AssertDescription: Private HTTP is optional and requires exact package, code hash and entry identity in retained mode
+  RetainedReleaseRequirements:
+    RuleCondition: !Equals [!Ref ReleaseIsolationMode, RETAINED_RELEASE_VERSIONS]
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref DeploymentProfile, HARDENED]
+          - !Equals [!Ref DeploymentProfile, RESTRICTED_PILOT]
+        AssertDescription: Retained versions preserve the selected validated encryption and immutable signing profile
+      - Assert: !Not [!Equals [!Ref TransitionWorkerPlacement, COMPUTE]]
+        AssertDescription: Retained routing requires FUNCTION or IN_PROCESS placement
+      - Assert: !Equals [!Ref RetainedReleaseValidation, validated]
+        AssertDescription: Retained versions require explicit observed registry, package, signing, routing and concurrency validation
+      - Assert: !Not [!Equals [!Ref WorkEntryId, '']]
+        AssertDescription: Retained versions require the original Release entry ID for WorkEntryId
+      - Assert: !Or
+          - !And [!Equals [!Ref TransitionWorkerPlacement, FUNCTION], !Not [!Equals [!Ref TransitionEntryId, '']]]
+          - !And [!Equals [!Ref TransitionWorkerPlacement, IN_PROCESS], !Equals [!Ref TransitionEntryId, '']]
+        AssertDescription: Only FUNCTION placement requires a Release transition entry
+      - Assert: !Not [!Equals [!Ref AwaitCompletionEntryId, '']]
+        AssertDescription: Retained versions require the original Release entry ID for AwaitCompletionEntryId
+      - Assert: !Not [!Equals [!Ref ActionEntryId, '']]
+        AssertDescription: Retained versions require the original Release entry ID for ActionEntryId
   ProfileSigningSelection:
     Assertions:
       - Assert: !Or
@@ -219,14 +298,18 @@ Rules:
     Assertions:
       - Assert: !Equals [!Ref AlarmTopicArn, '']
         AssertDescription: Restricted pilot provisions no alarm and requires no SNS destination
-      - Assert: !Equals [!Ref RestrictedPilotValidation, validated]
+      - Assert: !Or
+          - !Equals [!Ref RestrictedPilotValidation, validated]
+          - !Equals [!Ref RestrictedPilotValidation, UNRESERVED_SERIAL_SMOKE]
         AssertDescription: Restricted pilot requires supervised operational and security acceptance
       - Assert: !Equals [!Ref SigningParameterLifecycleValidation, validated]
         AssertDescription: Signing parameter metadata and immutable retention must be verified by its owner
-      - Assert: !Equals [!Ref ReleaseIsolationMode, FRESH_RELEASE_ISOLATED_STACK]
-        AssertDescription: Never retrofit service-owned encryption or SSM onto retained release resources
-      - Assert: !Equals [!Ref TransitionWorkerPlacement, FUNCTION]
-        AssertDescription: Restricted profile qualifies only the native FUNCTION consumer
+      - Assert: !Or
+          - !Equals [!Ref ReleaseIsolationMode, FRESH_RELEASE_ISOLATED_STACK]
+          - !Equals [!Ref ReleaseIsolationMode, RETAINED_RELEASE_VERSIONS]
+        AssertDescription: Restricted releases require a fresh stack or validated retained routing with unchanged signing and encryption
+      - Assert: !Not [!Equals [!Ref TransitionWorkerPlacement, COMPUTE]]
+        AssertDescription: Restricted profile requires FUNCTION or IN_PROCESS placement
       - Assert: !Equals [!Ref ResumeTokenParameterVersion, '1']
         AssertDescription: Immutable generation starts at version 1; rotation creates a new parameter
       - Assert: !Equals [!Ref WorkerSharedParameterVersion, '1']
@@ -255,6 +338,25 @@ Rules:
         AssertDescription: SSM signing must not retain a signing CMK grant
       - Assert: !EachMemberEquals [!Ref SemanticKmsKeyArns, '']
         AssertDescription: Service-owned semantic encryption must not claim semantic CMKs
+  UnreservedSerialSmokeRequirements:
+    RuleCondition: !Equals [!Ref RestrictedPilotValidation, UNRESERVED_SERIAL_SMOKE]
+    Assertions:
+      - Assert: !Equals [!Ref DeploymentProfile, RESTRICTED_PILOT]
+        AssertDescription: Unreserved serial smoke requires the existing restricted security and recovery profile
+      - Assert: !Equals [!Ref ReleaseIsolationMode, RETAINED_RELEASE_VERSIONS]
+        AssertDescription: Use the existing numbered routing contract for the first isolated publication
+      - Assert: !Equals [!Ref HttpEntryId, '']
+        AssertDescription: Unreserved serial smoke has no HTTP entry
+      - Assert: !Equals [!Ref CommandEffectTable, '']
+        AssertDescription: Unreserved serial smoke has no optional Command effect store
+      - Assert: !Equals [!Ref QueryCaptureTable, '']
+        AssertDescription: Unreserved serial smoke has no optional Query capture store
+      - Assert: !EachMemberEquals [!Ref RetainedWorkerVersionArns, '']
+        AssertDescription: Unreserved serial smoke has no previously published worker versions
+      - Assert: !EachMemberEquals [!Ref RetainedActionVersionArns, '']
+        AssertDescription: Unreserved serial smoke has no previously published action versions
+      - Assert: !EachMemberEquals [!Ref RetainedDurableVersionArns, '']
+        AssertDescription: Unreserved serial smoke has no previously published coordinator versions
   HardenedRequirements:
     RuleCondition: !Equals [!Ref DeploymentProfile, HARDENED]
     Assertions:
@@ -285,7 +387,7 @@ Rules:
   ReleaseIsolationValidated:
     Assertions:
       - Assert: !Equals [!Ref ReleaseIsolationValidation, validated]
-        AssertDescription: Require a fresh release-isolated stack or fully drained migration; compatible in-place upgrades are not accepted
+        AssertDescription: Fresh/drained isolation retains its existing requirements; retained versions additionally require the guarded retained profile
   CurrentSigningReferencesAccessible:
     RuleCondition: !Equals [!Ref SigningSource, SECRETS_MANAGER]
     Assertions:
@@ -324,8 +426,66 @@ Globals:
     Architectures: [arm64]
     Tracing: Active
     Tags: {tpf-coordination-host: aws-durable}
+    Environment:
+      Variables:
+        TPF_AWS_DURABLE_TRANSITION_WORKER_PLACEMENT: !Ref TransitionWorkerPlacement
 
 Resources:
+  RetainedReleaseRegistryReadOnlyPolicy:
+    Type: AWS::IAM::Policy
+    Condition: RetainedReleaseMode
+    Properties:
+      PolicyName: retained-release-registry-read-only
+      Roles:
+        - !Ref DurableRole
+        - !Ref IngressRole
+        - !Ref ActionRole
+        - !Ref WorkerRole
+        - !Ref WakeupRole
+        - !Ref DueWorkRole
+        - !If [HttpIngressSelected, !Ref HttpRole, !Ref 'AWS::NoValue']
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            NotAction: [dynamodb:GetItem, dynamodb:BatchGetItem, dynamodb:Query, dynamodb:Scan, dynamodb:DescribeTable]
+            Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ReleaseTable}'
+  RetainedWorkerInvocationPolicy:
+    Type: AWS::IAM::Policy
+    Condition: RetainedReleaseMode
+    Properties:
+      PolicyName: retained-worker-versions
+      Roles: [!Ref WorkerRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [lambda:InvokeFunction, lambda:GetFunctionConfiguration]
+            Resource: [!Ref WorkVersion, !If [FunctionTransitionConsumer, !Ref TransitionWorkerVersion, !Ref 'AWS::NoValue'], !Ref AwaitCompletionVersion]
+          - !If
+            - HasRetainedWorkerVersions
+            - Effect: Allow
+              Action: [lambda:InvokeFunction, lambda:GetFunctionConfiguration]
+              Resource: !Ref RetainedWorkerVersionArns
+            - !Ref 'AWS::NoValue'
+  RetainedActionInvocationPolicy:
+    Type: AWS::IAM::Policy
+    Condition: RetainedReleaseMode
+    Properties:
+      PolicyName: retained-action-versions
+      Roles: [!Ref ActionRole, !Ref DueWorkRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [lambda:InvokeFunction, lambda:GetFunctionConfiguration]
+            Resource: !Ref ActionVersion
+          - !If
+            - HasRetainedActionVersions
+            - Effect: Allow
+              Action: [lambda:InvokeFunction, lambda:GetFunctionConfiguration]
+              Resource: !Ref RetainedActionVersionArns
+            - !Ref 'AWS::NoValue'
   CallbackBindingTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Retain
@@ -386,11 +546,13 @@ Resources:
       VisibilityTimeout: 720
       RedrivePolicy: {deadLetterTargetArn: !GetAtt AwaitCompletionDlq.Arn, maxReceiveCount: 5}
   TransitionDlq:
+    Condition: TransitionQueues
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
     Properties: {MessageRetentionPeriod: 1209600, KmsMasterKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue'], SqsManagedSseEnabled: !If [HardenedProfile, !Ref 'AWS::NoValue', true]}
   TransitionRequestQueue:
+    Condition: TransitionQueues
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
@@ -400,6 +562,7 @@ Resources:
       VisibilityTimeout: 5400
       RedrivePolicy: {deadLetterTargetArn: !GetAtt TransitionDlq.Arn, maxReceiveCount: 5}
   TransitionResponseQueue:
+    Condition: TransitionQueues
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Type: AWS::SQS::Queue
@@ -477,7 +640,7 @@ Resources:
                 - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
-                Resource: [!GetAtt DueWorkQueue.Arn, !GetAtt TransitionResponseQueue.Arn]
+                Resource: [!GetAtt DueWorkQueue.Arn, !If [TransitionQueues, !GetAtt TransitionResponseQueue.Arn, !Ref 'AWS::NoValue']]
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${ReleaseArtifactBucket}/tpf/releases/*'
@@ -488,7 +651,7 @@ Resources:
                 Resource: !Ref SemanticDynamoResourceArns
               - Effect: Allow
                 Action: sqs:SendMessage
-                Resource: [!GetAtt WorkQueue.Arn, !GetAtt TransitionRequestQueue.Arn, !GetAtt WorkDlq.Arn]
+                Resource: [!GetAtt WorkQueue.Arn, !If [TransitionQueues, !GetAtt TransitionRequestQueue.Arn, !Ref 'AWS::NoValue'], !GetAtt WorkDlq.Arn]
 
   DurableRole:
     DeletionPolicy: Retain
@@ -546,6 +709,12 @@ Resources:
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource: !Ref DurableVersion
+              - !If
+                - HasRetainedDurableVersions
+                - Effect: Allow
+                  Action: lambda:InvokeFunction
+                  Resource: !Ref RetainedDurableVersionArns
+                - !Ref 'AWS::NoValue'
 
   ActionRole:
     DeletionPolicy: Retain
@@ -586,9 +755,12 @@ Resources:
                 - HardenedProfile
                 - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref SemanticKmsKeyArns}
                 - !Ref 'AWS::NoValue'
-              - Effect: Allow
-                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
-                Resource: !GetAtt TransitionResponseQueue.Arn
+              - !If
+                - TransitionQueues
+                - Effect: Allow
+                  Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                  Resource: !GetAtt TransitionResponseQueue.Arn
+                - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${ReleaseArtifactBucket}/tpf/releases/*'
@@ -602,7 +774,79 @@ Resources:
                 Resource: !GetAtt CallbackBindingTable.Arn
               - Effect: Allow
                 Action: sqs:SendMessage
-                Resource: [!GetAtt WorkQueue.Arn, !GetAtt TransitionRequestQueue.Arn]
+                Resource: [!GetAtt WorkQueue.Arn, !If [TransitionQueues, !GetAtt TransitionRequestQueue.Arn, !Ref 'AWS::NoValue']]
+
+  HttpRole:
+    Condition: HttpIngressSelected
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !If [RuntimePermissionsBoundarySelected, !Ref RuntimePermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess]
+      Policies:
+        - PolicyName: private-http-admission-and-callback
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${HttpFunctionLogs}:log-stream:*'
+              - !If
+                - SecretsManagerSigning
+                - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref SigningSecretAccessArns}
+                - {Effect: Allow, Action: 'ssm:GetParameter', Resource: !Ref SigningParameterAccessArns}
+              - !If
+                - SecretsManagerSigning
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref SigningKmsAccessArns
+                  Condition:
+                    StringEquals: {'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'}
+                    StringLike:
+                      kms:EncryptionContext:SecretARN: !Ref SigningSecretAccessArns
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref HostKmsKeyArn}
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HardenedProfile
+                - {Effect: Allow, Action: [kms:Decrypt, kms:GenerateDataKey], Resource: !Ref SemanticKmsKeyArns}
+                - !Ref 'AWS::NoValue'
+              - Effect: Allow
+                Action: [lambda:GetFunctionConfiguration, lambda:InvokeFunction]
+                Resource: !Ref DurableVersion
+              - !If
+                - HasRetainedDurableVersions
+                - Effect: Allow
+                  Action: [lambda:GetFunctionConfiguration, lambda:InvokeFunction]
+                  Resource: !Ref RetainedDurableVersionArns
+                - !Ref 'AWS::NoValue'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ReleaseArtifactBucket}/tpf/releases/*'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:BatchGetItem, dynamodb:Query, dynamodb:DescribeTable]
+                Resource: !Ref SemanticDynamoResourceArns
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
+                  dynamodb:ConditionCheckItem, dynamodb:TransactWriteItems]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ExecutionTable}'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ExecutionKeyTable}'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ExecutionPayloadTable}'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AwaitInteractionTable}'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AwaitInteractionKeyTable}'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AwaitCompletionLifecycleTable}'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AwaitUnitTable}'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AwaitAdmissionTable}'
+              - Effect: Allow
+                Action: [sqs:SendMessage, sqs:GetQueueAttributes]
+                Resource: [!GetAtt WorkQueue.Arn, !GetAtt WorkDlq.Arn]
 
   WorkerRole:
     DeletionPolicy: Retain
@@ -645,11 +889,23 @@ Resources:
                 - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
-                Resource: [!GetAtt WorkQueue.Arn, !GetAtt AwaitCompletionQueue.Arn, !GetAtt TransitionRequestQueue.Arn]
+                Resource: [!GetAtt WorkQueue.Arn, !GetAtt AwaitCompletionQueue.Arn,
+                  !If [TransitionQueues, !GetAtt TransitionRequestQueue.Arn, !Ref 'AWS::NoValue']]
               - Effect: Allow
                 Action: sqs:SendMessage
-                Resource: [!GetAtt TransitionResponseQueue.Arn, !GetAtt WorkDlq.Arn,
-                  !GetAtt AwaitCompletionDlq.Arn, !GetAtt TransitionDlq.Arn]
+                Resource: [!If [TransitionQueues, !GetAtt TransitionResponseQueue.Arn, !Ref 'AWS::NoValue'],
+                  !GetAtt WorkDlq.Arn, !GetAtt AwaitCompletionDlq.Arn,
+                  !If [TransitionQueues, !GetAtt TransitionDlq.Arn, !Ref 'AWS::NoValue']]
+              - !If
+                - RetainedRemoteTransitions
+                - {Effect: Allow, Action: 'sqs:SendMessage', Resource: !GetAtt TransitionRequestQueue.Arn}
+                - !Ref 'AWS::NoValue'
+              - !If
+                - RetainedRemoteTransitions
+                - Effect: Allow
+                  Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility]
+                  Resource: !GetAtt TransitionResponseQueue.Arn
+                - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
                   dynamodb:BatchGetItem, dynamodb:ConditionCheckItem, dynamodb:TransactWriteItems,
@@ -748,7 +1004,7 @@ Resources:
       Timeout: 900
       DeadLetterConfig: {TargetArn: !GetAtt DurableDlq.Arn}
       KmsKeyArn: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
-      ReservedConcurrentExecutions: 32
+      ReservedConcurrentExecutions: !If [UnreservedSerialSmoke, !Ref 'AWS::NoValue', 32]
       DurableConfig:
         KMSKeyArn: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
         ExecutionTimeout: !Ref DurableExecutionTimeoutSeconds
@@ -774,6 +1030,68 @@ Resources:
       FunctionName: !Ref DurableFunction
       FunctionVersion: !GetAtt DurableVersion.Version
 
+  HttpFunction:
+    Condition: HttpIngressSelected
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-http'
+      LoggingConfig: {LogGroup: !Ref HttpFunctionLogs}
+      CodeUri: !Sub '${HttpArtifactUri}'
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt HttpRole.Arn
+      MemorySize: 1536
+      Timeout: 15
+      ReservedConcurrentExecutions: 2
+      KmsKeyArn: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
+      Environment:
+        Variables:
+          TPF_AWS_DURABLE_PUBLICATION_ID: !Ref VersionPublicationId
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub
+            - |
+              {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${WorkerRequestUrl}","worker.sqs.response-queue-url":"${WorkerResponseUrl}"}
+            - WorkerRequestUrl: !If [TransitionQueues, !Ref TransitionRequestQueue, '']
+              WorkerResponseUrl: !If [TransitionQueues, !Ref TransitionResponseQueue, '']
+          TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref DurableActionTimeoutSeconds
+          TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref CallbackRetentionSeconds
+          TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref SigningSource
+          TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref DeploymentPreflightValidation
+          TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE: !If [HasCommandEffectTable, !Ref CommandEffectTable, !Ref AWS::NoValue]
+          TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE: !If [HasQueryCaptureTable, !Ref QueryCaptureTable, !Ref AWS::NoValue]
+          PIPELINE_AWAIT_ADMISSION_STORE: dynamo
+          TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref DurableEstimatedOperations
+          TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref DurableEstimatedWrittenStateBytes
+          TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref DurableExecutionTimeoutSeconds
+          TPF_AWS_DURABLE_RETENTION_DAYS: !Ref DurableRetentionDays
+          TPF_AWS_DURABLE_WORKER_TIMEOUT_SECONDS: '900'
+          TPF_AWS_DURABLE_SQS_VISIBILITY_SECONDS: '5400'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [SecretsManagerSigning, !Ref ResumeTokenSecretArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref ResumeTokenParameterArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [SecretsManagerSigning, !Ref ResumeTokenSecretVersion, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref ResumeTokenParameterVersion]
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !If [SecretsManagerSigning, !Ref WorkerSharedSecretArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_ARN: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref WorkerSharedParameterArn]
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !If [SecretsManagerSigning, !Ref WorkerSharedSecretVersion, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_VERSION: !If [SecretsManagerSigning, !Ref 'AWS::NoValue', !Ref WorkerSharedParameterVersion]
+          TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
+          TPF_AWS_DURABLE_RELEASE_ISOLATION_MODE: !Ref ReleaseIsolationMode
+          TPF_AWS_DURABLE_RETAINED_VALIDATION: !Ref RetainedReleaseValidation
+          TPF_AWS_DURABLE_ENTRY_ID: !Ref HttpEntryId
+          TPF_AWS_DURABLE_HTTP_ENABLED: 'true'
+          TPF_AWS_DURABLE_HTTP_COORDINATOR_FUNCTION_FAMILY: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-durable'
+
+  HttpVersion:
+    Condition: HttpIngressSelected
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RuntimePolicy: {UpdateRuntimeOn: FunctionUpdate}
+      FunctionName: !Ref HttpFunction
+      CodeSha256: !Ref HttpCodeSha256
+      Description: !Sub 'TPF private HTTP ${VersionPublicationId}'
+
   ActionFunction:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
@@ -786,18 +1104,24 @@ Resources:
       Role: !GetAtt ActionRole.Arn
       MemorySize: 1536
       Timeout: 120
-      ReservedConcurrentExecutions: 32
+      ReservedConcurrentExecutions: !If [UnreservedSerialSmoke, !Ref 'AWS::NoValue', !If [RetainedReleaseMode, 128, 32]]
       KmsKeyArn: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
       Environment:
         Variables:
           # Environment changes qualify a new publication even when the package SHA is unchanged.
           TPF_AWS_DURABLE_PUBLICATION_ID: !Ref VersionPublicationId
-          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
-            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub
+            - |
+              {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${WorkerRequestUrl}","worker.sqs.response-queue-url":"${WorkerResponseUrl}"}
+            - WorkerRequestUrl: !If [TransitionQueues, !Ref TransitionRequestQueue, '']
+              WorkerResponseUrl: !If [TransitionQueues, !Ref TransitionResponseQueue, '']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref DurableActionTimeoutSeconds
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref CallbackRetentionSeconds
           TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref SigningSource
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref DeploymentPreflightValidation
+          TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE: !If [HasCommandEffectTable, !Ref CommandEffectTable, !Ref AWS::NoValue]
+          TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE: !If [HasQueryCaptureTable, !Ref QueryCaptureTable, !Ref AWS::NoValue]
+          PIPELINE_AWAIT_ADMISSION_STORE: dynamo
           TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref DurableEstimatedOperations
           TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref DurableEstimatedWrittenStateBytes
           TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref DurableExecutionTimeoutSeconds
@@ -815,6 +1139,11 @@ Resources:
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
           TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
           TPF_AWS_DURABLE_QUALIFIER: !Ref DurableAlias
+          TPF_AWS_DURABLE_RELEASE_ISOLATION_MODE: !If [RetainedReleaseMode, !Ref ReleaseIsolationMode, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RETAINED_VALIDATION: !If [RetainedReleaseMode, !Ref RetainedReleaseValidation, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_ENTRY_ID: !If [RetainedReleaseMode, !Ref ActionEntryId, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_CONTINUATION_ENTRY_ID: !If [RetainedReleaseMode, !Ref ActionEntryId, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_ACTION_FUNCTION_FAMILY: !If [RetainedReleaseMode, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-action', !Ref 'AWS::NoValue']
           QUARKUS_LAMBDA_HANDLER: !Ref ActionHandler
 
   ActionVersion:
@@ -836,7 +1165,7 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-ingress'
       LoggingConfig: {LogGroup: !Ref IngressFunctionLogs}
       KmsKeyArn: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
-      ReservedConcurrentExecutions: 16
+      ReservedConcurrentExecutions: !If [UnreservedSerialSmoke, !Ref 'AWS::NoValue', 16]
       Handler: org.pipelineframework.aws.durable.AwsDurableIngressHandler::handleRequest
       Runtime: java21
       Architectures: [arm64]
@@ -872,17 +1201,23 @@ Resources:
       Role: !GetAtt 'WorkerRole.Arn'
       MemorySize: 1536
       Timeout: 900
-      ReservedConcurrentExecutions: 32
+      ReservedConcurrentExecutions: !If [UnreservedSerialSmoke, !Ref 'AWS::NoValue', 32]
       KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
         Variables:
           TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
-          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
-            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub
+            - |
+              {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${WorkerRequestUrl}","worker.sqs.response-queue-url":"${WorkerResponseUrl}"}
+            - WorkerRequestUrl: !If [TransitionQueues, !Ref TransitionRequestQueue, '']
+              WorkerResponseUrl: !If [TransitionQueues, !Ref TransitionResponseQueue, '']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
           TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE: !If [HasCommandEffectTable, !Ref CommandEffectTable, !Ref AWS::NoValue]
+          TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE: !If [HasQueryCaptureTable, !Ref QueryCaptureTable, !Ref AWS::NoValue]
+          PIPELINE_AWAIT_ADMISSION_STORE: dynamo
           TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
           TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
           TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
@@ -900,6 +1235,9 @@ Resources:
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
           TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
           TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          TPF_AWS_DURABLE_RELEASE_ISOLATION_MODE: !If [RetainedReleaseMode, !Ref ReleaseIsolationMode, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RETAINED_VALIDATION: !If [RetainedReleaseMode, !Ref RetainedReleaseValidation, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_ENTRY_ID: !If [RetainedReleaseMode, !Ref WorkEntryId, !Ref 'AWS::NoValue']
           QUARKUS_LAMBDA_HANDLER: !Ref 'WorkHandler'
 
   AwaitCompletionFunction:
@@ -915,17 +1253,23 @@ Resources:
       Role: !GetAtt 'WorkerRole.Arn'
       MemorySize: 1536
       Timeout: 120
-      ReservedConcurrentExecutions: 32
+      ReservedConcurrentExecutions: !If [UnreservedSerialSmoke, !Ref 'AWS::NoValue', 32]
       KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
         Variables:
           TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
-          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
-            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub
+            - |
+              {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${WorkerRequestUrl}","worker.sqs.response-queue-url":"${WorkerResponseUrl}"}
+            - WorkerRequestUrl: !If [TransitionQueues, !Ref TransitionRequestQueue, '']
+              WorkerResponseUrl: !If [TransitionQueues, !Ref TransitionResponseQueue, '']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
           TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE: !If [HasCommandEffectTable, !Ref CommandEffectTable, !Ref AWS::NoValue]
+          TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE: !If [HasQueryCaptureTable, !Ref QueryCaptureTable, !Ref AWS::NoValue]
+          PIPELINE_AWAIT_ADMISSION_STORE: dynamo
           TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
           TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
           TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
@@ -943,6 +1287,9 @@ Resources:
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
           TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
           TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          TPF_AWS_DURABLE_RELEASE_ISOLATION_MODE: !If [RetainedReleaseMode, !Ref ReleaseIsolationMode, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RETAINED_VALIDATION: !If [RetainedReleaseMode, !Ref RetainedReleaseValidation, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_ENTRY_ID: !If [RetainedReleaseMode, !Ref AwaitCompletionEntryId, !Ref 'AWS::NoValue']
           QUARKUS_LAMBDA_HANDLER: !Ref 'AwaitCompletionHandler'
 
   TransitionWorkerFunction:
@@ -958,17 +1305,23 @@ Resources:
       Role: !GetAtt 'WorkerRole.Arn'
       MemorySize: 1536
       Timeout: 900
-      ReservedConcurrentExecutions: 32
+      ReservedConcurrentExecutions: !If [UnreservedSerialSmoke, !Ref 'AWS::NoValue', 32]
       KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
         Variables:
           TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
-          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
-            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub
+            - |
+              {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${WorkerRequestUrl}","worker.sqs.response-queue-url":"${WorkerResponseUrl}"}
+            - WorkerRequestUrl: !If [TransitionQueues, !Ref TransitionRequestQueue, '']
+              WorkerResponseUrl: !If [TransitionQueues, !Ref TransitionResponseQueue, '']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
           TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE: !If [HasCommandEffectTable, !Ref CommandEffectTable, !Ref AWS::NoValue]
+          TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE: !If [HasQueryCaptureTable, !Ref QueryCaptureTable, !Ref AWS::NoValue]
+          PIPELINE_AWAIT_ADMISSION_STORE: dynamo
           TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
           TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
           TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
@@ -986,6 +1339,9 @@ Resources:
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
           TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
           TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          TPF_AWS_DURABLE_RELEASE_ISOLATION_MODE: !If [RetainedReleaseMode, !Ref ReleaseIsolationMode, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RETAINED_VALIDATION: !If [RetainedReleaseMode, !Ref RetainedReleaseValidation, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_ENTRY_ID: !If [RetainedReleaseMode, !Ref TransitionEntryId, !Ref 'AWS::NoValue']
           QUARKUS_LAMBDA_HANDLER: !Ref 'TransitionWorkerHandler'
     Condition: FunctionTransitionConsumer
 
@@ -1002,17 +1358,23 @@ Resources:
       Role: !GetAtt 'WakeupRole.Arn'
       MemorySize: 1536
       Timeout: 120
-      ReservedConcurrentExecutions: 32
+      ReservedConcurrentExecutions: !If [UnreservedSerialSmoke, !Ref 'AWS::NoValue', 32]
       KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
         Variables:
           TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
-          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
-            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub
+            - |
+              {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${WorkerRequestUrl}","worker.sqs.response-queue-url":"${WorkerResponseUrl}"}
+            - WorkerRequestUrl: !If [TransitionQueues, !Ref TransitionRequestQueue, '']
+              WorkerResponseUrl: !If [TransitionQueues, !Ref TransitionResponseQueue, '']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
           TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE: !If [HasCommandEffectTable, !Ref CommandEffectTable, !Ref AWS::NoValue]
+          TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE: !If [HasQueryCaptureTable, !Ref QueryCaptureTable, !Ref AWS::NoValue]
+          PIPELINE_AWAIT_ADMISSION_STORE: dynamo
           TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
           TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
           TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
@@ -1030,6 +1392,8 @@ Resources:
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
           TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
           TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          TPF_AWS_DURABLE_RELEASE_ISOLATION_MODE: !If [RetainedReleaseMode, !Ref ReleaseIsolationMode, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RETAINED_VALIDATION: !If [RetainedReleaseMode, !Ref RetainedReleaseValidation, !Ref 'AWS::NoValue']
           QUARKUS_LAMBDA_HANDLER: !Ref 'AwaitWakeupHandler'
           TPF_AWS_DURABLE_AWAIT_STREAM_ARN: !Ref 'AwaitInteractionStreamArn'
           TPF_AWS_DURABLE_BINDING_STREAM_ARN: !GetAtt 'CallbackBindingTable.StreamArn'
@@ -1047,17 +1411,23 @@ Resources:
       Role: !GetAtt 'WakeupRole.Arn'
       MemorySize: 1536
       Timeout: 120
-      ReservedConcurrentExecutions: 32
+      ReservedConcurrentExecutions: !If [UnreservedSerialSmoke, !Ref 'AWS::NoValue', 32]
       KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
         Variables:
           TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
-          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
-            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub
+            - |
+              {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${WorkerRequestUrl}","worker.sqs.response-queue-url":"${WorkerResponseUrl}"}
+            - WorkerRequestUrl: !If [TransitionQueues, !Ref TransitionRequestQueue, '']
+              WorkerResponseUrl: !If [TransitionQueues, !Ref TransitionResponseQueue, '']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
           TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE: !If [HasCommandEffectTable, !Ref CommandEffectTable, !Ref AWS::NoValue]
+          TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE: !If [HasQueryCaptureTable, !Ref QueryCaptureTable, !Ref AWS::NoValue]
+          PIPELINE_AWAIT_ADMISSION_STORE: dynamo
           TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
           TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
           TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
@@ -1075,6 +1445,8 @@ Resources:
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
           TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
           TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          TPF_AWS_DURABLE_RELEASE_ISOLATION_MODE: !If [RetainedReleaseMode, !Ref ReleaseIsolationMode, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RETAINED_VALIDATION: !If [RetainedReleaseMode, !Ref RetainedReleaseValidation, !Ref 'AWS::NoValue']
           QUARKUS_LAMBDA_HANDLER: !Ref 'ExecutionWakeupHandler'
           TPF_AWS_DURABLE_EXECUTION_STREAM_ARN: !Ref 'ExecutionStateStreamArn'
 
@@ -1091,17 +1463,23 @@ Resources:
       Role: !GetAtt 'DueWorkRole.Arn'
       MemorySize: 1536
       Timeout: 120
-      ReservedConcurrentExecutions: 2
+      ReservedConcurrentExecutions: !If [UnreservedSerialSmoke, !Ref 'AWS::NoValue', 2]
       KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
         Variables:
           TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
-          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
-            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub
+            - |
+              {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${WorkerRequestUrl}","worker.sqs.response-queue-url":"${WorkerResponseUrl}"}
+            - WorkerRequestUrl: !If [TransitionQueues, !Ref TransitionRequestQueue, '']
+              WorkerResponseUrl: !If [TransitionQueues, !Ref TransitionResponseQueue, '']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
           TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE: !If [HasCommandEffectTable, !Ref CommandEffectTable, !Ref AWS::NoValue]
+          TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE: !If [HasQueryCaptureTable, !Ref QueryCaptureTable, !Ref AWS::NoValue]
+          PIPELINE_AWAIT_ADMISSION_STORE: dynamo
           TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
           TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
           TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
@@ -1119,6 +1497,10 @@ Resources:
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
           TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
           TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          TPF_AWS_DURABLE_RELEASE_ISOLATION_MODE: !If [RetainedReleaseMode, !Ref ReleaseIsolationMode, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RETAINED_VALIDATION: !If [RetainedReleaseMode, !Ref RetainedReleaseValidation, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_CONTINUATION_ENTRY_ID: !If [RetainedReleaseMode, !Ref ActionEntryId, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_ACTION_FUNCTION_FAMILY: !If [RetainedReleaseMode, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-action', !Ref 'AWS::NoValue']
           QUARKUS_LAMBDA_HANDLER: !Ref 'DueWorkHandler'
           PIPELINE_ORCHESTRATOR_SWEEP_LIMIT: !Ref 'DueWorkSweepLimit'
 
@@ -1202,7 +1584,7 @@ Resources:
       EventSourceArn: !GetAtt WorkQueue.Arn
       BatchSize: 1
       FunctionResponseTypes: [ReportBatchItemFailures]
-      ScalingConfig: {MaximumConcurrency: 32}
+      ScalingConfig: {MaximumConcurrency: !If [UnreservedSerialSmoke, 2, !If [RetainedReleaseMode, 16, 32]]}
 
   AwaitCompletionFunctionAwaitCompletion:
     DeletionPolicy: Retain
@@ -1213,7 +1595,7 @@ Resources:
       EventSourceArn: !GetAtt AwaitCompletionQueue.Arn
       BatchSize: 1
       FunctionResponseTypes: [ReportBatchItemFailures]
-      ScalingConfig: {MaximumConcurrency: 32}
+      ScalingConfig: {MaximumConcurrency: !If [UnreservedSerialSmoke, 2, !If [RetainedReleaseMode, 16, 32]]}
 
   TransitionWorkerFunctionTransition:
     DeletionPolicy: Retain
@@ -1225,7 +1607,7 @@ Resources:
       EventSourceArn: !GetAtt TransitionRequestQueue.Arn
       BatchSize: 1
       FunctionResponseTypes: [ReportBatchItemFailures]
-      ScalingConfig: {MaximumConcurrency: 32}
+      ScalingConfig: {MaximumConcurrency: !If [UnreservedSerialSmoke, 2, !If [RetainedReleaseMode, 16, 32]]}
 
   DueWorkFunctionTick:
     DeletionPolicy: Retain
@@ -1336,17 +1718,23 @@ Resources:
       Role: !GetAtt 'WakeupRole.Arn'
       MemorySize: 1536
       Timeout: 120
-      ReservedConcurrentExecutions: 2
+      ReservedConcurrentExecutions: !If [UnreservedSerialSmoke, !Ref 'AWS::NoValue', 2]
       KmsKeyArn: !If [HardenedProfile, !Ref 'HostKmsKeyArn', !Ref 'AWS::NoValue']
       Environment:
         Variables:
           TPF_AWS_DURABLE_PUBLICATION_ID: !Ref 'VersionPublicationId'
-          TPF_AWS_DURABLE_CONFIGURATION: !Sub |
-            {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${TransitionRequestQueue}","worker.sqs.response-queue-url":"${TransitionResponseQueue}"}
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub
+            - |
+              {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.artifact-id":"${ReleaseArtifactId}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-digest":"${ReleaseArtifactDigest}","worker.sqs.visibility-timeout":"PT900S","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","worker.sqs.request-queue-url":"${WorkerRequestUrl}","worker.sqs.response-queue-url":"${WorkerResponseUrl}"}
+            - WorkerRequestUrl: !If [TransitionQueues, !Ref TransitionRequestQueue, '']
+              WorkerResponseUrl: !If [TransitionQueues, !Ref TransitionResponseQueue, '']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: !Ref 'DurableActionTimeoutSeconds'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: !Ref 'CallbackRetentionSeconds'
           TPF_AWS_DURABLE_SIGNING_SOURCE: !Ref 'SigningSource'
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: !Ref 'DeploymentPreflightValidation'
+          TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE: !If [HasCommandEffectTable, !Ref CommandEffectTable, !Ref AWS::NoValue]
+          TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE: !If [HasQueryCaptureTable, !Ref QueryCaptureTable, !Ref AWS::NoValue]
+          PIPELINE_AWAIT_ADMISSION_STORE: dynamo
           TPF_AWS_DURABLE_ESTIMATED_OPERATIONS: !Ref 'DurableEstimatedOperations'
           TPF_AWS_DURABLE_ESTIMATED_WRITTEN_STATE_BYTES: !Ref 'DurableEstimatedWrittenStateBytes'
           TPF_AWS_DURABLE_EXECUTION_TIMEOUT_SECONDS: !Ref 'DurableExecutionTimeoutSeconds'
@@ -1364,6 +1752,8 @@ Resources:
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref 'CallbackBindingTable'
           TPF_AWS_DURABLE_FUNCTION: !Sub '${AWS::StackName}-durable'
           TPF_AWS_DURABLE_QUALIFIER: !Ref 'DurableAlias'
+          TPF_AWS_DURABLE_RELEASE_ISOLATION_MODE: !If [RetainedReleaseMode, !Ref ReleaseIsolationMode, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RETAINED_VALIDATION: !If [RetainedReleaseMode, !Ref RetainedReleaseValidation, !Ref 'AWS::NoValue']
           QUARKUS_LAMBDA_HANDLER: !Ref 'ReconciliationHandler'
 
   ReconciliationInvokeConfig:
@@ -1469,7 +1859,7 @@ Resources:
 
   TransitionDlqAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: HardenedProfile
+    Condition: HardenedTransitionQueues
     Properties:
       AlarmActions:
       - !Ref 'AlarmTopicArn'
@@ -1507,6 +1897,17 @@ Resources:
       - Name: QueueName
         Value: !GetAtt 'StreamFailureDlq.QueueName'
 
+  HttpFunctionLogs:
+    Condition: HttpIngressSelected
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - '/tpf/aws-durable/${AWS::StackName}/${StackInstance}/http'
+        - StackInstance: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+      KmsKeyId: !If [HardenedProfile, !Ref HostKmsKeyArn, !Ref 'AWS::NoValue']
+      RetentionInDays: !Ref LogRetentionDays
   DurableFunctionLogs:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -1656,6 +2057,41 @@ Resources:
       Dimensions:
       - Name: FunctionName
         Value: !Sub '${AWS::StackName}-action'
+
+  HttpFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HardenedHttpIngress
+    Properties:
+      AlarmActions: [!Ref AlarmTopicArn]
+      OKActions: [!Ref AlarmTopicArn]
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions: [{Name: FunctionName, Value: !Ref HttpFunction}]
+  HttpFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HardenedHttpIngress
+    Properties:
+      AlarmActions:
+      - !Ref 'AlarmTopicArn'
+      OKActions:
+      - !Ref 'AlarmTopicArn'
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: FunctionName
+        Value: !Ref HttpFunction
 
   IngressFunctionLogs:
     Type: AWS::Logs::LogGroup
@@ -2010,7 +2446,7 @@ Resources:
 
   TransitionRequestQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: HardenedProfile
+    Condition: HardenedTransitionQueues
     Properties:
       AlarmActions:
       - !Ref 'AlarmTopicArn'
@@ -2030,7 +2466,7 @@ Resources:
 
   TransitionResponseQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: HardenedProfile
+    Condition: HardenedTransitionQueues
     Properties:
       AlarmActions:
       - !Ref 'AlarmTopicArn'
@@ -2815,11 +3251,14 @@ Outputs:
   DurableAliasArn: {Value: !Ref DurableAliasResource}
   IngressFunctionArn: {Value: !Ref IngressVersion}
   ActionFunctionArn: {Value: !Ref ActionVersion}
+  HttpFunctionArn:
+    Condition: HttpIngressSelected
+    Value: !Ref HttpVersion
   CallbackBindingTableName: {Value: !Ref CallbackBindingTable}
   WorkQueueUrl: {Value: !Ref WorkQueue}
   AwaitCompletionQueueUrl: {Value: !Ref AwaitCompletionQueue}
-  TransitionRequestQueueUrl: {Value: !Ref TransitionRequestQueue}
-  TransitionResponseQueueUrl: {Value: !Ref TransitionResponseQueue}
+  TransitionRequestQueueUrl: {Condition: TransitionQueues, Value: !Ref TransitionRequestQueue}
+  TransitionResponseQueueUrl: {Condition: TransitionQueues, Value: !Ref TransitionResponseQueue}
   StreamFailureQueueUrl: {Value: !Ref StreamFailureDlq}
   DueWorkQueueUrl: {Value: !Ref DueWorkQueue}
   DueWorkDlqUrl: {Value: !Ref DueWorkDlq}
@@ -2827,7 +3266,7 @@ Outputs:
     Description: Export this resolved manifest to the immutable release bundle before admission; never overwrite a prior publication manifest
     Value: !Sub
       - |
-        {"schemaVersion":2,"deploymentProfile":"${DeploymentProfile}","observability":"${ObservationMode}","scheduleProvider":"EVENTBRIDGE_RULE","encryption":{"host":"${HostEncryptionMode}","semantic":"${SemanticEncryptionMode}"},"stackId":"${AWS::StackId}","pipelineId":"${PipelineId}","contractVersion":"${ContractVersion}","releaseId":"${ReleaseVersion}","artifactId":"${ReleaseArtifactId}","artifactSha256":"${ReleaseArtifactDigest}","actionCodeSha256":"${ActionCodeSha256}","durableCodeSha256":"${DurableCodeSha256}","publicationId":"${VersionPublicationId}","placement":"${TransitionWorkerPlacement}","isolationMode":"${ReleaseIsolationMode}","runtimeUpdateMode":"FunctionUpdate","functionVersionArns":{"durable":"${DurableVersion}","action":"${ActionVersion}","ingress":"${IngressVersion}","work":"${WorkVersion}","transition":"${TransitionVersionArn}","awaitCompletion":"${AwaitCompletionVersion}","awaitWakeup":"${AwaitWakeupVersion}","executionWakeup":"${ExecutionWakeupVersion}","dueWork":"${DueWorkVersion}","reconciliation":"${ReconciliationVersion}"},"logGroupNames":{"durable":"${DurableFunctionLogs}","action":"${ActionFunctionLogs}","ingress":"${IngressFunctionLogs}","work":"${WorkFunctionLogs}","transition":"${TransitionLogGroupName}","awaitCompletion":"${AwaitCompletionFunctionLogs}","awaitWakeup":"${AwaitWakeupFunctionLogs}","executionWakeup":"${ExecutionWakeupFunctionLogs}","dueWork":"${DueWorkFunctionLogs}","reconciliation":"${ReconciliationFunctionLogs}"},"queueUrls":{"work":"${WorkQueue}","workDlq":"${WorkDlq}","awaitCompletion":"${AwaitCompletionQueue}","awaitCompletionDlq":"${AwaitCompletionDlq}","transitionRequest":"${TransitionRequestQueue}","transitionResponse":"${TransitionResponseQueue}","transitionDlq":"${TransitionDlq}","dueWork":"${DueWorkQueue}","dueWorkDlq":"${DueWorkDlq}","streamFailure":"${StreamFailureDlq}","repairFailure":"${RepairFailureDlq}","durableDlq":"${DurableDlq}"},"mappingIds":{"work":"${WorkFunctionWork}","awaitCompletion":"${AwaitCompletionFunctionAwaitCompletion}","transition":"${TransitionMappingId}","awaitState":"${AwaitWakeupFunctionAwaitState}","callbackBinding":"${AwaitWakeupFunctionCallbackBinding}","executionState":"${ExecutionWakeupFunctionExecutionState}","dueWork":"${DueWorkFunctionTick}"},"signing":${SigningManifest},"hostKmsKeyArn":"${HostKmsKeyArn}","semanticKmsKeyArns":${SemanticKeysManifest}}
+        {"schemaVersion":2,"deploymentProfile":"${DeploymentProfile}","observability":"${ObservationMode}","scheduleProvider":"EVENTBRIDGE_RULE","encryption":{"host":"${HostEncryptionMode}","semantic":"${SemanticEncryptionMode}"},"stackId":"${AWS::StackId}","pipelineId":"${PipelineId}","contractVersion":"${ContractVersion}","releaseId":"${ReleaseVersion}","artifactId":"${ReleaseArtifactId}","artifactSha256":"${ReleaseArtifactDigest}","actionCodeSha256":"${ActionCodeSha256}","durableCodeSha256":"${DurableCodeSha256}"${HttpManifestCode},"publicationId":"${VersionPublicationId}","placement":"${TransitionWorkerPlacement}","isolationMode":"${ReleaseIsolationMode}","runtimeUpdateMode":"FunctionUpdate","functionVersionArns":{"durable":"${DurableVersion}","action":"${ActionVersion}","ingress":"${IngressVersion}","work":"${WorkVersion}","transition":"${TransitionVersionArn}","awaitCompletion":"${AwaitCompletionVersion}","awaitWakeup":"${AwaitWakeupVersion}","executionWakeup":"${ExecutionWakeupVersion}","dueWork":"${DueWorkVersion}","reconciliation":"${ReconciliationVersion}"${HttpManifestVersion}},"logGroupNames":{"durable":"${DurableFunctionLogs}","action":"${ActionFunctionLogs}","ingress":"${IngressFunctionLogs}","work":"${WorkFunctionLogs}","transition":"${TransitionLogGroupName}","awaitCompletion":"${AwaitCompletionFunctionLogs}","awaitWakeup":"${AwaitWakeupFunctionLogs}","executionWakeup":"${ExecutionWakeupFunctionLogs}","dueWork":"${DueWorkFunctionLogs}","reconciliation":"${ReconciliationFunctionLogs}"${HttpManifestLogGroup}},"queueUrls":{"work":"${WorkQueue}","workDlq":"${WorkDlq}","awaitCompletion":"${AwaitCompletionQueue}","awaitCompletionDlq":"${AwaitCompletionDlq}","transitionRequest":"${TransitionRequestQueueUrlForManifest}","transitionResponse":"${TransitionResponseQueueUrlForManifest}","transitionDlq":"${TransitionDlqUrlForManifest}","dueWork":"${DueWorkQueue}","dueWorkDlq":"${DueWorkDlq}","streamFailure":"${StreamFailureDlq}","repairFailure":"${RepairFailureDlq}","durableDlq":"${DurableDlq}"},"mappingIds":{"work":"${WorkFunctionWork}","awaitCompletion":"${AwaitCompletionFunctionAwaitCompletion}","transition":"${TransitionMappingId}","awaitState":"${AwaitWakeupFunctionAwaitState}","callbackBinding":"${AwaitWakeupFunctionCallbackBinding}","executionState":"${ExecutionWakeupFunctionExecutionState}","dueWork":"${DueWorkFunctionTick}"},"signing":${SigningManifest},"hostKmsKeyArn":"${HostKmsKeyArn}","semanticKmsKeyArns":${SemanticKeysManifest}}
       - ObservationMode: !If [HardenedProfile, ALARMS, SUPERVISED_NO_ALARMS]
         HostEncryptionMode: !If [HardenedProfile, CUSTOMER_MANAGED, SERVICE_OWNED_EXCEPT_EVENTBRIDGE_CMK]
         SemanticEncryptionMode: !If [HardenedProfile, CUSTOMER_MANAGED, AWS_OWNED_AND_S3_MANAGED]
@@ -2840,9 +3279,15 @@ Outputs:
           - !Sub
             - '{"source":"SSM_STANDARD","tier":"Standard","type":"SecureString","keyKind":"AWS_MANAGED_SSM","lifecycle":"IMMUTABLE_GENERATION","resumeToken":{"arn":"${ResumeTokenParameterArn}","version":${ResumeTokenParameterVersion}},"worker":{"arn":"${WorkerSharedParameterArn}","version":${WorkerSharedParameterVersion}},"retainedParameterAccessArns":["${ParameterArns}"]}'
             - ParameterArns: !Join ['","', !Ref SigningParameterAccessArns]
+        HttpManifestCode: !If [HttpIngressSelected, !Sub ',"httpCodeSha256":"${HttpCodeSha256}"', '']
+        HttpManifestVersion: !If [HttpIngressSelected, !Sub ',"http":"${HttpVersion}"', '']
+        HttpManifestLogGroup: !If [HttpIngressSelected, !Sub ',"http":"${HttpFunctionLogs}"', '']
         TransitionVersionArn: !If [FunctionTransitionConsumer, !Ref TransitionWorkerVersion, '']
         TransitionLogGroupName: !If [FunctionTransitionConsumer, !Ref TransitionWorkerFunctionLogs, '']
         TransitionMappingId: !If [FunctionTransitionConsumer, !Ref TransitionWorkerFunctionTransition, '']
+        TransitionRequestQueueUrlForManifest: !If [TransitionQueues, !Ref TransitionRequestQueue, '']
+        TransitionResponseQueueUrlForManifest: !If [TransitionQueues, !Ref TransitionResponseQueue, '']
+        TransitionDlqUrlForManifest: !If [TransitionQueues, !Ref TransitionDlq, '']
         SemanticKeysManifest: !If
           - HardenedProfile
           - !Sub

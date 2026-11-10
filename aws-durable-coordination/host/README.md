@@ -26,7 +26,20 @@ Publication and immutable candidate validation follow the repository's normal
 runtime workflow. This module does not provision parameters or attest their tier,
 permissions, retention, deployment provenance or real-AWS conformance.
 
-### Queue-only native execution
+## Hosted Release verification
+
+The coordination model exposes the packaged function roles and artifact groups
+for the queue and in-process Hosted profiles. Consumers use these facts to
+validate a Release against its compiled contract and numbered functions.
+
+The existing private Lambda action gateway accepts `READ_RUNTIME_IDENTITY` with
+the tenant and exact pipeline, contract and Release pins. After successful
+strict startup it reports the loaded compiled contract and the selected
+Command and Query stores. A missing registration, foreign pin or unhealthy
+runtime fails the read. The action uses the gateway's existing Lambda invoke
+permissions.
+
+## Queue-only native execution
 
 The native deployment sets `pipeline.orchestrator.sqs.local-loopback=false` (the
 `sqs.local-loopback` entry in `TPF_AWS_DURABLE_CONFIGURATION`) on all eight semantic
@@ -40,3 +53,13 @@ execution inside the submitting Lambda, competing with the native Work consumer
 and allowing work to outlive the Lambda invocation. Native execution belongs to
 the SQS handler, which awaits processing before acknowledging the message. The
 ordinary runtime's local-development default is unchanged.
+
+## Hosted execution evidence
+
+The private Lambda action gateway reads the exact tenant, execution, Release
+and driver generation. `READ_EXECUTION_LOCATOR` returns the retained
+`AwsDurableRecoveryLocator`, or JSON null when that generation has no current
+locator. An execution can have a locator without registering an Await callback.
+`TYPED_RESULT` requires one successful terminal item and a current locator.
+It returns a `SerializedTransitionPayload` through the existing transition
+codec. The existing raw `RESULT` action still serves native driver replay.

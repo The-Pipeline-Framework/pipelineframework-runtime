@@ -16,6 +16,7 @@ import org.pipelineframework.aws.durable.model.AwsDurableCallbackRegistration;
 import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
 import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
 import org.pipelineframework.orchestrator.AwaitSemanticCheckpoint;
+import org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint;
 import org.pipelineframework.orchestrator.PipelineControlPlane;
 
 /** Synchronous Lambda shell over bounded reactive {@link PipelineControlPlane} actions. */
@@ -27,6 +28,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
     private final Duration actionTimeout;
     private final Duration callbackRetention;
     private final AwsDurableHostTelemetry telemetry;
+    private final org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher continuationDispatcher;
 
     public AwsDurableControlPlaneActions(
         PipelineControlPlane controlPlane,
@@ -39,6 +41,13 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         this(controlPlane, bindings, inputDecoder, mapper, actionTimeout, callbackRetention, new AwsDurableHostTelemetry());
     }
 
+    public AwsDurableControlPlaneActions(PipelineControlPlane controlPlane, AwsDurableCallbackBindingRepository bindings,
+        AwsDurableInputDecoder inputDecoder, ObjectMapper mapper, Duration actionTimeout, Duration callbackRetention,
+        org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher continuationDispatcher) {
+        this(controlPlane, bindings, inputDecoder, mapper, actionTimeout, callbackRetention,
+            new AwsDurableHostTelemetry(), continuationDispatcher);
+    }
+
     AwsDurableControlPlaneActions(
         PipelineControlPlane controlPlane,
         AwsDurableCallbackBindingRepository bindings,
@@ -48,6 +57,12 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         Duration callbackRetention,
         AwsDurableHostTelemetry telemetry
     ) {
+        this(controlPlane, bindings, inputDecoder, mapper, actionTimeout, callbackRetention, telemetry, null);
+    }
+
+    private AwsDurableControlPlaneActions(PipelineControlPlane controlPlane, AwsDurableCallbackBindingRepository bindings,
+        AwsDurableInputDecoder inputDecoder, ObjectMapper mapper, Duration actionTimeout, Duration callbackRetention,
+        AwsDurableHostTelemetry telemetry, org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher continuationDispatcher) {
         this.controlPlane = Objects.requireNonNull(controlPlane, "controlPlane");
         this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.inputDecoder = Objects.requireNonNull(inputDecoder, "inputDecoder");
@@ -55,6 +70,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         this.actionTimeout = positive(actionTimeout, "actionTimeout");
         this.callbackRetention = positive(callbackRetention, "callbackRetention");
         this.telemetry = Objects.requireNonNull(telemetry, "telemetry");
+        this.continuationDispatcher = continuationDispatcher;
     }
 
     @Override
@@ -66,6 +82,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             case RESULT -> AwsDurableActionResponse.result(json(controlPlane
                 .getExecutionResultPayload(request.tenantId(), required(request.executionId(), "executionId"))
                 .await().atMost(actionTimeout)));
+            case READ_RUNTIME_IDENTITY -> runtimeIdentity(request);
             case REDRIVE -> AwsDurableActionResponse.status(controlPlane.redriveExecution(
                     request.tenantId(),
                     required(request.executionId(), "executionId"),
@@ -74,6 +91,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
                     required(request.reason(), "reason"))
                 .await().atMost(actionTimeout).status().name());
             case SWEEP -> sweep();
+            case PROCESS_AWAIT_CONTINUATION -> itemContinuation(request);
             case QUERY_PENDING_AWAIT -> pendingAwait(request);
             case READ_AWAIT_CHECKPOINT -> awaitCheckpoint(request);
             case READ_EXECUTION_AWAITS -> executionAwaits(request);
@@ -83,7 +101,32 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             case REGISTER_EXECUTION -> registerExecution(request);
             case REGISTER_CALLBACK -> register(request);
             case BIND_CALLBACK -> bind(request);
+            case READ_EXECUTION_LOCATOR -> executionLocator(request);
+            case TYPED_RESULT -> typedResult(request);
         };
+    }
+
+    /** Only report readiness when the observed runtime matches the requested Release pin. */
+    private AwsDurableActionResponse runtimeIdentity(AwsDurableActionRequest request) {
+        String pipeline = required(request.pipelineId(), "pipelineId");
+        String contract = required(request.contractVersion(), "contractVersion");
+        String release = required(request.releaseVersion(), "releaseVersion");
+        return AwsDurableActionResponse.result(json(requireLocalRelease(request.tenantId(), pipeline, contract, release)));
+    }
+
+    private org.pipelineframework.orchestrator.PipelineRuntimeIdentityObservation requireLocalRelease(
+        String tenant, String pipeline, String contract, String release) {
+        var observed = controlPlane.runtimeIdentity(tenant).await().atMost(actionTimeout);
+        if (!observed.ready()) {
+            throw new IllegalStateException("Observed runtime is not ready");
+        }
+        if (!pipeline.equals(observed.pipelineId())
+            || !contract.equals(observed.contractVersion()) || !release.equals(observed.releaseVersion())) {
+            throw new IllegalStateException("Runtime identity differs from the requested Release. "
+                + "Observed pipelineId=%s, contractVersion=%s, releaseVersion=%s"
+                    .formatted(observed.pipelineId(), observed.contractVersion(), observed.releaseVersion()));
+        }
+        return observed;
     }
 
     private AwsDurableActionResponse completionObservation(AwsDurableActionRequest request) {
@@ -132,7 +175,8 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             var existing = request.executionId().isPresent()
                 ? Optional.of(controlPlane.getExecutionSemanticCheckpoint(request.tenantId(), request.executionId().orElseThrow())
                     .await().atMost(actionTimeout))
-                : controlPlane.getExecutionSemanticCheckpointByClientKey(request.tenantId(), request.idempotencyKey().orElseThrow())
+                : controlPlane.getExecutionSemanticCheckpointByClientKey(request.tenantId(), request.idempotencyKey().orElseThrow(),
+                    required(request.pipelineId(), "pipelineId"), required(request.releaseVersion(), "releaseVersion"))
                     .await().atMost(actionTimeout);
             existing.ifPresent(semantic -> requireRecoveryRelease(request, semantic));
             return AwsDurableActionResponse.bound(bindings.registerAdmission(
@@ -213,8 +257,41 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
     }
 
     private AwsDurableActionResponse sweep() {
-        controlPlane.sweepOnce(System.currentTimeMillis()).await().atMost(actionTimeout);
+        long now = System.currentTimeMillis();
+        (continuationDispatcher == null ? controlPlane.sweepOnce(now)
+            : controlPlane.sweepOnce(now, continuationDispatcher)).await().atMost(actionTimeout);
         return AwsDurableActionResponse.status("SWEEPED");
+    }
+
+    private AwsDurableActionResponse itemContinuation(AwsDurableActionRequest request) {
+        org.pipelineframework.orchestrator.AwaitItemContinuationCommand command;
+        try {
+            command = org.pipelineframework.config.pipeline.PipelineJson.mapper().readValue(
+                required(request.inputJson(), "inputJson"), org.pipelineframework.orchestrator.AwaitItemContinuationCommand.class);
+        } catch (java.io.IOException malformed) {
+            throw new IllegalArgumentException("Invalid item continuation command", malformed);
+        }
+        if (!request.tenantId().equals(command.tenantId())
+            || !required(request.executionId(), "executionId").equals(command.executionId())) {
+            throw new IllegalArgumentException("Item continuation command does not match its execution scope");
+        }
+        var semantic = controlPlane.getExecutionSemanticCheckpoint(command.tenantId(), command.executionId())
+            .await().atMost(actionTimeout);
+        requireRecoveryRelease(request, semantic);
+        if (!semantic.tenantId().equals(command.tenantId()) || !semantic.executionId().equals(command.executionId())) {
+            throw new IllegalStateException("Item continuation semantic checkpoint does not match command scope");
+        }
+        requireLocalRelease(semantic.tenantId(), semantic.pipelineId(), semantic.contractVersion(), semantic.releaseVersion());
+        var current = new org.pipelineframework.orchestrator.AwaitItemContinuationCommand(command.tenantId(),
+            command.executionId(), command.unitId(), command.interactionId(), command.itemIndex(), command.attempt(),
+            System.currentTimeMillis());
+        return AwsDurableActionResponse.result(canonicalJson(controlPlane.processAwaitItemContinuation(current)
+            .await().atMost(actionTimeout)));
+    }
+
+    private static String canonicalJson(Object value) {
+        try { return org.pipelineframework.config.pipeline.PipelineJson.mapper().writeValueAsString(value); }
+        catch (java.io.IOException failure) { throw new IllegalStateException("Cannot serialize item continuation result", failure); }
     }
 
     private AwsDurableActionResponse awaitCheckpoint(AwsDurableActionRequest request) {
@@ -295,6 +372,42 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         } catch (JsonProcessingException exception) {
             throw new IllegalStateException("TPF result could not be serialized", exception);
         }
+    }
+
+    /** Reads retained execution correlation after authorizing its exact semantic execution pin. */
+    private AwsDurableActionResponse executionLocator(AwsDurableActionRequest request) {
+        var pin = driverCheckpoint(request);
+        readPinnedExecution(pin);
+        return AwsDurableActionResponse.result(json(bindings.findCurrentRecovery(pin).orElse(null)));
+    }
+
+    /** Checks the driver generation around the result read, after authorizing the execution pin. */
+    private AwsDurableActionResponse typedResult(AwsDurableActionRequest request) {
+        var pin = driverCheckpoint(request);
+        var semantic = readPinnedExecution(pin);
+        requireCurrentRecovery(pin);
+        var result = controlPlane.getExecutionTypedResult(semantic).await().atMost(actionTimeout);
+        requireCurrentRecovery(pin);
+        return AwsDurableActionResponse.result(json(result));
+    }
+
+    /** Rejects absent or superseded driver generations. */
+    private void requireCurrentRecovery(AwsDurableDriverCheckpoint pin) {
+        if (bindings.findCurrentRecovery(pin).isEmpty()) {
+            throw new IllegalStateException("Typed result requires a current execution locator");
+        }
+    }
+
+    /** Applies the existing status-read admission and verifies all coordinates before returning evidence. */
+    private ExecutionSemanticCheckpoint readPinnedExecution(AwsDurableDriverCheckpoint pin) {
+        var semantic = controlPlane.getExecutionSemanticCheckpoint(pin.tenantId(), pin.executionId())
+            .await().atMost(actionTimeout);
+        if (!pin.tenantId().equals(semantic.tenantId()) || !pin.executionId().equals(semantic.executionId())
+            || !pin.pipelineId().equals(semantic.pipelineId()) || !pin.contractVersion().equals(semantic.contractVersion())
+            || !pin.releaseVersion().equals(semantic.releaseVersion())) {
+            throw new IllegalStateException("Semantic execution differs from the requested Release pin");
+        }
+        return semantic;
     }
 
     private static String required(java.util.Optional<String> value, String name) {

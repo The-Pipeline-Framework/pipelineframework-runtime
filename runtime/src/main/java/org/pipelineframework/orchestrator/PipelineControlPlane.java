@@ -23,6 +23,11 @@ public interface PipelineControlPlane {
      */
     void initializeQueueMode();
 
+    /** Observes the loaded runtime and its registered Release without changing execution state. */
+    default Uni<PipelineRuntimeIdentityObservation> runtimeIdentity(String tenantId) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Runtime identity observation is unsupported"));
+    }
+
     Uni<RunAsyncAcceptedDto> executePipelineAsync(
         Object input,
         String tenantId,
@@ -44,11 +49,28 @@ public interface PipelineControlPlane {
     /** Looks up admission by client key. Absence never establishes execution completion. */
     Uni<Optional<ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(String tenantId, String clientKey);
 
+    /** Looks up a client key within the execution's exact original Release. */
+    default Uni<Optional<ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(
+        String tenantId, String clientKey, String pipelineId, String releaseVersion) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Scoped execution checkpoint lookup is unsupported"));
+    }
+
+    /** Observes the original native admission timestamp and release pin without submitting work. */
+    default Uni<Optional<ExecutionClientAdmission>> getExecutionAdmissionByClientKey(
+        String tenantId, String clientKey, String pipelineId, String releaseVersion) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Execution client admission observation is unsupported"));
+    }
+
     Uni<ExecutionStatusDto> getExecutionStatus(String tenantId, String executionId);
 
     <T> Uni<T> getExecutionResult(String tenantId, String executionId, Class<?> outputType, boolean outputStreaming);
 
     Uni<Object> getExecutionResultPayload(String tenantId, String executionId);
+
+    /** Reads one successful result through its exact execution and Release pin. */
+    default Uni<SerializedTransitionPayload> getExecutionTypedResult(ExecutionSemanticCheckpoint pin) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Typed execution result is unsupported"));
+    }
 
     /**
      * Executes one bounded timeout and due-execution sweep using the configured sweep limit.
@@ -57,6 +79,11 @@ public interface PipelineControlPlane {
      * @return the successful timeout and dispatch counts for this sweep
      */
     Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs);
+
+    /** Runs ordinary due work, dispatching persisted item continuations to their selected original runtime. */
+    default Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs, AwaitItemContinuationDispatcher dispatcher) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Due item continuation dispatch is unsupported"));
+    }
 
     Uni<ExecutionRedriveResult> redriveExecution(
         String tenantId,
@@ -119,6 +146,12 @@ public interface PipelineControlPlane {
     Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(
         String tenantId,
         String interactionId);
+
+    /** Reads an Await checkpoint by its tenant-scoped correlation, with the same admission as an interaction read. */
+    default Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpointByCorrelation(
+        String tenantId, String correlationId) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Await checkpoint correlation reads are unavailable"));
+    }
 
     /**
      * Observes the primary interaction or the first bounded page of an itemised current Await unit.

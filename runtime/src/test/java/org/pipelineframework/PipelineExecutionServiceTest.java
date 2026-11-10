@@ -227,6 +227,21 @@ class PipelineExecutionServiceTest {
     }
 
     @Test
+    void executePipelineAsyncUsesTheEnabledHostedSubmission() {
+        @SuppressWarnings("unchecked")
+        jakarta.enterprise.inject.Instance<org.pipelineframework.orchestrator.AsyncExecutionSubmission> hosted =
+            mock(jakarta.enterprise.inject.Instance.class);
+        var submission = mock(org.pipelineframework.orchestrator.AsyncExecutionSubmission.class);
+        service.hostedSubmissions = hosted;
+        when(hosted.get()).thenReturn(submission);
+        var expected = new RunAsyncAcceptedDto("exec-hosted", false, "/pipeline/executions/exec-hosted", 5L);
+        when(submission.submit("input", "tenant-1", "idem-1", false)).thenReturn(Uni.createFrom().item(expected));
+
+        assertEquals(expected, service.executePipelineAsync("input", "tenant-1", "idem-1").await().indefinitely());
+        verify(controlPlane, never()).executePipelineAsync(any(), any(), any(), eq(false));
+    }
+
+    @Test
     void getExecutionStatusDelegatesToControlPlane() {
         ExecutionStatusDto expected = new ExecutionStatusDto("exec-3", null, 0, 0, 1L, 0L, 0L, null, null);
         when(controlPlane.getExecutionStatus("tenant-1", "exec-3"))

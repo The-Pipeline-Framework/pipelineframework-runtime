@@ -55,6 +55,48 @@ class NativeCommandRecoveryIT {
     }
 
     @Test
+    void pendingDispatchPreservesOriginalBindingAndRetriesOnlyAuthoritativeInquiry() throws Exception {
+        String id = "native-observation-pending";
+        var original = start(support(store(), false), id, descriptor("archive"));
+        fixture.applied(id).get(15, TimeUnit.SECONDS);
+        var before = effect(id); var rows = history(id);
+        fixture.ack(id).completeExceptionally(new CommandInProgressException("observation pending"));
+        var failure = assertThrows(ExecutionException.class, () -> original.get(15, TimeUnit.SECONDS));
+        assertEquals(before, effect(id)); assertEquals(rows, history(id));
+        assertEquals(CommandEffectStatus.DISPATCHING, effect(id).status());
+        var envelope = TransitionFailureTestAccess.from(failure.getCause(), 0);
+        assertTrue(envelope.failedCommandId().isEmpty(), "pending work must not authorize a new effect attempt");
+        assertInstanceOf(TransitionWorkerFailureException.class, TransitionFailureTestAccess.restore(envelope));
+        fixture.unresolved = true;
+        assertThrows(CommandInProgressException.class, () -> execute(support(store(), false), id, descriptor("archive")));
+        assertEquals(before, effect(id)); assertEquals(1, fixture.entries(id).get());
+        fixture.unresolved = false;
+        assertEquals(new Result("provider-result"), execute(support(store(), false), id, descriptor("archive")));
+        assertEquals(1, fixture.entries(id).get());
+        assertEquals(before.currentAttempt().attemptId(), effect(id).currentAttempt().attemptId());
+        assertEquals(1, effect(id).attempts().size());
+        assertEquals(CommandEffectStatus.SUCCEEDED, effect(id).status());
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void pendingDispatchWithoutRecoveryAuthorityCannotPreserveAnInProgressEffect(boolean recoverableStore) throws Exception {
+        fixture.targetSupported = !recoverableStore;
+        String id = "unbound-observation-pending";
+        var effectStore = spy(store());
+        doReturn(recoverableStore).when(effectStore).supportsRecovery();
+        var original = start(support(effectStore, false), id, descriptor("archive"));
+        fixture.applied(id).get(15, TimeUnit.SECONDS);
+        fixture.ack(id).completeExceptionally(new CommandInProgressException("observation pending"));
+        var failure = assertThrows(ExecutionException.class, () -> original.get(15, TimeUnit.SECONDS));
+        assertEquals(CommandEffectStatus.FAILED_RETRYABLE, effect(id).status());
+        assertTrue(effect(id).currentAttempt().recoveryBinding().isEmpty());
+        assertEquals(Optional.of(id), TransitionFailureTestAccess.from(failure.getCause(), 0).failedCommandId());
+        assertThrows(CommandRetryableOutcomeException.class, () -> execute(support(store(), false), id, descriptor("archive")));
+        assertEquals(1, fixture.entries(id).get());
+    }
+
+    @Test
     void transientSuccessWriteFailureRemainsAStoreFailure() {
         var faulty = spy(store());
         var failure = new CommandEffectStoreException("store unavailable");

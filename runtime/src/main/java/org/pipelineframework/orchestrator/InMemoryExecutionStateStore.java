@@ -198,6 +198,20 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
     }
 
     @Override
+    public Uni<Optional<Object>> getInitialExecutionInput(ExecutionRecord<Object, Object> execution) {
+        return Uni.createFrom().item(() -> {
+            synchronized (lock) {
+                String scopedId = scopedExecutionId(execution.tenantId(), execution.executionId());
+                var current = getActiveRecord(scopedId, System.currentTimeMillis());
+                if (current == null || !execution.executionKey().equals(current.executionKey())) {
+                    return Optional.empty();
+                }
+                return Optional.ofNullable(snapshotValue(initialInputByScopedId.get(scopedId)));
+            }
+        });
+    }
+
+    @Override
     public Uni<List<Optional<ExecutionRecord<Object, Object>>>> getExecutionsByKey(
         String tenantId,
         List<String> executionKeys

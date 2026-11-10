@@ -29,10 +29,15 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionException;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionOperation;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
+import org.pipelineframework.orchestrator.ExecutionClientAdmission;
+import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
 import org.pipelineframework.orchestrator.ExecutionRecord;
+import org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
+import org.pipelineframework.orchestrator.NativeExecutionAdmissionStore;
 import org.pipelineframework.orchestrator.OrchestratorMode;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
+import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.dto.ExecutionStatusDto;
 
@@ -202,38 +207,103 @@ class ExecutionReadModel {
         .onItem().transform(record -> new ExecutionResultView(record).rawPayload());
   }
 
+  /** Verifies the full pin on the admitted point read before producing a wire result. */
+  Uni<SerializedTransitionPayload> getExecutionTypedResult(ExecutionSemanticCheckpoint pin) {
+    return readExecution(pin.tenantId(), pin.executionId(), ControlPlaneAdmissionOperation.GET_EXECUTION_RESULT)
+        .map(record -> {
+          if (!pin.tenantId().equals(record.tenantId()) || !pin.executionId().equals(record.executionId())
+              || !pin.pipelineId().equals(record.pipelineId()) || !pin.contractVersion().equals(record.contractVersion())
+              || !pin.releaseVersion().equals(record.releaseVersion())) {
+            throw new IllegalStateException("Execution result differs from the requested Release pin");
+          }
+          return new ExecutionResultView(record).serializedSingleResult(payloadCodec);
+        });
+  }
+
   /** An absent admission remains absent; this lookup never creates or redrives execution state. */
-  Uni<Optional<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(
-      String tenantId, String clientKey) {
+  Uni<Optional<ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(String tenantId, String clientKey) {
+    return findExecutionByClientKey(tenantId, clientKey, null, null).map(found -> found.map(this::checkpoint));
+  }
+
+  Uni<Optional<ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(
+      String tenantId, String clientKey, String pipeline, String release) {
+    return findExecutionByClientKey(tenantId, clientKey, Objects.requireNonNull(pipeline), Objects.requireNonNull(release))
+        .map(found -> found.map(this::checkpoint));
+  }
+
+  Uni<Optional<ExecutionClientAdmission>> getExecutionAdmissionByClientKey(
+      String tenantId, String clientKey, String pipeline, String release) {
+    return findExecutionByClientKey(tenantId, clientKey, Objects.requireNonNull(pipeline), Objects.requireNonNull(release))
+        .chain(found -> {
+          if (found.isEmpty()) {
+            return Uni.createFrom().item(Optional.empty());
+          }
+          var execution = found.orElseThrow();
+          var checkpoint = checkpoint(execution);
+          if (!(executionStateStore instanceof NativeExecutionAdmissionStore nativeStore)) {
+            return Uni.createFrom().item(Optional.of(new ExecutionClientAdmission(
+                checkpoint, execution.createdAtEpochMs(), Optional.empty())));
+          }
+          return nativeStore.getInitialExecutionInput(execution).map(initial -> Optional.of(new ExecutionClientAdmission(
+              checkpoint, execution.createdAtEpochMs(), initial
+                  .filter(ExecutionInputSnapshot.class::isInstance)
+                  .map(ExecutionInputSnapshot.class::cast)
+                  .filter(snapshot -> snapshot.shape() == org.pipelineframework.orchestrator.ExecutionInputShape.UNI
+                      && snapshot.pipelineContext().isEmpty() && snapshot.payload() != null)
+                  .map(snapshot -> ExecutionClientAdmission.fingerprint(payloadCodec.get().encode(snapshot.payload()))))));
+        });
+  }
+
+  private Uni<Optional<ExecutionRecord<Object, Object>>> findExecutionByClientKey(
+      String tenantId, String clientKey, String pipeline, String release) {
     return Uni.createFrom().deferred(() -> {
       if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
         return Uni.createFrom().failure(new IllegalStateException("Async queue mode is disabled"));
       }
       String resolvedTenant = executionInputPolicy.normalizeTenant(tenantId);
       String resolvedKey = executionInputPolicy.requireRecoverableClientKey(clientKey);
+      String storageKey = pipeline == null ? resolvedKey
+          : PipelineRunSubmissionPlan.scopedRootExecutionKey(pipeline, release, resolvedKey);
+      String admissionPipeline = pipeline == null ? pipelineId.get() : pipeline;
+      String admissionRelease = release == null ? releaseVersion.get() : release;
       // There is no execution identifier before the lookup. Policies may reject this tenant-scoped read.
       Optional<RuntimeException> denied = admissionFailure(new ControlPlaneAdmissionRequest(resolvedTenant,
-          ControlPlaneAdmissionOperation.GET_EXECUTION_STATUS, pipelineId.get(), releaseVersion.get(),
+          ControlPlaneAdmissionOperation.GET_EXECUTION_STATUS, admissionPipeline, admissionRelease,
           "", "api", tenantId != null && !tenantId.isBlank()));
       if (denied.isPresent()) return Uni.createFrom().failure(denied.get());
-      return executionStateStore.getExecutionByKey(resolvedTenant, resolvedKey).onItem().transform(record ->
+      return executionStateStore.getExecutionByKey(resolvedTenant, storageKey).onItem().transform(record ->
           record.map(value -> {
-            if (!resolvedTenant.equals(value.tenantId()) || !resolvedKey.equals(value.executionKey())) {
-              throw new IllegalStateException("Execution key lookup returned a foreign tenant or client key");
+            if (!resolvedTenant.equals(value.tenantId()) || !storageKey.equals(value.executionKey())
+                || (pipeline != null && (!pipeline.equals(value.pipelineId()) || !release.equals(value.releaseVersion())))) {
+              throw new IllegalStateException("Execution key lookup returned a foreign tenant, client key or Release");
             }
             Optional<RuntimeException> executionDenied = admissionFailure(new ControlPlaneAdmissionRequest(resolvedTenant,
-                ControlPlaneAdmissionOperation.GET_EXECUTION_STATUS, pipelineId.get(), releaseVersion.get(),
+                ControlPlaneAdmissionOperation.GET_EXECUTION_STATUS, admissionPipeline, admissionRelease,
                 value.executionId(), "api", tenantId != null && !tenantId.isBlank()));
             if (executionDenied.isPresent()) throw executionDenied.get();
-            return new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint(value.tenantId(), value.executionId(),
-                value.pipelineId(), value.contractVersion(), value.releaseVersion(), value.status());
+            return value;
           }));
     });
+  }
+
+  private ExecutionSemanticCheckpoint checkpoint(ExecutionRecord<Object, Object> execution) {
+    return new ExecutionSemanticCheckpoint(execution.tenantId(), execution.executionId(), execution.pipelineId(),
+        execution.contractVersion(), execution.releaseVersion(), execution.status());
   }
 
   Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(
       String tenantId,
       String interactionId) {
+    return getAwaitSemanticCheckpoint(tenantId, tenant -> awaitCoordinator.getInteraction(tenant, interactionId));
+  }
+
+  Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpointByCorrelation(
+      String tenantId, String correlationId) {
+    return getAwaitSemanticCheckpoint(tenantId, tenant -> awaitCoordinator.getInteractionByCorrelation(tenant, correlationId));
+  }
+
+  private Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(
+      String tenantId, java.util.function.Function<String, Uni<Optional<AwaitInteractionRecord>>> lookup) {
     return Uni.createFrom().deferred(() -> {
       if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
         return Uni.createFrom().failure(new IllegalStateException("Async queue mode is disabled"));
@@ -247,7 +317,7 @@ class ExecutionReadModel {
       if (denied.isPresent()) {
         return Uni.createFrom().failure(denied.orElseThrow());
       }
-      return awaitCoordinator.getInteraction(resolvedTenant, interactionId)
+      return lookup.apply(resolvedTenant)
           .onItem().transformToUni(interaction -> interaction
               .map(record -> executionStateStore.getExecution(resolvedTenant, record.executionId())
                   .onItem().transform(execution -> execution.map(parent -> new AwaitSemanticCheckpoint(

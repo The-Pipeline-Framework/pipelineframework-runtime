@@ -47,6 +47,52 @@ import software.amazon.awssdk.services.dynamodb.model.TransactionCanceledExcepti
 public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
 
     @Override
+    public Uni<PipelineReleaseEntryBinding> registerEntryBinding(PipelineReleaseEntryBinding binding) {
+        return blocking(() -> {
+            binding.requireRelease(getReleaseRecord(binding.tenantId(), binding.pipelineId(), binding.releaseVersion(), Optional.empty())
+                .orElseThrow(() -> new IllegalStateException("Entry binding requires a registered Release")));
+            var item = new HashMap<>(key(binding.tenantId(), binding.pipelineId(), scopedSort(ENTRY_BINDING_PREFIX, binding.key())));
+            item.put(RECORD_TYPE, avS(ENTRY_BINDING_TYPE));
+            item.put(BINDING_JSON, avS(toJson(binding)));
+            try {
+                dynamoClient().putItem(PutItemRequest.builder().tableName(releaseTable()).item(item)
+                    .conditionExpression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
+                    .expressionAttributeNames(Map.of("#pk", REGISTRY_KEY, "#sk", REGISTRY_SORT)).build());
+                return binding;
+            } catch (ConditionalCheckFailedException raced) {
+                var existing = entryBindingBlocking(binding.tenantId(), binding.pipelineId(), binding.contractVersion(),
+                    binding.releaseVersion(), binding.entryId()).orElseThrow(() ->
+                        new IllegalStateException("Entry binding conflict lacks retained evidence"));
+                if (!existing.equals(binding)) {
+                    throw new IllegalStateException("Release entry is already bound to different deployment evidence");
+                }
+                return existing;
+            }
+        });
+    }
+
+    @Override
+    public Uni<Optional<PipelineReleaseEntryBinding>> getEntryBinding(
+        String tenant, String pipeline, String contract, String release, String entry) {
+        return blocking(() -> entryBindingBlocking(tenant, pipeline, contract, release, entry));
+    }
+
+    private Optional<PipelineReleaseEntryBinding> entryBindingBlocking(
+        String tenant, String pipeline, String contract, String release, String entry) {
+        var identity = List.of(tenant, pipeline, contract, release, entry);
+        var item = readItem(tenant, pipeline, scopedSort(ENTRY_BINDING_PREFIX, identity));
+        if (item.isEmpty()) return Optional.empty();
+        if (!ENTRY_BINDING_TYPE.equals(stringValue(item, RECORD_TYPE))) {
+            throw new IllegalStateException("Unexpected entry binding record type");
+        }
+        var binding = fromJson(stringValue(item, BINDING_JSON), PipelineReleaseEntryBinding.class);
+        if (!binding.key().equals(identity)) {
+            throw new IllegalStateException("Entry binding does not match requested scope");
+        }
+        return Optional.of(binding);
+    }
+
+    @Override
     public boolean supportsCurrentActivationObservation() { return true; }
 
     @Override
@@ -77,6 +123,10 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
     private static final String HEAD_SORT = "activation-head:v1";
     private static final String HEAD_TYPE = "ACTIVATION_HEAD_V1";
     private static final String OPERATION_TYPE = "ACTIVATION_OPERATION_V1";
+    private static final String EXPECTED_ACTIVATION_ID = "expected_activation_id";
+    private static final String ENTRY_BINDING_PREFIX = "entry-binding:v1:";
+    private static final String ENTRY_BINDING_TYPE = "ENTRY_BINDING_V1";
+    private static final String BINDING_JSON = "binding_json";
     private static final String SEQUENCE = "activation_sequence";
     private static final String RECEIPT_JSON = "receipt_json";
     private static final String ACTIVATION_ID = "activation_id";
@@ -97,22 +147,26 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
     private static final String ACTIVATED_AT_EPOCH_MS = "activated_at_epoch_ms";
 
     private final PipelineOrchestratorConfig explicitConfig;
+    private final boolean ownsClient;
     private volatile PipelineOrchestratorConfig orchestratorConfig;
     private volatile DynamoDbClient client;
 
     public DynamoPipelineReleaseRegistry() {
-        this.explicitConfig = null;
+        this(null);
     }
 
     public DynamoPipelineReleaseRegistry(PipelineOrchestratorConfig orchestratorConfig) {
         this.explicitConfig = orchestratorConfig;
         this.orchestratorConfig = orchestratorConfig;
+        this.ownsClient = true;
     }
 
-    DynamoPipelineReleaseRegistry(DynamoDbClient client, PipelineOrchestratorConfig orchestratorConfig) {
+    /** Uses a caller-owned client, including its scoped credentials, for all registry operations. */
+    public DynamoPipelineReleaseRegistry(DynamoDbClient client, PipelineOrchestratorConfig orchestratorConfig) {
         this.explicitConfig = orchestratorConfig;
         this.orchestratorConfig = orchestratorConfig;
-        this.client = client;
+        this.client = java.util.Objects.requireNonNull(client, "client");
+        this.ownsClient = false;
     }
 
     @Override
@@ -151,13 +205,21 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
 
     @Override
     public Uni<ActivationOperationReceipt> activateOnce(ActivationOperationCommand command) {
+        return activateOnce(command, null);
+    }
+
+    @Override
+    public Uni<ActivationOperationReceipt> activateOnceIfCurrent(
+        ActivationOperationCommand command, CurrentActivationObservation expected) {
+        return Uni.createFrom().deferred(() -> activateOnce(command, ActivationPrecondition.from(command, expected)));
+    }
+
+    private Uni<ActivationOperationReceipt> activateOnce(ActivationOperationCommand command, String expected) {
         return blocking(() -> {
             PipelineReleaseRecord release = command.release();
-            Optional<ActivationOperationReceipt> existing = operationBlocking(
-                release.tenantId(), release.pipelineId(), command.operationKey());
+            var existing = replayActivation(command, expected);
             if (existing.isPresent()) {
-                existing.get().requireIntent(command);
-                return existing.get();
+                return existing.orElseThrow();
             }
             PipelineReleaseRecord registered = getReleaseRecord(release.tenantId(), release.pipelineId(),
                 release.releaseVersion(), Optional.empty()).orElseThrow(() ->
@@ -168,18 +230,21 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
             ActivationOperationReceipt receipt = new ActivationOperationReceipt(1, command.operationKey(),
                 UUID.randomUUID().toString(), release.tenantId(), release.pipelineId(), release.contractVersion(),
                 release.releaseVersion(), PipelineReleaseEvidence.from(registered), command.activatedAtEpochMs());
-            return writeActivation(registered, command.activatedAtEpochMs(), Optional.of(receipt)).orElseThrow();
+            return writeActivation(registered, command.activatedAtEpochMs(), Optional.of(receipt), expected).orElseThrow();
         });
     }
 
     @Override
     public Uni<Optional<ActivationOperationReceipt>> getActivationOperation(
         String tenantId, String pipelineId, String operationKey) {
-        return blocking(() -> operationBlocking(tenantId, pipelineId, operationKey));
+        return blocking(() -> operationBlocking(tenantId, pipelineId, operationKey).map(StoredActivationOperation::receipt));
     }
 
     @PreDestroy
     void closeClient() {
+        if (!ownsClient) {
+            return;
+        }
         DynamoDbClient active = client;
         if (active == null) {
             return;
@@ -304,10 +369,16 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
 
     private Optional<ActivationOperationReceipt> writeActivation(PipelineReleaseRecord release, long now,
         Optional<ActivationOperationReceipt> receipt) {
+        return writeActivation(release, now, receipt, null);
+    }
+
+    private Optional<ActivationOperationReceipt> writeActivation(PipelineReleaseRecord release, long now,
+        Optional<ActivationOperationReceipt> receipt, String expected) {
         String tenant = release.tenantId();
         String pipeline = release.pipelineId();
         ActivationEvent event = new ActivationEvent(release.releaseVersion(), now);
         String activationId = receipt.map(ActivationOperationReceipt::activationId).orElseGet(() -> UUID.randomUUID().toString());
+        var command = receipt.map(value -> new ActivationOperationCommand(value.operationKey(), release, now));
         for (int attempt = 0; attempt < 32; attempt++) {
             Map<String, AttributeValue> registeredSnapshot = activationReleaseSnapshot(release);
             Map<String, AttributeValue> previous = readActivationHead(tenant, pipeline);
@@ -315,9 +386,17 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
             if (!previous.isEmpty()) {
                 validateHead(previous, tenant, pipeline);
                 sequence = Math.addExact(longValue(previous, SEQUENCE), 1);
-            } else {
-                // Retained legacy history is read-only. Older writers must be quiesced before first new write.
-                legacyLatestActivation(tenant, pipeline);
+            }
+            // Retained legacy history is read-only. Older writers must be quiesced before first new write.
+            boolean legacyUnknown = previous.isEmpty() && legacyLatestActivation(tenant, pipeline).isPresent();
+            String previousId = previous.isEmpty() ? "" : stringValue(previous, ACTIVATION_ID);
+            if (!ActivationPrecondition.matches(expected, previousId, legacyUnknown)) {
+                // Another exact retry may have committed between the first operation lookup and this head read.
+                var replay = command.flatMap(value -> replayActivation(value, expected));
+                if (replay.isPresent()) {
+                    return replay;
+                }
+                ActivationPrecondition.requireMatch(expected, previousId, legacyUnknown);
             }
             Map<String, AttributeValue> nextHead = new HashMap<>(toActivationItem(tenant, pipeline, event));
             nextHead.put(REGISTRY_SORT, avS(HEAD_SORT));
@@ -341,9 +420,15 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
                     .expressionAttributeValues(Map.of(":previous", avN(sequence - 1), ":type", avS(HEAD_TYPE)));
             }
             writes.add(TransactWriteItem.builder().put(headPut.build()).build());
-            receipt.ifPresent(value -> writes.add(absentPut(Map.of(
-                REGISTRY_KEY, avS(partitionKey(tenant, pipeline)), REGISTRY_SORT, avS(operationSort(tenant, pipeline, value.operationKey())),
-                RECORD_TYPE, avS(OPERATION_TYPE), RECEIPT_JSON, avS(toJson(value))))));
+            receipt.ifPresent(value -> {
+                Map<String, AttributeValue> operationItem = new HashMap<>(Map.of(
+                    REGISTRY_KEY, avS(partitionKey(tenant, pipeline)), REGISTRY_SORT, avS(operationSort(tenant, pipeline, value.operationKey())),
+                    RECORD_TYPE, avS(OPERATION_TYPE), RECEIPT_JSON, avS(toJson(value))));
+                if (expected != null) {
+                    operationItem.put(EXPECTED_ACTIVATION_ID, avS(expected));
+                }
+                writes.add(absentPut(operationItem));
+            });
             try {
                 dynamoClient().transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writes).build());
                 return receipt;
@@ -351,12 +436,9 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
                 var reasons = conflict.cancellationReasons();
                 // The first transaction member verifies the immutable registered Release.
                 if (!reasons.isEmpty() && "ConditionalCheckFailed".equals(reasons.getFirst().code())) throw conflict;
-                if (receipt.isPresent()) {
-                    Optional<ActivationOperationReceipt> winner = operationBlocking(tenant, pipeline, receipt.get().operationKey());
-                    if (winner.isPresent()) {
-                        winner.get().requireIntent(new ActivationOperationCommand(receipt.get().operationKey(), release, now));
-                        return winner;
-                    }
+                var winner = command.flatMap(value -> replayActivation(value, expected));
+                if (winner.isPresent()) {
+                    return winner;
                 }
                 if (reasons.stream().anyMatch(reason -> "TransactionConflict".equals(reason.code())
                     || "ThrottlingError".equals(reason.code()))) {
@@ -454,7 +536,17 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
             .consistentRead(true).limit(1).build()).items().isEmpty();
     }
 
-    private Optional<ActivationOperationReceipt> operationBlocking(String tenant, String pipeline, String operationKey) {
+    /** Replays immutable evidence before looking at the current activation head. */
+    private Optional<ActivationOperationReceipt> replayActivation(ActivationOperationCommand command, String expected) {
+        var release = command.release();
+        return operationBlocking(release.tenantId(), release.pipelineId(), command.operationKey()).map(operation -> {
+            operation.receipt().requireIntent(command);
+            ActivationPrecondition.requireReplay(operation.expectedActivationId(), expected);
+            return operation.receipt();
+        });
+    }
+
+    private Optional<StoredActivationOperation> operationBlocking(String tenant, String pipeline, String operationKey) {
         Map<String, AttributeValue> item = readItem(tenant, pipeline, operationSort(tenant, pipeline, operationKey));
         if (item.isEmpty()) {
             return Optional.empty();
@@ -466,19 +558,33 @@ public class DynamoPipelineReleaseRegistry implements PipelineReleaseRegistry {
         if (!receipt.tenantId().equals(tenant) || !receipt.pipelineId().equals(pipeline) || !receipt.operationKey().equals(operationKey)) {
             throw new IllegalStateException("Activation operation scope mismatch");
         }
-        return Optional.of(receipt);
+        String expected = null;
+        if (item.containsKey(EXPECTED_ACTIVATION_ID)) {
+            expected = item.get(EXPECTED_ACTIVATION_ID).s();
+            if (expected == null) {
+                throw new IllegalStateException("Invalid activation operation expected head");
+            }
+        }
+        return Optional.of(new StoredActivationOperation(receipt, expected));
     }
+
+    private record StoredActivationOperation(ActivationOperationReceipt receipt, String expectedActivationId) {}
 
     private static String operationSort(String tenant, String pipeline, String operationKey) {
         if (operationKey == null || operationKey.isBlank()) {
             throw new IllegalArgumentException("operationKey must not be blank");
         }
+        return scopedSort("activation-operation:v1:", List.of(tenant, pipeline, operationKey));
+    }
+
+    /** Hashes a structured identity to keep the storage key bounded and unambiguous. */
+    private static String scopedSort(String prefix, List<String> identity) {
         try {
-            byte[] bytes = PipelineJson.mapper().writeValueAsBytes(List.of(tenant, pipeline, operationKey));
-            return "activation-operation:v1:" + java.util.HexFormat.of().formatHex(
+            byte[] bytes = PipelineJson.mapper().writeValueAsBytes(identity);
+            return prefix + java.util.HexFormat.of().formatHex(
                 java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
         } catch (Exception failure) {
-            throw new IllegalArgumentException("Invalid activation operation scope", failure);
+            throw new IllegalArgumentException("Invalid registry scope", failure);
         }
     }
 

@@ -53,7 +53,7 @@ class AwsDurableDeploymentHardeningTest {
             assertEquals("/", instance.get(1).get(0).asText());
             assertEquals("AWS::StackId", instance.get(1).get(1).asText());
         }
-        assertEquals(10, hosts);
+        assertEquals(11, hosts);
     }
 
     @Test
@@ -111,7 +111,7 @@ class AwsDurableDeploymentHardeningTest {
         assertFalse(env.has("PIPELINE_ORCHESTRATOR_WORKER_SQS_SHARED_SECRET"));
         assertEquals("ResumeTokenSecretVersion", env.path("TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION").asText());
         assertEquals("WorkerSharedSecretVersion", env.path("TPF_AWS_DURABLE_WORKER_SECRET_VERSION").asText());
-        for (String role : List.of("ActionRole", "WorkerRole", "WakeupRole", "DueWorkRole")) {
+        for (String role : List.of("ActionRole", "HttpRole", "WorkerRole", "WakeupRole", "DueWorkRole")) {
             var statements = resources.path(role).path("Properties").path("Policies").get(0).path("PolicyDocument").path("Statement");
             boolean read = false, decrypt = false;
             for (var statement : statements) {
@@ -266,7 +266,7 @@ class AwsDurableDeploymentHardeningTest {
             assertTrue(template.path("Parameters").has(name));
             assertFalse(template.path("Parameters").path(name).has("Default"));
         }
-        assertEquals(List.of("FRESH_RELEASE_ISOLATED_STACK", "DRAINED_RELEASE_MIGRATION"),
+        assertEquals(List.of("FRESH_RELEASE_ISOLATED_STACK", "DRAINED_RELEASE_MIGRATION", "RETAINED_RELEASE_VERSIONS"),
             new ObjectMapper().convertValue(template.path("Parameters").path("ReleaseIsolationMode").path("AllowedValues"), List.class));
         assertTrue(template.path("Rules").has("ReleaseIsolationValidated"));
         assertEquals("ReleaseIsolationValidation", template.path("Rules").path("ReleaseIsolationValidated")

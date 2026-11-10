@@ -10,6 +10,7 @@ import com.google.protobuf.Value;
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.context.PipelineContext;
 import org.pipelineframework.config.pipeline.PipelineJson;
+import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -22,6 +23,24 @@ import static org.mockito.Mockito.when;
 class TransitionCommandEnvelopeTest {
 
     private final JsonTransitionPayloadCodec payloadCodec = new JsonTransitionPayloadCodec();
+
+    @Test
+    void awsDurableAllowsExactPackagedPayloadTypesWithoutAllowingTheirPackage() throws Exception {
+        var config = mock(PipelineOrchestratorConfig.class);
+        when(config.coordinationHost()).thenReturn(CoordinationHost.AWS_DURABLE);
+        var resolver = mock(PipelineReleaseIdentityResolver.class);
+        var contract = mock(PipelineContractDescriptor.class);
+        when(contract.steps()).thenReturn(List.of(new PipelineBundleStepDescriptor(0, "Transform", "internal",
+            "ONE_TO_ONE", String.class.getName(), java.net.URI.class.getName(), "app.Service", "app.Client", Map.of())));
+        when(resolver.contract()).thenReturn(contract);
+        payloadCodec.orchestratorConfig = config;
+        payloadCodec.releaseIdentityResolver = resolver;
+        var uri = java.net.URI.create("https://example.invalid/result");
+        assertEquals(uri, payloadCodec.decode(payloadCodec.encode(uri)));
+        var foreign = new SerializedTransitionPayload(java.net.URL.class.getName(), JsonTransitionPayloadCodec.ENCODING,
+            "\"https://example.invalid/result\"");
+        assertThrows(IllegalArgumentException.class, () -> payloadCodec.decode(foreign));
+    }
 
     @Test
     void preservesTypedUniInputPayloadAcrossEnvelopeRoundTrip() {

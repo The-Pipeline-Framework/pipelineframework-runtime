@@ -71,9 +71,10 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             }
             @Override public java.util.Iterator<String> iterateNames() { return originalContext.iterateNames(); }
         };
+        boolean http = value(context, PREFIX + "http.enabled").filter("true"::equals).isPresent();
         if (value(context, PREFIX + "deployment-validation").isEmpty()) {
-            if (!settings.isEmpty() || List.of(PREFIX + "configuration",
-                PREFIX + "signing-source", PREFIX + "resume-token-parameter-arn", PREFIX + "worker-parameter-arn",
+            if (http || !settings.isEmpty() || List.of(PREFIX + "configuration", PREFIX + "transition-worker-placement", PREFIX + "http.coordinator-function-family",
+                PREFIX + "command-effect-table", PREFIX + "query-capture-table", PREFIX + "signing-source", PREFIX + "resume-token-parameter-arn", PREFIX + "worker-parameter-arn",
                 PREFIX + "resume-token-parameter-version", PREFIX + "worker-parameter-version",
                 PREFIX + "resume-token-secret-arn", PREFIX + "worker-secret-arn",
                 PREFIX + "resume-token-secret-version", PREFIX + "worker-secret-version",
@@ -113,12 +114,36 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         }
         for (String property : List.of("pipeline.orchestrator.pipeline-id", "pipeline.orchestrator.release-version",
             "pipeline.orchestrator.releases.storage.s3.bucket", "pipeline.orchestrator.queue-url",
-            "pipeline.orchestrator.dlq-url", "pipeline.orchestrator.worker.sqs.request-queue-url",
-            "pipeline.orchestrator.worker.sqs.response-queue-url", "pipeline.orchestrator.worker.sqs.pipeline-id",
+            "pipeline.orchestrator.dlq-url", "pipeline.orchestrator.worker.sqs.pipeline-id",
             "pipeline.orchestrator.worker.sqs.contract-version", "pipeline.orchestrator.worker.sqs.release-version",
             "pipeline.orchestrator.worker.sqs.artifact-id", "pipeline.orchestrator.worker.sqs.artifact-digest",
             PREFIX + "binding-table")) {
             required(context, property);
+        }
+        validateTransitionPlacement(context, originalContext);
+        if (value(context, PREFIX + "release-isolation-mode").isPresent()) {
+            requireEqual(context, PREFIX + "release-isolation-mode", "RETAINED_RELEASE_VERSIONS");
+            requireEqual(context, PREFIX + "retained-validation", "validated");
+            String handler = http ? value(context, "quarkus.lambda.handler").orElse("")
+                : required(context, "quarkus.lambda.handler");
+            if (Set.of("aws-durable-action", "aws-durable-work-item", "aws-durable-transition-worker", "aws-durable-await-completion").contains(handler)) {
+                required(context, PREFIX + "entry-id");
+            }
+            if (Set.of("aws-durable-action", "aws-durable-due-work").contains(handler)) {
+                required(context, PREFIX + "continuation-entry-id");
+                if (!required(context, PREFIX + "action-function-family").matches(
+                    "arn:[a-z0-9-]+:lambda:[a-z0-9-]+:[0-9]{12}:function:[A-Za-z0-9_-]+")) {
+                    throw new IllegalArgumentException("Retained mode requires an exact Action function family");
+                }
+            }
+            var compiled = new org.pipelineframework.orchestrator.release.PipelineContractDescriptorLoader().load()
+                .orElseThrow(() -> new IllegalStateException("Retained mode requires actual compiled Contract metadata"));
+            if (compiled.steps().isEmpty()) throw new IllegalStateException("Retained mode requires a compiled pipeline entry");
+        }
+        if (http && (!required(context, PREFIX + "http.coordinator-function-family").matches(
+                "arn:[a-z0-9-]+:lambda:[a-z0-9-]+:[0-9]{12}:function:[A-Za-z0-9_-]+")
+            || value(context, "quarkus.lambda.handler").filter(value -> !value.isBlank()).isPresent())) {
+            throw new IllegalArgumentException("HTTP Durable admission requires a trusted coordinator family and the HTTP handler");
         }
         new AwsDurableHostLimits(
             Math.toIntExact(number(context, PREFIX + "estimated-operations")),
@@ -138,6 +163,8 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
                 throw new IllegalArgumentException("Pinned deployment must not also configure " + property);
             }
         }
+        var commandSettings = storeSettings(originalContext, "command-effect-table", "pipeline.command.effect-store");
+        var querySettings = storeSettings(originalContext, "query-capture-table", "pipeline.query.capture-store");
         // Validate both references before the first network call; absent or floating versions fail closed.
         String signingSource = value(context, PREFIX + "signing-source").orElse("SECRETS_MANAGER");
         String resume;
@@ -163,9 +190,52 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             throw new IllegalArgumentException("Unsupported AWS Durable signing source");
         }
         var resolved = new java.util.HashMap<>(settings);
+        resolved.putAll(commandSettings);
+        resolved.putAll(querySettings);
         resolved.put("pipeline.orchestrator.resume-token-secret", resume);
         resolved.put("pipeline.orchestrator.worker.sqs.shared-secret", worker);
         return List.of(new PinnedSecrets(resolved));
+    }
+
+    private void validateTransitionPlacement(ConfigSourceContext context, ConfigSourceContext original) {
+        String placement = value(context, PREFIX + "transition-worker-placement").orElse("FUNCTION");
+        String request = "pipeline.orchestrator.worker.sqs.request-queue-url";
+        String response = "pipeline.orchestrator.worker.sqs.response-queue-url";
+        switch (placement) {
+            case "FUNCTION", "COMPUTE" -> {
+                required(context, request);
+                required(context, response);
+            }
+            case "IN_PROCESS" -> {
+                for (String name : List.of(request, response, "pipeline.orchestrator.worker.rest.base-url",
+                    "pipeline.orchestrator.worker.grpc.endpoint")) {
+                    if (value(context, name).filter(v -> !v.isBlank()).isPresent()
+                        || value(original, name).filter(v -> !v.isBlank()).isPresent()) {
+                        throw new IllegalArgumentException("In-process placement forbids a remote worker: " + name);
+                    }
+                }
+                if (value(context, "pipeline.orchestrator.worker.targeting-mode").filter("registered-rest"::equals).isPresent()
+                    || value(context, "quarkus.lambda.handler").filter("aws-durable-transition-worker"::equals).isPresent()) {
+                    throw new IllegalArgumentException("In-process placement forbids a remote transition handler");
+                }
+            }
+            default -> throw new IllegalArgumentException("Unsupported transition worker placement");
+        }
+    }
+
+    private Map<String, String> storeSettings(ConfigSourceContext context, String binding, String prefix) {
+        var table = value(context, PREFIX + binding).filter(v -> !v.isBlank());
+        if (table.isEmpty()) return Map.of();
+        if (!table.orElseThrow().matches("[A-Za-z0-9_.-]{3,255}"))
+            throw new IllegalArgumentException("Invalid durable table binding: " + binding);
+        var pinned = Map.of(prefix + ".provider", "dynamo", prefix + ".dynamo.table", table.orElseThrow());
+        for (var entry : pinned.entrySet()) {
+            ConfigValue actual = context.getValue(entry.getKey());
+            if (actual != null && actual.getConfigSourceOrdinal() >= PINNED_SOURCE_ORDINAL
+                && !entry.getValue().equals(actual.getValue()))
+                throw new IllegalArgumentException("Durable table binding conflicts with effective runtime configuration: " + binding);
+        }
+        return pinned;
     }
 
     private Map<String, String> deploymentSettings(ConfigSourceContext context) {

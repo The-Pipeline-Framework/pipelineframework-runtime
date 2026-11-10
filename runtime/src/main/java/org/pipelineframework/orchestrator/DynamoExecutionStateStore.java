@@ -103,6 +103,16 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
     private static final String INITIAL_INPUT_PIPELINE_VERSION = "initial_input_pipeline_version";
     private static final String INITIAL_INPUT_PIPELINE_REPLAY_MODE = "initial_input_pipeline_replay_mode";
     private static final String INITIAL_INPUT_PIPELINE_CACHE_POLICY = "initial_input_pipeline_cache_policy";
+    private static final List<Map.Entry<String, String>> INITIAL_INPUT_ATTRIBUTES = List.of(
+            Map.entry(INPUT_SHAPE, INITIAL_INPUT_SHAPE),
+            Map.entry(INPUT_PAYLOAD_JSON, INITIAL_INPUT_PAYLOAD_JSON),
+            Map.entry(INPUT_PAYLOAD_REFERENCE, INITIAL_INPUT_PAYLOAD_REFERENCE),
+            Map.entry(INPUT_PAYLOAD_DIGEST, INITIAL_INPUT_PAYLOAD_DIGEST),
+            Map.entry(INPUT_PAYLOAD_TYPE_ID, INITIAL_INPUT_PAYLOAD_TYPE_ID),
+            Map.entry(INPUT_PAYLOAD_ENCODING, INITIAL_INPUT_PAYLOAD_ENCODING),
+            Map.entry(INPUT_PIPELINE_VERSION, INITIAL_INPUT_PIPELINE_VERSION),
+            Map.entry(INPUT_PIPELINE_REPLAY_MODE, INITIAL_INPUT_PIPELINE_REPLAY_MODE),
+            Map.entry(INPUT_PIPELINE_CACHE_POLICY, INITIAL_INPUT_PIPELINE_CACHE_POLICY));
     private static final int BATCH_GET_MAX_ATTEMPTS = 4;
     private static final long BATCH_GET_RETRY_BUDGET_MS = 750L;
     private static final long BATCH_GET_RETRY_INITIAL_DELAY_MS = 50L;
@@ -373,6 +383,22 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             tenantId,
             scopedExecutionKey(tenantId, executionKey),
             System.currentTimeMillis()));
+    }
+
+    @Override
+    public Uni<Optional<Object>> getInitialExecutionInput(ExecutionRecord<Object, Object> execution) {
+        return blocking(() -> {
+            var persisted = readExecutionItem(execution.tenantId(), execution.executionId());
+            if (!execution.tenantId().equals(readString(persisted, TENANT_ID))
+                || !execution.executionId().equals(readString(persisted, EXECUTION_ID))
+                || !execution.executionKey().equals(readString(persisted, EXECUTION_KEY))) {
+                return Optional.empty();
+            }
+            Map<String, AttributeValue> input = new HashMap<>();
+            INITIAL_INPUT_ATTRIBUTES.forEach(attribute ->
+                copyAttribute(persisted, attribute.getValue(), input, attribute.getKey()));
+            return Optional.ofNullable(readInputPayload(withCurrentStepIndex(execution, 0), input));
+        });
     }
 
     @Override
@@ -1843,16 +1869,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             throw new IllegalStateException(
                 "Command reissue requires the retained initial execution input");
         }
-        List<Map.Entry<String, String>> attributes = List.of(
-            Map.entry(INPUT_SHAPE, INITIAL_INPUT_SHAPE),
-            Map.entry(INPUT_PAYLOAD_JSON, INITIAL_INPUT_PAYLOAD_JSON),
-            Map.entry(INPUT_PAYLOAD_REFERENCE, INITIAL_INPUT_PAYLOAD_REFERENCE),
-            Map.entry(INPUT_PAYLOAD_DIGEST, INITIAL_INPUT_PAYLOAD_DIGEST),
-            Map.entry(INPUT_PAYLOAD_TYPE_ID, INITIAL_INPUT_PAYLOAD_TYPE_ID),
-            Map.entry(INPUT_PAYLOAD_ENCODING, INITIAL_INPUT_PAYLOAD_ENCODING),
-            Map.entry(INPUT_PIPELINE_VERSION, INITIAL_INPUT_PIPELINE_VERSION),
-            Map.entry(INPUT_PIPELINE_REPLAY_MODE, INITIAL_INPUT_PIPELINE_REPLAY_MODE),
-            Map.entry(INPUT_PIPELINE_CACHE_POLICY, INITIAL_INPUT_PIPELINE_CACHE_POLICY));
+        var attributes = INITIAL_INPUT_ATTRIBUTES;
         List<String> setExpressions = new ArrayList<>();
         List<String> removeNames = new ArrayList<>();
         for (int index = 0; index < attributes.size(); index++) {
@@ -2122,7 +2139,12 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         String source,
         String target
     ) {
-        Optional.ofNullable(item.get(source)).ifPresent(value -> item.put(target, value));
+        copyAttribute(item, source, item, target);
+    }
+
+    private static void copyAttribute(Map<String, AttributeValue> sourceItem, String source,
+        Map<String, AttributeValue> targetItem, String target) {
+        Optional.ofNullable(sourceItem.get(source)).ifPresent(value -> targetItem.put(target, value));
     }
 
     private void putSerializedInputPayload(

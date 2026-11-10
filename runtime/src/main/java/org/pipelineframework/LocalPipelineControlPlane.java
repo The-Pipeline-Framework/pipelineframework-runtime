@@ -19,13 +19,17 @@ import org.pipelineframework.orchestrator.CoordinatorSweepResult;
 import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 import org.pipelineframework.orchestrator.AwaitItemContinuationResult;
 import org.pipelineframework.orchestrator.AwaitSemanticCheckpoint;
+import org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint;
+import org.pipelineframework.orchestrator.ExecutionClientAdmission;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.ExecutionRedriveResult;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
 import org.pipelineframework.orchestrator.PipelineControlPlane;
+import org.pipelineframework.orchestrator.PipelineRuntimeIdentityObservation;
 import org.pipelineframework.orchestrator.PipelineTransitionWorker;
 import org.pipelineframework.orchestrator.dto.ExecutionStatusDto;
 import org.pipelineframework.orchestrator.dto.RunAsyncAcceptedDto;
+import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 
 /**
  * Local in-process control-plane facade backed by the queue async coordinator.
@@ -101,8 +105,25 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     }
 
     @Override
+    public Uni<Optional<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(
+        String tenantId, String clientKey, String pipelineId, String releaseVersion) {
+        return queueAsyncCoordinator.getExecutionSemanticCheckpointByClientKey(tenantId, clientKey, pipelineId, releaseVersion);
+    }
+
+    @Override
+    public Uni<Optional<ExecutionClientAdmission>> getExecutionAdmissionByClientKey(
+        String tenantId, String clientKey, String pipelineId, String releaseVersion) {
+        return queueAsyncCoordinator.getExecutionAdmissionByClientKey(tenantId, clientKey, pipelineId, releaseVersion);
+    }
+
+    @Override
     public Uni<ExecutionStatusDto> getExecutionStatus(String tenantId, String executionId) {
         return queueAsyncCoordinator.getExecutionStatus(tenantId, executionId);
+    }
+
+    @Override
+    public Uni<SerializedTransitionPayload> getExecutionTypedResult(ExecutionSemanticCheckpoint pin) {
+        return queueAsyncCoordinator.getExecutionTypedResult(pin);
     }
 
     @Override
@@ -115,11 +136,29 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
         return queueAsyncCoordinator.getExecutionResultPayload(tenantId, executionId);
     }
 
+    /** Reads the runtime identity only after the generated pipeline passes startup health checks. */
+    @Override
+    public Uni<PipelineRuntimeIdentityObservation> runtimeIdentity(String tenantId) {
+        return Uni.createFrom().deferred(() -> {
+            if (pipelineExecutionService.getStartupHealthState() != PipelineExecutionService.StartupHealthState.HEALTHY) {
+                return Uni.createFrom().failure(new IllegalStateException("Runtime startup validation has not passed"));
+            }
+            return queueAsyncCoordinator.runtimeIdentity(tenantId, pipelineExecutionService.loadPipelineSteps().size());
+        });
+    }
+
+
     @Override
     public Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs) {
         return queueAsyncCoordinator.sweepOnce(
             nowEpochMs,
             pipelineExecutionService.awaitItemContinuationHandlerForControlPlane());
+    }
+
+    @Override
+    public Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs,
+        org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher dispatcher) {
+        return queueAsyncCoordinator.sweepOnce(nowEpochMs, java.util.Objects.requireNonNull(dispatcher, "dispatcher"));
     }
 
     @Override
@@ -196,6 +235,12 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
         String tenantId,
         String interactionId) {
         return queueAsyncCoordinator.getAwaitSemanticCheckpoint(tenantId, interactionId);
+    }
+
+    @Override
+    public Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpointByCorrelation(
+        String tenantId, String correlationId) {
+        return queueAsyncCoordinator.getAwaitSemanticCheckpointByCorrelation(tenantId, correlationId);
     }
 
     @Override

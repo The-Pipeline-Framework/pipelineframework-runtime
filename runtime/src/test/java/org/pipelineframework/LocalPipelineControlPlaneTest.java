@@ -26,9 +26,11 @@ import org.pipelineframework.orchestrator.dto.ExecutionStatusDto;
 import org.pipelineframework.orchestrator.dto.RunAsyncAcceptedDto;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -53,6 +55,15 @@ class LocalPipelineControlPlaneTest {
     controlPlane = new LocalPipelineControlPlane();
     controlPlane.queueAsyncCoordinator = queueAsyncCoordinator;
     controlPlane.pipelineExecutionService = pipelineExecutionService;
+  }
+
+  @Test
+  void runtimeIdentityRequiresSuccessfulStartupBeforeReadingRelease() {
+    when(pipelineExecutionService.getStartupHealthState())
+        .thenReturn(PipelineExecutionService.StartupHealthState.PENDING);
+
+    assertThrows(IllegalStateException.class, () -> controlPlane.runtimeIdentity("tenant-1").await().indefinitely());
+    verifyNoInteractions(queueAsyncCoordinator);
   }
 
   @Test

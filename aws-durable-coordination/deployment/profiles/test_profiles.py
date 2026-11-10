@@ -52,21 +52,164 @@ def fixture(profile='RESTRICTED_PILOT'):
 
 
 def graph(template, profile):
-    return p.resources(template, {'DeploymentProfile': profile,
+    return p.resources(template, {'HttpEntryId':'', 'QueryCaptureTable':'', 'CommandEffectTable':'', 'RetainedDurableVersionArns':[''], 'RetainedWorkerVersionArns':[''], 'RetainedActionVersionArns':[''], 'ReleaseIsolationMode': 'FRESH_RELEASE_ISOLATED_STACK', 'DeploymentProfile': profile,
                        'SigningSource': 'SECRETS_MANAGER' if profile == 'HARDENED' else 'SSM_STANDARD',
                        'TransitionWorkerPlacement': 'FUNCTION', 'RuntimePermissionsBoundaryArn': ''})
+
+
+def project_reserved_capacity(template):
+    """Prove the opt-in wrapper, then compare the original branch against frozen evidence."""
+    selector = {'Fn::Equals': [{'Ref': 'RestrictedPilotValidation'}, 'UNRESERVED_SERIAL_SMOKE']}
+    assert template['Conditions'].pop('UnreservedSerialSmoke') == selector
+    assert template['Rules'].pop('UnreservedSerialSmokeRequirements')['RuleCondition'] == selector
+    validation = template['Parameters']['RestrictedPilotValidation']
+    assert validation['AllowedValues'].pop() == 'UNRESERVED_SERIAL_SMOKE'
+    validation['Description'] = 'Attest supervised admissions, operator failure checks, service-owned encryption and exact external resource metadata; no unattended operations acceptance'
+    for assertion in template['Rules']['RestrictedPilotRequirements']['Assertions']:
+        if assertion['AssertDescription'] == 'Restricted pilot requires supervised operational and security acceptance':
+            prior = {'Fn::Equals': [{'Ref': 'RestrictedPilotValidation'}, 'validated']}
+            assert assertion['Assert'] == {'Fn::Or': [prior, selector]}
+            assertion['Assert'] = prior
+    for resource in template['Resources'].values():
+        props = resource.get('Properties', {})
+        if isinstance(props.get('ReservedConcurrentExecutions'), dict):
+            wrap = props['ReservedConcurrentExecutions']['Fn::If']
+            assert wrap[:2] == ['UnreservedSerialSmoke', {'Ref': 'AWS::NoValue'}]
+            props['ReservedConcurrentExecutions'] = wrap[2]
+        scaling = props.get('ScalingConfig', {})
+        if isinstance(scaling.get('MaximumConcurrency'), dict):
+            wrap = scaling['MaximumConcurrency']['Fn::If']
+            assert wrap[:2] == ['UnreservedSerialSmoke', 2]
+            scaling['MaximumConcurrency'] = wrap[2]
 
 
 def legacy_deployment_contract(template):
     """Preserve frozen graphs after proving only the reviewed CodeUri/queue-isolation deltas."""
     template = copy.deepcopy(template)
+    project_reserved_capacity(template)
+    # Project the exact new placement condition onto the two pre-existing
+    # modes before comparing their frozen hashes. Other expressions remain.
+    placement = template['Parameters']['TransitionWorkerPlacement']
+    assert placement['AllowedValues'].pop() == 'IN_PROCESS'
+    placement['Description'] = 'COMPUTE disables only transition Lambda consumption; one external consumer must own the signed request queue'
+    assert template['Globals']['Function'].pop('Environment') == {
+        'Variables': {'TPF_AWS_DURABLE_TRANSITION_WORKER_PLACEMENT': {'Ref': 'TransitionWorkerPlacement'}}}
+    assert template['Conditions'].pop('TransitionQueues') == {
+        'Fn::Not': [{'Fn::Equals': [{'Ref': 'TransitionWorkerPlacement'}, 'IN_PROCESS']}]}
+    assert template['Conditions'].pop('HardenedTransitionQueues') == {
+        'Fn::And': [{'Condition': 'HardenedProfile'}, {'Condition': 'TransitionQueues'}]}
+    assert template['Conditions'].pop('RetainedRemoteTransitions') == {
+        'Fn::And': [{'Condition': 'RetainedReleaseMode'}, {'Condition': 'FunctionTransitionConsumer'}]}
+    for name in ('TransitionDlq', 'TransitionRequestQueue', 'TransitionResponseQueue'):
+        assert template['Resources'][name].pop('Condition') == 'TransitionQueues'
+    for name in ('TransitionDlqAlarm', 'TransitionRequestQueueAgeAlarm', 'TransitionResponseQueueAgeAlarm'):
+        assert template['Resources'][name]['Condition'] == 'HardenedTransitionQueues'
+        template['Resources'][name]['Condition'] = 'HardenedProfile'
+    for name in ('TransitionRequestQueueUrl', 'TransitionResponseQueueUrl'):
+        assert template['Outputs'][name].pop('Condition') == 'TransitionQueues'
+    for assertion in template['Rules']['RestrictedPilotRequirements']['Assertions']:
+        if assertion['AssertDescription'] == 'Restricted profile requires FUNCTION or IN_PROCESS placement':
+            assert assertion['Assert'] == {'Fn::Not': [{'Fn::Equals': [{'Ref': 'TransitionWorkerPlacement'}, 'COMPUTE']}]}
+            assertion.update(Assert={'Fn::Equals': [{'Ref': 'TransitionWorkerPlacement'}, 'FUNCTION']},
+                             AssertDescription='Restricted profile qualifies only the native FUNCTION consumer')
+    def project_queue_condition(value):
+        if isinstance(value, list):
+            return [project_queue_condition(item) for item in value]
+        if isinstance(value, dict):
+            if set(value) == {'Fn::If'} and value['Fn::If'][0] == 'TransitionQueues':
+                return project_queue_condition(value['Fn::If'][1])
+            return {key: project_queue_condition(item) for key, item in value.items()}
+        return value
+    template = project_queue_condition(template)
+    worker_statements = template['Resources']['WorkerRole']['Properties']['Policies'][0]['PolicyDocument']['Statement']
+    worker_statements[:] = [stmt for stmt in worker_statements
+                           if stmt.get('Fn::If', [None])[0] != 'RetainedRemoteTransitions']
+    manifest = template['Outputs']['DeploymentReleaseManifest']['Value']['Fn::Sub']
+    for name in ('TransitionRequestQueue', 'TransitionResponseQueue', 'TransitionDlq'):
+        assert manifest[1].pop(name + 'UrlForManifest') == {'Ref': name}
+        manifest[0] = manifest[0].replace('${' + name + 'UrlForManifest}', '${' + name + '}')
+    assert template['Outputs'].pop('HttpFunctionArn') == {
+        'Condition': 'HttpIngressSelected', 'Value': {'Ref': 'HttpVersion'}}
+    http_manifest_fields = {
+        'HttpManifestCode': ',"httpCodeSha256":"${HttpCodeSha256}"',
+        'HttpManifestVersion': ',"http":"${HttpVersion}"',
+        'HttpManifestLogGroup': ',"http":"${HttpFunctionLogs}"',
+    }
+    for name, field in http_manifest_fields.items():
+        assert manifest[1].pop(name) == {'Fn::If': ['HttpIngressSelected', {'Fn::Sub': field}, '']}
+        token = '${' + name + '}'
+        assert manifest[0].count(token) == 1
+        manifest[0] = manifest[0].replace(token, '')
+    for name in ('HttpArtifactUri', 'HttpCodeSha256', 'HttpEntryId'):
+        del template['Parameters'][name]
+    del template['Conditions']['HttpIngressSelected']
+    del template['Conditions']['HardenedHttpIngress']
+    del template['Rules']['PrivateHttpReleasePublication']
+    for name in ('HttpFunction', 'HttpVersion', 'HttpRole', 'HttpFunctionLogs'):
+        assert template['Resources'].pop(name)['Condition'] == 'HttpIngressSelected'
+    for name in ('HttpFunctionErrorsAlarm', 'HttpFunctionThrottlesAlarm'):
+        assert template['Resources'].pop(name)['Condition'] == 'HardenedHttpIngress'
+    assert template['Parameters'].pop('QueryCaptureTable')['Default'] == ''
+    assert template['Conditions'].pop('HasQueryCaptureTable') == {'Fn::Not': [{'Fn::Equals': [{'Ref': 'QueryCaptureTable'}, '']}]}
+    assert template['Parameters'].pop('CommandEffectTable')['Default'] == ''
+    assert template['Conditions'].pop('HasCommandEffectTable') == {'Fn::Not': [{'Fn::Equals': [{'Ref': 'CommandEffectTable'}, '']}]}
+    for resource in template['Resources'].values():
+        env = resource.get('Properties', {}).get('Environment', {}).get('Variables', {})
+        if 'TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE' in env:
+            assert env.pop('TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE') == {'Fn::If': ['HasQueryCaptureTable', {'Ref':'QueryCaptureTable'}, {'Ref':'AWS::NoValue'}]}
+            assert env.pop('PIPELINE_AWAIT_ADMISSION_STORE') == 'dynamo'
+        if 'TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE' in env:
+            assert env.pop('TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE') == {'Fn::If': ['HasCommandEffectTable', {'Ref':'CommandEffectTable'}, {'Ref':'AWS::NoValue'}]}
+    retained_parameters = ['RetainedReleaseValidation', 'WorkEntryId', 'TransitionEntryId', 'AwaitCompletionEntryId', 'ActionEntryId', 'RetainedWorkerVersionArns', 'RetainedActionVersionArns', 'RetainedDurableVersionArns']
+    for name in retained_parameters:
+        assert name in template['Parameters']
+        del template['Parameters'][name]
+    assert template['Parameters']['ReleaseIsolationMode']['AllowedValues'] == ['FRESH_RELEASE_ISOLATED_STACK', 'DRAINED_RELEASE_MIGRATION', 'RETAINED_RELEASE_VERSIONS']
+    template['Parameters']['ReleaseIsolationMode']['AllowedValues'].pop()
+    template['Parameters']['ReleaseIsolationValidation']['Description'] = 'Explicitly attest the selected isolation mode; moving shared consumers or coordinator aliases while retained executions need the previous release is forbidden'
+    template['Rules']['ReleaseIsolationValidated']['Assertions'][0]['AssertDescription'] = 'Require a fresh release-isolated stack or fully drained migration; compatible in-place upgrades are not accepted'
+    restricted_isolation = template['Rules']['RestrictedPilotRequirements']['Assertions'][3]
+    fresh = {'Fn::Equals': [{'Ref': 'ReleaseIsolationMode'}, 'FRESH_RELEASE_ISOLATED_STACK']}
+    retained = {'Fn::Equals': [{'Ref': 'ReleaseIsolationMode'}, 'RETAINED_RELEASE_VERSIONS']}
+    assert restricted_isolation == {
+        'Assert': {'Fn::Or': [fresh, retained]},
+        'AssertDescription': 'Restricted releases require a fresh stack or validated retained routing with unchanged signing and encryption',
+    }
+    restricted_isolation.update(
+        Assert=fresh,
+        AssertDescription='Never retrofit service-owned encryption or SSM onto retained release resources')
+    assert template['Rules'].pop('RetainedReleaseRequirements')['RuleCondition'] == {'Fn::Equals': [{'Ref': 'ReleaseIsolationMode'}, 'RETAINED_RELEASE_VERSIONS']}
+    for name in ['RetainedReleaseMode', 'HasRetainedWorkerVersions', 'HasRetainedActionVersions', 'HasRetainedDurableVersions']:
+        del template['Conditions'][name]
+    for name in ['RetainedReleaseRegistryReadOnlyPolicy', 'RetainedWorkerInvocationPolicy', 'RetainedActionInvocationPolicy']:
+        assert template['Resources'][name]['Condition'] == 'RetainedReleaseMode'
+        del template['Resources'][name]
+    ingress_statements = template['Resources']['IngressRole']['Properties']['Policies'][0]['PolicyDocument']['Statement']
+    assert ingress_statements.pop() == {'Fn::If': ['HasRetainedDurableVersions', {'Effect':'Allow', 'Action':'lambda:InvokeFunction', 'Resource':{'Ref':'RetainedDurableVersionArns'}}, {'Ref':'AWS::NoValue'}]}
+    for name, resource in template['Resources'].items():
+        props = resource.get('Properties', {})
+        env = props.get('Environment', {}).get('Variables', {})
+        for key in list(env):
+            if key in ['TPF_AWS_DURABLE_RELEASE_ISOLATION_MODE', 'TPF_AWS_DURABLE_RETAINED_VALIDATION', 'TPF_AWS_DURABLE_ENTRY_ID', 'TPF_AWS_DURABLE_CONTINUATION_ENTRY_ID', 'TPF_AWS_DURABLE_ACTION_FUNCTION_FAMILY']:
+                assert env[key]['Fn::If'][0] == 'RetainedReleaseMode' and env[key]['Fn::If'][2] == {'Ref': 'AWS::NoValue'}
+                del env[key]
+        if name == 'ActionFunction':
+            assert props['ReservedConcurrentExecutions'] == {'Fn::If': ['RetainedReleaseMode', 128, 32]}
+            props['ReservedConcurrentExecutions'] = 32
+        if name in ['WorkFunctionWork', 'AwaitCompletionFunctionAwaitCompletion', 'TransitionWorkerFunctionTransition']:
+            assert props['ScalingConfig']['MaximumConcurrency'] == {'Fn::If': ['RetainedReleaseMode', 16, 32]}
+            props['ScalingConfig']['MaximumConcurrency'] = 32
     count = 0
     for resource in template['Resources'].values():
         if resource['Type'] == 'AWS::Serverless::Function':
             assert resource['Properties']['CodeUri'] == {'Fn::Sub': '${ActionArtifactUri}'}
             resource['Properties']['CodeUri'] = {'Ref': 'ActionArtifactUri'}
             settings = resource['Properties']['Environment']['Variables']['TPF_AWS_DURABLE_CONFIGURATION']
-            encoded = settings['Fn::Sub']
+            encoded, substitutions = settings['Fn::Sub']
+            assert substitutions == {'WorkerRequestUrl': {'Ref': 'TransitionRequestQueue'},
+                                     'WorkerResponseUrl': {'Ref': 'TransitionResponseQueue'}}
+            encoded = encoded.replace('${WorkerRequestUrl}', '${TransitionRequestQueue}') \
+                .replace('${WorkerResponseUrl}', '${TransitionResponseQueue}')
             field = ',"sqs.local-loopback":"false"'
             if encoded.count(field) != 1 or json.loads(encoded).get('sqs.local-loopback') != 'false':
                 raise AssertionError('Every semantic host must contain exactly the queue-only correction')
@@ -92,15 +235,70 @@ class Profiles(unittest.TestCase):
 
     def test_legacy_comparison_rejects_missing_or_enabled_queue_isolation(self):
         for name, resource in self.template['Resources'].items():
-            if resource['Type'] != 'AWS::Serverless::Function':
+            if resource['Type'] != 'AWS::Serverless::Function' or name == 'HttpFunction':
                 continue
             for replacement in ['', ',"sqs.local-loopback":"true"']:
                 with self.subTest(host=name, replacement=replacement):
                     changed = copy.deepcopy(self.template)
                     settings = changed['Resources'][name]['Properties']['Environment']['Variables']['TPF_AWS_DURABLE_CONFIGURATION']
-                    settings['Fn::Sub'] = settings['Fn::Sub'].replace(',"sqs.local-loopback":"false"', replacement, 1)
+                    settings['Fn::Sub'][0] = settings['Fn::Sub'][0].replace(',"sqs.local-loopback":"false"', replacement, 1)
                     with self.assertRaisesRegex(AssertionError, 'queue-only correction'):
                         legacy_deployment_contract(changed)
+
+    def test_retained_version_lists_require_retained_mode_unique_arns_and_owner_account(self):
+        values, inventory, guard = fixture()
+        retained = values | dict(ReleaseIsolationMode='RETAINED_RELEASE_VERSIONS',
+                                 RetainedReleaseValidation='validated', WorkEntryId='work',
+                                 TransitionEntryId='transition', AwaitCompletionEntryId='completion',
+                                 ActionEntryId='action')
+        for name, suffix in (('RetainedDurableVersionArns', 'durable'), ('RetainedWorkerVersionArns', 'work'),
+                             ('RetainedActionVersionArns', 'action')):
+            version = f'arn:aws:lambda:us-east-2:123456789012:function:runtime-{suffix}:1'
+            foreign = version.replace('123456789012', '987654321098')
+            with self.subTest(parameter=name):
+                for settings, arns, message in (
+                    (values, [version], 'retained-mode list'),
+                    (retained, [], 'retained-mode list'),
+                    (retained, [version, version], 'retained-mode list'),
+                    (retained, [version, ''], 'retained-mode list'),
+                    (retained, [foreign], 'deployment account'),
+                ):
+                    with self.assertRaisesRegex(ValueError, name + '.*' + message):
+                        p.check(self.template, settings | {name: arns}, inventory, guard, account_id='123456789012')
+                self.assertEqual([version], p.check(
+                    self.template, retained | {name: [version]}, inventory, guard, account_id='123456789012')[name])
+
+    def test_optional_command_table_is_exact_and_bound_to_all_action_functions(self):
+        values, inventory, guard = fixture()
+        values['CommandEffectTable'] = 'effects'
+        with self.assertRaisesRegex(ValueError, 'exact owned DynamoDB ARN'):
+            p.check(self.template, values, inventory, guard)
+        values['SemanticDynamoResourceArns'].append('arn:aws:dynamodb:us-east-2:123456789012:table/effects')
+        with self.assertRaisesRegex(ValueError, 'Command effect table requires its distinct'):
+            p.check(self.template, values | {'ExecutionTable': 'effects'}, inventory, guard)
+        with self.assertRaisesRegex(ValueError, 'Query capture table requires its distinct'):
+            p.check(self.template, values | {'QueryCaptureTable': 'effects'}, inventory, guard)
+        checked = p.check(self.template, values, inventory, guard)
+        active = p.resources(self.template, checked)
+        functions = [r for r in active.values() if r['Type'] == 'AWS::Serverless::Function']
+        self.assertEqual(8, sum(r['Properties'].get('Environment', {}).get('Variables', {}).get('TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE') == 'effects' for r in functions))
+        values['CommandEffectTable'] = ''
+        active = p.resources(self.template, p.check(self.template, values, inventory, guard))
+        self.assertTrue(all('TPF_AWS_DURABLE_COMMAND_EFFECT_TABLE' not in r['Properties'].get('Environment', {}).get('Variables', {}) for r in active.values()))
+
+    def test_query_capture_requires_exact_distinct_table_and_pins_durable_await_admission(self):
+        values, inventory, guard = fixture()
+        values['QueryCaptureTable'] = 'captures'
+        with self.assertRaisesRegex(ValueError, 'distinct exact owned DynamoDB ARN'):
+            p.check(self.template, values, inventory, guard)
+        values['SemanticDynamoResourceArns'].append('arn:aws:dynamodb:us-east-2:123456789012:table/captures')
+        with self.assertRaisesRegex(ValueError, 'distinct exact owned DynamoDB ARN'):
+            p.check(self.template, values | {'ExecutionTable': 'captures'}, inventory, guard)
+        graph = p.resources(self.template, p.check(self.template, values, inventory, guard, account_id='123456789012'))
+        for function in (r for r in graph.values() if r['Type'] == 'AWS::Serverless::Function'):
+            env = function['Properties']['Environment']['Variables']
+            self.assertEqual('captures', env['TPF_AWS_DURABLE_QUERY_CAPTURE_TABLE'])
+            self.assertEqual('dynamo', env['PIPELINE_AWAIT_ADMISSION_STORE'])
 
     def test_default_hardened_resource_graph_matches_published_runtime63(self):
         self.assertEqual('HARDENED', self.template['Parameters']['DeploymentProfile']['Default'])
@@ -108,9 +306,7 @@ class Profiles(unittest.TestCase):
         self.assertEqual('af88bff8b42a5696793faee2356ae8610f031a0d1159afcabeb632d6b80ba222', digest)
 
     def test_optional_boundary_default_preserves_all_existing_parameters(self):
-        # The old published 73-parameter input remains valid; only this optional
-        # field is new and no release-manifest schema field is changed.
-        self.assertEqual(74, len(self.template['Parameters']))
+        self.assertEqual(87, len(self.template['Parameters']))
         spec = self.template['Parameters']['RuntimePermissionsBoundaryArn']
         self.assertEqual('', spec['Default'])
         for profile in ['HARDENED', 'RESTRICTED_PILOT']:
@@ -247,9 +443,12 @@ class Profiles(unittest.TestCase):
 
     def test_manifest_renders_both_discriminants_and_actual_log_references(self):
         import re
-        for profile,placement in [('HARDENED','FUNCTION'),('HARDENED','COMPUTE'),('RESTRICTED_PILOT','FUNCTION')]:
+        for profile, placement, http in [('HARDENED', 'FUNCTION', False), ('HARDENED', 'COMPUTE', False),
+            ('RESTRICTED_PILOT', 'FUNCTION', False), ('RESTRICTED_PILOT', 'FUNCTION', True)]:
             parameters,_,_=fixture(profile)
             parameters['TransitionWorkerPlacement']=placement
+            if http:
+                parameters.update(HttpEntryId='http', HttpCodeSha256='a' * 43 + '=')
             selected=p.conditions(self.template,parameters)
             value=p.resolve(self.template['Outputs']['DeploymentReleaseManifest']['Value'],parameters,selected)
             def sub(node):
@@ -265,7 +464,15 @@ class Profiles(unittest.TestCase):
             self.assertEqual(2,manifest['schemaVersion'])
             self.assertEqual(profile,manifest['deploymentProfile'])
             self.assertEqual('EVENTBRIDGE_RULE',manifest['scheduleProvider'])
-            self.assertEqual(10,len(manifest['logGroupNames']))
+            self.assertEqual(11 if http else 10, len(manifest['logGroupNames']))
+            if http:
+                self.assertEqual(parameters['HttpCodeSha256'], manifest['httpCodeSha256'])
+                self.assertEqual('resolved-HttpVersion', manifest['functionVersionArns']['http'])
+                self.assertEqual('resolved-HttpFunctionLogs', manifest['logGroupNames']['http'])
+            else:
+                self.assertNotIn('httpCodeSha256', manifest)
+                self.assertNotIn('http', manifest['functionVersionArns'])
+                self.assertNotIn('http', manifest['logGroupNames'])
             self.assertEqual('resolved-DurableFunctionLogs',manifest['logGroupNames']['durable'])
             expected_transition='' if placement=='COMPUTE' else 'resolved-TransitionWorkerFunctionLogs'
             self.assertEqual(expected_transition,manifest['logGroupNames']['transition'])

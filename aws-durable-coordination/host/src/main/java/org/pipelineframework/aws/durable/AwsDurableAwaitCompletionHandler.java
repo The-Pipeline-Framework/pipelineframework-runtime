@@ -17,10 +17,14 @@ import org.pipelineframework.awaitable.sqs.SqsAwaitCompletionAction;
 public final class AwsDurableAwaitCompletionHandler implements RequestHandler<SQSEvent, SQSBatchResponse> {
     @Inject
     SqsAwaitCompletionAction action;
+    @Inject
+    AwsDurableReleaseRouter releases;
 
     @Override
     public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
         Duration timeout = Duration.ofSeconds(30);
-        return new AwsDurableSqsBatchAdapter().handle(event, message -> action.handle(message, timeout), timeout);
+        return new AwsDurableSqsBatchAdapter().handle(event, message -> releases == null
+            ? action.handle(message, timeout)
+            : releases.completion(message, context, forwarded -> action.handle(forwarded, timeout)), timeout);
     }
 }

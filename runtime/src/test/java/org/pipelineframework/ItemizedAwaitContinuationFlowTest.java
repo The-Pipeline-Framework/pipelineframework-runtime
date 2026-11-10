@@ -432,6 +432,51 @@ class ItemizedAwaitContinuationFlowTest {
   }
 
   @Test
+  void providerSweepDispatchesPersistedCommandsWithoutLocalApplicationOrDispositionEffects() {
+    var first = new AwaitItemContinuationCommand("tenant-1", "exec-a", "unit-a", "interaction-a", 0, 1, 2000L);
+    var second = new AwaitItemContinuationCommand("tenant-1", "exec-b", "unit-b", "interaction-b", 1, 2, 2000L);
+    when(awaitCoordinator.findDueItemContinuations(2000L, 10))
+        .thenReturn(Uni.createFrom().item(List.of(first, second)));
+    var dispatched = new java.util.ArrayList<AwaitItemContinuationCommand>();
+    flow(executionStateStore, workDispatcher, awaitCoordinator).sweepDue(2000L, 10, command -> {
+      dispatched.add(command);
+      return Uni.createFrom().item(AwaitItemContinuationResult.notReady(command));
+    }).await().indefinitely();
+    assertEquals(List.of(first, second), dispatched);
+    org.mockito.Mockito.verifyNoInteractions(executionStateStore, workDispatcher);
+    verify(awaitCoordinator, never()).getUnit(any(), any());
+    verify(awaitCoordinator, never()).completeItemContinuation(any());
+    verify(awaitCoordinator, never()).rescheduleItemContinuation(any(), org.mockito.ArgumentMatchers.anyInt(), any(Long.class));
+  }
+
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+  void dispatcherFailureStillAttemptsLaterCommandsThenFailsSweepWithoutLocalRescheduling(boolean synchronousFailure) {
+    var first = new AwaitItemContinuationCommand("tenant-1", "exec-a", "unit-a", "interaction-a", 0, 1, 2000L);
+    var second = new AwaitItemContinuationCommand("tenant-1", "exec-b", "unit-b", "interaction-b", 1, 2, 2000L);
+    when(awaitCoordinator.findDueItemContinuations(2000L, 10))
+        .thenReturn(Uni.createFrom().item(List.of(first, second)));
+    var dispatched = new java.util.ArrayList<AwaitItemContinuationCommand>();
+    var unavailable = new IllegalStateException("retained A dispatch unavailable");
+    RuntimeException failure = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, () ->
+        flow(executionStateStore, workDispatcher, awaitCoordinator).sweepDue(2000L, 10, command -> {
+          dispatched.add(command);
+          if (command.equals(first)) {
+            if (synchronousFailure) throw unavailable;
+            return Uni.createFrom().failure(unavailable);
+          }
+          return Uni.createFrom().item(AwaitItemContinuationResult.completed(command));
+        }).await().indefinitely());
+    assertEquals(List.of(first, second), dispatched);
+    var aggregate = assertInstanceOf(io.smallrye.mutiny.CompositeException.class, failure);
+    assertEquals(List.of(unavailable), aggregate.getCauses());
+    org.mockito.Mockito.verifyNoInteractions(executionStateStore, workDispatcher);
+    verify(awaitCoordinator, never()).getUnit(any(), any());
+    verify(awaitCoordinator, never()).completeItemContinuation(any());
+    verify(awaitCoordinator, never()).rescheduleItemContinuation(any(), org.mockito.ArgumentMatchers.anyInt(), any(Long.class));
+  }
+
+  @Test
   void inlineDispatchPersistsRetryAndContinuesWithLaterItems() {
     AwaitInteractionRecord first = itemAwaitRecord("exec-1", 0, AwaitInteractionStatus.COMPLETED, "first");
     AwaitInteractionRecord second = itemAwaitRecord("exec-1", 1, AwaitInteractionStatus.COMPLETED, "second");

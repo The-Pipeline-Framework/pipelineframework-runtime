@@ -284,6 +284,25 @@ public final class AwsDurableCallbackBindingRepository {
         }
     }
 
+    /** Looks up the original locator without needing a callback or relying on the ARN index. */
+    public Optional<org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator> findCurrentRecovery(
+        AwsDurableDriverCheckpoint expected) {
+        String partition = expected.tenantId() + "#" + expected.executionId();
+        var item = read(partition, org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator.sortKey(expected.generation()));
+        if (item.isEmpty()) {
+            return Optional.empty();
+        }
+        if (!"RECOVERY".equals(text(item, RECORD_TYPE))) {
+            throw new IllegalStateException("Unexpected recovery locator record type");
+        }
+        var locator = recoveryFromItem(item);
+        if (!expected.equals(locator.checkpoint())) {
+            throw new IllegalStateException("Recovery locator differs from the requested execution pin");
+        }
+        return isCurrentGeneration(expected.tenantId(), expected.executionId(), expected.generation())
+            ? Optional.of(locator) : Optional.empty();
+    }
+
     public Optional<org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator> findRecoveryByProviderExecutionArn(String arn) {
         var response = dynamo.query(QueryRequest.builder().tableName(tableName)
             .indexName(PROVIDER_REGISTRATION_INDEX)

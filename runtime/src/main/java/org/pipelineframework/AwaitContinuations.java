@@ -119,6 +119,11 @@ class AwaitContinuations {
         saturatedDelayMs);
   }
 
+  Uni<Void> sweepDueItemContinuations(long nowEpochMs, int limit,
+      org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher dispatcher) {
+    return itemizedFlow.sweepDue(nowEpochMs, limit, dispatcher);
+  }
+
   Uni<AwaitCompletionResult> afterRecordedCompletion(
       AwaitCompletionResult result,
       AwaitUnitRecord unit,

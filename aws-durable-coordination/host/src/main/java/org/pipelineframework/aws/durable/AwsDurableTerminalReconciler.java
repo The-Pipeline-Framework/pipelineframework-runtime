@@ -73,7 +73,8 @@ public final class AwsDurableTerminalReconciler {
                 .orElseThrow(() -> new IllegalStateException("execution recovery locator is not visible; retry targeted reconciliation"));
             semantic = admission.executionId().isPresent()
                 ? controlPlane.getExecutionSemanticCheckpoint(admission.tenantId(), admission.executionId().orElseThrow()).await().atMost(timeout)
-                : controlPlane.getExecutionSemanticCheckpointByClientKey(admission.tenantId(), admission.clientKey()).await().atMost(timeout)
+                : controlPlane.getExecutionSemanticCheckpointByClientKey(admission.tenantId(), admission.clientKey(),
+                    admission.pipelineId(), admission.releaseVersion()).await().atMost(timeout)
                     .orElseThrow(() -> new IllegalStateException("semantic admission is not visible; retry without resubmission"));
             if (!admission.pipelineId().equals(semantic.pipelineId())
                 || !admission.contractVersion().equals(semantic.contractVersion())

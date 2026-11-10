@@ -32,14 +32,19 @@ public final class AwsDurableHostServices {
     @Inject
     LambdaClient lambda;
 
+    @Inject
+    AwsDurableReleaseRouter releases;
+
     public AwsDurableControlPlaneActions actions() {
+        org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher dispatcher =
+            releases != null && releases.dueEnabled() ? releases::dispatchDue : null;
         return new AwsDurableControlPlaneActions(
             controlPlane,
             bindings(),
             inputDecoder,
             mapper,
             duration("TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS", 30),
-            duration("TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS", 7_776_000));
+            duration("TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS", 7_776_000), dispatcher);
     }
 
     public AwsDurableAwaitStreamProcessor streamProcessor() {

@@ -70,6 +70,7 @@ class AwsDurableGenerationFencingIT {
         var locator = new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(registration.checkpoint(),
             registration.providerExecutionName(), registration.providerExecutionArn());
         assertThat(repository.registerRecovery(locator)).isTrue();
+        assertThat(repository.findCurrentRecovery(locator.checkpoint())).contains(locator);
         assertThat(repository.registerRecovery(locator)).isFalse();
         assertThatThrownBy(() -> repository.registerRecovery(new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(
             locator.checkpoint(), "conflicting", "arn:conflicting"))).isInstanceOf(IllegalStateException.class);
@@ -78,12 +79,14 @@ class AwsDurableGenerationFencingIT {
             "pk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(registration.partitionKey()).build(),
             "sk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(registration.sortKey()).build())));
         assertThat(repository.findRegistration(registration.checkpoint().tenantId(), registration.checkpoint().executionId(), 1)).isEmpty();
+        assertThat(repository.findCurrentRecovery(locator.checkpoint())).contains(locator);
         assertThat(repository.findRecoveryByProviderExecutionArn(locator.providerExecutionArn())).contains(locator);
         var item = dynamo.getItem(request -> request.tableName(TABLE).consistentRead(true).key(java.util.Map.of(
             "pk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(locator.partitionKey()).build(),
             "sk", software.amazon.awssdk.services.dynamodb.model.AttributeValue.builder().s(locator.sortKey()).build()))).item();
         assertThat(item).doesNotContainKey("expires_at_epoch_s");
         repository.claimGeneration(new AwsDurableDriverCheckpoint(locator.checkpoint().execution(), 2));
+        assertThat(repository.findCurrentRecovery(locator.checkpoint())).isEmpty();
         assertThatThrownBy(() -> repository.registerRecovery(locator)).isInstanceOf(AwsDurableStaleGenerationException.class);
     }
 
@@ -98,7 +101,7 @@ class AwsDurableGenerationFencingIT {
         var semantic = new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint("tenant", executionId,
             "pipeline", "contract", "release", org.pipelineframework.orchestrator.ExecutionStatus.RUNNING);
         var controlPlane = org.mockito.Mockito.mock(org.pipelineframework.orchestrator.PipelineControlPlane.class);
-        org.mockito.Mockito.when(controlPlane.getExecutionSemanticCheckpointByClientKey("tenant", "key-" + executionId))
+        org.mockito.Mockito.when(controlPlane.getExecutionSemanticCheckpointByClientKey("tenant", "key-" + executionId, "pipeline", "release"))
             .thenReturn(io.smallrye.mutiny.Uni.createFrom().item(java.util.Optional.of(semantic)));
         var starter = org.mockito.Mockito.mock(AwsDurableExecutionStarter.class);
         var pinned = org.mockito.Mockito.mock(AwsDurableExecutionStarter.class);
