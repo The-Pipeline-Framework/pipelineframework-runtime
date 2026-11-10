@@ -24,6 +24,29 @@ class AwsDurableHostedProfileTest {
             .isInstanceOf(UnsupportedOperationException.class);
     }
 
+    @Test
+    void colocatedTransitionRejectsBindingsCommandsAndDeferredCompletion() {
+        var internal = contract("com.customer.Input", "ONE_TO_ONE");
+        assertInProcessRejected(internal,
+            List.of(new PipelineReleaseDeployment.Binding("effects", AwsDurableHostedProfile.COMMAND_EFFECT_CAPABILITY)));
+        assertInProcessRejected(contract("com.customer.Input", "ONE_TO_ONE", "command", Map.of()), List.of());
+        assertInProcessRejected(
+            contract("com.customer.Input", "ONE_TO_ONE", "internal", Map.of("mode", "TRANSPORT")), List.of());
+    }
+
+    private static void assertInProcessRejected(PipelineContractDescriptor contract,
+        List<PipelineReleaseDeployment.Binding> bindings) {
+        var original = release(contract, AwsDurableHostedProfile.TYPED_JSON_ENCODING);
+        var entries = original.deployment().entries().stream()
+            .filter(entry -> !"SQS_TRANSITION".equals(entry.trigger())).toList();
+        var local = new PipelineReleaseDescriptor(original.schemaVersion(), original.pipelineId(),
+            original.contractVersion(), original.releaseVersion(), original.compiledTruthArtifactId(),
+            original.artifacts(), new PipelineReleaseDeployment(AwsDurableHostedProfile.IN_PROCESS_PROFILE_ID,
+                entries, bindings, original.deployment().check()));
+        assertThatThrownBy(() -> AwsDurableHostedProfile.requireSupported(local, contract))
+            .isInstanceOf(UnsupportedOperationException.class).hasMessageContaining("In-process placement");
+    }
+
     private static PipelineReleaseDescriptor withProfile(PipelineReleaseDescriptor original, String profile,
         List<PipelineReleaseDeployment.Entry> entries) {
         return new PipelineReleaseDescriptor(original.schemaVersion(), original.pipelineId(), original.contractVersion(),
@@ -186,8 +209,14 @@ class AwsDurableHostedProfileTest {
         return new PipelineReleaseArtifactDescriptor(id, "lambda-zip", "maven:example:" + id + ":zip:1", "sha256:" + "a".repeat(64), steps, List.of());
     }
     private static PipelineContractDescriptor contract(String input, String cardinality) {
+        return contract(input, cardinality, "internal", Map.of());
+    }
+
+    private static PipelineContractDescriptor contract(String input, String cardinality, String kind,
+        Map<String, Object> deferredCompletion) {
         return new PipelineContractDescriptor(1, "customer.pipeline", "contract-sha", "hash", "COMPUTE", "LOCAL", "customer-runtime", false, "monolith",
-            List.of(new PipelineBundleStepDescriptor(0,"Transform","internal",cardinality,input,"com.customer.Output","com.customer.Service","com.customer.Client",Map.of())),
+            List.of(new PipelineBundleStepDescriptor(0, "Transform", kind, cardinality, input, "com.customer.Output",
+                "com.customer.Service", "com.customer.Client", deferredCompletion)),
             null,Map.of(),"",null,List.of(),List.of(),List.of());
     }
     private static PipelineReleaseDescriptor release(PipelineContractDescriptor c, String encoding) {

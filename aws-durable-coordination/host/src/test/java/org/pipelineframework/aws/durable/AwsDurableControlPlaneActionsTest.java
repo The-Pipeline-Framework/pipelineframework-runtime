@@ -38,7 +38,9 @@ class AwsDurableControlPlaneActionsTest {
         var parsed = new ObjectMapper().readValue(response.resultJson().orElseThrow(), PipelineRuntimeIdentityObservation.class);
         assertThat(parsed).isEqualTo(actual);
         assertThatThrownBy(() -> actions.invoke(identityRequest("foreign-release")))
-            .isInstanceOf(IllegalStateException.class).hasMessageContaining("requested Release");
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("requested Release")
+            .hasMessageContaining("pipelineId=pipeline-1, contractVersion=contract-1, releaseVersion=release-1");
         assertThatThrownBy(() -> actions.invoke(identityRequest(null)))
             .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("releaseVersion");
     }

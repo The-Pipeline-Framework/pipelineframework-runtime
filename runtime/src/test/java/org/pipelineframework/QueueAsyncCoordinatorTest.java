@@ -241,12 +241,11 @@ class QueueAsyncCoordinatorTest {
         coordinator.queryCaptureStores = queryStores;
         var command = mock(DynamoCommandEffectStore.class);
         var query = mock(DynamoQueryCaptureStore.class);
-        when(commandStores.isResolvable()).thenReturn(true);
-        when(commandStores.get()).thenReturn(command);
+        when(commandStores.iterator()).thenAnswer(call -> List.<CommandEffectStore>of(command).iterator());
         when(command.supportsRecovery()).thenReturn(true);
         when(command.tableName()).thenReturn("effect-table");
-        when(queryStores.isResolvable()).thenReturn(true);
-        when(queryStores.get()).thenReturn(query);
+        when(queryStores.iterator()).thenAnswer(call -> List.<QueryCaptureStore>of(query).iterator());
+        when(query.providerName()).thenReturn("dynamo");
         when(query.tableName()).thenReturn("capture-table");
 
         var identity = coordinator.runtimeIdentity("tenant", 1).await().indefinitely();
@@ -257,8 +256,24 @@ class QueueAsyncCoordinatorTest {
         assertTrue(identity.commandEffectStoreRecoverySupported());
         assertEquals("effect-table", identity.commandEffectStoreTable());
         assertEquals("capture-table", identity.queryCaptureStoreTable());
-        assertThrows(IllegalStateException.class, () -> coordinator.runtimeIdentity("tenant", 2));
+        var invalidLayout = assertDoesNotThrow(() -> coordinator.runtimeIdentity("tenant", 2));
+        assertThrows(IllegalStateException.class, () -> invalidLayout.await().indefinitely());
         assertThrows(IllegalStateException.class, () -> coordinator.runtimeIdentity("other-tenant", 1).await().indefinitely());
+
+        var customQuery = mock(QueryCaptureStore.class);
+        when(customQuery.providerName()).thenReturn("custom-query");
+        when(queryStores.iterator()).thenAnswer(call -> List.of(customQuery).iterator());
+        when(commandStores.iterator()).thenAnswer(call -> List.<CommandEffectStore>of().iterator());
+        var custom = coordinator.runtimeIdentity("tenant", 1).await().indefinitely();
+        assertEquals("custom-query", custom.queryCaptureStoreProvider());
+        assertEquals("", custom.queryCaptureStoreTable());
+        assertEquals("", custom.commandEffectStoreProvider());
+        assertFalse(custom.commandEffectStoreRecoverySupported());
+
+        when(commandStores.iterator()).thenAnswer(call -> List.of(command, mock(CommandEffectStore.class)).iterator());
+        var ambiguous = assertThrows(IllegalStateException.class,
+            () -> coordinator.runtimeIdentity("tenant", 1).await().indefinitely());
+        assertTrue(ambiguous.getMessage().contains("Multiple CommandEffectStore"));
     }
 
     @Test

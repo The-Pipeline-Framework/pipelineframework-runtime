@@ -26,7 +26,7 @@ Publication and immutable candidate validation follow the repository's normal
 runtime workflow. This module does not provision parameters or attest their tier,
 permissions, retention, deployment provenance or real-AWS conformance.
 
-### Hosted Release verification
+## Hosted Release verification
 
 The coordination model exposes the packaged function roles and artifact groups
 for the queue and in-process Hosted profiles. Consumers use these facts to
@@ -39,7 +39,7 @@ Command and Query stores. A missing registration, foreign pin or unhealthy
 runtime fails the read. The action uses the gateway's existing Lambda invoke
 permissions.
 
-### Queue-only native execution
+## Queue-only native execution
 
 The native deployment sets `pipeline.orchestrator.sqs.local-loopback=false` (the
 `sqs.local-loopback` entry in `TPF_AWS_DURABLE_CONFIGURATION`) on all eight semantic

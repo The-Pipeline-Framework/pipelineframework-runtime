@@ -116,6 +116,7 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
         return queueAsyncCoordinator.getExecutionResultPayload(tenantId, executionId);
     }
 
+    /** Reads the runtime identity only after the generated pipeline passes startup health checks. */
     @Override
     public Uni<PipelineRuntimeIdentityObservation> runtimeIdentity(String tenantId) {
         return Uni.createFrom().deferred(() -> {

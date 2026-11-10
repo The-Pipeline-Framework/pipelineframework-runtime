@@ -19,12 +19,14 @@ public final class AwsDurableHostedProfile {
     public enum CodeGroup { DURABLE, ACTION, HTTP }
     public record Entry(String functionLogicalId, String versionLogicalId, String entryClass, String namedHandler,
                         CodeGroup codeGroup) {
+        /** Assigns the native coordinator and ingress to the durable package and other handlers to the action package. */
         public Entry(String functionLogicalId, String versionLogicalId, String entryClass, String namedHandler) {
             this(functionLogicalId, versionLogicalId, entryClass, namedHandler,
                 "DurableFunction".equals(functionLogicalId) || "IngressFunction".equals(functionLogicalId)
                     ? CodeGroup.DURABLE : CodeGroup.ACTION);
         }
 
+        /** Returns the Lambda handler configured for the selected package, including Quarkus dispatch where needed. */
         public String lambdaHandler() {
             return (codeGroup == CodeGroup.DURABLE ? entryClass : "io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler")
                 + "::handleRequest";
@@ -45,6 +47,7 @@ public final class AwsDurableHostedProfile {
         entry("SQS_DUE_WORK", "DueWork", "AwsDurableDueWorkHandler", "aws-durable-due-work"),
         entry("AWS_DURABLE_RECONCILIATION", "Reconciliation", "AwsDurableReconciliationHandler", "aws-durable-reconcile"));
 
+    /** Resolves a Release trigger to an existing host entry, including the separately packaged HTTP entry. */
     public static Entry entryForTrigger(String trigger) {
         return HTTP_TRIGGER.equals(trigger) ? HTTP_ENTRY : ENTRIES_BY_TRIGGER.get(trigger);
     }
@@ -67,6 +70,7 @@ public final class AwsDurableHostedProfile {
 
     /** A compiled connector identity approved for this immutable Release by the deployment owner. */
     public record ConnectorAuthority(String bindingName, String provider, int providerVersion) {
+        /** Requires exact binding and provider names and a positive provider version. */
         public ConnectorAuthority {
             if (bindingName == null || bindingName.isBlank() || provider == null || provider.isBlank() || providerVersion < 1) {
                 throw new IllegalArgumentException("Invalid connector authority identity");
@@ -159,6 +163,7 @@ public final class AwsDurableHostedProfile {
         require(check.input().get("payload") != null && check.expectedResult().get("payload") != null, "Native typed payload bytes are required");
     }
 
+    /** Matches each compiled Command and Query to one explicitly approved connector binding. */
     private static void requireAuthorizedConnectors(List<PipelineBundleStepDescriptor> steps, Map<String, Object> metadata,
         Set<ConnectorAuthority> approvals) {
         require(metadata != null && version(metadata.get("schemaVersion")) == 3 && emptyList(metadata.get("capabilityImports"))
@@ -197,6 +202,7 @@ public final class AwsDurableHostedProfile {
         require(remaining.isEmpty() && observed.equals(approvals), "Connector authorization must cover exactly the compiled bindings and steps");
     }
 
+    /** Checks that a deferred Command uses a signed scalar callback for the same authorized operation. */
     private static void requireScalarCallback(PipelineBundleStepDescriptor step, ConnectorAuthority identity, String operation,
         int operationVersion) {
         var deferred = step.deferredCompletion();
@@ -218,24 +224,29 @@ public final class AwsDurableHostedProfile {
             "Deferred callback does not match its authorized connector operation");
     }
 
+    /** Accepts only a positive ISO-8601 duration from compiled metadata. */
     private static boolean positiveDuration(Object value) {
         if (!(value instanceof String text)) return false;
         try { return Duration.parse(text).isPositive(); }
         catch (DateTimeParseException invalid) { return false; }
     }
 
+    /** Decodes a whole numeric version and returns zero for malformed values. */
     private static int version(Object value) {
         return value instanceof Number number && number.doubleValue() == number.intValue() ? number.intValue() : 0;
     }
 
+    /** Reads a required string from compiled connector metadata. */
     private static String nonBlank(Object value) {
         if (value instanceof String text && !text.isBlank()) return text;
         throw new UnsupportedOperationException("Required compiled connector identity or type is missing");
     }
 
+    /** Treats omitted configuration references and an explicit empty list as connection-free. */
     private static boolean absentOrEmptyReferences(Map<?, ?> value) {
         return !value.containsKey("externalConfigurationReferenceFields") || emptyList(value.get("externalConfigurationReferenceFields"));
     }
+    /** Requires complete compiled Command metadata with no external configuration references. */
     private static void requireConnectionFreeCommands(Map<String, Object> metadata, java.util.Set<String> commands) {
         require(metadata != null && metadata.get("schemaVersion") instanceof Number schema && schema.doubleValue() == 3.0
             && emptyList(metadata.get("capabilityImports")) && metadata.get("bindings") instanceof List<?>,
@@ -260,6 +271,7 @@ public final class AwsDurableHostedProfile {
         }
         require(seen.equals(commands), "Every Command requires exact compiler-owned connector capability facts");
     }
+    /** Checks that the compiler emitted an explicit empty list. */
     private static boolean emptyList(Object value) { return value instanceof List<?> list && list.isEmpty(); }
 
     /** Resolves owner SAM code groups from immutable Release entries. */
@@ -297,6 +309,7 @@ public final class AwsDurableHostedProfile {
         return Map.copyOf(groups);
     }
 
+    /** Resolves transition placement from one of the two supported schema-2 profile IDs. */
     public static TransitionPlacement transitionPlacement(
         org.pipelineframework.orchestrator.release.PipelineReleaseDescriptor release) {
         require(release.schemaVersion() == 2 && release.deployment() != null, "Unsupported hosted profile");
@@ -307,9 +320,11 @@ public final class AwsDurableHostedProfile {
         };
     }
 
+    /** Checks for a fully qualified Java type name in the compiled payload metadata. */
     private static boolean javaType(String id) {
         return id != null && id.matches("[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)+");
     }
+    /** Stops profile validation at the first unsupported fact. */
     private static void require(boolean accepted, String reason) {
         if (!accepted) throw new UnsupportedOperationException(reason);
     }

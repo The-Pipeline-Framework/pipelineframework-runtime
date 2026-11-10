@@ -93,9 +93,14 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         String contract = required(request.contractVersion(), "contractVersion");
         String release = required(request.releaseVersion(), "releaseVersion");
         var observed = controlPlane.runtimeIdentity(request.tenantId()).await().atMost(actionTimeout);
-        if (!observed.ready() || !pipeline.equals(observed.pipelineId())
+        if (!observed.ready()) {
+            throw new IllegalStateException("Observed runtime is not ready");
+        }
+        if (!pipeline.equals(observed.pipelineId())
             || !contract.equals(observed.contractVersion()) || !release.equals(observed.releaseVersion())) {
-            throw new IllegalStateException("Runtime identity differs from the requested Release");
+            throw new IllegalStateException("Runtime identity differs from the requested Release. "
+                + "Observed pipelineId=%s, contractVersion=%s, releaseVersion=%s"
+                    .formatted(observed.pipelineId(), observed.contractVersion(), observed.releaseVersion()));
         }
         return AwsDurableActionResponse.result(json(observed));
     }
