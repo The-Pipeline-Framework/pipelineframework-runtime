@@ -79,7 +79,9 @@ function watchCancellation(signal, acceptCancel) {
       acceptCancel();
       return;
     }
-    return addAbortListener(signal, acceptCancel);
+    // Follow native abort state through a private signal. An arbitrary event
+    // dispatched on the caller's EventTarget cannot consume this listener.
+    return addAbortListener(AbortSignal.any([signal]), acceptCancel);
   } catch {
     throw new NodeLocalDiagnostic('INVALID_SIGNAL', 'expected a native AbortSignal');
   }

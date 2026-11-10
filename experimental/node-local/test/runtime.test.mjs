@@ -248,6 +248,29 @@ test('cancellation records the winner while an in-flight handler drains, even if
   assert.deepEqual(events.map(event => event.kind), ['ATTEMPT_STARTED', 'TERMINAL']);
 });
 
+test('a synthetic abort event neither cancels execution nor consumes genuine cancellation', async () => {
+  for (const cancel of [false, true]) {
+    const controller = new AbortController();
+    const gate = Promise.withResolvers();
+    const events = [];
+    const runtime = createNodeLocalRuntime({onObservation: event => events.push(event)});
+    const app = runtime.load(binding({add: () => gate.promise}));
+    const pending = app.run({value: 3}, context, controller.signal);
+
+    controller.signal.dispatchEvent(new Event('abort'));
+    assert.equal(controller.signal.aborted, false);
+    assert.deepEqual(events.map(event => event.kind), ['ATTEMPT_STARTED']);
+    if (cancel) controller.abort();
+    gate.resolve(value(4));
+
+    const expected = cancel ? {kind: 'CANCELLED'} : completed(5);
+    assert.deepEqual(await pending, expected);
+    assert.deepEqual(events.filter(event => event.kind === 'ATTEMPT_STARTED')
+      .map(event => event.stepId), cancel ? ['A'] : ['A', 'B', 'C']);
+    assert.deepEqual(events.filter(event => event.kind === 'TERMINAL').map(event => event.record), [expected]);
+  }
+});
+
 test('cancellation before handoff or retry prevents dispatch, while a committed completion wins', async () => {
   for (const [cancelOn, stepId, expectedCalls, expected] of [
     ['RETURNED', 'A', ['A'], {kind: 'CANCELLED'}],
