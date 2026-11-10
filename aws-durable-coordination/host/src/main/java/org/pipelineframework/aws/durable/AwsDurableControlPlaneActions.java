@@ -307,15 +307,21 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         return AwsDurableActionResponse.result(json(bindings.findCurrentRecovery(pin).orElse(null)));
     }
 
-    /** Reads the admitted result and confirms that the requested driver generation still owns it. */
+    /** Checks the driver generation around the result read, after authorizing the execution pin. */
     private AwsDurableActionResponse typedResult(AwsDurableActionRequest request) {
         var pin = driverCheckpoint(request);
         var semantic = readPinnedExecution(pin);
+        requireCurrentRecovery(pin);
         var result = controlPlane.getExecutionTypedResult(semantic).await().atMost(actionTimeout);
+        requireCurrentRecovery(pin);
+        return AwsDurableActionResponse.result(json(result));
+    }
+
+    /** Rejects absent or superseded driver generations. */
+    private void requireCurrentRecovery(AwsDurableDriverCheckpoint pin) {
         if (bindings.findCurrentRecovery(pin).isEmpty()) {
             throw new IllegalStateException("Typed result requires a current execution locator");
         }
-        return AwsDurableActionResponse.result(json(result));
     }
 
     /** Applies the existing status-read admission and verifies all coordinates before returning evidence. */

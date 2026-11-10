@@ -3,6 +3,8 @@ package org.pipelineframework.aws.durable;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -51,6 +53,12 @@ class AwsDurableHostedExecutionReadsTest {
         assertThat(actions.invoke(lookup).resultJson()).contains("null");
         var stale = assertThrows(IllegalStateException.class, () -> actions.invoke(typed));
         assertThat(stale).hasMessageContaining("current execution locator");
+        verify(controlPlane, times(1)).getExecutionTypedResult(semantic);
+
+        when(repository.findCurrentRecovery(pin)).thenReturn(Optional.of(locator)).thenReturn(Optional.empty());
+        var supersededDuringRead = assertThrows(IllegalStateException.class, () -> actions.invoke(typed));
+        assertThat(supersededDuringRead).hasMessageContaining("current execution locator");
+        verify(controlPlane, times(2)).getExecutionTypedResult(semantic);
     }
 
     private static AwsDurableActionRequest pinnedRead(AwsDurableOperation operation, String release) {

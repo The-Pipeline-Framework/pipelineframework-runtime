@@ -179,11 +179,15 @@ class DynamoActivationOperationIT {
         var contract = PipelineContractDescriptor.localFallback();
         var artifact = new PipelineReleaseArtifactDescriptor("archive", "lambda-zip", "s3://releases/archive",
             "sha256:" + "a".repeat(64), List.of(), List.of());
+        var otherArtifact = new PipelineReleaseArtifactDescriptor("other", "lambda-zip", "s3://releases/other",
+            "sha256:" + "b".repeat(64), List.of(), List.of());
         var entry = new PipelineReleaseDeployment.Entry("action", "archive", contract.module(), ".",
             "com.example.Action", "AWS_DURABLE_ACTION", List.of());
-        var deployment = new PipelineReleaseDeployment("aws-durable", List.of(entry), List.of(), null);
+        var otherEntry = new PipelineReleaseDeployment.Entry("ingress", "other", contract.module(), ".",
+            "com.example.Ingress", "AWS_DURABLE_INGRESS", List.of());
+        var deployment = new PipelineReleaseDeployment("aws-durable", List.of(entry, otherEntry), List.of(), null);
         var descriptor = new PipelineReleaseDescriptor(2, "pipeline", contract.contractVersion(), "release",
-            "archive", List.of(artifact), deployment);
+            "archive", List.of(artifact, otherArtifact), deployment);
         var release = new PipelineReleaseRecord("tenant", "pipeline", contract.contractVersion(), "release",
             PipelineReleaseStatus.REGISTERED, descriptor, artifact.artifactId(), artifact.digest(), artifact.uri(),
             10, artifact.digest(), contract, 1, 1, 0);
@@ -191,17 +195,24 @@ class DynamoActivationOperationIT {
             "action", "archive", artifact.digest(), "aws-lambda", "arn:aws:lambda:eu-west-1:123456789012:function:action:1",
             "code", "original-attempt");
         var registry = fresh();
-        assertThrows(IllegalStateException.class, () -> registry.registerEntryBinding(binding).await().indefinitely());
+        assertBindingRejectedWithoutWrites(IllegalStateException.class, binding);
         registry.register(release).await().indefinitely();
         assertEquals(binding, registry.registerEntryBinding(binding).await().indefinitely());
         assertEquals(binding, fresh().registerEntryBinding(binding).await().indefinitely());
         var conflict = new PipelineReleaseEntryBinding("tenant", "pipeline", contract.contractVersion(), "release",
             "action", "archive", artifact.digest(), "aws-lambda", "arn:aws:lambda:eu-west-1:123456789012:function:action:2",
             "other-code", "other-attempt");
-        assertThrows(IllegalStateException.class, () -> fresh().registerEntryBinding(conflict).await().indefinitely());
+        assertBindingRejectedWithoutWrites(IllegalStateException.class, conflict);
         var foreignArtifact = new PipelineReleaseEntryBinding("tenant", "pipeline", contract.contractVersion(), "release",
             "action", "archive", "sha256:foreign", "aws-lambda", binding.resourceId(), "code", "original-attempt");
-        assertThrows(IllegalArgumentException.class, () -> fresh().registerEntryBinding(foreignArtifact).await().indefinitely());
+        assertBindingRejectedWithoutWrites(IllegalArgumentException.class, foreignArtifact);
+        var undeclaredEntry = new PipelineReleaseEntryBinding("tenant", "pipeline", contract.contractVersion(), "release",
+            "undeclared", "archive", artifact.digest(), "aws-lambda", binding.resourceId(), "code", "original-attempt");
+        assertBindingRejectedWithoutWrites(IllegalArgumentException.class, undeclaredEntry);
+        var wrongEntryArtifact = new PipelineReleaseEntryBinding("tenant", "pipeline", contract.contractVersion(), "release",
+            "action", otherArtifact.artifactId(), otherArtifact.digest(), "aws-lambda", binding.resourceId(),
+            "code", "original-attempt");
+        assertBindingRejectedWithoutWrites(IllegalArgumentException.class, wrongEntryArtifact);
         registry.closeClient();
         assertEquals(binding, fresh().getEntryBinding("tenant", "pipeline", contract.contractVersion(), "release", "action")
             .await().indefinitely().orElseThrow());
@@ -210,6 +221,13 @@ class DynamoActivationOperationIT {
         assertTrue(fresh().getEntryBinding("tenant", "pipeline", "foreign-contract", "release", "action")
             .await().indefinitely().isEmpty());
         assertEquals(0, events());
+    }
+
+    private void assertBindingRejectedWithoutWrites(Class<? extends RuntimeException> failure,
+        PipelineReleaseEntryBinding binding) {
+        var before = rows();
+        assertThrows(failure, () -> fresh().registerEntryBinding(binding).await().indefinitely());
+        assertEquals(before, rows());
     }
 
     @Test
