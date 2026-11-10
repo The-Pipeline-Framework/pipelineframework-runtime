@@ -28,7 +28,8 @@ public final class AwsDurableWorkItemHandler implements RequestHandler<SQSEvent,
     @Override
     public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
         return new AwsDurableSqsBatchAdapter().handle(event, message -> {
-            if (config.coordinationHost() == CoordinationHost.NATIVE) return action.handle(message);
+            // Directly constructed native delegates predate CDI-provided Hosted routing.
+            if (config == null || config.coordinationHost() == CoordinationHost.NATIVE) return action.handle(message);
             if (releases == null || !releases.isResolvable()) throw new IllegalStateException("AWS Durable release routing is unavailable");
             return releases.get().work(message, context, action::handle);
         }, Duration.ofMinutes(5));
