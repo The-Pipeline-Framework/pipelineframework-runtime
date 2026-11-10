@@ -58,7 +58,9 @@ class AwsDurableCompatibleScalarHttpCompletionIT {
     var message=new SQSEvent.SQSMessage();message.setMessageId("actual-resume-work");
     message.setBody(PipelineJson.mapper().writeValueAsString(fixture.queue.getFirst()));
     var event=new SQSEvent();event.setRecords(List.of(message));
-    var context=mock(Context.class);when(context.getInvokedFunctionArn()).thenReturn(arn("2"));
+    var context=mock(Context.class);
+    when(context.getInvokedFunctionArn()).thenReturn(arn("2"));
+    when(context.getRemainingTimeInMillis()).thenReturn(120_000);
     assertThat(handler.handleRequest(event,context).getBatchItemFailures()).isEmpty();
     assertThat(destinations).containsExactly(arn("1"));verifyNoInteractions(handler.action);
     assertThat(fixture.execution().status()).isEqualTo(ExecutionStatus.QUEUED);
