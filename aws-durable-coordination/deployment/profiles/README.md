@@ -1,7 +1,6 @@
-> **20 October deployment-only boundary amendment (unpublished):** the new optional
-> `RuntimePermissionsBoundaryArn` raises this candidate template from 73 to 74
-> parameters. The signed runtime64 73-parameter artifact remains an unchanged legacy
-> contract; no deployment may substitute these unpublished bytes for that pin.
+> The signed runtime64 template has 73 parameters. The 20 October permissions
+> boundary amendment raised the count to 74. The current 87-parameter candidate
+> requires its own signed publication before it can replace a pinned template.
 
 # Restricted pilot deployment profile
 
@@ -70,7 +69,7 @@ the admitted work and its obligations have drained.
 
 ## Input and immutable signing contract
 
-Nine added parameters bring the canonical parameter count to 73:
+The signed runtime64 baseline added these nine parameters:
 
 | Parameter | HARDENED | RESTRICTED_PILOT |
 | --- | --- | --- |
@@ -84,8 +83,10 @@ Nine added parameters bring the canonical parameter count to 73:
 | WorkerSharedParameterVersion | empty | `1` |
 | SigningParameterAccessArns | empty list element | current + all retained exact ARNs |
 
-Restricted requires `ReleaseIsolationMode=FRESH_RELEASE_ISOLATED_STACK` and
-`TransitionWorkerPlacement=FUNCTION` for a Release with a separate Lambda transition worker.
+Restricted requires `ReleaseIsolationMode=FRESH_RELEASE_ISOLATED_STACK` or
+explicitly validated `ReleaseIsolationMode=RETAINED_RELEASE_VERSIONS`.
+For a Release with a separate Lambda transition worker, set
+`TransitionWorkerPlacement=FUNCTION`.
 Use `IN_PROCESS` only for the `aws-durable-java21-in-process-v1` profile
 after verifying its Release closure and supported steps. That profile has
 no `SQS_TRANSITION` entry. Its Work Lambda executes the transition in its
@@ -167,10 +168,10 @@ Signing is discriminated by `source`. SSM includes `tier=Standard`, `type=Secure
 The existing profile/preflight/schema2 baseline was published by runtime64
 (`931196a7bf7aa1102129da98f5344c5fd7b82f7b`), with 73 parameters and template SHA256
 `5fee5ee1b7afa687903deaf19b9f10b4f6ad02c85cf6afd2cd91d3ca4414a3bc`.
-Only the new 74-parameter permissions-boundary amendment below is unpublished;
-copying its parameter into the old signed artifact does not enable it. The host
-JAR is unchanged. Matching canonical documentation/consumers, owner/downstream CI,
-normal signed publication and live AWS conformance remain distinct gates.
+The current 87-parameter candidate adds the permissions boundary, private HTTP
+ingress, retained Release routing and optional stores. These features require the
+matching template and host package. The signed runtime64 template continues to
+serve its pinned deployments.
 
 ## Optional runtime permissions boundary
 

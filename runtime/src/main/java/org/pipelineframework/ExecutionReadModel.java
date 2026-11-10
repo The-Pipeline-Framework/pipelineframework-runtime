@@ -294,6 +294,16 @@ class ExecutionReadModel {
   Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(
       String tenantId,
       String interactionId) {
+    return getAwaitSemanticCheckpoint(tenantId, tenant -> awaitCoordinator.getInteraction(tenant, interactionId));
+  }
+
+  Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpointByCorrelation(
+      String tenantId, String correlationId) {
+    return getAwaitSemanticCheckpoint(tenantId, tenant -> awaitCoordinator.getInteractionByCorrelation(tenant, correlationId));
+  }
+
+  private Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpoint(
+      String tenantId, java.util.function.Function<String, Uni<Optional<AwaitInteractionRecord>>> lookup) {
     return Uni.createFrom().deferred(() -> {
       if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
         return Uni.createFrom().failure(new IllegalStateException("Async queue mode is disabled"));
@@ -307,7 +317,7 @@ class ExecutionReadModel {
       if (denied.isPresent()) {
         return Uni.createFrom().failure(denied.orElseThrow());
       }
-      return awaitCoordinator.getInteraction(resolvedTenant, interactionId)
+      return lookup.apply(resolvedTenant)
           .onItem().transformToUni(interaction -> interaction
               .map(record -> executionStateStore.getExecution(resolvedTenant, record.executionId())
                   .onItem().transform(execution -> execution.map(parent -> new AwaitSemanticCheckpoint(

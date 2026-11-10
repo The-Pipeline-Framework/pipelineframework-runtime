@@ -847,6 +847,10 @@ public class AwaitCoordinator {
         return interactionStore().get(tenantId, interactionId);
     }
 
+    public Uni<Optional<AwaitInteractionRecord>> getInteractionByCorrelation(String tenantId, String correlationId) {
+        return interactionStore().findByCorrelation(tenantId, correlationId);
+    }
+
     public Uni<Optional<AwaitCompletionAdmission>> getCompletionAdmission(String tenantId, String interactionId) {
         return interactionStore().getCompletionAdmission(tenantId, interactionId);
     }

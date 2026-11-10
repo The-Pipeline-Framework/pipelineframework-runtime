@@ -151,25 +151,29 @@ def check(template, supplied, inventory=None, guard=None, account_id=None):
         boundary = parameters.get('RuntimePermissionsBoundaryArn', '')
         if boundary and boundary.split(':')[4] != account_id:
             raise ValueError('Runtime permissions boundary must belong to the deployment account')
-    retained_durable = parameters.get('RetainedDurableVersionArns', [''])
-    if retained_durable != ['']:
+    for name in ('RetainedDurableVersionArns', 'RetainedWorkerVersionArns', 'RetainedActionVersionArns'):
+        versions = parameters.get(name, [''])
+        if versions == ['']:
+            continue
         if (parameters['ReleaseIsolationMode'] != 'RETAINED_RELEASE_VERSIONS'
-                or '' in retained_durable or len(retained_durable) != len(set(retained_durable))):
-            raise ValueError('Retained coordinator versions require a unique nonempty retained-mode list')
-        if account_id is not None and any(arn.split(':')[4] != account_id for arn in retained_durable):
-            raise ValueError('Retained coordinator versions must belong to the deployment account')
+                or not versions or '' in versions or len(versions) != len(set(versions))):
+            raise ValueError(name + ' requires a unique nonempty retained-mode list')
+        if account_id is not None and any(arn.split(':')[4] != account_id for arn in versions):
+            raise ValueError(name + ' must belong to the deployment account')
+    native_tables = {value for name, value in parameters.items()
+                     if name.endswith('Table') and name not in ('CommandEffectTable', 'QueryCaptureTable')}
     command_table = parameters.get('CommandEffectTable', '')
     if command_table:
         candidates = [arn for arn in parameters['SemanticDynamoResourceArns']
                       if re.fullmatch(r'arn:[a-z0-9-]+:dynamodb:[a-z0-9-]+:[0-9]{12}:table/' + re.escape(command_table), arn)]
-        if len(candidates) != 1 or (account_id is not None and candidates[0].split(':')[4] != account_id):
-            raise ValueError('Command effect table requires its exact owned DynamoDB ARN')
+        if (command_table in native_tables or len(candidates) != 1
+                or (account_id is not None and candidates[0].split(':')[4] != account_id)):
+            raise ValueError('Command effect table requires its distinct exact owned DynamoDB ARN')
     query_table = parameters.get('QueryCaptureTable', '')
     if query_table:
         candidates = [arn for arn in parameters['SemanticDynamoResourceArns']
                       if re.fullmatch(r'arn:[a-z0-9-]+:dynamodb:[a-z0-9-]+:[0-9]{12}:table/' + re.escape(query_table), arn)]
-        native_tables = {value for name, value in parameters.items() if name.endswith('Table') and name != 'QueryCaptureTable'}
-        if (query_table in native_tables or len(candidates) != 1
+        if (query_table in native_tables or query_table == command_table or len(candidates) != 1
                 or (account_id is not None and candidates[0].split(':')[4] != account_id)):
             raise ValueError('Query capture table requires its distinct exact owned DynamoDB ARN')
     selected = conditions(template, parameters)

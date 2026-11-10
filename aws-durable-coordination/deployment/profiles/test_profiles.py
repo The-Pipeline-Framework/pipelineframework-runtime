@@ -245,12 +245,39 @@ class Profiles(unittest.TestCase):
                     with self.assertRaisesRegex(AssertionError, 'queue-only correction'):
                         legacy_deployment_contract(changed)
 
+    def test_retained_version_lists_require_retained_mode_unique_arns_and_owner_account(self):
+        values, inventory, guard = fixture()
+        retained = values | dict(ReleaseIsolationMode='RETAINED_RELEASE_VERSIONS',
+                                 RetainedReleaseValidation='validated', WorkEntryId='work',
+                                 TransitionEntryId='transition', AwaitCompletionEntryId='completion',
+                                 ActionEntryId='action')
+        for name, suffix in (('RetainedDurableVersionArns', 'durable'), ('RetainedWorkerVersionArns', 'work'),
+                             ('RetainedActionVersionArns', 'action')):
+            version = f'arn:aws:lambda:us-east-2:123456789012:function:runtime-{suffix}:1'
+            foreign = version.replace('123456789012', '987654321098')
+            with self.subTest(parameter=name):
+                for settings, arns, message in (
+                    (values, [version], 'retained-mode list'),
+                    (retained, [], 'retained-mode list'),
+                    (retained, [version, version], 'retained-mode list'),
+                    (retained, [version, ''], 'retained-mode list'),
+                    (retained, [foreign], 'deployment account'),
+                ):
+                    with self.assertRaisesRegex(ValueError, name + '.*' + message):
+                        p.check(self.template, settings | {name: arns}, inventory, guard, account_id='123456789012')
+                self.assertEqual([version], p.check(
+                    self.template, retained | {name: [version]}, inventory, guard, account_id='123456789012')[name])
+
     def test_optional_command_table_is_exact_and_bound_to_all_action_functions(self):
         values, inventory, guard = fixture()
         values['CommandEffectTable'] = 'effects'
         with self.assertRaisesRegex(ValueError, 'exact owned DynamoDB ARN'):
             p.check(self.template, values, inventory, guard)
         values['SemanticDynamoResourceArns'].append('arn:aws:dynamodb:us-east-2:123456789012:table/effects')
+        with self.assertRaisesRegex(ValueError, 'Command effect table requires its distinct'):
+            p.check(self.template, values | {'ExecutionTable': 'effects'}, inventory, guard)
+        with self.assertRaisesRegex(ValueError, 'Query capture table requires its distinct'):
+            p.check(self.template, values | {'QueryCaptureTable': 'effects'}, inventory, guard)
         checked = p.check(self.template, values, inventory, guard)
         active = p.resources(self.template, checked)
         functions = [r for r in active.values() if r['Type'] == 'AWS::Serverless::Function']

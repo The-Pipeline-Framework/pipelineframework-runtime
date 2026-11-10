@@ -147,6 +147,12 @@ public interface PipelineControlPlane {
         String tenantId,
         String interactionId);
 
+    /** Reads an Await checkpoint by its tenant-scoped correlation, with the same admission as an interaction read. */
+    default Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpointByCorrelation(
+        String tenantId, String correlationId) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Await checkpoint correlation reads are unavailable"));
+    }
+
     /**
      * Observes the primary interaction or the first bounded page of an itemised current Await unit.
      * Use the cursor overload for itemised units that may span multiple pages.

@@ -26,12 +26,33 @@ class AwsDurableReleaseRouterTest {
         f.registry.activate("tenant", "pipeline", "release-b", 2).await().indefinitely();
         f.registry.activate("tenant", "pipeline", "release-a", 3).await().indefinitely();
         when(f.lambda.getFunctionConfiguration(any(GetFunctionConfigurationRequest.class))).thenReturn(
-            GetFunctionConfigurationResponse.builder().codeSha256(codeDigest("release-a")).build());
+            GetFunctionConfigurationResponse.builder().codeSha256(codeDigest("release-a")).timeout(10).build());
         when(f.lambda.invoke(any(InvokeRequest.class))).thenReturn(InvokeResponse.builder().statusCode(200)
             .executedVersion("1").payload(SdkBytes.fromUtf8String("{\"batchItemFailures\":[]}")).build());
         assertThat(f.handle()).isEqualTo(SqsMessageDisposition.ACKNOWLEDGE);
+        verify(f.lambda).getFunctionConfiguration(argThat((GetFunctionConfigurationRequest request) ->
+            request.overrideConfiguration().flatMap(config -> config.apiCallTimeout()).orElseThrow().equals(Duration.ofSeconds(5))));
         verify(f.lambda).invoke(argThat((InvokeRequest request) -> request.functionName().equals(arn("1"))
-            && request.payload().asUtf8String().contains("execution-a")));
+            && request.payload().asUtf8String().contains("execution-a")
+            && request.overrideConfiguration().flatMap(config -> config.apiCallTimeout()).orElseThrow()
+                .equals(Duration.ofSeconds(11))));
+        assertThat(f.localCalls).hasValue(0);
+    }
+
+    @Test
+    void exhaustedLambdaBudgetLeavesWorkForRetryWithoutInvokingTheTarget() throws Exception {
+        var f = new Fixture();
+        f.bind(arn("1"), codeDigest("release-a"));
+        var context = context("2");
+        when(context.getRemainingTimeInMillis()).thenReturn(900);
+        String body = PipelineJson.mapper().writeValueAsString(new ExecutionWorkItem("tenant", "execution-a"));
+
+        assertThatThrownBy(() -> f.router.work(new SqsInboundMessage(Optional.of("message"), Optional.of(body)), context,
+            message -> {
+                f.localCalls.incrementAndGet();
+                return Uni.createFrom().item(SqsMessageDisposition.ACKNOWLEDGE);
+            }).await().atMost(Duration.ofSeconds(2))).hasMessageContaining("Insufficient time");
+        verifyNoInteractions(f.lambda);
         assertThat(f.localCalls).hasValue(0);
     }
 
@@ -87,14 +108,21 @@ class AwsDurableReleaseRouterTest {
         assertThat(f.handle()).isEqualTo(SqsMessageDisposition.RETRY); assertThat(f.localCalls).hasValue(0);
     }
 
-    @Test
-    void awaitCompletionPreservesOriginalOpaqueTokenAndPayloadForSelectedRuntimeAdmission() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void awaitCompletionPreservesOriginalOpaqueTokenAndPayloadForSelectedRuntimeAdmission(boolean correlationOnly) throws Exception {
         var f = new Fixture();
         String original = PipelineJson.mapper().writeValueAsString(new org.pipelineframework.awaitable.sqs.SqsAwaitCompletionEnvelope(
-            "tenant", "interaction-a", "correlation-a", "opaque-original-token", "stable-key", java.util.Map.of("approved", true), "actor-a"));
-        when(f.controlPlane.getAwaitSemanticCheckpoint("tenant", "interaction-a")).thenReturn(Uni.createFrom().item(Optional.of(
+            "tenant", correlationOnly ? null : "interaction-a", "correlation-a", "opaque-original-token",
+            "stable-key", java.util.Map.of("approved", true), "actor-a"));
+        var checkpoint = Uni.createFrom().item(Optional.of(
             new AwaitSemanticCheckpoint("tenant", "execution-a", "interaction-a", "correlation-a", "unit-a", "await-step",
-                org.pipelineframework.awaitable.AwaitInteractionStatus.COMPLETED, "pipeline", contract("release-a").contractVersion(), "release-a"))));
+                org.pipelineframework.awaitable.AwaitInteractionStatus.COMPLETED, "pipeline", contract("release-a").contractVersion(), "release-a")));
+        if (correlationOnly) {
+            when(f.controlPlane.getAwaitSemanticCheckpointByCorrelation("tenant", "correlation-a")).thenReturn(checkpoint);
+        } else {
+            when(f.controlPlane.getAwaitSemanticCheckpoint("tenant", "interaction-a")).thenReturn(checkpoint);
+        }
         String destination = arn("1").replace(":transition:", ":completion:");
         f.registry.registerEntryBinding(new PipelineReleaseEntryBinding("tenant", "pipeline", contract("release-a").contractVersion(),
             "release-a", "completion", "archive", digest("release-a"), "aws-lambda", destination, codeDigest("release-a"), "op-a"))
@@ -102,6 +130,7 @@ class AwsDurableReleaseRouterTest {
         f.router.entryId = Optional.of("completion");
         var context = mock(com.amazonaws.services.lambda.runtime.Context.class);
         when(context.getInvokedFunctionArn()).thenReturn(arn("2").replace(":transition:", ":completion:"));
+        when(context.getRemainingTimeInMillis()).thenReturn(120_000);
         when(f.lambda.getFunctionConfiguration(any(GetFunctionConfigurationRequest.class))).thenReturn(
             GetFunctionConfigurationResponse.builder().codeSha256(codeDigest("release-a")).build());
         when(f.lambda.invoke(any(InvokeRequest.class))).thenAnswer(call -> {
@@ -123,10 +152,13 @@ class AwsDurableReleaseRouterTest {
         var f = new Fixture();
         String original = PipelineJson.mapper().writeValueAsString(new org.pipelineframework.awaitable.sqs.SqsAwaitCompletionEnvelope(
             "tenant", null, "correlation-a", "token", "stable-key", "approved", "actor-a"));
+        when(f.controlPlane.getAwaitSemanticCheckpointByCorrelation("tenant", "correlation-a"))
+            .thenReturn(Uni.createFrom().item(Optional.empty()));
         assertThatThrownBy(() -> f.router.completion(new SqsInboundMessage(Optional.of("completion"), Optional.of(original)), context("2"), message -> {
             f.localCalls.incrementAndGet(); return Uni.createFrom().item(SqsMessageDisposition.ACKNOWLEDGE);
-        }).await().atMost(Duration.ofSeconds(2))).hasMessageContaining("correlation-only");
-        assertThat(f.localCalls).hasValue(0); verifyNoInteractions(f.lambda, f.controlPlane);
+        }).await().atMost(Duration.ofSeconds(2))).hasMessageContaining("Pinned Await checkpoint is unavailable");
+        assertThat(f.localCalls).hasValue(0);
+        verifyNoInteractions(f.lambda);
     }
 
     private static final class Fixture {

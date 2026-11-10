@@ -88,6 +88,8 @@ class AwsDurableHttpSubmissionTest {
         var durable = fixture.submission.mapper.readValue(request.getValue().payload().asUtf8String(), AwsDurableExecutionInput.class);
         assertThat(durable.idempotencyKey()).isEqualTo("key");
         assertThat(durable.submissionAttemptId()).isPresent();
+        assertThat(request.getValue().durableExecutionName()).isEqualTo(
+            org.pipelineframework.aws.durable.model.AwsDurableExecutionNames.durableExecutionName(durable));
     }
 
     @Test

@@ -431,6 +431,12 @@ class QueueAsyncCoordinator {
     return Uni.createFrom().deferred(() -> executionReadModel().getAwaitSemanticCheckpoint(tenantId, interactionId));
   }
 
+  Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpointByCorrelation(
+      String tenantId, String correlationId) {
+    return Uni.createFrom().deferred(
+        () -> executionReadModel().getAwaitSemanticCheckpointByCorrelation(tenantId, correlationId));
+  }
+
   Uni<Optional<AwaitSemanticCheckpoint>> getCurrentAwaitSemanticCheckpoint(
       String tenantId, String executionId) {
     return Uni.createFrom().deferred(() -> executionReadModel().getCurrentAwaitSemanticCheckpoint(tenantId, executionId));

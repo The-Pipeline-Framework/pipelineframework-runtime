@@ -10,7 +10,9 @@ import static org.mockito.Mockito.when;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 import org.pipelineframework.orchestrator.AwaitSemanticSelection;
+import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.awaitable.AwaitInteractionCursor;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -48,6 +50,35 @@ class AwsDurableControlPlaneActionsTest {
             .hasMessageContaining("pipelineId=pipeline-1, contractVersion=contract-1, releaseVersion=release-1");
         assertThatThrownBy(() -> actions.invoke(identityRequest(null)))
             .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("releaseVersion");
+    }
+
+    @Test
+    void dueContinuationRequiresTheLocallyLoadedReleaseBeforeRunning() throws Exception {
+        var controlPlane = mock(PipelineControlPlane.class);
+        var checkpoint = new AwsDurableExecutionCheckpoint("tenant-1", "execution-1", "pipeline-1", "contract-1", "release-1");
+        var command = new AwaitItemContinuationCommand("tenant-1", "execution-1", "unit-1", "interaction-1", 0, 1, 1);
+        var request = AwsDurableActionRequest.itemContinuation(checkpoint, PipelineJson.mapper().writeValueAsString(command));
+        when(controlPlane.getExecutionSemanticCheckpoint("tenant-1", "execution-1")).thenReturn(Uni.createFrom().item(
+            new ExecutionSemanticCheckpoint("tenant-1", "execution-1", "pipeline-1", "contract-1", "release-1",
+                ExecutionStatus.WAITING_EXTERNAL)));
+        when(controlPlane.runtimeIdentity("tenant-1")).thenReturn(Uni.createFrom().item(
+            new PipelineRuntimeIdentityObservation("pipeline-1", "contract-1", "release-2", true, 3, null,
+                "dynamo", true, "command-effects", "dynamo", "query-captures")));
+
+        assertThatThrownBy(() -> actions(controlPlane).invoke(request))
+            .isInstanceOf(IllegalStateException.class).hasMessageContaining("Runtime identity differs");
+        verify(controlPlane, never()).processAwaitItemContinuation(org.mockito.ArgumentMatchers.any());
+
+        when(controlPlane.runtimeIdentity("tenant-1")).thenReturn(Uni.createFrom().item(
+            new PipelineRuntimeIdentityObservation("pipeline-1", "contract-1", "release-1", true, 3, null,
+                "dynamo", true, "command-effects", "dynamo", "query-captures")));
+        when(controlPlane.processAwaitItemContinuation(org.mockito.ArgumentMatchers.any()))
+            .thenAnswer(call -> Uni.createFrom().item(org.pipelineframework.orchestrator.AwaitItemContinuationResult
+                .completed(call.getArgument(0))));
+        var result = PipelineJson.mapper().readValue(actions(controlPlane).invoke(request).resultJson().orElseThrow(),
+            org.pipelineframework.orchestrator.AwaitItemContinuationResult.class);
+        assertThat(result.command().interactionId()).isEqualTo(command.interactionId());
+        assertThat(result.disposition()).isEqualTo(org.pipelineframework.orchestrator.AwaitItemContinuationDisposition.COMPLETED);
     }
 
     private static AwsDurableActionRequest identityRequest(String release) {

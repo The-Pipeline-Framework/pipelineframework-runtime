@@ -62,8 +62,7 @@ public final class AwsDurableExecutionStarter {
 
     private StartOutcome invoke(AwsDurableExecutionInput input, Duration timeout) {
         Objects.requireNonNull(input, "input");
-        String executionName = AwsDurableExecutionNames.durableExecutionName(
-            input.tenantId(), input.idempotencyKey(), input.generation());
+        String executionName = AwsDurableExecutionNames.durableExecutionName(input);
         try {
             var request = InvokeRequest.builder()
                 .functionName(functionName)

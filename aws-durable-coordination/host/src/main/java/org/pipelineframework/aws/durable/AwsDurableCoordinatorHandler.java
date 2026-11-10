@@ -68,7 +68,7 @@ public final class AwsDurableCoordinatorHandler
         Objects.requireNonNull(input, "input");
         Objects.requireNonNull(context, "context");
 
-        String providerName = AwsDurableExecutionNames.durableExecutionName(input.tenantId(), input.idempotencyKey(), input.generation());
+        String providerName = AwsDurableExecutionNames.durableExecutionName(input);
         context.step("register-admission-recovery", Boolean.class, ignored ->
             actions.invoke(AwsDurableActionRequest.registerAdmission(input, providerName, context.getExecutionArn())).bindingCreated());
 
@@ -134,8 +134,7 @@ public final class AwsDurableCoordinatorHandler
         DurableContext context,
         int awaitIndex
     ) {
-        String providerExecutionName = AwsDurableExecutionNames.durableExecutionName(
-            input.tenantId(), input.idempotencyKey(), input.generation());
+        String providerExecutionName = AwsDurableExecutionNames.durableExecutionName(input);
         AwsDurableCallbackSignal signal = context.waitForCallback(
             "await-completion-" + awaitIndex,
             AwsDurableCallbackSignal.class,

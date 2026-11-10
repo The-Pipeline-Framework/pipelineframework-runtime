@@ -487,6 +487,26 @@ class QueueAsyncCoordinatorTest {
     }
 
     @Test
+    void correlationReadReturnsTheAwaitAndItsOriginalExecutionRelease() {
+        when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+        var interaction = itemAwaitRecord(0, AwaitInteractionStatus.COMPLETED, "approved");
+        when(awaitCoordinator.getInteractionByCorrelation("tenant-1", interaction.correlationId()))
+            .thenReturn(Uni.createFrom().item(Optional.of(interaction)));
+        ExecutionRecord<Object, Object> execution = mock(ExecutionRecord.class);
+        when(execution.pipelineId()).thenReturn("pipeline-1");
+        when(execution.contractVersion()).thenReturn("contract-1");
+        when(execution.releaseVersion()).thenReturn("release-1");
+        when(executionStateStore.getExecution("tenant-1", interaction.executionId()))
+            .thenReturn(Uni.createFrom().item(Optional.of(execution)));
+
+        var checkpoint = coordinator.getAwaitSemanticCheckpointByCorrelation("tenant-1", interaction.correlationId())
+            .await().indefinitely().orElseThrow();
+        assertEquals(interaction.interactionId(), checkpoint.interactionId());
+        assertEquals(interaction.correlationId(), checkpoint.correlationId());
+        assertEquals("release-1", checkpoint.releaseVersion());
+    }
+
+    @Test
     void semanticCheckpointReadsApplyTenantAdmissionBeforeStorageAccess() {
         when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         ControlPlaneAdmissionPolicy policy = mock(ControlPlaneAdmissionPolicy.class);
@@ -499,6 +519,9 @@ class QueueAsyncCoordinatorTest {
             .getAwaitSemanticCheckpoint("tenant-denied", "interaction-1")
             .await().indefinitely());
         assertThrows(ControlPlaneAdmissionException.class, () -> coordinator
+            .getAwaitSemanticCheckpointByCorrelation("tenant-denied", "correlation-1")
+            .await().indefinitely());
+        assertThrows(ControlPlaneAdmissionException.class, () -> coordinator
             .getAwaitSemanticCheckpoints("tenant-denied", "exec-1", 10)
             .await().indefinitely());
 
@@ -508,7 +531,7 @@ class QueueAsyncCoordinatorTest {
             .getCurrentAwaitSemanticCheckpoint("tenant-denied", "exec-1").await().indefinitely());
         assertThrows(ControlPlaneAdmissionException.class, () -> coordinator
             .getCurrentAwaitSemanticCheckpoint("tenant-denied", "exec-1", Optional.empty()).await().indefinitely());
-        verify(policy, times(4)).admit(requests.capture());
+        verify(policy, times(5)).admit(requests.capture());
         assertTrue(requests.getAllValues().stream().allMatch(request ->
             request.operation() == ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT));
         verifyNoInteractions(awaitCoordinator);

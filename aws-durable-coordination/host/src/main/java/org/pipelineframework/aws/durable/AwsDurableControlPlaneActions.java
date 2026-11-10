@@ -111,7 +111,12 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         String pipeline = required(request.pipelineId(), "pipelineId");
         String contract = required(request.contractVersion(), "contractVersion");
         String release = required(request.releaseVersion(), "releaseVersion");
-        var observed = controlPlane.runtimeIdentity(request.tenantId()).await().atMost(actionTimeout);
+        return AwsDurableActionResponse.result(json(requireLocalRelease(request.tenantId(), pipeline, contract, release)));
+    }
+
+    private org.pipelineframework.orchestrator.PipelineRuntimeIdentityObservation requireLocalRelease(
+        String tenant, String pipeline, String contract, String release) {
+        var observed = controlPlane.runtimeIdentity(tenant).await().atMost(actionTimeout);
         if (!observed.ready()) {
             throw new IllegalStateException("Observed runtime is not ready");
         }
@@ -121,7 +126,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
                 + "Observed pipelineId=%s, contractVersion=%s, releaseVersion=%s"
                     .formatted(observed.pipelineId(), observed.contractVersion(), observed.releaseVersion()));
         }
-        return AwsDurableActionResponse.result(json(observed));
+        return observed;
     }
 
     private AwsDurableActionResponse completionObservation(AwsDurableActionRequest request) {
@@ -276,6 +281,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         if (!semantic.tenantId().equals(command.tenantId()) || !semantic.executionId().equals(command.executionId())) {
             throw new IllegalStateException("Item continuation semantic checkpoint does not match command scope");
         }
+        requireLocalRelease(semantic.tenantId(), semantic.pipelineId(), semantic.contractVersion(), semantic.releaseVersion());
         var current = new org.pipelineframework.orchestrator.AwaitItemContinuationCommand(command.tenantId(),
             command.executionId(), command.unitId(), command.interactionId(), command.itemIndex(), command.attempt(),
             System.currentTimeMillis());

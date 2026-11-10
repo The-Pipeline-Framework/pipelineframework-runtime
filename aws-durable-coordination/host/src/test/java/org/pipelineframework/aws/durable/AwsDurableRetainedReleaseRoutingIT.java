@@ -166,7 +166,10 @@ class AwsDurableRetainedReleaseRoutingIT {
     }
     static String arn(String version) { return "arn:aws:lambda:eu-west-1:123456789012:function:transition:" + version; }
     static Context context(String version) {
-        var context = mock(Context.class); when(context.getInvokedFunctionArn()).thenReturn(arn(version)); return context;
+        var context = mock(Context.class);
+        when(context.getInvokedFunctionArn()).thenReturn(arn(version));
+        when(context.getRemainingTimeInMillis()).thenReturn(120_000);
+        return context;
     }
     static AwsDurableReleaseRouter router(PipelineReleaseRegistry registry, PipelineControlPlane controlPlane, LambdaClient lambda) {
         var router = new AwsDurableReleaseRouter(); router.releases = registry; router.controlPlane = controlPlane;
