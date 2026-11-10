@@ -37,6 +37,10 @@ class AwsDurableDueReleaseDispatchTest {
         f.registry.activate("tenant", "pipeline", "release-b", 2000).await().indefinitely();
         var original = mock(PipelineControlPlane.class);
         when(original.getExecutionSemanticCheckpoint("tenant", "execution-a")).thenReturn(Uni.createFrom().item(checkpoint()));
+        var originalContract = contract("release-a");
+        when(original.runtimeIdentity("tenant")).thenReturn(Uni.createFrom().item(
+            new PipelineRuntimeIdentityObservation("pipeline", originalContract.contractVersion(), "release-a", true,
+                originalContract.steps().size(), originalContract, "dynamo", true, "effects", "dynamo", "captures")));
         when(original.processAwaitItemContinuation(any())).thenAnswer(call ->
             Uni.createFrom().item(AwaitItemContinuationResult.completed(call.getArgument(0))));
         var actions = new AwsDurableControlPlaneActions(original, mock(AwsDurableCallbackBindingRepository.class), value -> value,

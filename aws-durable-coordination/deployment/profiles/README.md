@@ -232,7 +232,8 @@ must inspect an AWS change-set preview before executing a newly qualified asset.
 AWS references: [CodeUri](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-function.html#sam-function-codeuri),
 [language extensions](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-specification-language-extensions.html),
 and [transform ordering and parameter resolution](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/transform-aws-languageextensions.html).
-# Optional private HTTP entry
+
+## Optional private HTTP entry
 
 The original ten retained AWS Durable roles remain required. A Release can add
 one private Quarkus HTTP ZIP through `HttpArtifactUri`, `HttpCodeSha256` and
