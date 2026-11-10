@@ -401,6 +401,48 @@ class DynamoActivationOperationIT {
         assertEquals(remainingRows, rows());
     }
 
+    @Test
+    void conditionalRollbackDoesNotRebaseAfterAConcurrentActivation() {
+        var a = fresh().register(release("A")).await().indefinitely();
+        var b = fresh().register(release("B")).await().indefinitely();
+        var none = fresh().currentActivationObservation("tenant", "pipeline").await().indefinitely();
+        var initial = new ActivationOperationCommand("initial", a, 1000);
+        var initialReceipt = fresh().activateOnceIfCurrent(initial, none).await().indefinitely();
+        var expected = fresh().currentActivationObservation("tenant", "pipeline").await().indefinitely();
+        var raced = new java.util.concurrent.atomic.AtomicBoolean();
+        var racing = new DynamoPipelineReleaseRegistry(boundary(request -> {
+            if (raced.compareAndSet(false, true))
+                fresh().activateOnce(new ActivationOperationCommand("intervening", b, 1000)).await().indefinitely();
+            return client.transactWriteItems(request);
+        }), config);
+        assertThrows(IllegalStateException.class, () -> racing.activateOnceIfCurrent(
+            new ActivationOperationCommand("rollback",a,1000),expected).await().indefinitely());
+        assertEquals("B", fresh().active("tenant","pipeline").await().indefinitely().orElseThrow().releaseVersion());
+        assertEquals(2, events());
+        assertTrue(fresh().getActivationOperation("tenant","pipeline","rollback").await().indefinitely().isEmpty());
+        assertEquals(initialReceipt, fresh().activateOnceIfCurrent(initial,none).await().indefinitely());
+        assertEquals(2,events());
+        assertThrows(IllegalStateException.class, () -> fresh().activateOnceIfCurrent(initial,expected).await().indefinitely());
+    }
+
+    @Test
+    void conditionalActivationRecoversACommittedButLostResponseWithoutReactivation() {
+        var a = fresh().register(release("A")).await().indefinitely();
+        var none = fresh().currentActivationObservation("tenant","pipeline").await().indefinitely();
+        var command = new ActivationOperationCommand("response-lost",a,1000);
+        var lossy = new DynamoPipelineReleaseRegistry(boundary(request -> {
+            client.transactWriteItems(request);
+            throw software.amazon.awssdk.core.exception.SdkClientException.create("injected response loss");
+        }), config);
+        assertThrows(RuntimeException.class, () -> lossy.activateOnceIfCurrent(command,none).await().indefinitely());
+        var receipt = fresh().getActivationOperation("tenant","pipeline",command.operationKey()).await().indefinitely().orElseThrow();
+        fresh().activateOnce(new ActivationOperationCommand("new-head",a,1000)).await().indefinitely();
+        var head = fresh().currentActivationObservation("tenant","pipeline").await().indefinitely();
+        assertEquals(receipt,fresh().activateOnceIfCurrent(command,none).await().indefinitely());
+        assertEquals(head,fresh().currentActivationObservation("tenant","pipeline").await().indefinitely());
+        assertEquals(2,events());
+    }
+
     private void deleteRow(Map<String, software.amazon.awssdk.services.dynamodb.model.AttributeValue> row) {
         client.deleteItem(request -> request.tableName(table).key(Map.of("registry_key", row.get("registry_key"),
             "registry_sort", row.get("registry_sort"))));

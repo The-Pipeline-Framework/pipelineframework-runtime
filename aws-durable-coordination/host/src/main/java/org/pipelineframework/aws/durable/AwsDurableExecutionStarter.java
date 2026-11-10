@@ -1,5 +1,6 @@
 package org.pipelineframework.aws.durable;
 
+import java.time.Duration;
 import java.util.Objects;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -48,24 +49,41 @@ public final class AwsDurableExecutionStarter {
     }
 
     public AwsDurableStartResponse start(AwsDurableExecutionInput input) {
+        return invoke(input, null).response();
+    }
+
+    boolean startForHttpAdmission(AwsDurableExecutionInput input, Duration timeout) {
+        var outcome = invoke(input, Objects.requireNonNull(timeout, "timeout"));
+        if (outcome.response().statusCode() != 202) {
+            throw new IllegalStateException("Durable coordinator did not accept asynchronous invocation");
+        }
+        return outcome.duplicate();
+    }
+
+    private StartOutcome invoke(AwsDurableExecutionInput input, Duration timeout) {
         Objects.requireNonNull(input, "input");
         String executionName = AwsDurableExecutionNames.durableExecutionName(
             input.tenantId(), input.idempotencyKey(), input.generation());
         try {
-            var response = lambda.invoke(InvokeRequest.builder()
+            var request = InvokeRequest.builder()
                 .functionName(functionName)
                 .qualifier(qualifier)
                 .invocationType(InvocationType.EVENT)
                 .durableExecutionName(executionName)
-                .payload(SdkBytes.fromUtf8String(mapper.writeValueAsString(input)))
-                .build());
-            return new AwsDurableStartResponse(executionName, response.statusCode());
+                .payload(SdkBytes.fromUtf8String(mapper.writeValueAsString(input)));
+            if (timeout != null) {
+                request.overrideConfiguration(override -> override.apiCallTimeout(timeout));
+            }
+            var response = lambda.invoke(request.build());
+            return new StartOutcome(new AwsDurableStartResponse(executionName, response.statusCode()), false);
         } catch (DurableExecutionAlreadyStartedException duplicate) {
-            return new AwsDurableStartResponse(executionName, 202);
+            return new StartOutcome(new AwsDurableStartResponse(executionName, 202), true);
         } catch (JsonProcessingException malformed) {
             throw new IllegalArgumentException("durable execution input could not be serialized", malformed);
         }
     }
+
+    private record StartOutcome(AwsDurableStartResponse response, boolean duplicate) {}
 
     private static String required(String value, String name) {
         if (value == null || value.isBlank()) {

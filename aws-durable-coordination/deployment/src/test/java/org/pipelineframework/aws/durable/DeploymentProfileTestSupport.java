@@ -8,8 +8,8 @@ import java.util.Set;
 
 /** Resolve only the new profile choices before applying all existing hardened assertions. */
 final class DeploymentProfileTestSupport {
-    private static final Set<String> TRUE_DEFAULT = Set.of("HardenedProfile", "SecretsManagerSigning", "HardenedFunctionTransition");
-    private static final Set<String> FALSE_DEFAULT = Set.of("RestrictedPilotProfile", "RuntimePermissionsBoundarySelected");
+    private static final Set<String> TRUE_DEFAULT = Set.of("HardenedProfile", "SecretsManagerSigning", "HardenedFunctionTransition", "TransitionQueues");
+    private static final Set<String> FALSE_DEFAULT = Set.of("RestrictedPilotProfile", "RuntimePermissionsBoundarySelected", "RetainedReleaseMode", "HasRetainedWorkerVersions", "HasRetainedActionVersions", "HttpIngressSelected", "RetainedRemoteTransitions", "UnreservedSerialSmoke");
 
     private DeploymentProfileTestSupport() {}
 
@@ -19,7 +19,11 @@ final class DeploymentProfileTestSupport {
         if (output.isArray() && output.size() == 2 && output.get(1).has("SigningManifest")) {
             String signing = output.get(1).path("SigningManifest").get(0).asText();
             String semanticKeys = output.get(1).path("SemanticKeysManifest").get(0).asText();
-            ((ArrayNode) output).set(0, com.fasterxml.jackson.databind.node.TextNode.valueOf(output.get(0).asText().replace("${SigningManifest}", signing).replace("${SemanticKeysManifest}", semanticKeys)));
+            String manifest = output.get(0).asText().replace("${SigningManifest}", signing).replace("${SemanticKeysManifest}", semanticKeys);
+            for (String optional : Set.of("HttpManifestCode", "HttpManifestVersion", "HttpManifestLogGroup")) {
+                manifest = manifest.replace("${" + optional + "}", output.get(1).path(optional).asText());
+            }
+            ((ArrayNode) output).set(0, com.fasterxml.jackson.databind.node.TextNode.valueOf(manifest));
         }
         return resolved;
     }
@@ -35,6 +39,12 @@ final class DeploymentProfileTestSupport {
             node.fieldNames().forEachRemaining(names::add);
             for (String name : names) {
                 JsonNode value = resolve(node.get(name));
+                if ("TPF_AWS_DURABLE_CONFIGURATION".equals(name) && value.isArray()
+                    && value.size() == 2 && value.get(1).has("WorkerRequestUrl")) {
+                    value = com.fasterxml.jackson.databind.node.TextNode.valueOf(value.get(0).asText()
+                        .replace("${WorkerRequestUrl}", "${" + value.get(1).path("WorkerRequestUrl").asText() + "}")
+                        .replace("${WorkerResponseUrl}", "${" + value.get(1).path("WorkerResponseUrl").asText() + "}"));
+                }
                 if ("AWS::NoValue".equals(value.asText())) ((ObjectNode) node).remove(name);
                 else ((ObjectNode) node).set(name, value);
             }

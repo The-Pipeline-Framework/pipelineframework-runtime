@@ -1,12 +1,14 @@
 package org.pipelineframework;
 
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
+import io.smallrye.mutiny.CompositeException;
 import org.pipelineframework.awaitable.AwaitCoordinator;
 import org.pipelineframework.awaitable.AwaitInteractionRecord;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
@@ -327,12 +329,25 @@ class ItemizedAwaitContinuationFlow {
       int limit,
       AwaitItemContinuationHandler itemContinuationHandler,
       long saturatedDelayMs) {
+    return sweepDue(nowEpochMs, limit, command -> processOne(command, itemContinuationHandler, saturatedDelayMs));
+  }
+
+  Uni<Void> sweepDue(long nowEpochMs, int limit,
+      org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher dispatcher) {
     return awaitCoordinator.findDueItemContinuations(nowEpochMs, limit)
-        .onItem().transformToMulti(commands -> Multi.createFrom().iterable(commands))
-        .onItem().transformToUniAndConcatenate(command -> processOne(
-            command, itemContinuationHandler, saturatedDelayMs))
-        .collect().last()
-        .replaceWithVoid();
+        .onItem().transformToUni(commands -> {
+          List<Throwable> failures = new ArrayList<>();
+          return Multi.createFrom().iterable(commands)
+              .onItem().transformToUniAndConcatenate(command -> Uni.createFrom()
+                  .deferred(() -> dispatcher.dispatch(command))
+                  .onFailure().invoke(failures::add)
+                  .onFailure().recoverWithNull())
+              .collect().last().replaceWithVoid()
+              // Attempt the whole bounded page, then retain the sweep failure for host retry.
+              // Dispatch failures never authorize local continuation scheduling or execution.
+              .chain(() -> failures.isEmpty() ? Uni.createFrom().voidItem()
+                  : Uni.createFrom().failure(new CompositeException(failures)));
+        });
   }
 
   private Uni<AwaitItemContinuationResult> recordWorkDisposition(

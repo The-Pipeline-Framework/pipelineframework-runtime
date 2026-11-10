@@ -70,13 +70,17 @@ def rule_value(value, parameters, selected):
         if not isinstance(arguments, str): raise ValueError('Invalid condition reference')
         return selected[arguments] # Conditions are ordered by dependency, not source position.
     arities = {'Fn::Equals': (2, 2), 'Fn::And': (2, 10), 'Fn::Or': (2, 10),
-               'Fn::Not': (1, 1), 'Fn::Contains': (2, 2), 'Fn::EachMemberEquals': (2, 2)}
+               'Fn::Not': (1, 1), 'Fn::Join': (2, 2), 'Fn::Contains': (2, 2), 'Fn::EachMemberEquals': (2, 2)}
     if operator not in arities:
         raise ValueError('Unsupported rule intrinsic: ' + operator)
     minimum, maximum = arities[operator]
     if not isinstance(arguments, list) or not minimum <= len(arguments) <= maximum:
         raise ValueError('Invalid rule intrinsic arguments: ' + operator)
     args = [rule_value(arg, parameters, selected) for arg in arguments]
+    if operator == 'Fn::Join':
+        if type(args[0]) is not str or not isinstance(args[1], list) or any(type(item) is not str for item in args[1]):
+            raise ValueError('Join requires string separator and string list')
+        return args[0].join(args[1])
     if operator == 'Fn::Equals':
         if any(type(arg) not in (str, int, float, bool) for arg in args):
             raise ValueError('Rule equality requires resolved scalar operands')
@@ -106,6 +110,7 @@ def defaults(template):
 
 
 def conditions(template, parameters):
+    parameters = defaults(template) | parameters
     result = {}
     pending = dict(template.get('Conditions', {}))
     while pending:
@@ -146,6 +151,27 @@ def check(template, supplied, inventory=None, guard=None, account_id=None):
         boundary = parameters.get('RuntimePermissionsBoundaryArn', '')
         if boundary and boundary.split(':')[4] != account_id:
             raise ValueError('Runtime permissions boundary must belong to the deployment account')
+    retained_durable = parameters.get('RetainedDurableVersionArns', [''])
+    if retained_durable != ['']:
+        if (parameters['ReleaseIsolationMode'] != 'RETAINED_RELEASE_VERSIONS'
+                or '' in retained_durable or len(retained_durable) != len(set(retained_durable))):
+            raise ValueError('Retained coordinator versions require a unique nonempty retained-mode list')
+        if account_id is not None and any(arn.split(':')[4] != account_id for arn in retained_durable):
+            raise ValueError('Retained coordinator versions must belong to the deployment account')
+    command_table = parameters.get('CommandEffectTable', '')
+    if command_table:
+        candidates = [arn for arn in parameters['SemanticDynamoResourceArns']
+                      if re.fullmatch(r'arn:[a-z0-9-]+:dynamodb:[a-z0-9-]+:[0-9]{12}:table/' + re.escape(command_table), arn)]
+        if len(candidates) != 1 or (account_id is not None and candidates[0].split(':')[4] != account_id):
+            raise ValueError('Command effect table requires its exact owned DynamoDB ARN')
+    query_table = parameters.get('QueryCaptureTable', '')
+    if query_table:
+        candidates = [arn for arn in parameters['SemanticDynamoResourceArns']
+                      if re.fullmatch(r'arn:[a-z0-9-]+:dynamodb:[a-z0-9-]+:[0-9]{12}:table/' + re.escape(query_table), arn)]
+        native_tables = {value for name, value in parameters.items() if name.endswith('Table') and name != 'QueryCaptureTable'}
+        if (query_table in native_tables or len(candidates) != 1
+                or (account_id is not None and candidates[0].split(':')[4] != account_id)):
+            raise ValueError('Query capture table requires its distinct exact owned DynamoDB ARN')
     selected = conditions(template, parameters)
     for name, rule in template['Rules'].items():
         if 'RuleCondition' in rule and not rule_boolean(rule['RuleCondition'], parameters, selected): continue
@@ -156,6 +182,18 @@ def check(template, supplied, inventory=None, guard=None, account_id=None):
         retained = parameters['SigningParameterAccessArns']
         if len(retained) != len(set(retained)) or '' in retained: raise ValueError('Invalid retained parameter set')
         if set(inventory) != set(retained): raise ValueError('Inventory must cover every retained parameter exactly')
+        # Every retained signing generation belongs to one application namespace.
+        # Immutable versions alone cannot establish tenant or purpose ownership.
+        pins = [re.fullmatch(r'arn:([a-z0-9-]+):ssm:([a-z0-9-]+):([0-9]{12}):parameter/tpf/durable/([A-Za-z0-9._-]+)/(resume-token|worker)/g-[a-f0-9]{32,64}', arn)
+                for arn in retained]
+        if any(pin is None for pin in pins) or len({pin.group(1, 2, 3, 4) for pin in pins}) != 1:
+            raise ValueError('Retained signing generations must share one exact application namespace')
+        if account_id is not None and pins[0].group(3) != account_id:
+            raise ValueError('Signing parameters must belong to the deployment account')
+        for name, purpose in [('ResumeTokenParameterArn', 'resume-token'), ('WorkerSharedParameterArn', 'worker')]:
+            if '/' + purpose + '/g-' not in parameters[name]:
+                raise ValueError('Signing parameter purpose mismatch')
+
         for arn, observed in inventory.items():
             if observed != {'arn': arn, 'version': 1, 'type': 'SecureString', 'tier': 'Standard', 'keyKind': 'AWS_MANAGED_SSM'}:
                 raise ValueError('Signing parameter owner observation mismatch')

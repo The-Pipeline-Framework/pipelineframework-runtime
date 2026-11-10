@@ -207,6 +207,36 @@ class DynamoExecutionStateStoreTest {
     }
 
     @Test
+    void readsTheRetainedTypedInitialInputAfterTheExecutionCursorMoves() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        var store = new DynamoExecutionStateStore(client, mockConfig("tpf_execution", "tpf_execution_key"));
+        store.durablePayloadResolver = mock(ExecutionDurablePayloadResolver.class);
+        String initialJson = typed("PaymentRecord");
+        var initial = new PaymentRecord("initial");
+        long ttl = System.currentTimeMillis() / 1000 + 3600;
+        var persisted = new HashMap<>(executionItem("tenant-a", "execution", "key", ttl, ExecutionStatus.RUNNING));
+        persisted.put("current_step_index", AttributeValue.builder().n("1").build());
+        persisted.put("input_shape", AttributeValue.builder().s("UNI").build());
+        persisted.put("input_payload_json", AttributeValue.builder().s("\"continuation\"").build());
+        persisted.put("input_payload_type_id", AttributeValue.builder().s("java.lang.String").build());
+        persisted.put("input_payload_encoding", AttributeValue.builder().s(JsonTransitionPayloadCodec.ENCODING).build());
+        persisted.put("initial_input_shape", AttributeValue.builder().s("UNI").build());
+        persisted.put("initial_input_payload_json", AttributeValue.builder().s(initialJson).build());
+        persisted.put("initial_input_payload_type_id", AttributeValue.builder().s("typed-durable").build());
+        persisted.put("initial_input_payload_encoding", AttributeValue.builder().s("application/tpf-canonical+json").build());
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(persisted).build());
+        when(store.durablePayloadResolver.decode(argThat(execution -> execution.currentStepIndex() == 0),
+            eq(ExecutionDurablePayloadResolver.Slot.INPUT), eq(initialJson))).thenReturn(initial);
+
+        var execution = store.getExecution("tenant-a", "execution").await().indefinitely().orElseThrow();
+        assertEquals(1, execution.currentStepIndex());
+        assertEquals("continuation", assertInstanceOf(ExecutionInputSnapshot.class, execution.inputPayload()).payload());
+        var retained = assertInstanceOf(ExecutionInputSnapshot.class,
+            store.getInitialExecutionInput(execution).await().indefinitely().orElseThrow());
+        assertEquals(initial, retained.payload());
+    }
+
+    @Test
     void decodesRemoteTransitionResultsBeforeTypedDurablePersistence() {
         DynamoDbClient client = mock(DynamoDbClient.class);
         DynamoExecutionStateStore store = new DynamoExecutionStateStore(

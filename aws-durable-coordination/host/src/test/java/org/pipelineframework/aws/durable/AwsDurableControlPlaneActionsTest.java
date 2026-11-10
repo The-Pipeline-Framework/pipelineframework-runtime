@@ -21,8 +21,13 @@ import org.pipelineframework.aws.durable.model.AwsDurableActionRequest;
 import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
 import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
 import org.pipelineframework.aws.durable.model.AwsDurableOperation;
+import org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator;
 import org.pipelineframework.orchestrator.AwaitSemanticCheckpoint;
+import org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint;
+import org.pipelineframework.orchestrator.ExecutionStatus;
+import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
 import org.pipelineframework.orchestrator.PipelineControlPlane;
+import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 import org.pipelineframework.orchestrator.PipelineRuntimeIdentityObservation;
 
 class AwsDurableControlPlaneActionsTest {
@@ -106,6 +111,91 @@ class AwsDurableControlPlaneActionsTest {
             assertThat(identity.interactionId()).isEqualTo("beyond-page-one"));
         assertThat(second.awaitSelectionCursor()).isEmpty();
         verify(controlPlane, never()).getAwaitSemanticCheckpoints("tenant-1", "execution-1", 100);
+    }
+
+    @Test
+    void nativeTypedResultPreservesOpaquePayloadAndExistingRawResult() throws Exception {
+        PipelineControlPlane cp = mock(PipelineControlPlane.class);
+        var payload = new org.pipelineframework.orchestrator.TypedDurablePayload("app.Result", "type-sha", "catalog-sha",
+            "application/tpf-canonical+json", 1, "{\"answer\":42}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        when(cp.getExecutionResultPayload("tenant-1", "execution-1")).thenReturn(Uni.createFrom().item(payload));
+        var typed = request(AwsDurableOperation.TYPED_RESULT);
+        var encoded = new SerializedTransitionPayload("app.Result", "application/tpf-canonical+json", "{\"answer\":42}");
+        var tree = new ObjectMapper().readTree(pinnedActions(cp, encoded).invoke(typed).resultJson().orElseThrow());
+        assertThat(tree.get("payloadTypeId").asText()).isEqualTo("app.Result");
+        assertThat(tree.get("payloadEncoding").asText()).isEqualTo("application/tpf-canonical+json");
+        assertThat(tree.get("payload").asText()).isEqualTo("{\"answer\":42}");
+        assertThat(tree.size()).isEqualTo(3);
+        assertThat(new ObjectMapper().readTree(actions(cp).invoke(AwsDurableActionRequest.result(driverCheckpoint()))
+            .resultJson().orElseThrow()).has("canonicalTypeId")).isTrue();
+    }
+
+    @Test
+    void nativeTypedResultUsesExistingCollectionCodecWithoutLosingElementTypes() throws Exception {
+        PipelineControlPlane cp = mock(PipelineControlPlane.class);
+        var payload = new JsonTransitionPayloadCodec().encode(new String[]{"one", "two"});
+        String result = pinnedActions(cp, payload).invoke(request(AwsDurableOperation.TYPED_RESULT)).resultJson().orElseThrow();
+        var encoded = org.pipelineframework.config.pipeline.PipelineJson.mapper().readValue(result,
+            org.pipelineframework.orchestrator.SerializedTransitionPayload.class);
+        assertThat(new org.pipelineframework.orchestrator.JsonTransitionPayloadCodec().decode(encoded)).isEqualTo(List.of("one", "two"));
+    }
+
+    @Test
+    void nativeIdentityDelegatesToRuntimeObservationAndPropagatesUnknown() throws Exception {
+        PipelineControlPlane cp = mock(PipelineControlPlane.class);
+        when(cp.runtimeIdentity("tenant-1")).thenReturn(Uni.createFrom().item(new org.pipelineframework.orchestrator.PipelineRuntimeIdentityObservation(
+            "pipeline-1", "contract-1", "release-1", true, 2, null)));
+        var result = new ObjectMapper().readTree(actions(cp).invoke(request(org.pipelineframework.aws.durable.model.AwsDurableOperation.READ_RUNTIME_IDENTITY))
+            .resultJson().orElseThrow());
+        assertThat(result.get("pipelineId").asText()).isEqualTo("pipeline-1");
+        assertThat(result.get("contractVersion").asText()).isEqualTo("contract-1");
+        assertThat(result.get("releaseVersion").asText()).isEqualTo("release-1");
+        assertThat(result.get("ready").asBoolean()).isTrue();
+        when(cp.runtimeIdentity("tenant-1")).thenReturn(Uni.createFrom().failure(new UnsupportedOperationException("unknown")));
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> actions(cp).invoke(request(org.pipelineframework.aws.durable.model.AwsDurableOperation.READ_RUNTIME_IDENTITY)))
+            .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void executionLocatorRejectsSupersededGenerationAndExposesCurrentExactRegistration() throws Exception {
+        PipelineControlPlane cp = mock(PipelineControlPlane.class);
+        var repository = mock(AwsDurableCallbackBindingRepository.class);
+        var locator = recoveryLocator();
+        when(cp.getExecutionSemanticCheckpoint("tenant-1", "execution-1")).thenReturn(Uni.createFrom().item(semanticCheckpoint()));
+        when(repository.findCurrentRecovery(driverCheckpoint())).thenReturn(Optional.empty(), Optional.of(locator));
+        var actions = new AwsDurableControlPlaneActions(cp, repository, input -> input, new ObjectMapper(), Duration.ofSeconds(5), Duration.ofDays(1));
+        var request = request(org.pipelineframework.aws.durable.model.AwsDurableOperation.READ_EXECUTION_LOCATOR);
+        assertThat(actions.invoke(request).resultJson()).contains("null");
+        var result = new ObjectMapper().readTree(actions.invoke(request).resultJson().orElseThrow());
+        assertThat(result.get("checkpoint").get("generation").asInt()).isEqualTo(7);
+        assertThat(result.get("providerExecutionName").asText()).isEqualTo("original-name");
+    }
+
+    private static AwsDurableControlPlaneActions pinnedActions(PipelineControlPlane controlPlane, SerializedTransitionPayload payload) {
+        var semantic = semanticCheckpoint();
+        var repository = mock(AwsDurableCallbackBindingRepository.class);
+        when(controlPlane.getExecutionSemanticCheckpoint("tenant-1", "execution-1")).thenReturn(Uni.createFrom().item(semantic));
+        when(controlPlane.getExecutionTypedResult(semantic)).thenReturn(Uni.createFrom().item(payload));
+        when(repository.findCurrentRecovery(driverCheckpoint())).thenReturn(Optional.of(recoveryLocator()));
+        return new AwsDurableControlPlaneActions(controlPlane, repository, input -> input, new ObjectMapper(),
+            Duration.ofSeconds(5), Duration.ofDays(1));
+    }
+
+    private static ExecutionSemanticCheckpoint semanticCheckpoint() {
+        return new ExecutionSemanticCheckpoint("tenant-1", "execution-1", "pipeline-1", "contract-1", "release-1",
+            ExecutionStatus.SUCCEEDED);
+    }
+
+    private static AwsDurableRecoveryLocator recoveryLocator() {
+        return new AwsDurableRecoveryLocator(driverCheckpoint(), "original-name",
+            "arn:aws:lambda:us-east-2:123456789012:function:coordinator:7/durable-execution/execution");
+    }
+
+    private static AwsDurableActionRequest request(org.pipelineframework.aws.durable.model.AwsDurableOperation op) {
+        var r = AwsDurableActionRequest.result(driverCheckpoint());
+        return new AwsDurableActionRequest(op, r.tenantId(), r.executionId(), r.idempotencyKey(), r.pipelineId(), r.contractVersion(),
+            r.releaseVersion(), r.inputJson(), r.awaitIdentity(), r.providerExecutionName(), r.providerExecutionArn(), r.providerCallbackId(),
+            r.expectedVersion(), r.reason(), r.generation());
     }
 
     private static AwsDurableControlPlaneActions actions(PipelineControlPlane controlPlane) {

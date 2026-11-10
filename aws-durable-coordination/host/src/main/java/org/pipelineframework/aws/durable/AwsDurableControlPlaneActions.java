@@ -28,6 +28,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
     private final Duration actionTimeout;
     private final Duration callbackRetention;
     private final AwsDurableHostTelemetry telemetry;
+    private final org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher continuationDispatcher;
 
     public AwsDurableControlPlaneActions(
         PipelineControlPlane controlPlane,
@@ -40,6 +41,13 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         this(controlPlane, bindings, inputDecoder, mapper, actionTimeout, callbackRetention, new AwsDurableHostTelemetry());
     }
 
+    public AwsDurableControlPlaneActions(PipelineControlPlane controlPlane, AwsDurableCallbackBindingRepository bindings,
+        AwsDurableInputDecoder inputDecoder, ObjectMapper mapper, Duration actionTimeout, Duration callbackRetention,
+        org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher continuationDispatcher) {
+        this(controlPlane, bindings, inputDecoder, mapper, actionTimeout, callbackRetention,
+            new AwsDurableHostTelemetry(), continuationDispatcher);
+    }
+
     AwsDurableControlPlaneActions(
         PipelineControlPlane controlPlane,
         AwsDurableCallbackBindingRepository bindings,
@@ -49,6 +57,12 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         Duration callbackRetention,
         AwsDurableHostTelemetry telemetry
     ) {
+        this(controlPlane, bindings, inputDecoder, mapper, actionTimeout, callbackRetention, telemetry, null);
+    }
+
+    private AwsDurableControlPlaneActions(PipelineControlPlane controlPlane, AwsDurableCallbackBindingRepository bindings,
+        AwsDurableInputDecoder inputDecoder, ObjectMapper mapper, Duration actionTimeout, Duration callbackRetention,
+        AwsDurableHostTelemetry telemetry, org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher continuationDispatcher) {
         this.controlPlane = Objects.requireNonNull(controlPlane, "controlPlane");
         this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.inputDecoder = Objects.requireNonNull(inputDecoder, "inputDecoder");
@@ -56,6 +70,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         this.actionTimeout = positive(actionTimeout, "actionTimeout");
         this.callbackRetention = positive(callbackRetention, "callbackRetention");
         this.telemetry = Objects.requireNonNull(telemetry, "telemetry");
+        this.continuationDispatcher = continuationDispatcher;
     }
 
     @Override
@@ -76,6 +91,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
                     required(request.reason(), "reason"))
                 .await().atMost(actionTimeout).status().name());
             case SWEEP -> sweep();
+            case PROCESS_AWAIT_CONTINUATION -> itemContinuation(request);
             case QUERY_PENDING_AWAIT -> pendingAwait(request);
             case READ_AWAIT_CHECKPOINT -> awaitCheckpoint(request);
             case READ_EXECUTION_AWAITS -> executionAwaits(request);
@@ -154,7 +170,8 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             var existing = request.executionId().isPresent()
                 ? Optional.of(controlPlane.getExecutionSemanticCheckpoint(request.tenantId(), request.executionId().orElseThrow())
                     .await().atMost(actionTimeout))
-                : controlPlane.getExecutionSemanticCheckpointByClientKey(request.tenantId(), request.idempotencyKey().orElseThrow())
+                : controlPlane.getExecutionSemanticCheckpointByClientKey(request.tenantId(), request.idempotencyKey().orElseThrow(),
+                    required(request.pipelineId(), "pipelineId"), required(request.releaseVersion(), "releaseVersion"))
                     .await().atMost(actionTimeout);
             existing.ifPresent(semantic -> requireRecoveryRelease(request, semantic));
             return AwsDurableActionResponse.bound(bindings.registerAdmission(
@@ -235,8 +252,40 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
     }
 
     private AwsDurableActionResponse sweep() {
-        controlPlane.sweepOnce(System.currentTimeMillis()).await().atMost(actionTimeout);
+        long now = System.currentTimeMillis();
+        (continuationDispatcher == null ? controlPlane.sweepOnce(now)
+            : controlPlane.sweepOnce(now, continuationDispatcher)).await().atMost(actionTimeout);
         return AwsDurableActionResponse.status("SWEEPED");
+    }
+
+    private AwsDurableActionResponse itemContinuation(AwsDurableActionRequest request) {
+        org.pipelineframework.orchestrator.AwaitItemContinuationCommand command;
+        try {
+            command = org.pipelineframework.config.pipeline.PipelineJson.mapper().readValue(
+                required(request.inputJson(), "inputJson"), org.pipelineframework.orchestrator.AwaitItemContinuationCommand.class);
+        } catch (java.io.IOException malformed) {
+            throw new IllegalArgumentException("Invalid item continuation command", malformed);
+        }
+        if (!request.tenantId().equals(command.tenantId())
+            || !required(request.executionId(), "executionId").equals(command.executionId())) {
+            throw new IllegalArgumentException("Item continuation command does not match its execution scope");
+        }
+        var semantic = controlPlane.getExecutionSemanticCheckpoint(command.tenantId(), command.executionId())
+            .await().atMost(actionTimeout);
+        requireRecoveryRelease(request, semantic);
+        if (!semantic.tenantId().equals(command.tenantId()) || !semantic.executionId().equals(command.executionId())) {
+            throw new IllegalStateException("Item continuation semantic checkpoint does not match command scope");
+        }
+        var current = new org.pipelineframework.orchestrator.AwaitItemContinuationCommand(command.tenantId(),
+            command.executionId(), command.unitId(), command.interactionId(), command.itemIndex(), command.attempt(),
+            System.currentTimeMillis());
+        return AwsDurableActionResponse.result(canonicalJson(controlPlane.processAwaitItemContinuation(current)
+            .await().atMost(actionTimeout)));
+    }
+
+    private static String canonicalJson(Object value) {
+        try { return org.pipelineframework.config.pipeline.PipelineJson.mapper().writeValueAsString(value); }
+        catch (java.io.IOException failure) { throw new IllegalStateException("Cannot serialize item continuation result", failure); }
     }
 
     private AwsDurableActionResponse awaitCheckpoint(AwsDurableActionRequest request) {

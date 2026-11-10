@@ -27,6 +27,54 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
     private static final String SECRET = "a-pinned-signing-key-with-at-least-32-characters";
 
     @Test
+    void inProcessHasNoRemoteWorkerAndRejectsConflictingConfigurationBeforeSecretReads() {
+        var values = validConfiguration();
+        String request = "pipeline.orchestrator.worker.sqs.request-queue-url";
+        String response = "pipeline.orchestrator.worker.sqs.response-queue-url";
+        values.remove(request);
+        values.remove(response);
+        values.put("tpf.aws.durable.transition-worker-placement", "IN_PROCESS");
+        var requests = new ArrayList<GetSecretValueRequest>();
+        var config = build(values, requests).getConfigMapping(PipelineOrchestratorConfig.class);
+        assertThat(config.workerSqs().isEnabled()).isFalse();
+        assertThat(config.workerRest().isEnabled()).isFalse();
+        assertThat(config.workerGrpc().isEnabled()).isFalse();
+        requests.clear();
+        for (String target : List.of(request, response, "pipeline.orchestrator.worker.rest.base-url",
+            "pipeline.orchestrator.worker.grpc.endpoint")) {
+            var override = new PropertiesConfigSource(Map.of(target, "https://unexpected.example/queue"), "override", 900);
+            assertThatThrownBy(() -> build(values, requests, override)).hasMessageContaining("In-process placement");
+            assertThat(requests).isEmpty();
+        }
+        values.remove("tpf.aws.durable.transition-worker-placement");
+        assertThatThrownBy(() -> build(values, requests)).hasMessageContaining(request);
+        assertThat(requests).isEmpty();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+        "command-effect-table, pipeline.command.effect-store",
+        "query-capture-table, pipeline.query.capture-store"})
+    void pinsOptionalDurableStoreBeforeResolvingSigningKeys(String binding, String prefix) {
+        var values = validConfiguration();
+        values.put("tpf.aws.durable." + binding, "test-durable-store");
+        var requests = new ArrayList<GetSecretValueRequest>();
+        var config = build(values, requests);
+        assertThat(config.getValue(prefix + ".provider", String.class)).isEqualTo("dynamo");
+        assertThat(config.getValue(prefix + ".dynamo.table", String.class)).isEqualTo("test-durable-store");
+        for (String property : List.of(prefix + ".provider", prefix + ".dynamo.table")) {
+            requests.clear();
+            var override = new PropertiesConfigSource(Map.of(property, "different"), "override", 900);
+            assertThatThrownBy(() -> build(values, requests, override)).isInstanceOf(IllegalArgumentException.class);
+            assertThat(requests).isEmpty();
+        }
+        values.put("tpf.aws.durable." + binding, "bad/table");
+        requests.clear();
+        assertThatThrownBy(() -> build(values, requests)).isInstanceOf(IllegalArgumentException.class);
+        assertThat(requests).isEmpty();
+    }
+
+    @Test
     void discoversTheFactoryWithoutLoadingAwsOrSecretsInOrdinaryBuilds() {
         assertThat(ServiceLoader.load(ConfigSourceFactory.class).stream()
             .map(ServiceLoader.Provider::type)).contains(AwsDurableDeploymentConfigSourceFactory.class);
@@ -37,7 +85,7 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {
-        "tpf.aws.durable.resume-token-secret-arn", "tpf.aws.durable.worker-secret-arn",
+        "tpf.aws.durable.command-effect-table", "tpf.aws.durable.query-capture-table", "tpf.aws.durable.resume-token-secret-arn", "tpf.aws.durable.worker-secret-arn",
         "tpf.aws.durable.resume-token-secret-version", "tpf.aws.durable.worker-secret-version",
         "pipeline.orchestrator.resume-token-secret", "pipeline.orchestrator.worker.sqs.shared-secret",
         "pipeline.orchestrator.worker.sqs.shared-secret-ref", "tpf.aws.durable.configuration"})
@@ -46,6 +94,28 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
         var values = Map.of(property, property.endsWith("configuration") ? "{}" : SECRET);
         assertThatThrownBy(() -> build(values, requests)).isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("requires preflight validation").hasMessageNotContaining(SECRET);
+        assertThat(requests).isEmpty();
+    }
+
+    @Test
+    void httpAdmissionRequiresValidatedDeploymentAndUnqualifiedTrustedFamily() {
+        String family = "arn:aws:lambda:eu-west-1:123456789012:function:coordinator";
+        var values = validConfiguration();
+        values.put("tpf.aws.durable.http.enabled", "true");
+        var requests = new ArrayList<GetSecretValueRequest>();
+        assertThatThrownBy(() -> build(values, requests)).hasMessageContaining("http.coordinator-function-family");
+        values.put("tpf.aws.durable.http.coordinator-function-family", family + ":active");
+        assertThatThrownBy(() -> build(values, requests)).hasMessageContaining("trusted coordinator family");
+        values.put("tpf.aws.durable.http.coordinator-function-family", family);
+        values.put("quarkus.lambda.handler", "aws-durable-work-item");
+        assertThatThrownBy(() -> build(values, requests)).hasMessageContaining("HTTP handler");
+        values.remove("quarkus.lambda.handler");
+        assertThat(requests).isEmpty();
+        assertThat(build(values, requests).getValue("tpf.aws.durable.http.enabled", Boolean.class)).isTrue();
+        assertThat(requests).hasSize(2);
+        values.remove("tpf.aws.durable.deployment-validation");
+        requests.clear();
+        assertThatThrownBy(() -> build(values, requests)).hasMessageContaining("requires preflight validation");
         assertThat(requests).isEmpty();
     }
 

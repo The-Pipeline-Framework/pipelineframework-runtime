@@ -18,7 +18,7 @@ public record PipelineReleaseEntryBinding(
     }
 
     /** Checks the original descriptor's artifact digest and declared entry association. */
-    void requireRelease(PipelineReleaseRecord release) {
+    public void requireRelease(PipelineReleaseRecord release) {
         if (!tenantId.equals(release.tenantId()) || !pipelineId.equals(release.pipelineId())
             || !contractVersion.equals(release.contractVersion()) || !releaseVersion.equals(release.releaseVersion())
             || release.descriptor().artifacts().stream().noneMatch(artifact ->
@@ -32,7 +32,7 @@ public record PipelineReleaseEntryBinding(
         }
     }
 
-    List<String> key() {
+    public List<String> key() {
         return List.of(tenantId, pipelineId, contractVersion, releaseVersion, entryId);
     }
 }

@@ -11,6 +11,8 @@ import java.util.List;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.pipelineframework.orchestrator.CoordinationHost;
+import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.SqsInboundMessage;
 import org.pipelineframework.orchestrator.SqsMessageDisposition;
 import org.pipelineframework.orchestrator.SqsWorkItemAction;
@@ -23,6 +25,8 @@ class AwsDurableWorkItemHandlerTest {
             Uni.createFrom().item(SqsMessageDisposition.RETRY));
         var handler = new AwsDurableWorkItemHandler();
         handler.action = action;
+        handler.config = mock(PipelineOrchestratorConfig.class);
+        when(handler.config.coordinationHost()).thenReturn(CoordinationHost.NATIVE);
         var first = new SQSEvent.SQSMessage();
         first.setMessageId("first"); first.setBody("first-body");
         var second = new SQSEvent.SQSMessage();

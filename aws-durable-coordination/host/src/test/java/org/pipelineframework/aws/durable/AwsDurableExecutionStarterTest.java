@@ -34,6 +34,16 @@ class AwsDurableExecutionStarterTest {
     }
 
     @Test
+    void oldIngressWireShapeOmitsTheHttpAttemptIdentifier() throws Exception {
+        var mapper = new ObjectMapper().registerModule(new com.fasterxml.jackson.datatype.jdk8.Jdk8Module());
+        var input = new AwsDurableExecutionInput(
+            "tenant", "stable-key", "pipeline", "contract", "release", "{}", Optional.empty(), 1);
+        String wire = mapper.writeValueAsString(input);
+        assertThat(mapper.readTree(wire).has("submissionAttemptId")).isFalse();
+        assertThat(mapper.readValue(wire, AwsDurableExecutionInput.class)).isEqualTo(input);
+    }
+
+    @Test
     void invokesNumberedAliasWithStableDurableExecutionName() {
         LambdaClient lambda = mock(LambdaClient.class);
         when(lambda.invoke(any(InvokeRequest.class))).thenReturn(InvokeResponse.builder().statusCode(202).build());

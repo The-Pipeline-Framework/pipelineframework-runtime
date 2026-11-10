@@ -28,6 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.enterprise.event.ObservesAsync;
 import jakarta.inject.Inject;
 
@@ -55,6 +56,7 @@ import org.pipelineframework.execution.PipelineExecutionContext;
 import org.pipelineframework.execution.PipelineExecutionContextHolder;
 import org.pipelineframework.runtime.core.RuntimeAdapters;
 import org.pipelineframework.command.CommandReexecutionBoundary;
+import org.pipelineframework.orchestrator.AsyncExecutionSubmission;
 import org.pipelineframework.orchestrator.ExecutionInputShape;
 import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
 import org.pipelineframework.context.PipelineContext;
@@ -134,6 +136,9 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
 
   @Inject
   PipelineControlPlane controlPlane;
+
+  @Inject
+  Instance<AsyncExecutionSubmission> hostedSubmissions;
 
   @Inject
   PipelineOrchestratorConfig orchestratorConfig;
@@ -267,6 +272,9 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
       String tenantId,
       String idempotencyKey,
       boolean outputStreaming) {
+    if (hostedSubmissions != null && !hostedSubmissions.isUnsatisfied()) {
+      return hostedSubmissions.get().submit(input, tenantId, idempotencyKey, outputStreaming);
+    }
     return controlPlane.executePipelineAsync(input, tenantId, idempotencyKey, outputStreaming);
   }
 

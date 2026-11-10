@@ -232,6 +232,18 @@ class QueueAsyncCoordinator {
     return executionReadModel().getExecutionSemanticCheckpointByClientKey(tenantId, clientKey);
   }
 
+  Uni<Optional<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(
+      String tenantId, String clientKey, String pipelineId, String releaseVersion) {
+    if (!ensureQueueModeReady()) return Uni.createFrom().failure(queueModeDisabledException());
+    return executionReadModel().getExecutionSemanticCheckpointByClientKey(tenantId, clientKey, pipelineId, releaseVersion);
+  }
+
+  Uni<Optional<org.pipelineframework.orchestrator.ExecutionClientAdmission>> getExecutionAdmissionByClientKey(
+      String tenantId, String clientKey, String pipelineId, String releaseVersion) {
+    if (!ensureQueueModeReady()) return Uni.createFrom().failure(queueModeDisabledException());
+    return executionReadModel().getExecutionAdmissionByClientKey(tenantId, clientKey, pipelineId, releaseVersion);
+  }
+
   Uni<ExecutionStatusDto> getExecutionStatus(String tenantId, String executionId) {
     if (!ensureQueueModeReady()) {
       return Uni.createFrom().failure(queueModeDisabledException());
@@ -331,6 +343,16 @@ class QueueAsyncCoordinator {
 
   Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs) {
     return sweepOnce(nowEpochMs, NOOP_ITEM_CONTINUATION_HANDLER);
+  }
+
+  Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs,
+      org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher dispatcher) {
+    Objects.requireNonNull(dispatcher, "dispatcher");
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) return Uni.createFrom().failure(queueModeDisabledException());
+      return sweepFlow().sweepOnce(nowEpochMs).chain(result -> awaitContinuations()
+          .sweepDueItemContinuations(nowEpochMs, orchestratorConfig.sweepLimit(), dispatcher).replaceWith(result));
+    });
   }
 
   Uni<CoordinatorSweepResult> sweepOnce(

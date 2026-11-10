@@ -96,7 +96,7 @@ class AwsDurableAdmissionRecoveryTest {
                 if (loseSubmitAcknowledgement) return Uni.createFrom().failure(new IllegalStateException("injected loss of submit acknowledgement"));
                 return Uni.createFrom().item(new RunAsyncAcceptedDto("execution-a", false, "/pipeline/executions/execution-a", 1L));
             });
-            when(controlPlane.getExecutionSemanticCheckpointByClientKey("tenant-a", "stable-key"))
+            when(controlPlane.getExecutionSemanticCheckpointByClientKey("tenant-a", "stable-key", "pipeline-a", "release-a"))
                 .thenAnswer(call -> Uni.createFrom().item(semantic.get()));
             when(controlPlane.getExecutionSemanticCheckpoint("tenant-a", "execution-a"))
                 .thenAnswer(call -> Uni.createFrom().item(semantic.get().orElseThrow()));

@@ -14,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AwsDurableRuntimePermissionsBoundaryTest {
     private static final Set<String> ROLES = Set.of(
-        "DueWorkRole", "DurableRole", "IngressRole", "ActionRole", "WorkerRole", "WakeupRole");
+        "DueWorkRole", "DurableRole", "IngressRole", "ActionRole", "HttpRole", "WorkerRole", "WakeupRole");
 
     private JsonNode template() throws Exception {
         try (var input = getClass().getResourceAsStream("/aws-durable-queue-async.yaml")) {
@@ -26,7 +26,7 @@ class AwsDurableRuntimePermissionsBoundaryTest {
     void boundaryIsOptionalExactCustomerPolicyAndDoesNotChangeProfileDefault() throws Exception {
         JsonNode template = template();
         JsonNode parameter = template.path("Parameters").path("RuntimePermissionsBoundaryArn");
-        assertEquals(74, template.path("Parameters").size());
+        assertEquals(87, template.path("Parameters").size());
         assertEquals("String", parameter.path("Type").asText());
         assertEquals("", parameter.path("Default").asText());
         assertEquals("HARDENED", template.path("Parameters").path("DeploymentProfile").path("Default").asText());

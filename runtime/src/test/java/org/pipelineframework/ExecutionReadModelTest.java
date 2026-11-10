@@ -124,6 +124,45 @@ class ExecutionReadModelTest {
   }
 
   @Test
+  void scopedClientKeyObservesOnlyTheExactReleaseAndOriginalInput() {
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(orchestratorConfig.idempotencyPolicy()).thenReturn(org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy.CLIENT_KEY_REQUIRED);
+    when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.allow());
+    var store = new org.pipelineframework.orchestrator.InMemoryExecutionStateStore();
+    var nativeReads = new ExecutionReadModel(orchestratorConfig, executionInputPolicy, store, awaitCoordinator,
+        admissionPolicy, () -> "pipeline-a", () -> "release-a", () -> payloadCodec);
+    long createdAt = System.currentTimeMillis();
+    String key = PipelineRunSubmissionPlan.scopedRootExecutionKey("pipeline-a", "release-a", "key-1");
+    var created = store.createOrGetExecution(new org.pipelineframework.orchestrator.ExecutionCreateCommand(
+        "tenant-1", key, "pipeline-a", "contract-a", "release-a",
+        new org.pipelineframework.orchestrator.ExecutionInputSnapshot(
+            org.pipelineframework.orchestrator.ExecutionInputShape.UNI, "initial-input"),
+        ExecutionResultShape.SINGLE, createdAt, createdAt / 1000 + 3600)).await().indefinitely();
+    var observed = nativeReads.getExecutionAdmissionByClientKey(" tenant-1 ", " key-1 ", "pipeline-a", "release-a")
+        .await().indefinitely().orElseThrow();
+    assertEquals(created.record().executionId(), observed.checkpoint().executionId());
+    assertEquals(createdAt, observed.submittedAtEpochMs());
+    assertEquals(Optional.of(org.pipelineframework.orchestrator.ExecutionClientAdmission.fingerprint(payloadCodec.encode("initial-input"))),
+        observed.inputFingerprint());
+    assertTrue(nativeReads.getExecutionAdmissionByClientKey("tenant-1", "key-1", "pipeline-a", "release-b")
+        .await().indefinitely().isEmpty());
+  }
+
+  @Test
+  void initialInputFingerprintIgnoresObjectOrderButPreservesDecimalPrecision() {
+    String first = "{\"alpha\":1.12345678901234567890,\"beta\":2}";
+    String reordered = "{\"beta\":2,\"alpha\":1.12345678901234567890}";
+    String different = "{\"alpha\":1.12345678901234567891,\"beta\":2}";
+    assertEquals(initialInputFingerprint(first), initialInputFingerprint(reordered));
+    org.junit.jupiter.api.Assertions.assertNotEquals(initialInputFingerprint(first), initialInputFingerprint(different));
+  }
+
+  private static String initialInputFingerprint(String json) {
+    return org.pipelineframework.orchestrator.ExecutionClientAdmission.fingerprint(
+        new SerializedTransitionPayload("example.Input", JsonTransitionPayloadCodec.ENCODING, json));
+  }
+
+  @Test
   void missingClientKeyCheckpointIsAnEmptyObservationWithoutResubmission() {
     when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
     when(orchestratorConfig.idempotencyPolicy()).thenReturn(org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy.OPTIONAL_CLIENT_KEY);

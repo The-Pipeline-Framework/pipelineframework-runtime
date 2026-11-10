@@ -59,7 +59,7 @@ record PipelineRunSubmissionPlan(
         ttlEpochS);
   }
 
-  private static String scopedRootExecutionKey(String pipelineId, String releaseVersion, String executionKey) {
+  static String scopedRootExecutionKey(String pipelineId, String releaseVersion, String executionKey) {
     return compositeScopedKey("pipelineId", pipelineId, "releaseVersion", releaseVersion)
         + ":executionKey:"
         + requireScopedValue("executionKey", executionKey);

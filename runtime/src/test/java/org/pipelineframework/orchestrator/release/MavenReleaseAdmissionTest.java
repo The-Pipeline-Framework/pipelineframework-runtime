@@ -236,6 +236,100 @@ class MavenReleaseAdmissionTest {
     }
 
     @Test
+    void operationScopedAuthenticatedProfileBypassesGlobalConfigurationAndWorksAsync() throws Exception {
+        var authenticated = new AtomicInteger();
+        var server = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        String authorization = "Basic " + java.util.Base64.getEncoder().encodeToString("operation-user:operation-password".getBytes());
+        server.createContext("/", exchange -> {
+            try {
+                if (!authorization.equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
+                    exchange.getResponseHeaders().set("WWW-Authenticate", "Basic realm=operation-fixture");
+                    exchange.sendResponseHeaders(401, -1);
+                    return;
+                }
+                authenticated.incrementAndGet();
+                Path file = repository.resolve(exchange.getRequestURI().getPath().substring(1)).normalize();
+                if (!file.startsWith(repository) || !Files.isRegularFile(file)) {
+                    exchange.sendResponseHeaders(404, -1);
+                    return;
+                }
+                byte[] bytes = Files.readAllBytes(file);
+                exchange.sendResponseHeaders(200, bytes.length);
+                exchange.getResponseBody().write(bytes);
+            } finally { exchange.close(); }
+        });
+        server.start();
+        try {
+            String remote = "http://127.0.0.1:" + server.getAddress().getPort() + "/";
+            Path settings = Files.writeString(directory.resolve("operation-settings.xml"), """
+                <settings><servers><server><id>operation-private</id><username>operation-user</username>
+                <password>operation-password</password></server></servers><activeProfiles><activeProfile>operation</activeProfile>
+                </activeProfiles><profiles><profile><id>operation</id><repositories><repository><id>operation-private</id>
+                <url>%s</url></repository></repositories></profile></profiles></settings>
+                """.formatted(remote));
+            configure(repository.toUri().toString(), Optional.of(directory.resolve("global-settings-must-not-be-read.xml")));
+            Path descriptor = descriptor(CARRIER, digest(carrier), List.of());
+            byte[] original = Files.readAllBytes(descriptor);
+            assertThrows(IllegalArgumentException.class, () -> registrar.validate("tenant", PIPELINE, descriptor.toString(), 1000L));
+            var profile = new org.pipelineframework.deployment.release.ResolverProfile(true,
+                Optional.of(new org.pipelineframework.deployment.release.MavenResolverConfiguration(settings,
+                    directory.resolve("operation-cache"), List.of(URI.create(remote)))), Optional.empty());
+            var record = registrar.validateAsync("tenant", PIPELINE, descriptor.toString(), 1000L, profile,
+                org.pipelineframework.deployment.release.CredentialResolver.NONE).await().indefinitely();
+            assertTrue(authenticated.get() > 0);
+            assertArrayEquals(original, Files.readAllBytes(descriptor));
+            assertEquals(digest(carrier), record.primaryArtifactDigest());
+            assertArrayEquals(Files.readAllBytes(carrier), Files.readAllBytes(Path.of(URI.create(record.primaryArtifactUri()))));
+            registrar.verify(record);
+        } finally { server.stop(0); }
+    }
+
+    @Test
+    void operationProfileStillRejectsBadSecondaryDigestBeforeAnyArtifactStoreWrite() throws Exception {
+        Path secondary = Files.writeString(directory.resolve("operation-secondary.bin"), "secondary");
+        Path descriptor = descriptor(CARRIER, digest(carrier), List.of(artifact("secondary", "native-binary",
+            secondary.toUri().toString(), "sha256:" + "0".repeat(64))));
+        var profile = new org.pipelineframework.deployment.release.ResolverProfile(true,
+            Optional.of(new org.pipelineframework.deployment.release.MavenResolverConfiguration(null,
+                directory.resolve("operation-cache"), List.of(repository.toUri()))), Optional.empty());
+        assertThrows(IllegalArgumentException.class, () -> registrar.validate("tenant", PIPELINE, descriptor.toString(),
+            1000L, profile, org.pipelineframework.deployment.release.CredentialResolver.NONE));
+        assertFalse(Files.exists(directory.resolve("store")), "explicit resolver must verify the entire closure before storage");
+    }
+
+    @Test
+    void operationProfileCannotBypassExistingUrlCredentialGuard() throws Exception {
+        Path descriptor = descriptor(CARRIER, digest(carrier), List.of());
+        var profile = new org.pipelineframework.deployment.release.ResolverProfile(true,
+            Optional.of(new org.pipelineframework.deployment.release.MavenResolverConfiguration(null,
+                directory.resolve("operation-cache"), List.of(URI.create("https://operation-user:operation-secret@example.invalid/maven")))), Optional.empty());
+        var failure = assertThrows(IllegalArgumentException.class, () -> registrar.validate("tenant", PIPELINE,
+            descriptor.toString(), 1000L, profile, org.pipelineframework.deployment.release.CredentialResolver.NONE));
+        assertFalse(failure.getMessage().contains("operation-secret"));
+        assertFalse(Files.exists(directory.resolve("store")));
+    }
+
+    @Test
+    void operationProfileRejectsMissingSettingsWithoutPublicFallback() throws Exception {
+        Path descriptor = descriptor(CARRIER, digest(carrier), List.of());
+        var profile = new org.pipelineframework.deployment.release.ResolverProfile(true,
+            Optional.of(new org.pipelineframework.deployment.release.MavenResolverConfiguration(directory.resolve("missing-operation-settings.xml"),
+                directory.resolve("operation-cache"), List.of(repository.toUri()))), Optional.empty());
+        assertThrows(IllegalArgumentException.class, () -> registrar.validate("tenant", PIPELINE,
+            descriptor.toString(), 1000L, profile, org.pipelineframework.deployment.release.CredentialResolver.NONE));
+        assertFalse(Files.exists(directory.resolve("store")));
+    }
+
+    @Test
+    void legacyLocalAdmissionDoesNotEagerlyReadUnusedGlobalResolverSettings() throws Exception {
+        configure(repository.toUri().toString(), Optional.of(directory.resolve("unused-missing-settings.xml")));
+        var record = registrar.validate("tenant", PIPELINE,
+            descriptor(carrier.toUri().toString(), digest(carrier), List.of()).toString(), 1000L);
+        assertEquals(digest(carrier), record.primaryArtifactDigest());
+        registrar.verify(record);
+    }
+
+    @Test
     void rejectsRepositoryUrlCredentialsWithoutEchoingThem() throws Exception {
         configure("https://fixture-user:fixture-secret@example.invalid/maven", Optional.empty());
         Response response = register(descriptor(CARRIER, digest(carrier), List.of()));

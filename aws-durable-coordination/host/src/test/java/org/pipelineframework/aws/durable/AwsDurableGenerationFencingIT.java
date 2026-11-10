@@ -101,7 +101,7 @@ class AwsDurableGenerationFencingIT {
         var semantic = new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint("tenant", executionId,
             "pipeline", "contract", "release", org.pipelineframework.orchestrator.ExecutionStatus.RUNNING);
         var controlPlane = org.mockito.Mockito.mock(org.pipelineframework.orchestrator.PipelineControlPlane.class);
-        org.mockito.Mockito.when(controlPlane.getExecutionSemanticCheckpointByClientKey("tenant", "key-" + executionId))
+        org.mockito.Mockito.when(controlPlane.getExecutionSemanticCheckpointByClientKey("tenant", "key-" + executionId, "pipeline", "release"))
             .thenReturn(io.smallrye.mutiny.Uni.createFrom().item(java.util.Optional.of(semantic)));
         var starter = org.mockito.Mockito.mock(AwsDurableExecutionStarter.class);
         var pinned = org.mockito.Mockito.mock(AwsDurableExecutionStarter.class);

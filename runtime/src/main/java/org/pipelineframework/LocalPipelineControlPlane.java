@@ -20,6 +20,7 @@ import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 import org.pipelineframework.orchestrator.AwaitItemContinuationResult;
 import org.pipelineframework.orchestrator.AwaitSemanticCheckpoint;
 import org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint;
+import org.pipelineframework.orchestrator.ExecutionClientAdmission;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.ExecutionRedriveResult;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
@@ -104,6 +105,18 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     }
 
     @Override
+    public Uni<Optional<org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint>> getExecutionSemanticCheckpointByClientKey(
+        String tenantId, String clientKey, String pipelineId, String releaseVersion) {
+        return queueAsyncCoordinator.getExecutionSemanticCheckpointByClientKey(tenantId, clientKey, pipelineId, releaseVersion);
+    }
+
+    @Override
+    public Uni<Optional<ExecutionClientAdmission>> getExecutionAdmissionByClientKey(
+        String tenantId, String clientKey, String pipelineId, String releaseVersion) {
+        return queueAsyncCoordinator.getExecutionAdmissionByClientKey(tenantId, clientKey, pipelineId, releaseVersion);
+    }
+
+    @Override
     public Uni<ExecutionStatusDto> getExecutionStatus(String tenantId, String executionId) {
         return queueAsyncCoordinator.getExecutionStatus(tenantId, executionId);
     }
@@ -134,11 +147,18 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
         });
     }
 
+
     @Override
     public Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs) {
         return queueAsyncCoordinator.sweepOnce(
             nowEpochMs,
             pipelineExecutionService.awaitItemContinuationHandlerForControlPlane());
+    }
+
+    @Override
+    public Uni<CoordinatorSweepResult> sweepOnce(long nowEpochMs,
+        org.pipelineframework.orchestrator.AwaitItemContinuationDispatcher dispatcher) {
+        return queueAsyncCoordinator.sweepOnce(nowEpochMs, java.util.Objects.requireNonNull(dispatcher, "dispatcher"));
     }
 
     @Override

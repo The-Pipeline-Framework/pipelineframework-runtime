@@ -14,7 +14,15 @@ published runtime63 (`a084c50e672645cde42b592b5415d218a8a24b73`), including its
 CMKs, Secrets Manager reads and 64 alarms. The explicit signing-source environment
 setting selects the reader's existing default; the native host binaries are unchanged.
 
-`RESTRICTED_PILOT` is a fresh, isolated, supervised FUNCTION deployment. It omits
+`RESTRICTED_PILOT` is an isolated, supervised FUNCTION deployment. It supports
+fresh stacks and the explicitly validated `RETAINED_RELEASE_VERSIONS` mode.
+Compatible retained updates freeze the namespace, signing generations, encryption
+authorities, resources and routing entry IDs; preserve all numbered function grants
+needed by older executions; and change only the immutable Release/package pins.
+The version-1 SSM signing parameters must share the same account, region and
+namespace and remain protected against overwrite and deletion until drained.
+Changing those authorities requires a separately qualified migration. This local
+qualification does not establish live AWS delivery or unattended acceptance. It omits
 alarm resources and uses SSE-SQS, DynamoDB AWS-owned encryption, default Lambda /
 Durable / Logs encryption, and externally verified S3 SSE-S3 / semantic AWS-owned
 resources. Logs, metrics emission, PITR, deletion protection, Streams, seven native
@@ -38,6 +46,28 @@ host telemetry remain. A separately owned, authenticated, exact-log-group CloudW
 Logs metric extraction policy may control that charge; this graph does not change
 an account-wide policy. Free-tier allowance and actual idle traffic are unverified.
 
+## Unreserved capacity for a supervised first deployment
+
+Set `RestrictedPilotValidation=UNRESERVED_SERIAL_SMOKE` only for a fresh
+restricted deployment under the retained numbered-routing contract. The
+ordinary `validated` setting keeps the existing reservations and mapping
+limits. The smoke setting omits reservations on all active functions and sets
+the SQS invocation maximum to two per mapping. The existing Streams, scheduled
+and event-driven recovery, retry/DLQ settings, retention and signing stay in
+effect. The smoke setting forbids HTTP, optional effect/capture stores and
+retained version inputs.
+
+The operator must keep developer admissions closed, allow one supervised check
+at a time across the account/region and reserve observed headroom for its
+recovery. Keep the Release-selected placement, routing and permissions constraints.
+The template cannot tell whether a caller is creating a fresh stack or updating
+an existing one. Deployment policy must prevent updates and retained-version
+qualification under this setting. The SQS cap is per mapping, and Streams and
+synchronous internal calls share the same regional pool. The setting provides
+no dedicated concurrency or availability promise. Stop new admissions if
+throttling or backlog threatens recovery, and leave recovery enabled until
+the admitted work and its obligations have drained.
+
 ## Input and immutable signing contract
 
 Nine added parameters bring the canonical parameter count to 73:
@@ -55,7 +85,16 @@ Nine added parameters bring the canonical parameter count to 73:
 | SigningParameterAccessArns | empty list element | current + all retained exact ARNs |
 
 Restricted requires `ReleaseIsolationMode=FRESH_RELEASE_ISOLATED_STACK` and
-`TransitionWorkerPlacement=FUNCTION`. Supply explicit empty AlarmTopicArn (no SNS dependency), empty secret ARN/version/signing CMK
+`TransitionWorkerPlacement=FUNCTION` for a Release with a separate Lambda transition worker.
+Use `IN_PROCESS` only for the `aws-durable-java21-in-process-v1` profile
+after verifying its Release closure and supported steps. That profile has
+no `SQS_TRANSITION` entry. Its Work Lambda executes the transition in its
+existing runtime. The template omits the remote function, mapping, logs,
+version and transition queues. Use a distinct Environment when changing
+placement. A compatible code-only update uses the same placement, keeps
+the existing event bindings and retains the numbered versions.
+
+Supply explicit empty AlarmTopicArn (no SNS dependency), empty secret ARN/version/signing CMK
 inputs, empty signing-secret/CMK and semantic-CMK access list elements. Mixed sources,
 mutable versions and incompatible selectors fail closed in template Rules and preflight.
 `HostKmsKeyArn` remains a real retained key ARN. The old deployment, callback and
@@ -192,3 +231,17 @@ must inspect an AWS change-set preview before executing a newly qualified asset.
 AWS references: [CodeUri](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-function.html#sam-function-codeuri),
 [language extensions](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-specification-language-extensions.html),
 and [transform ordering and parameter resolution](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/transform-aws-languageextensions.html).
+# Optional private HTTP entry
+
+The original ten retained AWS Durable roles remain required. A Release can add
+one private Quarkus HTTP ZIP through `HttpArtifactUri`, `HttpCodeSha256` and
+`HttpEntryId`. The provider supplies all three from the immutable Release and
+observes its numbered Lambda version and log group in the deployment manifest.
+The HTTP function uses the original configuration source and signing references.
+It retains its numbered versions and can inspect or invoke only the current and
+explicitly retained numbered coordinator versions. IAM-authorized callers use
+the numbered HTTP Lambda ARN.
+
+A Query-capable Release binds the existing append-only Dynamo Query capture
+store through its exact `QueryCaptureTable`. The table uses `capture_key` (S)
+and `revision` (N). Semantic functions select Dynamo for Await admission.

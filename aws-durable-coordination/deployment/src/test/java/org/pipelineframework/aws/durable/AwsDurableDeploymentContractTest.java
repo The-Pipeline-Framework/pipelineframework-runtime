@@ -33,7 +33,7 @@ class AwsDurableDeploymentContractTest {
             assertEquals("false", new ObjectMapper().readTree(encoded.asText())
                 .path("sqs.local-loopback").asText(), "Each native semantic host must dispatch only through SQS");
         }
-        assertEquals(8, hosts, "Must inspect every native semantic host");
+        assertEquals(9, hosts, "Must inspect every native semantic host");
     }
 
     @Test
