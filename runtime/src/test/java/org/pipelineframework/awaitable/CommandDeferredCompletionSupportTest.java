@@ -24,6 +24,7 @@ import org.pipelineframework.command.*;
 import org.pipelineframework.connector.*;
 import org.pipelineframework.execution.PipelineExecutionContext;
 import org.pipelineframework.execution.PipelineExecutionContextHolder;
+import org.pipelineframework.invocation.PipelineInvocationContext;
 import org.pipelineframework.orchestrator.*;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -140,9 +141,12 @@ public class CommandDeferredCompletionSupportTest {
     }
 
     @ParameterizedTest
-    @org.junit.jupiter.params.provider.CsvSource({"false,false,false", "true,false,false", "true,true,false", "true,false,true"})
+    @org.junit.jupiter.params.provider.CsvSource({
+        "false,false,false,false", "true,false,false,false", "true,true,false,false", "true,false,true,false",
+        "false,false,false,true", "true,false,false,true"
+    })
     void acknowledgedCompletionJoinsBothOrdersAndRejectsMismatchedCallback(boolean callbackFirst,
-        boolean projectionUnavailableOnce, boolean acknowledgeAfterDeadline) throws Exception {
+        boolean projectionUnavailableOnce, boolean acknowledgeAfterDeadline, boolean nested) throws Exception {
         when(config.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
         var bindings = ConnectorBindingRegistry.fromProviders(List.of(new ConnectorBindingDefinition(
             ConnectorBindingName.of("jobs"), ConnectorProviderId.of("test.jobs"), 1, ConnectorConfigurationDocument.empty())),
@@ -174,6 +178,13 @@ public class CommandDeferredCompletionSupportTest {
         AwaitCoordinator coordinator = coordinator();
         CommandDeferredCompletionSupport support = support(coordinator);
         AtomicReference<AwaitInteractionRecord> registered = new AtomicReference<>();
+        var invocationPath = nested
+            ? Optional.of(PipelineInvocationContext.root(4).atStep(0).enter("verify-node", "Verify upstream", false)
+                .atStep(0).path())
+            : Optional.<org.pipelineframework.invocation.PipelineInvocationPath>empty();
+        AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant", "execution", 0,
+            AwaitContinuationMode.DURABLE_HANDOFF, TerminalOutputOwnership.TRANSITION_WORKER,
+            Map.of(), Optional.empty(), Optional.empty(), invocationPath));
         PipelineExecutionContextHolder.set(new PipelineExecutionContext("tenant", "execution", 0));
         CompletableFuture<String> result = support.<String, String>execute(descriptor, "input", record -> {
             registered.set(interactions.get(record.tenantId(), record.interactionId()).await().indefinitely().orElseThrow());
@@ -183,6 +194,7 @@ public class CommandDeferredCompletionSupportTest {
         assertTrue(provider.operation.entered.await(5, TimeUnit.SECONDS));
         var record = registered.get();
         assertEquals(AwaitCompletionDescriptor.CONNECTOR_CALLBACK_TRANSPORT, record.transportType());
+        assertEquals(invocationPath, record.invocationPath());
         String token = provider.operation.callback.orElseThrow().callbackUri().getPath()
             .substring(("/" + CommandDeferredCompletionSupport.CALLBACK_PATH).length());
         if (callbackFirst) {
@@ -190,6 +202,7 @@ public class CommandDeferredCompletionSupportTest {
                 record.correlationId(), token, "early", "accepted", "provider", System.currentTimeMillis()))
                 .await().indefinitely();
             assertEquals(AwaitInteractionStatus.COMPLETION_OBSERVED, staged.record().status());
+            assertEquals(invocationPath, staged.record().invocationPath());
             assertTrue(staged.record().commandAcknowledgement().isEmpty());
             assertEquals(Optional.of("accepted"), staged.record().stagedCompletionPayload());
             assertFalse(result.isDone());
@@ -258,6 +271,7 @@ public class CommandDeferredCompletionSupportTest {
         assertEquals(Optional.of("accepted"), interactions.get("tenant", record.interactionId())
             .await().indefinitely().orElseThrow().commandAcknowledgement());
         var completedRecord = interactions.get("tenant", record.interactionId()).await().indefinitely().orElseThrow();
+        assertEquals(invocationPath, completedRecord.invocationPath());
         var admission = interactions.getCompletionAdmission("tenant", record.interactionId())
             .await().indefinitely().orElseThrow();
         assertEquals(completedRecord.updatedAtEpochMs(), admission.firstAdmittedAtEpochMs());

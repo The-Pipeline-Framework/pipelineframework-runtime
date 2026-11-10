@@ -634,7 +634,7 @@ public class AwaitCoordinator {
             current.requestPayload(), response, current.unitId(), current.itemIndex(), actor,
             current.assignee(), current.group(), current.transportType(), metadata,
             current.deadlineEpochMs(), current.createdAtEpochMs(), nowEpochMs, current.ttlEpochS(),
-            current.transportOutputType(), acknowledgement, stagedCompletion);
+            current.transportOutputType(), acknowledgement, stagedCompletion, current.invocationPath());
     }
 
     private Uni<AwaitCompletionCommand> validateCompletionAdmission(
