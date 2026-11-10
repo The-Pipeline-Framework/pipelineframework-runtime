@@ -20,6 +20,19 @@ import jakarta.enterprise.inject.Instance;
 
 class AwsDurableDueWorkHandlerTest {
     @Test
+    void directlyConstructedHandlerAcknowledgesANativeSweep() {
+        var controlPlane = mock(PipelineControlPlane.class);
+        when(controlPlane.sweepOnce(1000L)).thenReturn(
+            Uni.createFrom().item(new CoordinatorSweepResult(1000L, 50, 0, 0)));
+        var handler = new AwsDurableDueWorkHandler(controlPlane,
+            Clock.fixed(Instant.ofEpochMilli(1000L), ZoneOffset.UTC));
+
+        assertThat(handler.handleRequest(event("tick"), mock(Context.class)).getBatchItemFailures()).isEmpty();
+        verify(controlPlane).sweepOnce(1000L);
+        verifyNoMoreInteractions(controlPlane);
+    }
+
+    @Test
     void delayedAndDuplicateTicksUseFreshHostTimeWithoutExecutionOrProviderState() {
         var controlPlane = mock(PipelineControlPlane.class);
         var clock = mock(Clock.class);

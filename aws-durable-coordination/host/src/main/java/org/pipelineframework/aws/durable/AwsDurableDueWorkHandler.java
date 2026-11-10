@@ -43,8 +43,9 @@ public final class AwsDurableDueWorkHandler implements RequestHandler<SQSEvent, 
     public SQSBatchResponse handleRequest(SQSEvent event, Context context) {
         // A tick is a hint, not a persisted deadline or authority supplied by its payload.
         return new AwsDurableSqsBatchAdapter().handle(event, message -> {
-            if (config.coordinationHost() == CoordinationHost.NATIVE)
+            if (config == null || config.coordinationHost() == CoordinationHost.NATIVE) {
                 return controlPlane.sweepOnce(clock.millis()).replaceWith(SqsMessageDisposition.ACKNOWLEDGE);
+            }
             if (releases == null || !releases.isResolvable()) throw new IllegalStateException("AWS Durable release routing is unavailable");
             var router = releases.get();
             return (router.dueEnabled() ? controlPlane.sweepOnce(clock.millis(), router::dispatchDue)

@@ -150,10 +150,26 @@ class AwsDurableHttpSubmissionTest {
         verify(fixture.submission.lambda, never()).invoke(any(InvokeRequest.class));
     }
 
+    @Test
+    void malformedStoredBindingDigestFailsAsAServerFaultBeforeProviderCalls() {
+        var fixture = new Fixture("invalid-base64!");
+        when(fixture.read()).thenReturn(Uni.createFrom().item(Optional.empty()));
+
+        assertThatThrownBy(() -> fixture.submit("input"))
+            .isInstanceOf(IllegalStateException.class).hasMessageContaining("Stored Durable coordinator code digest")
+            .hasNoCause().satisfies(failure -> assertThat(failure.getSuppressed())
+                .anySatisfy(suppressed -> assertThat(suppressed).isInstanceOf(IllegalArgumentException.class)));
+        verifyNoInteractions(fixture.submission.lambda);
+    }
+
     private static final class Fixture {
         final AwsDurableHttpSubmission submission = new AwsDurableHttpSubmission();
 
         Fixture() {
+            this(AwsDurableRetainedReleaseRoutingIT.codeDigest("release"));
+        }
+
+        Fixture(String codeDigest) {
             var contract = AwsDurableRetainedReleaseRoutingIT.contract("release");
             submission.controlPlane = mock(PipelineControlPlane.class);
             submission.config = mock(PipelineOrchestratorConfig.class);
@@ -174,7 +190,6 @@ class AwsDurableHttpSubmissionTest {
             when(submission.identity.contractVersion()).thenReturn("contract-release");
             when(submission.identity.releaseVersion(submission.config)).thenReturn("release");
             String digest = AwsDurableRetainedReleaseRoutingIT.digest("release");
-            String codeDigest = AwsDurableRetainedReleaseRoutingIT.codeDigest("release");
             var artifact = new PipelineReleaseArtifactDescriptor("archive", "lambda-zip", "s3://release/archive", digest, List.of(), List.of());
             var entry = new PipelineReleaseDeployment.Entry("coordinator", "archive", contract.module(), ".",
                 AwsDurableCoordinatorHandler.class.getName(), "AWS_DURABLE_COORDINATOR", List.of());

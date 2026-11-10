@@ -163,7 +163,14 @@ public class AwsDurableHttpSubmission implements AsyncExecutionSubmission {
         }
         var artifact = release.descriptor().artifacts().stream()
             .filter(value -> binding.artifactId().equals(value.artifactId())).findFirst().orElseThrow();
-        byte[] codeDigest = Base64.getDecoder().decode(binding.codeDigest());
+        byte[] codeDigest;
+        try {
+            codeDigest = Base64.getDecoder().decode(binding.codeDigest());
+        } catch (IllegalArgumentException malformed) {
+            var failure = new IllegalStateException("Stored Durable coordinator code digest is not valid Base64");
+            failure.addSuppressed(malformed);
+            throw failure;
+        }
         if (!"lambda-zip".equals(artifact.kind()) || codeDigest.length != 32
             || !artifact.digest().equals("sha256:" + HexFormat.of().formatHex(codeDigest))) {
             throw new IllegalStateException("The Durable coordinator digest does not match the Release ZIP");
