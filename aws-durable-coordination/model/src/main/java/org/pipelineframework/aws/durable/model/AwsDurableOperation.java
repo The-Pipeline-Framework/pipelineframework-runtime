@@ -4,6 +4,7 @@ public enum AwsDurableOperation {
     SUBMIT,
     STATUS,
     RESULT,
+    READ_RUNTIME_IDENTITY,
     REDRIVE,
     SWEEP,
     QUERY_PENDING_AWAIT,

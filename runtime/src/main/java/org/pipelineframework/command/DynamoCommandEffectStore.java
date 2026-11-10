@@ -79,6 +79,11 @@ public class DynamoCommandEffectStore implements CommandEffectStore {
         return true;
     }
 
+    /** Returns the table bound to this store instance. */
+    public String tableName() {
+        return tableName;
+    }
+
     @Override
     public Uni<CommandEffectRecord> createPending(CommandRequest<?> request, CommandRecoveryBinding binding, long nowEpochMs) {
         return createPendingBound(request, Optional.of(Objects.requireNonNull(binding)), nowEpochMs);

@@ -78,7 +78,7 @@ class AwsDurableCoordinatorHandlerTest {
             case RESULT -> AwsDurableActionResponse.result("{\"approved\":true}");
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REDRIVE -> throw new AssertionError("driver must not re-drive implicitly");
-            case QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS, BIND_CALLBACK ->
+            case READ_RUNTIME_IDENTITY, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS, BIND_CALLBACK ->
                 throw new AssertionError("driver must register before resolving the TPF Await identity");
         };
         AwsDurableCoordinatorHandler handler = new AwsDurableCoordinatorHandler(actions);
@@ -226,7 +226,7 @@ class AwsDurableCoordinatorHandlerTest {
             }
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
             case REDRIVE -> throw new AssertionError("driver must not re-drive implicitly");
-            case QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS, BIND_CALLBACK, RECORD_AWAIT_RESUMED ->
+            case READ_RUNTIME_IDENTITY, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS, BIND_CALLBACK, RECORD_AWAIT_RESUMED ->
                 throw new AssertionError("driver must register before resolving the TPF Await identity");
         };
         AwsDurableCoordinatorHandler handler = new AwsDurableCoordinatorHandler(actions);
@@ -264,7 +264,7 @@ class AwsDurableCoordinatorHandlerTest {
                 : AwsDurableActionResponse.status("SUCCEEDED");
             case RESULT -> AwsDurableActionResponse.result("{\"awaits\":2}");
             case SWEEP -> AwsDurableActionResponse.status("SWEEPED");
-            case REDRIVE, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS, BIND_CALLBACK ->
+            case READ_RUNTIME_IDENTITY, REDRIVE, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS, BIND_CALLBACK ->
                 throw new AssertionError("unexpected driver action " + request.operation());
         };
         AwsDurableExecutionInput input = new AwsDurableExecutionInput(
@@ -314,7 +314,7 @@ class AwsDurableCoordinatorHandlerTest {
                 callbackBound.set(true);
                 throw new AssertionError("terminal TPF state must not register a replacement callback");
             }
-            case QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS ->
+            case READ_RUNTIME_IDENTITY, QUERY_PENDING_AWAIT, READ_AWAIT_CHECKPOINT, READ_EXECUTION_AWAITS, READ_AWAIT_COMPLETION, QUERY_AWAIT_COMPLETIONS ->
                 throw new AssertionError("terminal TPF state has no pending Await");
             case RECORD_AWAIT_RESUMED -> throw new AssertionError("terminal TPF state has no resumed Await");
             case REDRIVE -> throw new AssertionError("driver must not re-drive implicitly");
