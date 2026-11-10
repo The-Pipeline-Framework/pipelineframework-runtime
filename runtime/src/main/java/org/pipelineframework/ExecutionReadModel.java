@@ -30,9 +30,11 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionOperation;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
 import org.pipelineframework.orchestrator.ExecutionRecord;
+import org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.OrchestratorMode;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
+import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.dto.ExecutionStatusDto;
 
@@ -200,6 +202,19 @@ class ExecutionReadModel {
   Uni<Object> getExecutionResultPayload(String tenantId, String executionId) {
     return readExecution(tenantId, executionId, ControlPlaneAdmissionOperation.GET_EXECUTION_RESULT)
         .onItem().transform(record -> new ExecutionResultView(record).rawPayload());
+  }
+
+  /** Verifies the full pin on the admitted point read before producing a wire result. */
+  Uni<SerializedTransitionPayload> getExecutionTypedResult(ExecutionSemanticCheckpoint pin) {
+    return readExecution(pin.tenantId(), pin.executionId(), ControlPlaneAdmissionOperation.GET_EXECUTION_RESULT)
+        .map(record -> {
+          if (!pin.tenantId().equals(record.tenantId()) || !pin.executionId().equals(record.executionId())
+              || !pin.pipelineId().equals(record.pipelineId()) || !pin.contractVersion().equals(record.contractVersion())
+              || !pin.releaseVersion().equals(record.releaseVersion())) {
+            throw new IllegalStateException("Execution result differs from the requested Release pin");
+          }
+          return new ExecutionResultView(record).serializedSingleResult(payloadCodec);
+        });
   }
 
   /** An absent admission remains absent; this lookup never creates or redrives execution state. */

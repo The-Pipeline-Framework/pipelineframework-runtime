@@ -17,6 +17,7 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
+import org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
@@ -354,6 +355,26 @@ class ExecutionReadModelTest {
         readModel.getExecutionResult("tenant-1", "exec-dlq", String.class, false).await().indefinitely());
 
     assertTrue(error.getMessage().contains("Execution finished without a successful result: DLQ"));
+  }
+
+  @Test
+  void hostedResultPreservesTheStoredWirePayloadAndRequiresTheExactPin() {
+    when(orchestratorConfig.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(admissionPolicy.admit(any())).thenReturn(ControlPlaneAdmissionDecision.allow());
+    var expected = new SerializedTransitionPayload(String.class.getName(), JsonTransitionPayloadCodec.ENCODING, "\"value\"");
+    var stored = succeeded("tenant-1", "exec", ExecutionResultShape.SINGLE, List.of(expected));
+    when(executionStateStore.getExecution("tenant-1", "exec"))
+        .thenReturn(Uni.createFrom().item(Optional.of(stored)));
+    var pin = new ExecutionSemanticCheckpoint("tenant-1", "exec", stored.pipelineId(), stored.contractVersion(),
+        stored.releaseVersion(), ExecutionStatus.SUCCEEDED);
+    assertEquals(expected, readModel.getExecutionTypedResult(pin).await().indefinitely());
+    var foreign = new ExecutionSemanticCheckpoint("tenant-1", "exec", stored.pipelineId(), stored.contractVersion(),
+        "different-release", ExecutionStatus.SUCCEEDED);
+    assertThrows(IllegalStateException.class, () -> readModel.getExecutionTypedResult(foreign).await().indefinitely());
+
+    var materialized = succeeded("tenant-1", "exec", ExecutionResultShape.MATERIALIZED_MULTI, List.of(expected));
+    when(executionStateStore.getExecution("tenant-1", "exec")).thenReturn(Uni.createFrom().item(Optional.of(materialized)));
+    assertThrows(IllegalStateException.class, () -> readModel.getExecutionTypedResult(pin).await().indefinitely());
   }
 
   @Test

@@ -16,6 +16,7 @@ import org.pipelineframework.aws.durable.model.AwsDurableCallbackRegistration;
 import org.pipelineframework.aws.durable.model.AwsDurableDriverCheckpoint;
 import org.pipelineframework.aws.durable.model.AwsDurableExecutionCheckpoint;
 import org.pipelineframework.orchestrator.AwaitSemanticCheckpoint;
+import org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint;
 import org.pipelineframework.orchestrator.PipelineControlPlane;
 
 /** Synchronous Lambda shell over bounded reactive {@link PipelineControlPlane} actions. */
@@ -83,6 +84,8 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             case REGISTER_EXECUTION -> registerExecution(request);
             case REGISTER_CALLBACK -> register(request);
             case BIND_CALLBACK -> bind(request);
+            case READ_EXECUTION_LOCATOR -> executionLocator(request);
+            case TYPED_RESULT -> typedResult(request);
         };
     }
 
@@ -295,6 +298,36 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         } catch (JsonProcessingException exception) {
             throw new IllegalStateException("TPF result could not be serialized", exception);
         }
+    }
+
+    /** Reads retained execution correlation after authorizing its exact semantic execution pin. */
+    private AwsDurableActionResponse executionLocator(AwsDurableActionRequest request) {
+        var pin = driverCheckpoint(request);
+        readPinnedExecution(pin);
+        return AwsDurableActionResponse.result(json(bindings.findCurrentRecovery(pin).orElse(null)));
+    }
+
+    /** Reads the admitted result and confirms that the requested driver generation still owns it. */
+    private AwsDurableActionResponse typedResult(AwsDurableActionRequest request) {
+        var pin = driverCheckpoint(request);
+        var semantic = readPinnedExecution(pin);
+        var result = controlPlane.getExecutionTypedResult(semantic).await().atMost(actionTimeout);
+        if (bindings.findCurrentRecovery(pin).isEmpty()) {
+            throw new IllegalStateException("Typed result requires a current execution locator");
+        }
+        return AwsDurableActionResponse.result(json(result));
+    }
+
+    /** Applies the existing status-read admission and verifies all coordinates before returning evidence. */
+    private ExecutionSemanticCheckpoint readPinnedExecution(AwsDurableDriverCheckpoint pin) {
+        var semantic = controlPlane.getExecutionSemanticCheckpoint(pin.tenantId(), pin.executionId())
+            .await().atMost(actionTimeout);
+        if (!pin.tenantId().equals(semantic.tenantId()) || !pin.executionId().equals(semantic.executionId())
+            || !pin.pipelineId().equals(semantic.pipelineId()) || !pin.contractVersion().equals(semantic.contractVersion())
+            || !pin.releaseVersion().equals(semantic.releaseVersion())) {
+            throw new IllegalStateException("Semantic execution differs from the requested Release pin");
+        }
+        return semantic;
     }
 
     private static String required(java.util.Optional<String> value, String name) {

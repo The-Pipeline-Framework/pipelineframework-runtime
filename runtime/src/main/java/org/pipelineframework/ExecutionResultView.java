@@ -63,6 +63,15 @@ record ExecutionResultView(ExecutionRecord<Object, Object> record) {
     return List.copyOf(items);
   }
 
+  /** The Hosted readiness check requires exactly one terminal payload. */
+  SerializedTransitionPayload serializedSingleResult(Supplier<TransitionPayloadCodec> payloadCodec) {
+    List<?> items = successfulItems();
+    if (record.resultShape() != ExecutionResultShape.SINGLE || items.size() != 1) {
+      throw new IllegalStateException("Typed execution result requires exactly one successful item");
+    }
+    return payloadCodec.get().encode(items.getFirst());
+  }
+
   Optional<Object> typedOptionalResult(
       Class<?> outputType,
       boolean outputStreaming,

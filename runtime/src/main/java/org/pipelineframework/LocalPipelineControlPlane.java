@@ -19,6 +19,7 @@ import org.pipelineframework.orchestrator.CoordinatorSweepResult;
 import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 import org.pipelineframework.orchestrator.AwaitItemContinuationResult;
 import org.pipelineframework.orchestrator.AwaitSemanticCheckpoint;
+import org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.ExecutionRedriveResult;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
@@ -26,6 +27,7 @@ import org.pipelineframework.orchestrator.PipelineControlPlane;
 import org.pipelineframework.orchestrator.PipelineTransitionWorker;
 import org.pipelineframework.orchestrator.dto.ExecutionStatusDto;
 import org.pipelineframework.orchestrator.dto.RunAsyncAcceptedDto;
+import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 
 /**
  * Local in-process control-plane facade backed by the queue async coordinator.
@@ -103,6 +105,11 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     @Override
     public Uni<ExecutionStatusDto> getExecutionStatus(String tenantId, String executionId) {
         return queueAsyncCoordinator.getExecutionStatus(tenantId, executionId);
+    }
+
+    @Override
+    public Uni<SerializedTransitionPayload> getExecutionTypedResult(ExecutionSemanticCheckpoint pin) {
+        return queueAsyncCoordinator.getExecutionTypedResult(pin);
     }
 
     @Override

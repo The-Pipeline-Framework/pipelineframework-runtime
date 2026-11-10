@@ -11,6 +11,17 @@ import io.smallrye.mutiny.Uni;
  */
 public interface PipelineReleaseRegistry {
 
+    /** Records immutable physical deployment evidence for one entry of a registered Release. */
+    default Uni<PipelineReleaseEntryBinding> registerEntryBinding(PipelineReleaseEntryBinding binding) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Release entry bindings are unsupported"));
+    }
+
+    /** Reads the binding of the exact scoped Release entry without altering activation or worker state. */
+    default Uni<Optional<PipelineReleaseEntryBinding>> getEntryBinding(
+        String tenantId, String pipelineId, String contractVersion, String releaseVersion, String entryId) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Release entry bindings are unsupported"));
+    }
+
     default boolean supportsCurrentActivationObservation() { return false; }
 
     /** Strong read-only observation; legacy unknown identity is never inferred from release or time. */
@@ -25,6 +36,12 @@ public interface PipelineReleaseRegistry {
     /** Atomically commits the activation event, common ordered head and immutable operation receipt. */
     default Uni<ActivationOperationReceipt> activateOnce(ActivationOperationCommand command) {
         return Uni.createFrom().failure(new UnsupportedOperationException("Activation operations are unsupported"));
+    }
+
+    /** Atomically changes only the observed head; replay returns its receipt without reactivation. */
+    default Uni<ActivationOperationReceipt> activateOnceIfCurrent(
+        ActivationOperationCommand command, CurrentActivationObservation expected) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Conditional activation is unsupported"));
     }
 
     /** Strong read-only historical inquiry; unknown never authorizes an activation. */

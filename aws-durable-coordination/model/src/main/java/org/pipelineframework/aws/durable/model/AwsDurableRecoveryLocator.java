@@ -11,5 +11,13 @@ public record AwsDurableRecoveryLocator(AwsDurableDriverCheckpoint checkpoint,
         providerExecutionArn = AwsDurableValidation.required(providerExecutionArn, "providerExecutionArn");
     }
     public String partitionKey() { return checkpoint.tenantId() + "#" + checkpoint.executionId(); }
-    public String sortKey() { return "RECOVERY#" + String.format(java.util.Locale.ROOT, "%020d", checkpoint.generation()); }
+    public String sortKey() { return sortKey(checkpoint.generation()); }
+
+    /** Storage key for the retained locator of a particular generation. */
+    public static String sortKey(long generation) {
+        if (generation < 1) {
+            throw new IllegalArgumentException("generation must be positive");
+        }
+        return "RECOVERY#" + String.format(java.util.Locale.ROOT, "%020d", generation);
+    }
 }

@@ -42,6 +42,24 @@ class CurrentActivationObservationTest {
     }
 
     @Test
+    void memoryConditionalActivationCannotUseAbsenceToReplaceUnidentifiedLegacyHead() {
+        var registry = new InMemoryPipelineReleaseRegistry();
+        var release = release(PipelineReleaseStatus.ACTIVE);
+        registry.register(release).await().indefinitely();
+        var original = registry.currentActivationObservation("tenant", "pipeline").await().indefinitely();
+        var command = new ActivationOperationCommand("conditional", release, 2000);
+        var claimedAbsence = new CurrentActivationObservation(1, "tenant", "pipeline",
+            CurrentActivationObservation.State.NONE, Optional.empty());
+
+        assertThrows(IllegalArgumentException.class,
+            () -> registry.activateOnceIfCurrent(command, original).await().indefinitely());
+        assertThrows(IllegalStateException.class,
+            () -> registry.activateOnceIfCurrent(command, claimedAbsence).await().indefinitely());
+        assertEquals(original, registry.currentActivationObservation("tenant", "pipeline").await().indefinitely());
+        assertTrue(registry.getActivationOperation("tenant", "pipeline", "conditional").await().indefinitely().isEmpty());
+    }
+
+    @Test
     void guardedReadOnlyRoutePreservesAuthAndUnsupportedDefaults() {
         var admin = new HostedReleaseAdminResource();
         admin.orchestratorConfig = mock(PipelineOrchestratorConfig.class);

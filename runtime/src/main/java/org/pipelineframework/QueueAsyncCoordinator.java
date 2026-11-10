@@ -39,10 +39,12 @@ import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
 import org.pipelineframework.telemetry.PipelineReplayTelemetry;
 import org.pipelineframework.orchestrator.DeadLetterPublisher;
 import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
+import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 import org.pipelineframework.orchestrator.ExecutionRedriveResult;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionResultShapeResolver;
+import org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy;
@@ -223,6 +225,16 @@ class QueueAsyncCoordinator {
       return Uni.createFrom().failure(queueModeDisabledException());
     }
     return executionReadModel().getExecutionStatus(tenantId, executionId);
+  }
+
+  /** Uses the same queue-mode and admission gates as the existing result read. */
+  Uni<SerializedTransitionPayload> getExecutionTypedResult(ExecutionSemanticCheckpoint pin) {
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) {
+        return Uni.createFrom().failure(queueModeDisabledException());
+      }
+      return executionReadModel().getExecutionTypedResult(pin);
+    });
   }
 
   <T> Uni<T> getExecutionResult(String tenantId, String executionId, Class<?> outputType, boolean outputStreaming) {

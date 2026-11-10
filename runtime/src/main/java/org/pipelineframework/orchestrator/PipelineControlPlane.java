@@ -50,6 +50,11 @@ public interface PipelineControlPlane {
 
     Uni<Object> getExecutionResultPayload(String tenantId, String executionId);
 
+    /** Reads one successful result through its exact execution and Release pin. */
+    default Uni<SerializedTransitionPayload> getExecutionTypedResult(ExecutionSemanticCheckpoint pin) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Typed execution result is unsupported"));
+    }
+
     /**
      * Executes one bounded timeout and due-execution sweep using the configured sweep limit.
      *

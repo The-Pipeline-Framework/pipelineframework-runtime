@@ -53,6 +53,9 @@ public class JsonTransitionPayloadCodec implements TransitionPayloadCodec {
     @Inject
     PipelineOrchestratorConfig orchestratorConfig;
 
+    @Inject
+    PipelineReleaseIdentityResolver releaseIdentityResolver;
+
     @Override
     public String encoding() {
         return ENCODING;
@@ -297,7 +300,16 @@ public class JsonTransitionPayloadCodec implements TransitionPayloadCodec {
     private boolean isAllowedPayloadType(String payloadTypeId) {
         return payloadTypeId != null
             && (SAFE_JDK_PAYLOAD_TYPES.contains(payloadTypeId)
-                || allowedApplicationPayloadPrefixes().stream().anyMatch(payloadTypeId::startsWith));
+                || allowedApplicationPayloadPrefixes().stream().anyMatch(payloadTypeId::startsWith)
+                || declaredAwsDurablePayloadType(payloadTypeId));
+    }
+
+    /** Allows only exact step type identities from the packaged AWS Durable contract. */
+    private boolean declaredAwsDurablePayloadType(String payloadTypeId) {
+        return orchestratorConfig != null && orchestratorConfig.coordinationHost() == CoordinationHost.AWS_DURABLE
+            && releaseIdentityResolver != null
+            && releaseIdentityResolver.contract().steps().stream()
+                .anyMatch(step -> payloadTypeId.equals(step.inputTypeId()) || payloadTypeId.equals(step.outputTypeId()));
     }
 
     private List<String> allowedApplicationPayloadPrefixes() {

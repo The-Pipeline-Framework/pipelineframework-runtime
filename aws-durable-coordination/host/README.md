@@ -40,3 +40,13 @@ execution inside the submitting Lambda, competing with the native Work consumer
 and allowing work to outlive the Lambda invocation. Native execution belongs to
 the SQS handler, which awaits processing before acknowledging the message. The
 ordinary runtime's local-development default is unchanged.
+
+## Hosted execution evidence
+
+The private Lambda action gateway reads the exact tenant, execution, Release
+and driver generation. `READ_EXECUTION_LOCATOR` returns the retained
+`AwsDurableRecoveryLocator`, or JSON null when that generation has no current
+locator. An execution can have a locator without registering an Await callback.
+`TYPED_RESULT` requires one successful terminal item and a current locator.
+It returns a `SerializedTransitionPayload` through the existing transition
+codec. The existing raw `RESULT` action still serves native driver replay.
