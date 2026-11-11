@@ -51,6 +51,19 @@ See [Coordinator admission configuration](https://pipelineframework.org/deploy/r
 for environment-owned Maven access and current OCI/settings/native-image limits. Secondary-artifact
 activation verification and garbage collection are unchanged.
 
+## Experimental worker payload binding
+
+Construct `PolyglotInt32PayloadBinding` with the four distinct logical type IDs
+from the verified compiler projection. Use `encode(typeId, value)` to create a
+`SerializedTransitionPayload`. Use `decode(expectedTypeId, envelope)` to check
+the type and inner encoding and recover the int32 for the generated model.
+
+The application value uses `tpf-polyglot-int32-json/1`. The REST worker command
+and result use the outer `application/tpf-transition-envelope+json` encoding.
+The deployment host owns Release verification, authorization and selection of
+the expected type and inner encoding for the dispatch. This helper is available
+for future host integration and conformance tests.
+
 ## Unit coverage
 
 The normal Maven verify lifecycle writes a JaCoCo HTML and XML report for each

@@ -78,6 +78,29 @@ The bounded profile excludes streaming, Connectors, durable Await, providers,
 plugins, blocking-work hints, and remote or distributed execution. The loader
 rejects incompatible artifacts and the factory rejects unsupported options.
 
+## Experimental worker payload binding
+
+The package exports `PolyglotInt32PayloadBinding`. Construct it with the four distinct
+logical type IDs from a verified compiler projection. `encode(typeId, value)`
+creates a serialized payload carrier. `decode(expectedTypeId, envelope)` checks
+the exact logical type and inner encoding and returns the signed int32. The
+caller can then construct the generated model for that boundary.
+
+```javascript
+import { PolyglotInt32PayloadBinding } from '@tpf/experimental-node-local';
+
+const binding = new PolyglotInt32PayloadBinding('InputValue', 'FirstValue', 'SecondValue', 'OutputValue');
+const envelope = binding.encode('InputValue', 7);
+const value = binding.decode('InputValue', envelope);
+```
+
+`tpf-polyglot-int32-json/1` encodes only the application value as a JSON object
+with a single required integer field, `value`. The REST worker command and result
+use `application/tpf-transition-envelope+json` as their outer encoding. A future
+worker host must select the inner encoding and expected type from its trusted,
+verified Release binding and pin them to the dispatch. This helper is available
+for future host integration and conformance tests.
+
 ## Verify or remove
 
 From the runtime repository root:
