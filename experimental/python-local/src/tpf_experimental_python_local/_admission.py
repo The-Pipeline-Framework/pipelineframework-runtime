@@ -3,9 +3,11 @@
 import hashlib
 import json
 import re
+from annotationlib import Format
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal, InvalidOperation
+from inspect import Parameter, signature
 from types import MemberDescriptorType
 from typing import Any, TypeGuard
 
@@ -128,11 +130,19 @@ def _frozen_slots(record: object, names: tuple[str, ...], kind: str = "") -> Typ
         or any(type(vars(record).get(name)) is not MemberDescriptorType for name in names)
     ):
         return False
-    if kind:
-        return all(field.init for field in data_fields[:-1]) and (
-            not data_fields[-1].init and data_fields[-1].default == kind
-        )
-    return all(field.init for field in data_fields)
+    arguments = data_fields[:-1] if kind else data_fields
+    if not all(field.init for field in arguments):
+        return False
+    if kind and (data_fields[-1].init or data_fields[-1].default != kind):
+        return False
+    try:
+        parameters = signature(record, follow_wrapped=False, annotation_format=Format.STRING).parameters
+    except (TypeError, ValueError):
+        return False
+    return tuple(parameters) == tuple(field.name for field in arguments) and all(
+        parameter.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
+        for parameter in parameters.values()
+    )
 
 
 def _models(raw: object, ids: set[str]) -> dict[str, type]:

@@ -133,6 +133,26 @@ class LoaderTests(unittest.TestCase):
             create_python_local_runtime(retry=None)
         self.assertEqual(raised.exception.code, "UNSUPPORTED_RUNTIME_OPTIONS")
 
+    def test_rejects_incompatible_model_and_carrier_constructors(self):
+        keyword_model = make_dataclass("Input", [("value", int)], slots=True, frozen=True, kw_only=True)
+        keyword_context = make_dataclass(
+            "Context", [("executionId", str), ("traceId", str)], slots=True, frozen=True, kw_only=True,
+        )
+        carrier_layout = vars(CARRIERS) | {"invocation_context": keyword_context}
+        never = Mock()
+        handlers = binding().handlers | {"first": never}
+        runtime = create_python_local_runtime()
+        cases = (
+            ("INVALID_MODEL_REGISTRY", binding(model_types=MODELS | {"Input": keyword_model}, handlers=handlers)),
+            ("INVALID_CARRIERS", binding(carrier_types=SimpleNamespace(**carrier_layout), handlers=handlers)),
+        )
+        for expected, candidate in cases:
+            with self.subTest(expected=expected):
+                with self.assertRaises(PythonLocalDiagnostic) as raised:
+                    runtime.load(candidate)
+                self.assertEqual(raised.exception.code, expected)
+        never.assert_not_called()
+
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_exact_generated_nominal_value_and_context_admission(self):
@@ -432,6 +452,33 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
         self.assertEqual(await asyncio.wait_for(task, timeout=5), 1)
+
+    async def test_returned_coroutine_scheduled_on_the_loop_keeps_its_task(self):
+        async def independent_work():
+            return 1
+
+        for malformed_signal in (False, True):
+            with self.subTest(malformed_signal=malformed_signal):
+                scheduled = []
+
+                def schedule():
+                    coroutine = independent_work()
+                    scheduled.append(asyncio.create_task(coroutine, eager_start=False))
+                    return coroutine
+
+                def observer(event):
+                    if event["kind"] == "ATTEMPT_STARTED" and event["stepId"] == "A":
+                        return schedule()
+
+                if malformed_signal:
+                    signal = SimpleNamespace(cancelled=False, subscribe=lambda callback: schedule())
+                    result = await application().run(Input(3), CONTEXT, signal)
+                    self.assertEqual(result, Rejected("INVALID_SIGNAL"))
+                else:
+                    result = await application(observer).run(Input(3), CONTEXT)
+                    self.assertEqual(result, Completed(Value(Output(5))))
+                self.assertEqual(len(scheduled), 1)
+                self.assertEqual(await asyncio.wait_for(scheduled[0], timeout=5), 1)
 
 
 if __name__ == "__main__":
