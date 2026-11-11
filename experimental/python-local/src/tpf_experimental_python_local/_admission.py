@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal, InvalidOperation
 from types import MemberDescriptorType
-from typing import Any
+from typing import Any, TypeGuard
 
 
 class PythonLocalDiagnostic(ValueError):
@@ -117,10 +117,10 @@ def _type_ids(declarations: Any) -> set[str]:
     return names
 
 
-def _frozen_slots(record: Any, names: tuple[str, ...], kind: str = "") -> bool:
+def _frozen_slots(record: object, names: tuple[str, ...], kind: str = "") -> TypeGuard[type]:
     if not isinstance(record, type) or not is_dataclass(record):
         return False
-    parameters = record.__dataclass_params__
+    parameters = getattr(record, "__dataclass_params__")
     data_fields = fields(record)
     if (
         not parameters.frozen or record.__dictoffset__
@@ -157,7 +157,7 @@ def _carriers(raw: Any) -> Carriers:
         ("rejected", ("diagnostic", "kind"), "REJECTED"),
         ("cancelled", ("kind",), "CANCELLED"),
     )
-    carriers = {}
+    carriers: dict[str, type] = {}
     for name, names, kind in layouts:
         carrier = getattr(raw, name, None)
         if not _frozen_slots(carrier, names, kind):

@@ -310,6 +310,30 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             result = await application(first=handler).run(Input(3), CONTEXT)
             self.assertEqual(result, Failed(Failure("A", "UNCLASSIFIED", "Unclassified business function failure", False)))
 
+    async def test_terminal_observer_self_cancel_preserves_handler_outcome(self):
+        async def self_cancel(item, ctx):
+            asyncio.current_task().cancel()
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                if not handles_cancellation:
+                    raise
+            return Value(First(4))
+
+        def observer(event):
+            if event["kind"] == "TERMINAL":
+                task = asyncio.current_task()
+                terminals.append((event["record"], task.cancelling()))
+                task.cancel()
+
+        failure = Failed(Failure("A", "UNCLASSIFIED", "Unclassified business function failure", False))
+        for handles_cancellation, expected in ((False, failure), (True, Completed(Value(Output(5))))):
+            with self.subTest(handles_cancellation=handles_cancellation):
+                terminals = []
+                app = application(observer, first=self_cancel)
+                self.assertEqual(await app.run(Input(3), CONTEXT), expected)
+                self.assertEqual(terminals, [(expected, 0)])
+
     async def test_sync_return_yields_before_handoff_and_final_observation_preserves_commit(self):
         token = CancellationToken()
         second = Mock()
