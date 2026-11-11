@@ -10,7 +10,7 @@ SHA-256 against the accompanying manifest. The runtime uses the Python standard
 library. The qualification target is CPython 3.14.10 on Linux.
 
 ```sh
-python -m pip install --no-deps /path/to/tpf_experimental_python_local-0.0.0-py3-none-any.whl
+python -m pip install --no-deps --force-reinstall /path/to/tpf_experimental_python_local-0.0.0-py3-none-any.whl
 ```
 
 Use the generated entrypoint and the application's typed handler registry.
@@ -84,7 +84,7 @@ and run the tests against that installation.
 ```sh
 python -m venv /path/to/venv
 /path/to/venv/bin/python -m pip wheel --no-deps --wheel-dir /path/to/wheels .
-/path/to/venv/bin/python -m pip install --no-deps /path/to/wheels/tpf_experimental_python_local-0.0.0-py3-none-any.whl
+/path/to/venv/bin/python -m pip install --no-deps --force-reinstall /path/to/wheels/tpf_experimental_python_local-0.0.0-py3-none-any.whl
 /path/to/venv/bin/python -W error -m unittest discover -s tests -v
 ```
 
