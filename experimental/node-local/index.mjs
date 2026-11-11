@@ -170,7 +170,9 @@ export function createNodeLocalRuntime(options = {}) {
       // Observations are synchronous. A callback's failure or returned promise has no
       // authority over application settlement and is never awaited by the runtime.
       const result = onObservation(Object.freeze(event));
-      if (isPromise(result)) void result.catch(() => {});
+      // A native Promise can have an overridden or missing instance catch method.
+      // Attach directly through the intrinsic instead of trusting observer-owned methods.
+      if (isPromise(result)) void Promise.prototype.then.call(result, undefined, () => {});
     } catch {
       // Diagnostic observers cannot make a business invocation fail.
     }
