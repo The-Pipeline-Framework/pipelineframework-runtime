@@ -64,6 +64,19 @@ export class StructuredFailure extends Error {
   constructor(envelope: Failure);
 }
 
+export interface SerializedTransitionPayload {
+  readonly payloadTypeId: string;
+  readonly payloadEncoding: string;
+  readonly payload: string;
+}
+
+/** An opt-in inner payload binding for four verified compiler logical type IDs. */
+export class PolyglotInt32PayloadBinding {
+  constructor(...typeIds: [string, string, string, string]);
+  encode(typeId: string, value: number): SerializedTransitionPayload;
+  decode(expectedTypeId: string, envelope: SerializedTransitionPayload): number;
+}
+
 export function createNodeLocalRuntime(options?: {
   readonly onObservation?: (observation: Observation) => void;
 }): NodeLocalRuntime;

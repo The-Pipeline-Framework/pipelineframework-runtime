@@ -4,6 +4,7 @@ import { admitBinding } from './projection.mjs';
 import { NodeLocalDiagnostic, requireKeys, snapshot } from './records.mjs';
 
 export { NodeLocalDiagnostic };
+export { PolyglotInt32PayloadBinding } from './payload-binding.mjs';
 
 const unclassified = 'Unclassified business function failure';
 const readAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get;
