@@ -358,3 +358,24 @@ test('observer failures and rejected promises do not affect the result', async (
   }});
   assert.deepEqual(await runtime.load(binding()).run({value: 3}, context), completed(5));
 });
+
+for (const variant of ['overridden', 'missing']) {
+  test(`observer rejection is handled with ${variant} Promise.catch`, async () => {
+    let catchCalls = 0;
+    let observations = 0;
+    const runtime = createNodeLocalRuntime({onObservation: () => {
+      observations += 1;
+      const rejected = Promise.reject(new Error('observer rejected'));
+      Object.defineProperty(rejected, 'catch', {value: variant === 'missing' ? undefined : () => {
+        catchCalls += 1;
+        throw new Error('observer-controlled catch must not run');
+      }});
+      return rejected;
+    }});
+    assert.deepEqual(await runtime.load(binding()).run({value: 3}, context), completed(5));
+    // Cross an event-loop turn so node:test observes any unhandled rejection.
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(observations > 0);
+    assert.equal(catchCalls, 0);
+  });
+}
