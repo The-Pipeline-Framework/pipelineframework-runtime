@@ -47,3 +47,28 @@ jobs:
           path: ${{ runner.temp }}/node-local-runtime/
           if-no-files-found: error
           retention-days: 14
+
+  test-merge-package:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # On pull_request, github.sha is the synthetic merge of head with base.
+          # Keep this integration check separate from the head-pinned artefact above.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Pack and test the merge result in an isolated Node consumer
+        run: |
+          artifacts="$(mktemp -d)"
+          npm pack --ignore-scripts --pack-destination "$artifacts" ./experimental/node-local
+          consumer="$(mktemp -d)"
+          cp experimental/node-local/test/runtime.test.mjs "$consumer/"
+          cd "$consumer"
+          printf '{"type":"module","private":true}\n' > package.json
+          npm install --offline --ignore-scripts --no-audit --no-fund "$artifacts"/*.tgz
+          node --test runtime.test.mjs
