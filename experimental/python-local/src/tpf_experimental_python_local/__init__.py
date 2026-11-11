@@ -144,13 +144,21 @@ def _restore_cancellation_count(task: asyncio.Task[Any] | None, previous: int) -
             task.uncancel()
 
 
+def _close_unowned_coroutine(coroutine: CoroutineType[Any, Any, Any]) -> None:
+    if inspect.getcoroutinestate(coroutine) != inspect.CORO_CREATED:
+        return
+    # A scheduled task can own the coroutine before it has taken its first turn.
+    if not any(asyncio.Task.get_coro(task) is coroutine for task in asyncio.all_tasks()):
+        coroutine.close()
+
+
 def _observe(callback: _Observer, fields: dict[str, Any]) -> None:
     task = asyncio.current_task()
     pending = task.cancelling() if task is not None else 0
     try:
         result = callback(MappingProxyType(fields))
-        if type(result) is CoroutineType and inspect.getcoroutinestate(result) == inspect.CORO_CREATED:
-            result.close()
+        if type(result) is CoroutineType:
+            _close_unowned_coroutine(result)
         elif issubclass(type(result), asyncio.Future):
             future = cast(asyncio.Future[Any], result)
             if asyncio.Future.done(future):
@@ -248,8 +256,8 @@ class _Invocation:
             if type(cancelled) is not bool or not callable(subscribe) or _is_async_callable(subscribe):
                 raise TypeError("invalid cancellation signal")
             unsubscribe: object = subscribe(request)
-            if type(unsubscribe) is CoroutineType and inspect.getcoroutinestate(unsubscribe) == inspect.CORO_CREATED:
-                unsubscribe.close()
+            if type(unsubscribe) is CoroutineType:
+                _close_unowned_coroutine(unsubscribe)
             if not callable(unsubscribe) or _is_async_callable(unsubscribe):
                 raise TypeError("invalid cancellation subscription")
         except (Exception, asyncio.CancelledError) as error:
