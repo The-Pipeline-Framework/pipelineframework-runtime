@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
 from types import CoroutineType, MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from ._admission import Carriers, Projection, PythonLocalDiagnostic, Step, admit
 
@@ -117,14 +117,17 @@ def _bind_context(value: Any, model: type) -> tuple[str, str]:
     if type(value) is not model:
         raise PythonLocalDiagnostic("INVALID_CONTEXT")
     execution_id, trace_id = getattr(value, "executionId", None), getattr(value, "traceId", None)
-    if any(type(entry) is not str or not entry.strip(" \t\r\n") for entry in (execution_id, trace_id)):
+    if (
+        type(execution_id) is not str or type(trace_id) is not str
+        or not execution_id.strip(" \t\r\n") or not trace_id.strip(" \t\r\n")
+    ):
         raise PythonLocalDiagnostic("INVALID_CONTEXT")
     return execution_id, trace_id
 
 
 def _is_async_callable(callback: object) -> bool:
     while issubclass(type(callback), partial):
-        callback = callback.func
+        callback = cast(partial[Any], callback).func
     call = getattr(type(callback), "__call__", None)
     return any(inspect.iscoroutinefunction(candidate) or inspect.isasyncgenfunction(candidate)
                for candidate in (callback, call))
@@ -135,6 +138,12 @@ def _consume_future(future: asyncio.Future[Any]) -> None:
         asyncio.Future.exception(future)
 
 
+def _restore_cancellation_count(task: asyncio.Task[Any] | None, previous: int) -> None:
+    if task is not None:
+        while task.cancelling() > previous:
+            task.uncancel()
+
+
 def _observe(callback: _Observer, fields: dict[str, Any]) -> None:
     task = asyncio.current_task()
     pending = task.cancelling() if task is not None else 0
@@ -143,19 +152,18 @@ def _observe(callback: _Observer, fields: dict[str, Any]) -> None:
         if type(result) is CoroutineType and inspect.getcoroutinestate(result) == inspect.CORO_CREATED:
             result.close()
         elif issubclass(type(result), asyncio.Future):
-            if asyncio.Future.done(result):
-                _consume_future(result)
+            future = cast(asyncio.Future[Any], result)
+            if asyncio.Future.done(future):
+                _consume_future(future)
             else:
-                asyncio.Future.add_done_callback(result, _consume_future)
+                asyncio.Future.add_done_callback(future, _consume_future)
     except (Exception, asyncio.CancelledError):
         # Observations cannot settle business execution.
         pass
     finally:
         # A synchronous hook runs on the shell task. It may cancel a token, but
         # cancellation it requests on that same task is not a caller detachment.
-        if task is not None:
-            while task.cancelling() > pending:
-                task.uncancel()
+        _restore_cancellation_count(task, pending)
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +196,10 @@ async def _invoke(step: Step, value: object, context: object) -> _Returned | _Ra
             except asyncio.CancelledError as cancellation:
                 return _Raised(cancellation)
         return _Raised(error)
+    finally:
+        # Cancellation requested on the private task belongs to this handler.
+        # Once classified or handled, its count must not affect later hooks.
+        _restore_cancellation_count(task, pending)
 
 
 class _Invocation:
@@ -235,7 +247,7 @@ class _Invocation:
             subscribe = signal.subscribe
             if type(cancelled) is not bool or not callable(subscribe) or _is_async_callable(subscribe):
                 raise TypeError("invalid cancellation signal")
-            unsubscribe = subscribe(request)
+            unsubscribe: object = subscribe(request)
             if type(unsubscribe) is CoroutineType and inspect.getcoroutinestate(unsubscribe) == inspect.CORO_CREATED:
                 unsubscribe.close()
             if not callable(unsubscribe) or _is_async_callable(unsubscribe):
