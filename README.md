@@ -79,7 +79,8 @@ the existing Release resolver to verify the closure and recover Compiled Truth.
 The native Contract must equal the coordinator's generated Contract. The
 selected `application-archive` must cover all three Steps and both `local` and
 `rest` capabilities. The descriptor-named Compiled Truth supplies the exact
-projection bytes and the runnable can carry these resources itself.
+projection bytes, which are limited to 1 MiB. The runnable can carry these
+resources itself.
 
 Prepare one application archive per language with its generated application
 and models, authored handlers, and the complete unpacked native runtime package.
