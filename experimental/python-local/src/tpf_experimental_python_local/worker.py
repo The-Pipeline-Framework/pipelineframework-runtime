@@ -7,7 +7,9 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 import hashlib
 import hmac
+from http.client import LineTooLong
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BufferedIOBase
 import json
 from os import PathLike
 import re
@@ -50,6 +52,20 @@ _ServerRequest = socket.socket | tuple[bytes, socket.socket]
 class _RejectedRequest(Exception):
     def __init__(self, status: int) -> None:
         self.status = status
+
+
+class _BoundedHeaderReader(BufferedIOBase):
+    def __init__(self, stream: BufferedIOBase) -> None:
+        self._stream = stream
+        self._remaining = _HEADER_LIMIT
+
+    def readline(self, size: int | None = -1, /) -> bytes:
+        limit = self._remaining + 1
+        line = self._stream.readline(limit if size is None or size < 0 else min(size, limit))
+        self._remaining -= len(line)
+        if self._remaining < 0:
+            raise LineTooLong("native worker request headers")
+        return line
 
 
 def _command_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -265,7 +281,15 @@ def create_native_transition_worker(
                 pass
 
         def parse_request(self) -> bool:
-            if not super().parse_request():
+            # Bound raw bytes while the standard parser reads headers. Restore the original
+            # stream for the body, including any bytes already buffered by the connection.
+            stream = self.rfile
+            self.rfile = _BoundedHeaderReader(stream)
+            try:
+                parsed = super().parse_request()
+            finally:
+                self.rfile = stream
+            if not parsed:
                 return False
             # Check the raw target. BaseHTTPRequestHandler normalises leading slashes.
             if (self.command, self.requestline.split()[1]) not in {("GET", _CAPABILITIES_PATH), ("POST", _EXECUTE_PATH)}:
@@ -319,17 +343,13 @@ def create_native_transition_worker(
 
         def _headers(self) -> dict[str, str]:
             headers: dict[str, str] = {}
-            size = 0
             if self.headers.defects:
                 raise _RejectedRequest(400)
             for name, value in self.headers.raw_items():
-                size += len(name) + len(value) + 4
                 name = name.lower()
                 if name in headers or "\r" in value or "\n" in value:
                     raise _RejectedRequest(400)
                 headers[name] = value.strip(" \t")
-            if size > _HEADER_LIMIT:
-                raise _RejectedRequest(431)
             if headers.keys() & {"content-encoding", "transfer-encoding", "expect"}:
                 raise _RejectedRequest(400)
             return headers
