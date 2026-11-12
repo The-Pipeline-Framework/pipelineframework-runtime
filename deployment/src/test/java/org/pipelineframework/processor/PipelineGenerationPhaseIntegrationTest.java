@@ -88,10 +88,11 @@ class PipelineGenerationPhaseIntegrationTest {
         var contract = compilation.generatedFile(StandardLocation.CLASS_OUTPUT, "META-INF/pipeline", "pipeline-contract.json").orElseThrow();
         assertTrue(contract.getCharContent(true).toString().contains("composition"));
         var order = compilation.generatedFile(StandardLocation.CLASS_OUTPUT, "META-INF/pipeline", "order.json").orElseThrow();
-        String orderJson = order.getCharContent(true).toString();
+        String orderJson = org.pipelineframework.config.pipeline.PipelineJson.mapper()
+            .readTree(order.getCharContent(true).toString()).required("order").toString();
         assertTrue(orderJson.contains(invocationName));
         assertFalse(orderJson.contains("ProcessXLocalClientStep"),
-            "Child order must be injected by the invocation bean, not appended to root order.json");
+            "Child execution order must be injected by the invocation bean, not appended to the root order array");
     }
 
     private static javax.tools.JavaFileObject service(String name, String input, String output) {

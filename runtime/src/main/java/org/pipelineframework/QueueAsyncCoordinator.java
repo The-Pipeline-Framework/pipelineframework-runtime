@@ -795,7 +795,9 @@ class QueueAsyncCoordinator {
             this::releaseVersion,
             this::segmentBoundaryLedger,
             this::activateLocalReleaseForSubmission,
-            this::pagingPlanFor);
+            this::pagingPlanFor,
+            command -> registeredTargets == null ? Uni.createFrom().item(command)
+                : registeredTargets.pinAdmission(command));
         submissionFlow = current;
       }
       return current;
@@ -803,7 +805,7 @@ class QueueAsyncCoordinator {
   }
 
   private Optional<PipelinePagingPlan> localPagingPlan() {
-    return PipelinePagingPlan.from(releaseIdentityResolver().contract());
+    return releaseIdentityResolver().compiledContract().flatMap(PipelinePagingPlan::from);
   }
 
   private Uni<Optional<PipelinePagingPlan>> pagingPlanFor(PipelineRunSubmission submission) {
@@ -842,6 +844,11 @@ class QueueAsyncCoordinator {
   }
 
   private boolean targetsLocalContract(PipelineRunSubmission submission) {
+    var controlPlane = orchestratorConfig.controlPlane();
+    if (controlPlane != null && controlPlane.enabled() && controlPlane.requireRemoteWorker()
+        && releaseIdentityResolver().compiledContract().isEmpty()) {
+      return false;
+    }
     return pipelineId().equals(submission.pipelineId())
         && contractVersion().equals(submission.contractVersion())
         && releaseVersion().equals(submission.releaseVersion());
@@ -935,7 +942,7 @@ class QueueAsyncCoordinator {
             this::payloadCodec,
             this::segmentBoundaryLedger,
             this::saturatedDelay,
-            pipelineStepCount,
+            this::pipelineStepCountFor,
             new SegmentCommitEffects(
             executionStateStore,
             workDispatcher,
@@ -953,47 +960,26 @@ class QueueAsyncCoordinator {
         queueWorkerId);
   }
 
+  /** Local optimization only; the remote worker owns its generated execution order. */
+  java.util.OptionalInt pipelineStepCountFor(ExecutionRecord<?, ?> execution) {
+    var controlPlane = orchestratorConfig.controlPlane();
+    if (controlPlane != null && controlPlane.enabled() && controlPlane.requireRemoteWorker()) {
+      return java.util.OptionalInt.empty();
+    }
+    if (!pipelineId().equals(execution.pipelineId())
+        || !contractVersion().equals(execution.contractVersion())
+        || !releaseVersion().equals(execution.releaseVersion())) {
+      return java.util.OptionalInt.empty();
+    }
+    return java.util.OptionalInt.of(pipelineStepCount.getAsInt());
+  }
+
   private int loadPipelineStepCount() {
     return PipelineOrderResourceLoader.loadOrder()
         .filter(order -> !order.isEmpty())
         .map(List::size)
         .orElseThrow(() -> new IllegalStateException(
             "Pipeline order metadata is required to resolve a terminal queue segment"));
-  }
-
-  /**
-   * Caches generated pipeline metadata for this coordinator's active pipeline deployment.
-   * A queue coordinator is tied to one generated application artifact; a new deployment
-   * constructs a new coordinator and therefore a new cache.
-   */
-  static final class CachedIntSupplier implements IntSupplier {
-
-    private final IntSupplier resolver;
-    private volatile OptionalInt cached = OptionalInt.empty();
-
-    CachedIntSupplier(IntSupplier resolver) {
-      this.resolver = Objects.requireNonNull(resolver, "resolver must not be null");
-    }
-
-    @Override
-    public int getAsInt() {
-      OptionalInt current = cached;
-      if (current.isPresent()) {
-        return current.getAsInt();
-      }
-      synchronized (this) {
-        current = cached;
-        if (current.isPresent()) {
-          return current.getAsInt();
-        }
-        int resolved = resolver.getAsInt();
-        if (resolved <= 0) {
-          throw new IllegalStateException("Generated pipeline step count must be positive");
-        }
-        cached = OptionalInt.of(resolved);
-        return resolved;
-      }
-    }
   }
 
   private SegmentBoundaryLedger segmentBoundaryLedger() {

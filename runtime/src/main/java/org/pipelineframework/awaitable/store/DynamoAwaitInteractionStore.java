@@ -442,6 +442,78 @@ public class DynamoAwaitInteractionStore implements
             nowEpochMs));
     }
 
+    private static void requireCompletionScope(AwaitInteractionRecord expected, AwaitCompletionCommand command) {
+        Objects.requireNonNull(expected, "expected");
+        Objects.requireNonNull(command, "command");
+        if (!Objects.equals(expected.tenantId(), command.tenantId())
+            || !Objects.equals(expected.interactionId(), command.interactionId())) {
+            throw new IllegalArgumentException("Fenced completion requires the expected tenant and interaction identifier");
+        }
+    }
+
+    private static boolean matchesCompletionSnapshot(AwaitInteractionRecord current, AwaitInteractionRecord expected) {
+        return current.version() == expected.version() && current.status() == expected.status()
+            && Objects.equals(current.tenantId(), expected.tenantId())
+            && Objects.equals(current.interactionId(), expected.interactionId())
+            && Objects.equals(current.executionId(), expected.executionId())
+            && Objects.equals(current.unitId(), expected.unitId())
+            && Objects.equals(current.stepId(), expected.stepId())
+            && current.stepIndex() == expected.stepIndex()
+            && Objects.equals(current.itemIndex(), expected.itemIndex())
+            && Objects.equals(current.correlationId(), expected.correlationId())
+            && Objects.equals(current.causationId(), expected.causationId())
+            && Objects.equals(current.idempotencyKey(), expected.idempotencyKey())
+            && Objects.equals(current.outputType(), expected.outputType())
+            && Objects.equals(current.transportOutputType(), expected.transportOutputType())
+            && Objects.equals(current.transportType(), expected.transportType())
+            && Objects.equals(current.transportMetadata(), expected.transportMetadata())
+            && Objects.equals(current.invocationPath(), expected.invocationPath())
+            && current.deadlineEpochMs() == expected.deadlineEpochMs()
+            && Objects.equals(current.assignee(), expected.assignee())
+            && Objects.equals(current.group(), expected.group());
+    }
+
+    @Override
+    public boolean supportsFencedCompletion() {
+        return true;
+    }
+
+    @Override
+    public Uni<Optional<AwaitCompletionResult>> complete(
+        AwaitInteractionRecord expected, AwaitCompletionCommand command
+    ) {
+        return blocking(() -> {
+            requireCompletionScope(expected, command);
+            AwaitInteractionRecord current = getBlocking(expected.tenantId(), expected.interactionId(), command.nowEpochMs())
+                .orElseThrow(() -> new AwaitInteractionNotFoundException("No await interaction matches completion"));
+            if (!matchesCompletionSnapshot(current, expected)) {
+                return Optional.empty();
+            }
+            if (current.status() == AwaitInteractionStatus.COMPLETED
+                || current.status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
+                verifyRetainedCompletionAdmission(current);
+                if (current.status() == AwaitInteractionStatus.COMPLETED) {
+                    ensureItemContinuationProjection(current, command.nowEpochMs());
+                }
+                return Optional.of(new AwaitCompletionResult(current, true));
+            }
+            if (current.status().terminal()) {
+                throw new AwaitInteractionTerminalException("Await interaction is terminal: " + current.status());
+            }
+            if (current.deadlineEpochMs() <= command.nowEpochMs()) {
+                Optional<AwaitInteractionRecord> timedOut = transitionStatus(current.tenantId(), current.interactionId(),
+                    current.version(), current.status(), AwaitInteractionStatus.TIMED_OUT, null, null, null, command.nowEpochMs());
+                if (timedOut.isEmpty()) {
+                    return Optional.empty();
+                }
+                throw new AwaitInteractionTerminalException("Await interaction timed out before completion");
+            }
+            // A projected value belongs to this snapshot only. Never retry it against refreshed state.
+            return transitionCompletionWithAdmission(current, command)
+                .map(completed -> new AwaitCompletionResult(completed, false));
+        });
+    }
+
     @Override
     public Uni<AwaitCompletionResult> complete(AwaitCompletionCommand command) {
         return blocking(() -> completeBlocking(command));

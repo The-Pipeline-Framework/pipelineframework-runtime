@@ -72,6 +72,92 @@ public final class PipelineOrderResourceLoader {
         }
     }
 
+    /** Exact canonical boundaries of the selected physical worker order, when emitted by its compiler. */
+    public static Optional<List<StepBoundary>> loadBoundaries() {
+        List<String> selected = loadOrder().orElse(List.of());
+        if (selected.isEmpty()) return Optional.empty();
+        ClassLoader loader = PipelineResources.resolveClassLoader();
+        try {
+            Enumeration<java.net.URL> resources = loader.getResources(RESOURCE);
+            List<StepBoundary> resolved = null;
+            while (resources.hasMoreElements()) {
+                try (InputStream stream = resources.nextElement().openStream()) {
+                    Map<?,?> data = PipelineJson.mapper().readValue(stream, Map.class);
+                    if (!selected.equals(data.get("order"))) continue;
+                    if (!data.containsKey("boundarySchemaVersion") && !data.containsKey("stepBoundaries")) continue;
+                    if (!versionOne(data.get("boundarySchemaVersion"))
+                        || !(data.get("stepBoundaries") instanceof List<?> boundaries) || boundaries.size() != selected.size()) {
+                        throw new IllegalStateException("Invalid physical boundary metadata");
+                    }
+                    List<StepBoundary> candidate = new ArrayList<>();
+                    for (int index = 0; index < selected.size(); index++) {
+                        if (!(boundaries.get(index) instanceof Map<?,?> boundary)
+                            || !selected.get(index).equals(boundary.get("stepClass"))
+                            || !(boundary.get("inputTypeId") instanceof String input) || input.isBlank()
+                            || !(boundary.get("outputTypeId") instanceof String output) || output.isBlank()) {
+                            throw new IllegalStateException("Physical boundary differs from generated order");
+                        }
+                        candidate.add(new StepBoundary(selected.get(index), input, output));
+                    }
+                    if (resolved != null && !resolved.equals(candidate)) throw new IllegalStateException("Conflicting physical boundary resources");
+                    resolved = List.copyOf(candidate);
+                }
+            }
+            return Optional.ofNullable(resolved);
+        } catch (Exception failure) {
+            throw new IllegalStateException("Failed to read physical boundary metadata", failure);
+        }
+    }
+
+    private static boolean versionOne(Object value) {
+        if (!(value instanceof Number number) || number instanceof Double || number instanceof Float) return false;
+        try { return new java.math.BigDecimal(number.toString()).compareTo(java.math.BigDecimal.ONE) == 0; }
+        catch (NumberFormatException invalid) { return false; }
+    }
+
+    public record StepBoundary(String stepClass, String inputTypeId, String outputTypeId) { }
+
+    public static List<DefinitionBoundary> loadDefinitionBoundaries() {
+        List<String> selected = loadOrder().orElse(List.of());
+        var definitions = new java.util.LinkedHashMap<String, DefinitionBoundary>();
+        try {
+            var resources = PipelineResources.resolveClassLoader().getResources(RESOURCE);
+            while (resources.hasMoreElements()) {
+                try (InputStream stream = resources.nextElement().openStream()) {
+                    Map<?,?> data = PipelineJson.mapper().readValue(stream, Map.class);
+                    if (!selected.equals(data.get("order")) || !data.containsKey("definitionBoundaries")) continue;
+                    if (!versionOne(data.get("boundarySchemaVersion"))
+                        || !(data.get("definitionBoundaries") instanceof List<?> entries)) {
+                        throw new IllegalStateException("Invalid nested physical boundary metadata");
+                    }
+                    for (Object entry : entries) {
+                        DefinitionBoundary definition = PipelineJson.mapper().convertValue(entry, DefinitionBoundary.class);
+                        if (definition.invocationClass() == null || definition.invocationClass().isBlank()
+                            || definition.definitionId() == null || definition.definitionId().isBlank()
+                            || definition.callsiteId() == null || definition.callsiteId().isBlank()
+                            || definition.stepBoundaries() == null || definition.stepBoundaries().isEmpty()
+                            || definition.stepBoundaries().stream().anyMatch(boundary -> boundary.stepClass() == null || boundary.stepClass().isBlank()
+                                || boundary.inputTypeId() == null || boundary.inputTypeId().isBlank()
+                                || boundary.outputTypeId() == null || boundary.outputTypeId().isBlank())) {
+                            throw new IllegalStateException("Incomplete nested physical boundary metadata");
+                        }
+                        var previous = definitions.putIfAbsent(definition.invocationClass(), definition);
+                        if (previous != null && !previous.equals(definition)) throw new IllegalStateException("Conflicting nested physical boundary metadata");
+                    }
+                }
+            }
+            return List.copyOf(definitions.values());
+        } catch (Exception failure) {
+            throw new IllegalStateException("Failed to read nested physical boundary metadata", failure);
+        }
+    }
+
+    public record DefinitionBoundary(String invocationClass, String definitionId, String callsiteId,
+        List<StepBoundary> stepBoundaries) {
+        public DefinitionBoundary { stepBoundaries = stepBoundaries == null ? null : List.copyOf(stepBoundaries); }
+    }
+
+
     private static List<String> parseOrder(InputStream stream) throws Exception {
         Map<?, ?> data = PipelineJson.mapper().readValue(stream, Map.class);
         Object value = data.get("order");

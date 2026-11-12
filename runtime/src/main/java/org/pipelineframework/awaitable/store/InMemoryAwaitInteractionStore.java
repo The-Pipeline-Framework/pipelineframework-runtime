@@ -399,6 +399,60 @@ public class InMemoryAwaitInteractionStore implements
             current.transportOutputType()).withInvocationPath(current.invocationPath()));
     }
 
+    private static void requireCompletionScope(AwaitInteractionRecord expected, AwaitCompletionCommand command) {
+        Objects.requireNonNull(expected, "expected");
+        Objects.requireNonNull(command, "command");
+        if (!Objects.equals(expected.tenantId(), command.tenantId())
+            || !Objects.equals(expected.interactionId(), command.interactionId())) {
+            throw new IllegalArgumentException("Fenced completion requires the expected tenant and interaction identifier");
+        }
+    }
+
+    private static boolean matchesCompletionSnapshot(AwaitInteractionRecord current, AwaitInteractionRecord expected) {
+        return current.version() == expected.version() && current.status() == expected.status()
+            && Objects.equals(current.tenantId(), expected.tenantId())
+            && Objects.equals(current.interactionId(), expected.interactionId())
+            && Objects.equals(current.executionId(), expected.executionId())
+            && Objects.equals(current.unitId(), expected.unitId())
+            && Objects.equals(current.stepId(), expected.stepId())
+            && current.stepIndex() == expected.stepIndex()
+            && Objects.equals(current.itemIndex(), expected.itemIndex())
+            && Objects.equals(current.correlationId(), expected.correlationId())
+            && Objects.equals(current.causationId(), expected.causationId())
+            && Objects.equals(current.idempotencyKey(), expected.idempotencyKey())
+            && Objects.equals(current.outputType(), expected.outputType())
+            && Objects.equals(current.transportOutputType(), expected.transportOutputType())
+            && Objects.equals(current.transportType(), expected.transportType())
+            && Objects.equals(current.transportMetadata(), expected.transportMetadata())
+            && Objects.equals(current.invocationPath(), expected.invocationPath())
+            && current.deadlineEpochMs() == expected.deadlineEpochMs()
+            && Objects.equals(current.assignee(), expected.assignee())
+            && Objects.equals(current.group(), expected.group());
+    }
+
+    @Override
+    public boolean supportsFencedCompletion() {
+        return true;
+    }
+
+    @Override
+    public Uni<Optional<AwaitCompletionResult>> complete(
+        AwaitInteractionRecord expected, AwaitCompletionCommand command
+    ) {
+        return Uni.createFrom().item(() -> {
+            requireCompletionScope(expected, command);
+            synchronized (lock) {
+                purgeExpired(command.nowEpochMs());
+                AwaitInteractionRecord current = resolveForCompletion(command)
+                    .orElseThrow(() -> new AwaitInteractionNotFoundException("No await interaction matches completion"));
+                if (!matchesCompletionSnapshot(current, expected)) {
+                    return Optional.empty();
+                }
+                return Optional.of(completeResolvedLocked(current, command));
+            }
+        });
+    }
+
     @Override
     public Uni<AwaitCompletionResult> complete(AwaitCompletionCommand command) {
         return Uni.createFrom().item(() -> {

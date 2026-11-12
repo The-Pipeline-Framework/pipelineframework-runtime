@@ -32,6 +32,10 @@ import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
 import org.pipelineframework.invocation.TransportBoundaryDescriptor;
 import org.pipelineframework.invocation.TransportBoundaryInvocation;
+import org.pipelineframework.awaitable.AwaitValueOperationRequest;
+import org.pipelineframework.awaitable.AwaitValueOperationResult;
+import org.pipelineframework.awaitable.AwaitValueOperationFailure;
+import org.pipelineframework.awaitable.CommandCompletionRejectedException;
 
 /**
  * REST client adapter for transition workers.
@@ -180,6 +184,92 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
             Executor signalContext = subscriberSignalContext();
             return capabilitiesAt(endpoint, targetSecret(secretRef), signalContext);
         });
+    }
+
+    public Uni<AwaitValueOperationResult> executeAwaitValueOperation(AwaitValueOperationRequest request) {
+        return Uni.createFrom().deferred(() -> awaitValueOperationAt(request, configuredEndpoint(), sharedSecret(),
+            subscriberSignalContext()));
+    }
+
+    public Uni<AwaitValueOperationResult> executeAwaitValueOperation(
+        AwaitValueOperationRequest request, URI endpoint, String secretRef) {
+        return Uni.createFrom().deferred(() -> awaitValueOperationAt(request, endpoint, targetSecret(secretRef),
+            subscriberSignalContext()));
+    }
+
+    private Uni<AwaitValueOperationResult> awaitValueOperationAt(
+        AwaitValueOperationRequest request, URI endpoint, String secret, Executor signalContext) {
+        return capabilitiesAt(endpoint, secret, signalContext).chain(capability -> {
+            if (!PipelineWorkerCapability.PROTOCOL_VERSION.equals(capability.protocolVersion())
+                || !"rest".equals(capability.providerName())
+                || !capability.workerProtocols().contains(AwaitValueOperationRequest.CAPABILITY)
+                || !capability.payloadEncodings().contains(TransitionPayloadEncoding.JSON)
+                || !request.pipelineId().equals(capability.pipelineId())
+                || !request.contractVersion().equals(capability.contractVersion())
+                || !request.releaseVersion().equals(capability.releaseVersion())) {
+                return Uni.createFrom().failure(new TransitionWorkerFailureException(
+                    "REST worker does not support Await value operations for the pinned Release"));
+            }
+            return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(
+                    () -> awaitValueRequest(request, endpoint, secret), blockingExecutor)
+                .thenCompose(httpRequest -> httpClient().sendAsync(httpRequest, HttpResponse.BodyHandlers.ofString()))
+                .thenCompose(response -> CompletableFuture.supplyAsync(
+                    () -> decodeAwaitValueResponse(response, request), blockingExecutor)))
+                .emitOn(signalContext).onFailure().transform(this::unwrapFailure);
+        });
+    }
+
+    private HttpRequest awaitValueRequest(AwaitValueOperationRequest request, URI endpoint, String secret) {
+        try {
+            byte[] body = JSON.writeValueAsBytes(request);
+            String timestamp = Instant.now().toString();
+            String nonce = UUID.randomUUID().toString();
+            String signature = TransitionWorkerSignature.sign(secret,
+                RestTransitionWorkerProtocol.AWAIT_VALUE_OPERATION_METHOD,
+                RestTransitionWorkerProtocol.AWAIT_VALUE_OPERATION_PATH, timestamp, nonce, body);
+            return HttpRequest.newBuilder(workerUri(endpoint, RestTransitionWorkerProtocol.AWAIT_VALUE_OPERATION_PATH))
+                .timeout(orchestratorConfig.workerRest().requestTimeout())
+                .header("Content-Type", "application/json").header("Accept", "application/json")
+                .header(TransitionWorkerSignature.TIMESTAMP_HEADER, timestamp)
+                .header(TransitionWorkerSignature.NONCE_HEADER, nonce)
+                .header(TransitionWorkerSignature.SIGNATURE_HEADER, signature)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
+        } catch (IOException failure) {
+            throw new IllegalArgumentException("Unable to encode Await value operation", failure);
+        }
+    }
+
+    private AwaitValueOperationResult decodeAwaitValueResponse(
+        HttpResponse<String> response, AwaitValueOperationRequest request) {
+        if (response.statusCode() == 422) {
+            try {
+                AwaitValueOperationFailure rejection = JSON.readerFor(AwaitValueOperationFailure.class)
+                    .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                    .readValue(response.body());
+                if (rejection != null && rejection.matches(request)
+                    && rejection.code() == AwaitValueOperationFailure.Code.COMMAND_COMPLETION_REJECTED) {
+                    throw new CommandCompletionRejectedException("Pinned worker rejected Command completion identity");
+                }
+                throw new TransitionWorkerFailureException("REST Await rejection differs from the admitted operation");
+            } catch (IOException failure) {
+                throw new TransitionWorkerFailureException("REST Await value rejection returned malformed JSON", failure);
+            }
+        }
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new TransitionWorkerFailureException("REST Await value operation returned HTTP "
+                + response.statusCode() + " with response body omitted");
+        }
+        try {
+            AwaitValueOperationResult result = JSON.readerFor(AwaitValueOperationResult.class)
+                .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                .readValue(response.body());
+            if (result == null || !result.matches(request)) {
+                throw new TransitionWorkerFailureException("REST Await value result differs from the admitted operation");
+            }
+            return result;
+        } catch (IOException failure) {
+            throw new TransitionWorkerFailureException("REST Await value operation returned malformed JSON", failure);
+        }
     }
 
     private Uni<PipelineWorkerCapability> capabilitiesAt(URI endpoint, String secret, Executor signalContext) {

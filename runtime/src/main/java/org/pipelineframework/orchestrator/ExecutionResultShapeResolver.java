@@ -24,6 +24,9 @@ public class ExecutionResultShapeResolver {
     @Inject
     PipelineContractDescriptorLoader contractLoader;
 
+    @Inject
+    org.pipelineframework.orchestrator.release.PipelineReleaseRegistry releases;
+
     private volatile ExecutionResultShape cachedShape;
 
     /**
@@ -40,6 +43,27 @@ public class ExecutionResultShapeResolver {
             }
             return cachedShape;
         }
+    }
+
+    /** Resolves structural result cardinality from the admitted Release, without local application metadata. */
+    public io.smallrye.mutiny.Uni<ExecutionResultShape> resolvePinned(
+        String tenantId, String pipelineId, String contractVersion, String releaseVersion) {
+        return releases.get(tenantId, pipelineId, releaseVersion).map(found -> {
+            var release = found.orElseThrow(() -> new IllegalStateException("Pinned Release is unavailable"));
+            var contract = release.contract();
+            if (!tenantId.equals(release.tenantId()) || !pipelineId.equals(release.pipelineId())
+                || !contractVersion.equals(release.contractVersion()) || !releaseVersion.equals(release.releaseVersion())
+                || contract == null || !pipelineId.equals(contract.pipelineId())
+                || !contractVersion.equals(contract.contractVersion())) {
+                throw new IllegalStateException("Result-shape metadata differs from the admitted Release");
+            }
+            var cardinalities = contract.composition().present()
+                ? contract.composition().definition(contract.composition().rootDefinitionId()).nodes().stream()
+                    .map(org.pipelineframework.orchestrator.composition.PipelineCompositionNode::cardinality).toList()
+                : contract.steps().stream().map(PipelineBundleStepDescriptor::cardinality).toList();
+            if (cardinalities.isEmpty()) throw new IllegalStateException("Pinned Release has no result cardinality metadata");
+            return resolveShape(cardinalities);
+        });
     }
 
     private ExecutionResultShape loadShape() {

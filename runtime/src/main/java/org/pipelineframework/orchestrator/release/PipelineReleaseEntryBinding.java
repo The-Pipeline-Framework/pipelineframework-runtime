@@ -1,14 +1,26 @@
 package org.pipelineframework.orchestrator.release;
 
 import java.util.List;
+import java.util.Optional;
+import com.fasterxml.jackson.annotation.JsonInclude;
 
 /** Immutable deployment observation of one physical entry of an original registered Release. */
 public record PipelineReleaseEntryBinding(
     String tenantId, String pipelineId, String contractVersion, String releaseVersion, String entryId,
     String artifactId, String artifactDigest, String provider, String resourceId, String codeDigest,
-    String deploymentOperationId
+    String deploymentOperationId,
+    @JsonInclude(JsonInclude.Include.NON_ABSENT) Optional<PipelineReleaseDispatchBinding> dispatchBinding
 ) {
+    /** Retains the original observation constructor and wire shape for entries without worker dispatch. */
+    public PipelineReleaseEntryBinding(String tenantId, String pipelineId, String contractVersion, String releaseVersion,
+        String entryId, String artifactId, String artifactDigest, String provider, String resourceId, String codeDigest,
+        String deploymentOperationId) {
+        this(tenantId, pipelineId, contractVersion, releaseVersion, entryId, artifactId, artifactDigest, provider,
+            resourceId, codeDigest, deploymentOperationId, Optional.empty());
+    }
+
     public PipelineReleaseEntryBinding {
+        dispatchBinding = java.util.Objects.requireNonNullElse(dispatchBinding, Optional.empty());
         for (String field : List.of(tenantId, pipelineId, contractVersion, releaseVersion, entryId,
             artifactId, artifactDigest, provider, resourceId, codeDigest, deploymentOperationId)) {
             if (field.isBlank() || !field.equals(field.trim())) {

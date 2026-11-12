@@ -90,6 +90,11 @@ public class PipelineReleaseIdentityResolver {
      * using it as that execution's release binding.</p>
      */
     public PipelineContractDescriptor contract() {
+        return compiledContract().orElseGet(PipelineContractDescriptor::localFallback);
+    }
+
+    /** Returns only actual packaged metadata; a coordinator need not carry a local application. */
+    public Optional<PipelineContractDescriptor> compiledContract() {
         Optional<PipelineContractDescriptor> loaded = cachedContract;
         if (loaded == null) {
             synchronized (this) {
@@ -100,7 +105,7 @@ public class PipelineReleaseIdentityResolver {
                 }
             }
         }
-        return loaded.orElseGet(PipelineContractDescriptor::localFallback);
+        return loaded;
     }
 
     private PipelineContractDescriptorLoader contractLoader() {

@@ -39,6 +39,85 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.UpdateItemResponse;
 
 class DynamoAwaitInteractionStoreTest {
+    @Test
+    void fencedCompletionDoesNotRefreshOrRetryAProjectedValueAfterTransactionConflict() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        var store = new DynamoAwaitInteractionStore(client, mockConfig());
+        var waiting = item("tenant-a", "interaction-1", "unit-1", null,
+            AwaitInteractionStatus.WAITING, 10_000L, "alice", "finance");
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(waiting).build());
+        var expected = store.get("tenant-a", "interaction-1").await().indefinitely().orElseThrow();
+        when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
+            .thenThrow(ConditionalCheckFailedException.builder().message("concurrent version change").build());
+        assertTrue(store.supportsFencedCompletion());
+        assertTrue(store.complete(expected, new AwaitCompletionCommand("tenant-a", "interaction-1", null,
+            "completion", "projected", "alice", 2_000L)).await().indefinitely().isEmpty());
+        verify(client, times(2)).getItem(any(GetItemRequest.class));
+        var writes = ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+        verify(client, times(1)).transactWriteItems(writes.capture());
+        assertEquals(3, writes.getValue().transactItems().size());
+        assertTrue(writes.getValue().transactItems().getFirst().update().conditionExpression().contains("#version = :expected"));
+    }
+
+    @Test
+    void fencedCompletionTimeoutRaceReturnsConflictWithoutRefreshing() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        var store = new DynamoAwaitInteractionStore(client, mockConfig());
+        var waiting = item("tenant-a", "interaction-1", "unit-1", null,
+            AwaitInteractionStatus.WAITING, 10_000L, "alice", "finance");
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(waiting).build());
+        when(client.updateItem(any(UpdateItemRequest.class)))
+            .thenThrow(ConditionalCheckFailedException.builder().message("completion won").build());
+        var expected = store.get("tenant-a", "interaction-1").await().indefinitely().orElseThrow();
+        assertTrue(store.complete(expected, new AwaitCompletionCommand("tenant-a", "interaction-1", null,
+            "completion", "projected", "alice", 10_000L)).await().indefinitely().isEmpty());
+        verify(client, times(2)).getItem(any(GetItemRequest.class));
+        var update = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        verify(client).updateItem(update.capture());
+        assertEquals("WAITING", update.getValue().expressionAttributeValues().get(":requiredStatus").s());
+        verify(client, never()).transactWriteItems(any(TransactWriteItemsRequest.class));
+    }
+
+    @Test
+    void fencedCompletionCommitsThroughCompletionAdmissionTransaction() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        var store = new DynamoAwaitInteractionStore(client, mockConfig());
+        var waiting = item("tenant-a", "interaction-1", "unit-1", null,
+            AwaitInteractionStatus.WAITING, 10_000L, "alice", "finance");
+        var completed = new java.util.HashMap<>(waiting);
+        completed.put("version", avN(1));
+        completed.put("status", avS("COMPLETED"));
+        completed.put("response_payload_json", avS("\"projected\""));
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(waiting).build(),
+            GetItemResponse.builder().item(waiting).build(), GetItemResponse.builder().item(completed).build());
+        when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
+            .thenReturn(TransactWriteItemsResponse.builder().build());
+        var expected = store.get("tenant-a", "interaction-1").await().indefinitely().orElseThrow();
+        var result = store.complete(expected, new AwaitCompletionCommand("tenant-a", "interaction-1", null,
+            "completion", "projected", "alice", 2_000L)).await().indefinitely().orElseThrow();
+        assertFalse(result.duplicate());
+        assertEquals("projected", result.record().responsePayload());
+        var writes = ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+        verify(client).transactWriteItems(writes.capture());
+        assertEquals(3, writes.getValue().transactItems().size());
+    }
+
+    @Test
+    void fencedCompletionRejectsChangedOwnerBeforeWriting() {
+        DynamoDbClient client = mock(DynamoDbClient.class);
+        var store = new DynamoAwaitInteractionStore(client, mockConfig());
+        var waiting = item("tenant-a", "interaction-1", "unit-1", null,
+            AwaitInteractionStatus.WAITING, 10_000L, "alice", "finance");
+        var foreign = new java.util.HashMap<>(waiting);
+        foreign.put("execution_id", avS("foreign-execution"));
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(waiting).build(),
+            GetItemResponse.builder().item(foreign).build());
+        var expected = store.get("tenant-a", "interaction-1").await().indefinitely().orElseThrow();
+        assertTrue(store.complete(expected, new AwaitCompletionCommand("tenant-a", "interaction-1", null,
+            "completion", "projected", "alice", 2_000L)).await().indefinitely().isEmpty());
+        verify(client, never()).transactWriteItems(any(TransactWriteItemsRequest.class));
+    }
+
 
     @Test
     void boundedUnitPagePreservesEmptyFilteredContinuationWithoutFetchingNextPage() {

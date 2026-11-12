@@ -4,7 +4,8 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.function.IntSupplier;
+import java.util.function.Function;
+import java.util.OptionalInt;
 import java.util.function.Supplier;
 
 import io.smallrye.mutiny.Uni;
@@ -44,7 +45,7 @@ class QueueAsyncSegmentPipeline {
   private final Supplier<TransitionPayloadCodec> payloadCodec;
   private final Supplier<SegmentBoundaryLedger> segmentBoundaryLedger;
   private final Supplier<Duration> saturatedDelay;
-  private final IntSupplier pipelineStepCount;
+  private final Function<ExecutionRecord<?, ?>, OptionalInt> pipelineStepCount;
   private final SegmentCommitEffects segmentCommitEffects;
 
   QueueAsyncSegmentPipeline(
@@ -57,7 +58,7 @@ class QueueAsyncSegmentPipeline {
       Supplier<TransitionPayloadCodec> payloadCodec,
       Supplier<SegmentBoundaryLedger> segmentBoundaryLedger,
       Supplier<Duration> saturatedDelay,
-      IntSupplier pipelineStepCount,
+      Function<ExecutionRecord<?, ?>, OptionalInt> pipelineStepCount,
       SegmentCommitEffects segmentCommitEffects,
       String queueWorkerId) {
     this.executionLease = new QueueAsyncExecutionLease(executionStateStore, orchestratorConfig, queueWorkerId);
@@ -152,12 +153,36 @@ class QueueAsyncSegmentPipeline {
           .orElse(result));
     }
     return transitionCommand(segment)
-        .onItem().transformToUni(command -> transitionWorkerExecutor.execute(worker, command));
+        .onItem().transformToUni(command -> transitionWorkerExecutor.execute(worker, command))
+        .chain(result -> normalizeTerminalAwaitResult(segment, result));
   }
+
+  private Uni<TransitionResultEnvelope> normalizeTerminalAwaitResult(
+      ClaimedSegment segment, TransitionResultEnvelope result) {
+    if (result != null && result.outcome() == org.pipelineframework.orchestrator.TransitionWorkerOutcome.WAITING_EXTERNAL
+        && awaitCoordinator.requiresAuthoritativeSuspension()) {
+      return awaitCoordinator.authoritativeSuspension(result.awaitSuspension()).map(TransitionResultEnvelope::waiting);
+    }
+    if (result == null || !result.terminalInputPassthrough() || !segment.resumesFromAwait()) {
+      return Uni.createFrom().item(result);
+    }
+    // The worker establishes the terminal cursor using its generated execution order.
+    // The authoritative completed Await value, not the execution's original input, is the result.
+    return awaitCoordinator.loadResumePayload(segment.record().tenantId(), segment.record().awaitUnitId())
+        .map(payload -> {
+          TransitionResultEnvelope completed = TransitionResultEnvelope.completedInProcess(
+              terminalOutputItems(segment, payload));
+          return result.pageCompletion().map(completed::withPageCompletion).orElse(completed);
+        });
+  }
+
   private boolean isCoordinatorTerminalMaterialization(ClaimedSegment segment) {
-    return (segment.record().resultShape() == ExecutionResultShape.MATERIALIZED_MULTI
-        || segment.resumesFromAwait())
-        && segment.record().currentStepIndex() == pipelineStepCount.getAsInt();
+    if (segment.record().resultShape() != ExecutionResultShape.MATERIALIZED_MULTI
+        && !segment.resumesFromAwait()) {
+      return false;
+    }
+    OptionalInt localCount = pipelineStepCount.apply(segment.record());
+    return localCount.isPresent() && segment.record().currentStepIndex() == localCount.getAsInt();
   }
   private static List<?> terminalOutputItems(ClaimedSegment segment, Object payload) {
     if (segment.record().resultShape() == ExecutionResultShape.SINGLE) {
