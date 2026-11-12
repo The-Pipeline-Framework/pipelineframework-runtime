@@ -91,9 +91,30 @@ Legacy unmarked lease recovery follows its existing path. The in-memory provider
 uses the same fences only for its process lifetime; it cannot survive a restart.
 This is not an exactly-once invocation guarantee.
 
-Native worker selection, hosted payload admission and the worker endpoint are
-outside this explicit path. Persistent-store tests use a substituted HTTP client.
-Pure LOCAL loading remains JVM-free.
+### Hosted unary admission
+
+In a `QUEUE_ASYNC` coordinator with the hosted control plane enabled, the
+deployment opts in by exposing one prepared `NativeWorkerReleaseBinding` as a
+CDI bean, for example through a `@Produces @Singleton` method. Register the
+verified Release in the existing registry and configure the binding's secret
+reference and HTTPS origin. The paired client uses the fixed REST worker routes.
+
+Submit `UNI` input and set `outputStreaming` to `false` on
+`POST /tpf/control-plane/tenants/{tenantId}/pipelines/{pipelineId}/execution-admissions`.
+Supply the expected Contract and Release, the compiled logical input type, and
+`tpf-polyglot-int32-json/1`. The coordinator checks the registered Release against
+the prepared binding and verifies the worker's runnable identity and capabilities
+over authenticated HTTPS before creating the execution. Repeating the same
+immutable admission returns its original receipt without probing the worker again.
+The complete worker command, including JSON escaping and reserved space for the
+coordinator's counters, must fit within 16 KiB. Oversized admissions return 413.
+
+The ordinary queue path reloads the typed input and retained Release Descriptor
+digest, checks the current prepared binding, and dispatches under the execution
+lease. The exact submitted payload text reaches the worker. The durable execution
+ID also supplies the trace ID, so business context needs no credentials or ambient
+request state. Java submissions continue through the existing Java path. Pure LOCAL
+loading remains JVM-free.
 
 The deployment supplies a `NativeWorkerReleaseBinding.Target` with the scoped
 tenant and worker, HTTPS origin, secret reference, native language, generated

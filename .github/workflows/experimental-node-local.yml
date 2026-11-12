@@ -36,11 +36,11 @@ jobs:
       - name: Test the installed package in an isolated Node consumer
         run: |
           consumer="$(mktemp -d)"
-          cp experimental/node-local/test/runtime.test.mjs "$consumer/"
+          cp -R experimental/node-local/test "$consumer/tests"
           cd "$consumer"
           printf '{"type":"module","private":true}\n' > package.json
           npm install --offline --ignore-scripts --no-audit --no-fund "$RUNNER_TEMP"/node-local-runtime/*.tgz
-          node --test runtime.test.mjs
+          node --test tests/*.test.mjs
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: node-local-runtime-${{ github.event.pull_request.head.sha || github.sha }}
@@ -67,8 +67,8 @@ jobs:
           artifacts="$(mktemp -d)"
           npm pack --ignore-scripts --pack-destination "$artifacts" ./experimental/node-local
           consumer="$(mktemp -d)"
-          cp experimental/node-local/test/runtime.test.mjs "$consumer/"
+          cp -R experimental/node-local/test "$consumer/tests"
           cd "$consumer"
           printf '{"type":"module","private":true}\n' > package.json
           npm install --offline --ignore-scripts --no-audit --no-fund "$artifacts"/*.tgz
-          node --test runtime.test.mjs
+          node --test tests/*.test.mjs
