@@ -81,7 +81,7 @@ class WorkerTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
         return server
 
-    def send(self, server, method, path, body=b"", *, headers=None, extra=()):
+    def send(self, server, method, path, body=b"", *, headers=None, extra=(), response_headers=None):
         connection = HTTPSConnection("127.0.0.1", server.server_port, context=self.context, timeout=5)
         try:
             connection.putrequest(method, path, skip_accept_encoding=True)
@@ -92,6 +92,8 @@ class WorkerTests(unittest.TestCase):
                 connection.putheader(name, value)
             connection.endheaders(body)
             response = connection.getresponse()
+            if response_headers is not None:
+                response_headers.extend(response.getheaders())
             data = response.read()
             return response.status, json.loads(data) if data else None
         finally:
@@ -179,11 +181,16 @@ class WorkerTests(unittest.TestCase):
             if event["kind"] == "ATTEMPT_STARTED":
                 calls.append((event["stepId"], event["context"].executionId, event["context"].traceId))
 
-        server = self.listen(**self.options(), on_observation=observe)
+        options = self.options()
+        server = self.listen(**options, on_observation=observe)
+        headers = []
         self.assertEqual((200, {"protocolVersion": "1", "providerName": "rest", "pipelineId": "local",
                                 "contractVersion": CONTRACT, "releaseVersion": "release", "artifactId": "runnable",
                                 "artifactDigest": ARTIFACT, "payloadEncodings": [PROFILES["outerEncoding"]],
-                                "workerProtocols": ["local", "rest"]}), self.send(server, "GET", CAPABILITIES_PATH))
+                                "workerProtocols": ["local", "rest"]}),
+                         self.send(server, "GET", CAPABILITIES_PATH, response_headers=headers))
+        digest = "sha256:" + hashlib.sha256(options["expected_projection"]).hexdigest()
+        self.assertEqual([digest], [value for name, value in headers if name.lower() == "x-tpf-worker-projection-digest"])
         self.assertEqual((404, None), self.send(server, "GET", CAPABILITIES_PATH + "?query=1"))
         self.assertEqual((404, None), self.send(server, "GET", "/" + CAPABILITIES_PATH))
         self.assertEqual((401, None), self.send(server, "POST", EXECUTE_PATH, command(),

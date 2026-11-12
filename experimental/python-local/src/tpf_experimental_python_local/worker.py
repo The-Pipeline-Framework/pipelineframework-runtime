@@ -24,6 +24,7 @@ from ._payload_binding import PolyglotInt32PayloadBinding
 
 _EXECUTE_PATH = "/pipeline/worker/transitions/execute"
 _CAPABILITIES_PATH = "/pipeline/worker/capabilities"
+_PROJECTION_DIGEST_HEADER = "X-TPF-Worker-Projection-Digest"
 _PROFILES = {
     "outerEncoding": "application/tpf-transition-envelope+json",
     "payloadEncoding": "tpf-polyglot-int32-json/1",
@@ -240,6 +241,7 @@ def create_native_transition_worker(
     carriers = application.projection.carriers
     step_ids = {step.id for step in steps}
     payloads = PolyglotInt32PayloadBinding(input_type.input_id, *(step.output_id for step in steps))
+    projection_digest = "sha256:" + hashlib.sha256(expected_projection).hexdigest()
     capabilities = {"protocolVersion": "1", "providerName": "rest", "pipelineId": pipeline_id,
                     "contractVersion": contract_version, "releaseVersion": release_version, "artifactId": artifact_id,
                     "artifactDigest": artifact_digest, "payloadEncodings": [_PROFILES["outerEncoding"]],
@@ -331,7 +333,7 @@ def create_native_transition_worker(
                 self._respond(400)
                 return
             if not execute:
-                self._respond(200, capabilities)
+                self._respond(200, capabilities, ((_PROJECTION_DIGEST_HEADER, projection_digest),))
                 return
             try:
                 # Once admitted, losing the HTTP client does not cancel or retry business execution.
@@ -370,7 +372,8 @@ def create_native_transition_worker(
                 raise _RejectedRequest(400)
             return body
 
-        def _respond(self, status: int, value: dict[str, Any] | None = None) -> None:
+        def _respond(self, status: int, value: dict[str, Any] | None = None,
+                     headers: tuple[tuple[str, str], ...] = ()) -> None:
             self.close_connection = True
             body = b"" if value is None else json.dumps(value, separators=(",", ":")).encode("utf-8")
             try:
@@ -378,6 +381,8 @@ def create_native_transition_worker(
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Connection", "close")
+                for name, value in headers:
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
             except OSError:
