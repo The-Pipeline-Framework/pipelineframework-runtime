@@ -7,7 +7,7 @@ import io.smallrye.mutiny.Uni;
 import org.pipelineframework.orchestrator.DeadLetterPublisher;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.PairedTransitionSettlementStore;
-import org.pipelineframework.orchestrator.PairedTransitionSettlementStore.Lease;
+import org.pipelineframework.orchestrator.PairedDispatchIntent;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope.PairedResult;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 
@@ -35,13 +35,13 @@ final class PairedSegmentSettlement {
 
   Uni<Void> complete(CompletedSegment completed, PairedResult paired) {
     ClaimedSegment segment = completed.segment();
-    return withPairedLease(segment, paired, lease -> {
+    return withPairedIntent(segment, paired, intent -> {
       PairedTransitionSettlementStore store = pairedStore();
       if (terminalPublicationBoundary.publicationConfigured()) {
         return executionFailureHandler.rejectPairedTerminalPublication(
-            segment.record(), lease, store, deadLetterPublisher);
+            segment.record(), intent, store, deadLetterPublisher);
       }
-      return store.settlePairedSuccess(lease, completed.result().outputPayloads().getFirst())
+      return store.settlePairedSuccess(intent, completed.result().outputPayloads().getFirst())
           .chain(updated -> updated
               .map(succeeded -> segmentBoundaryLedger.get()
                   .recordSegmentCompleted(
@@ -53,12 +53,12 @@ final class PairedSegmentSettlement {
   }
 
   Uni<Void> fail(PairedFailedSegment failed) {
-    return withPairedLease(failed.segment(), failed.result(),
-        lease -> executionFailureHandler.handlePortableFailure(failed.segment().record(), lease,
+    return withPairedIntent(failed.segment(), failed.result(),
+        intent -> executionFailureHandler.handlePortableFailure(failed.segment().record(), intent,
             failed.result().failure().orElseThrow(), pairedStore(), deadLetterPublisher));
   }
 
-  private Uni<Void> withPairedLease(ClaimedSegment segment, PairedResult paired, Function<Lease, Uni<Void>> settle) {
+  private Uni<Void> withPairedIntent(ClaimedSegment segment, PairedResult paired, Function<PairedDispatchIntent, Uni<Void>> settle) {
     var command = paired.attempt().command();
     var claimed = segment.record();
     if (!command.tenantId().equals(claimed.tenantId()) || !command.executionId().equals(claimed.executionId())
@@ -69,8 +69,7 @@ final class PairedSegmentSettlement {
         || claimed.leaseOwner() == null) {
       return Uni.createFrom().voidItem();
     }
-    return settle.apply(new Lease(claimed.tenantId(), claimed.executionId(), claimed.version(),
-        claimed.leaseOwner(), segment.transitionKey()));
+    return settle.apply(PairedDispatchIntent.from(paired.attempt(), claimed.leaseOwner()));
   }
 
   private PairedTransitionSettlementStore pairedStore() {
