@@ -38,6 +38,10 @@ class TerminalPublicationBoundary {
         .chain(() -> composeExhaustedPagedOutput(completed));
   }
 
+  boolean publicationConfigured() {
+    return (checkpointPublicationService != null && checkpointPublicationService.enabled()) || pagedOutputEnabled();
+  }
+
   boolean pagedOutputEnabled() {
     return objectPublishCompletionService != null && objectPublishCompletionService.enabled();
   }

@@ -615,9 +615,20 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
     @Override
     public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedFailure(Lease lease,
             TransitionResultEnvelope.PortableFailure failure) {
+        return settlePairedFailure(lease, failure.code().name(), failure.code().diagnostic(), failure.stepIndex());
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedRejection(Lease lease,
+            String errorCode, String diagnostic) {
+        return settlePairedFailure(lease, errorCode, diagnostic, -1);
+    }
+
+    private Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedFailure(Lease lease,
+            String errorCode, String diagnostic, int failedStepIndex) {
         return blocking(() -> markTerminalFailureBlocking(lease.tenantId(), lease.executionId(), lease.version(),
-            ExecutionStatus.FAILED, lease.transitionKey(), failure.code().name(), failure.code().diagnostic(),
-            failure.stepIndex(), Optional.empty(), System.currentTimeMillis(), Optional.of(lease.owner())));
+            ExecutionStatus.FAILED, lease.transitionKey(), errorCode, diagnostic, failedStepIndex,
+            Optional.empty(), System.currentTimeMillis(), Optional.of(lease.owner())));
     }
 
     @Override

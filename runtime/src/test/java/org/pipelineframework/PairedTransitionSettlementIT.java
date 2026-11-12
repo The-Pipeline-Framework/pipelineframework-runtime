@@ -2,9 +2,18 @@ package org.pipelineframework;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.ignoreStubs;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
@@ -24,7 +33,9 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.pipelineframework.awaitable.AwaitCoordinator;
+import org.pipelineframework.checkpoint.CheckpointPublicationService;
 import org.pipelineframework.config.pipeline.PipelineJson;
+import org.pipelineframework.objectpublish.ObjectPublishCompletionService;
 import org.pipelineframework.orchestrator.DeadLetterEnvelope;
 import org.pipelineframework.orchestrator.DynamoAwaitLifecycleTestStores;
 import org.pipelineframework.orchestrator.DynamoExecutionStateStore;
@@ -35,6 +46,7 @@ import org.pipelineframework.orchestrator.ExecutionResultShape;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.JsonDurablePayloadCodec;
+import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
 import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding;
 import org.pipelineframework.orchestrator.NativeWorkerReleaseBindingTest;
 import org.pipelineframework.orchestrator.NativeWorkerReleaseBindingTest.TransportFixture;
@@ -85,6 +97,9 @@ class PairedTransitionSettlementIT {
   private final List<DeadLetterEnvelope> deadLetters = new ArrayList<>();
   private final WorkDispatcher dispatcher = mock(WorkDispatcher.class);
   private final AwaitItemContinuationHandler continuation = mock(AwaitItemContinuationHandler.class);
+  private final SegmentBoundaryLedger ledger = spy(new SegmentBoundaryLedger());
+  private final CheckpointPublicationService checkpointPublication = mock(CheckpointPublicationService.class);
+  private final ObjectPublishCompletionService objectPublication = mock(ObjectPublishCompletionService.class);
   private ExecutionStateStore store;
   private SegmentCommitEffects effects;
 
@@ -113,7 +128,6 @@ class PairedTransitionSettlementIT {
     store = storeWithResolver();
     var config = mock(PipelineOrchestratorConfig.class);
     when(config.maxRetries()).thenReturn(3);
-    var ledger = new SegmentBoundaryLedger();
     var failureHandler = new ExecutionFailureHandler();
     failureHandler.orchestratorConfig = config;
     failureHandler.segmentBoundaryLedger = ledger;
@@ -121,7 +135,8 @@ class PairedTransitionSettlementIT {
       deadLetters.add(envelope);
       return Uni.createFrom().voidItem();
     }, mock(AwaitCoordinator.class), failureHandler, () -> ledger, mock(AwaitContinuations.class),
-        mock(TerminalPublicationBoundary.class), ignored -> {});
+        new TerminalPublicationBoundary(checkpointPublication, objectPublication, JsonTransitionPayloadCodec::new,
+            () -> ledger), ignored -> {});
   }
 
   @Test
@@ -139,6 +154,48 @@ class PairedTransitionSettlementIT {
     settle(claim, completion(retained, -7));
     assertEquals(completed, read(claim));
     assertTrue(deadLetters.isEmpty());
+    verifyNoInteractions(dispatcher, continuation);
+  }
+
+  @ParameterizedTest
+  @EnumSource(TerminalPublication.class)
+  void rejectsPairedCompletionWithConfiguredTerminalPublication(TerminalPublication publication) throws Exception {
+    when(checkpointPublication.enabled()).thenReturn(publication == TerminalPublication.CHECKPOINT);
+    when(objectPublication.enabled()).thenReturn(publication == TerminalPublication.OBJECT);
+
+    var expired = claim(publication + "-expired", System.currentTimeMillis() - LEASE_MS, 1);
+    var staleResult = completion(attempt(expired), -1);
+    settle(expired, staleResult);
+    assertEquals(expired.record(), read(expired));
+
+    var replacement = ClaimedSegment.from(store.claimLease(expired.record().tenantId(), expired.record().executionId(),
+        "replacement", System.currentTimeMillis(), LEASE_MS).await().atMost(TIMEOUT).orElseThrow());
+    settle(expired, staleResult);
+    settle(replacement, staleResult);
+    assertEquals(replacement.record(), read(replacement));
+    assertTrue(deadLetters.isEmpty());
+
+    var currentResult = completion(attempt(replacement), 42);
+    settle(replacement, currentResult);
+    var rejected = read(replacement);
+    assertEquals(ExecutionStatus.FAILED, rejected.status());
+    assertEquals(replacement.record().version() + 1, rejected.version());
+    assertEquals(replacement.record().attempt(), rejected.attempt());
+    assertEquals(replacement.transitionKey(), rejected.lastTransitionKey());
+    assertEquals("PAIRED_TERMINAL_PUBLICATION_UNSUPPORTED", rejected.errorCode());
+    assertNull(rejected.resultPayload());
+
+    settle(replacement, currentResult);
+    assertEquals(rejected, read(replacement));
+    assertEquals(1, deadLetters.size());
+    assertEquals(rejected.errorCode(), deadLetters.getFirst().errorCode());
+    assertFalse(deadLetters.getFirst().retryable());
+    verify(ledger).recordRunFailed(eq(rejected), eq(rejected.errorCode()), eq(rejected.errorMessage()), anyLong());
+    verify(ledger, never()).recordSegmentCompleted(any(), any(), any(), anyLong());
+    verify(ledger, never()).recordRunSucceeded(any(), any(), anyLong());
+    verify(ledger, never()).claimTerminalPublication(any(), any(), any(), anyLong());
+    verify(ledger, never()).completeTerminalPublication(any(), any(), any(), anyLong());
+    verifyNoMoreInteractions(ignoreStubs(checkpointPublication, objectPublication));
     verifyNoInteractions(dispatcher, continuation);
   }
 
@@ -223,6 +280,11 @@ class PairedTransitionSettlementIT {
   private static RemoteTransitionOutcomeUnknownException unknownOutcome() {
     return new RemoteTransitionOutcomeUnknownException("rest", "worker.example", 30, 30,
         new IOException("response interrupted"));
+  }
+
+  private enum TerminalPublication {
+    CHECKPOINT,
+    OBJECT
   }
 
   private ClaimedSegment claim(String key, long now, long leaseMs) {

@@ -128,6 +128,17 @@ class ExecutionFailureHandler {
         deadLetterPublisher);
   }
 
+  Uni<Void> rejectPairedTerminalPublication(
+      ExecutionRecord<Object, Object> record,
+      Lease lease,
+      PairedTransitionSettlementStore executionStateStore,
+      DeadLetterPublisher deadLetterPublisher) {
+    String code = "PAIRED_TERMINAL_PUBLICATION_UNSUPPORTED";
+    String message = "Paired native completion requires checkpoint and object output publication to be disabled";
+    return publishTerminalFailure(executionStateStore.settlePairedRejection(lease, code, message),
+        record, lease.transitionKey(), code, message, false, deadLetterPublisher);
+  }
+
   private Uni<Void> terminalFailure(
       ExecutionRecord<Object, Object> record,
       String transitionKey,
