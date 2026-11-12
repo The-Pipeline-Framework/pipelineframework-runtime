@@ -55,6 +55,9 @@ import org.pipelineframework.orchestrator.PipelineRuntimeIdentityObservation;
 import org.pipelineframework.orchestrator.PipelineTransitionWorker;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
+import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding;
+import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding.AdmittedInput;
+import org.pipelineframework.orchestrator.RestPipelineTransitionWorker;
 import org.pipelineframework.orchestrator.TransitionWorkerExecutor;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
@@ -126,6 +129,12 @@ class QueueAsyncCoordinator {
 
   @Inject
   org.pipelineframework.orchestrator.RegisteredRestWorkerTargets registeredTargets;
+
+  @Inject
+  Instance<NativeWorkerReleaseBinding> nativeWorkerBinding;
+
+  @Inject
+  RestPipelineTransitionWorker pairedRestWorker;
 
   @Inject
   PipelineReleaseIdentityResolver releaseIdentityResolver;
@@ -333,7 +342,8 @@ class QueueAsyncCoordinator {
       }
       if (org.pipelineframework.orchestrator.RegisteredRestWorkerTargets.enabled(orchestratorConfig)) {
         return executionStateStore.getExecution(workItem.tenantId(), workItem.executionId())
-            .chain(execution -> execution.map(registeredTargets::validateExecutionPin)
+            .chain(execution -> execution.filter(record -> AdmittedInput.fromSnapshot(record.inputPayload()).isEmpty())
+                .map(registeredTargets::validateExecutionPin)
                 .orElseGet(() -> Uni.createFrom().voidItem()))
             .chain(() -> segmentPipeline().process(workItem, worker, itemContinuationHandler));
       }
@@ -808,7 +818,7 @@ class QueueAsyncCoordinator {
 
   private Uni<Optional<PipelinePagingPlan>> pagingPlanFor(PipelineRunSubmission submission) {
     if (targetsLocalContract(submission)) {
-      return validatePagingStore(localPagingPlan());
+      return Uni.createFrom().item(localPagingPlan());
     }
     if (releaseRegistry == null) {
       return Uni.createFrom().failure(new IllegalStateException(
@@ -816,29 +826,19 @@ class QueueAsyncCoordinator {
     }
     return releaseRegistry.get(
             submission.tenantId(), submission.pipelineId(), submission.releaseVersion())
-        .onItem().transformToUni(release -> {
+        .onItem().transform(release -> {
           if (release.isEmpty() || release.orElseThrow().contract() == null) {
-            return Uni.createFrom().failure(new IllegalStateException(
+            throw new IllegalStateException(
                 "submitted release contract is unavailable for paging validation: "
-                    + submission.pipelineId() + ":" + submission.releaseVersion()));
+                    + submission.pipelineId() + ":" + submission.releaseVersion());
           }
           var pinned = release.orElseThrow();
           if (!submission.contractVersion().equals(pinned.contractVersion())) {
-            return Uni.createFrom().failure(new IllegalStateException(
-                "submitted contract version does not match the pinned release contract"));
+            throw new IllegalStateException(
+                "submitted contract version does not match the pinned release contract");
           }
-          return validatePagingStore(PipelinePagingPlan.from(pinned.contract()));
+          return PipelinePagingPlan.from(pinned.contract());
         });
-  }
-
-  private Uni<Optional<PipelinePagingPlan>> validatePagingStore(
-      Optional<PipelinePagingPlan> plan) {
-    if (plan.isPresent() && !executionStateStore.supportsPagedProgress()) {
-      return Uni.createFrom().failure(new IllegalStateException(
-          "ExecutionStateStore(" + executionStateStore.providerName()
-              + ") does not support fenced paged progress"));
-    }
-    return Uni.createFrom().item(plan);
   }
 
   private boolean targetsLocalContract(PipelineRunSubmission submission) {
@@ -932,6 +932,8 @@ class QueueAsyncCoordinator {
         awaitCoordinator,
         transitionWorkerExecutor,
         admissionPolicy(),
+            () -> NativeWorkerReleaseBinding.configured(nativeWorkerBinding),
+            () -> Optional.ofNullable(pairedRestWorker),
             this::payloadCodec,
             this::segmentBoundaryLedger,
             this::saturatedDelay,

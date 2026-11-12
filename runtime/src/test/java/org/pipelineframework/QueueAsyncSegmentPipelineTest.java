@@ -28,15 +28,20 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ControlPlaneTransitionAdmission;
 import org.pipelineframework.orchestrator.ControlPlaneTransitionPermit;
 import org.pipelineframework.orchestrator.DeadLetterPublisher;
+import org.pipelineframework.orchestrator.ExecutionInputShape;
+import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
+import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding.AdmittedInput;
 import org.pipelineframework.orchestrator.PagedExecutionState;
 import org.pipelineframework.orchestrator.PagedTransitionCompletion;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
+import org.pipelineframework.orchestrator.PipelineTransitionWorker;
+import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 import org.pipelineframework.orchestrator.TransitionAwaitSuspension;
 import org.pipelineframework.orchestrator.TransitionCommandEnvelope;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope;
@@ -45,9 +50,11 @@ import org.pipelineframework.orchestrator.TransitionWorkerExecutionMode;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 import org.pipelineframework.orchestrator.controlplane.TerminalPublicationClaim;
+import org.pipelineframework.serialization.PolyglotInt32JsonCodec;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -58,9 +65,11 @@ import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -596,6 +605,36 @@ class QueueAsyncSegmentPipelineTest {
   }
 
   @Test
+  void admittedNativeInputWithUnavailableBindingFailsWithoutDispatchingToJava() {
+    var input = new ExecutionInputSnapshot(ExecutionInputShape.UNI, new AdmittedInput(
+        new SerializedTransitionPayload("InputValue", PolyglotInt32JsonCodec.ENCODING, "{\"value\":3}"),
+        "sha256:" + "a".repeat(64)));
+    String executionId = "exec-admitted-native";
+    var claimed = withCurrentStep(record(executionId, ExecutionResultShape.SINGLE), 0, input);
+    when(executionStateStore.claimLease(eq("tenant-1"), eq(executionId), any(), anyLong(), eq(1000L)))
+        .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
+    var javaWorker = mock(PipelineTransitionWorker.class);
+
+    pipeline().process(
+            new ExecutionWorkItem("tenant-1", executionId),
+            javaWorker,
+            AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER)
+        .await().atMost(Duration.ofSeconds(5));
+
+    ArgumentCaptor<Throwable> failure = ArgumentCaptor.forClass(Throwable.class);
+    verify(executionFailureHandler).handleExecutionFailure(
+        same(claimed),
+        eq(executionId + ":0:0"),
+        failure.capture(),
+        same(executionStateStore),
+        same(workDispatcher),
+        same(deadLetterPublisher));
+    assertEquals("The admitted native worker binding is unavailable",
+        assertInstanceOf(IllegalStateException.class, failure.getValue()).getMessage());
+    verifyNoInteractions(javaWorker);
+  }
+
+  @Test
   void awaitSuspensionImportsMarksWaitingAndReleasesCompletedWork() {
     ExecutionRecord<Object, Object> claimed = record("exec-await", ExecutionResultShape.MATERIALIZED_MULTI);
     ExecutionRecord<Object, Object> waiting = withStatus(claimed, ExecutionStatus.WAITING_EXTERNAL, 1L);
@@ -784,6 +823,8 @@ class QueueAsyncSegmentPipelineTest {
         awaitCoordinator,
         executor,
         admissionPolicy,
+        Optional::empty,
+        Optional::empty,
         () -> payloadCodec,
         () -> segmentBoundaryLedger,
         () -> Duration.ofMillis(25),

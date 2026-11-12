@@ -13,12 +13,16 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionDecision;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionException;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.CreateExecutionResult;
+import org.pipelineframework.orchestrator.ExecutionAdmissionIntent;
 import org.pipelineframework.orchestrator.ExecutionCreateCommand;
+import org.pipelineframework.orchestrator.ExecutionInputShape;
 import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
 import org.pipelineframework.orchestrator.ExecutionResultShapeResolver;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
+import org.pipelineframework.orchestrator.NativeExecutionAdmissionStore;
+import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding.AdmittedInput;
 import org.pipelineframework.orchestrator.OrchestratorMode;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.WorkDispatcher;
@@ -164,8 +168,9 @@ class QueueAsyncSubmissionFlow {
       long ttlEpochS = ttlEpochS(now);
       return releaseActivation.apply(submission)
           .chain(() -> executionInputPolicy.resolveExecutionInputPayload(executionInput, pipelineContext))
-          .onItem().transformToUni(snapshot -> createPlan(submission, snapshot, now, ttlEpochS))
-          .onItem().transform(PipelineRunSubmissionPlan::createCommand)
+          .onItem().transformToUni(snapshot -> snapshot.payload() instanceof AdmittedInput
+              ? Uni.createFrom().failure(new BadRequestException("Native execution requires expected-Release admission"))
+              : createCommand(submission, snapshot, Optional.empty(), now, ttlEpochS))
           .onItem().transformToUni(command -> executionStateStore.createOrGetExecution(command)
               .onItem().transformToUni(created -> accept(created, command, now)));
     });
@@ -184,19 +189,14 @@ class QueueAsyncSubmissionFlow {
   }
 
   Uni<org.pipelineframework.orchestrator.ExecutionAdmissionResult> admit(
-      Object input, org.pipelineframework.orchestrator.ExecutionAdmissionIntent intent,
+      Object input, ExecutionAdmissionIntent intent,
       org.pipelineframework.orchestrator.release.PipelineReleaseEvidence evidence,
-      org.pipelineframework.orchestrator.NativeExecutionAdmissionStore nativeStore) {
+      NativeExecutionAdmissionStore nativeStore) {
     PipelineContext context = PipelineContextHolder.get();
     return Uni.createFrom().deferred(() -> {
       var guard = guardSubmission(intent.outputStreaming());
       if (guard.isPresent()) {
         return Uni.createFrom().failure(guard.get());
-      }
-      Object executionInput = executionInputPolicy.normalizeExecutionInput(input);
-      RuntimeException inputFailure = executionInputPolicy.validateInputShape(executionInput);
-      if (inputFailure != null) {
-        return Uni.createFrom().failure(inputFailure);
       }
       var submission = new PipelineRunSubmission(intent.tenantId(), true, intent.pipelineId(),
           intent.contractVersion(), intent.releaseVersion(), intent.clientKey(), intent.outputStreaming());
@@ -206,10 +206,10 @@ class QueueAsyncSubmissionFlow {
       }
       long now = System.currentTimeMillis();
       // Expected Release admission is not activation and must not execute the local activation hook.
-      return executionInputPolicy.resolveExecutionInputPayload(executionInput, context)
-          .flatMap(snapshot -> createPlan(submission, snapshot, now, ttlEpochS(now)))
-          .flatMap(plan -> {
-            var command = plan.createCommand();
+      return admittedInputSnapshot(input, context)
+          .flatMap(snapshot -> createCommand(submission, snapshot,
+              Optional.of(intent).filter(ignored -> snapshot.payload() instanceof AdmittedInput), now, ttlEpochS(now)))
+          .flatMap(command -> {
             var wrapper = new org.pipelineframework.orchestrator.ExecutionAdmissionCreateCommand(command, intent,
                 evidence.metadataFingerprint(), evidence.primaryArtifactId(), evidence.primaryArtifactDigest());
             return nativeStore.createOrGetNativeAdmittedExecution(wrapper, evidence).flatMap(result -> {
@@ -222,31 +222,51 @@ class QueueAsyncSubmissionFlow {
     });
   }
 
-  private Uni<PipelineRunSubmissionPlan> createPlan(
+  private Uni<ExecutionInputSnapshot> admittedInputSnapshot(Object input, PipelineContext context) {
+    if (input instanceof AdmittedInput paired) {
+      return Uni.createFrom().item(new ExecutionInputSnapshot(ExecutionInputShape.UNI, paired));
+    }
+    Object executionInput = executionInputPolicy.normalizeExecutionInput(input);
+    RuntimeException inputFailure = executionInputPolicy.validateInputShape(executionInput);
+    if (inputFailure != null) {
+      return Uni.createFrom().failure(inputFailure);
+    }
+    return executionInputPolicy.resolveExecutionInputPayload(executionInput, context);
+  }
+
+  private Uni<ExecutionCreateCommand> createCommand(
       PipelineRunSubmission submission,
       ExecutionInputSnapshot snapshot,
+      Optional<ExecutionAdmissionIntent> pairedIntent,
       long now,
       long ttlEpochS) {
     String executionKey;
     try {
-      executionKey = executionInputPolicy.resolveExecutionKey(
-          submission.tenantId(),
-          snapshot.payload(),
-          submission.idempotencyKey());
+      executionKey = pairedIntent.map(NativeExecutionAdmissionStore::pairedExecutionKey)
+          .orElseGet(() -> executionInputPolicy.resolveExecutionKey(
+              submission.tenantId(), snapshot.payload(), submission.idempotencyKey()));
     } catch (IllegalArgumentException e) {
       return Uni.createFrom().failure(new BadRequestException(e.getMessage()));
     }
-    ExecutionResultShape resultShape = executionResultShapeResolver.resolve();
+    boolean paired = pairedIntent.isPresent();
+    ExecutionResultShape resultShape = paired ? ExecutionResultShape.SINGLE : executionResultShapeResolver.resolve();
     try {
       return pagingPlan.apply(submission)
-          .onItem().transform(plan -> new PipelineRunSubmissionPlan(
-              submission,
-              snapshot,
-              executionKey,
-              resultShape,
-              plan,
-              now,
-              ttlEpochS));
+          .onItem().transform(plan -> {
+            if (plan.isPresent() && !executionStateStore.supportsPagedProgress()) {
+              throw new IllegalStateException("ExecutionStateStore(" + executionStateStore.providerName()
+                  + ") does not support fenced paged progress");
+            }
+            if (paired) {
+              if (plan.isPresent()) {
+                throw new IllegalStateException("Hosted native execution does not support paging");
+              }
+              return new ExecutionCreateCommand(submission.tenantId(), executionKey, submission.pipelineId(),
+                  submission.contractVersion(), submission.releaseVersion(), snapshot, resultShape, now, ttlEpochS);
+            }
+            return new PipelineRunSubmissionPlan(submission, snapshot, executionKey, resultShape, plan, now, ttlEpochS)
+                .createCommand();
+          });
     } catch (IllegalArgumentException e) {
       return Uni.createFrom().failure(new BadRequestException(e.getMessage()));
     }

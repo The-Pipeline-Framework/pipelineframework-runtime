@@ -113,10 +113,47 @@ const value = binding.decode('InputValue', envelope);
 
 `tpf-polyglot-int32-json/1` encodes only the application value as a JSON object
 with a single required integer field, `value`. The REST worker command and result
-use `application/tpf-transition-envelope+json` as their outer encoding. A future
-worker host must select the inner encoding and expected type from its trusted,
-verified Release binding and pin them to the dispatch. This helper is available
-for future host integration and conformance tests.
+use `application/tpf-transition-envelope+json` as their outer encoding. The
+worker selects the inner encoding and expected type from its verified Release binding.
+
+## Opt in to a whole-bundle HTTPS worker
+
+Import `createNativeTransitionWorker` from `@tpf/experimental-node-local/worker`
+in a deployment-owned entry point. Verify the pinned Release, runnable inventory
+and Compiled Truth before importing the generated application or authored handlers.
+Import the application, handlers and runtime from that prepared tree and keep it
+immutable during use. Use the exact verified projection bytes as `expectedProjection`.
+
+```javascript
+const server = createNativeTransitionWorker({
+  bind: runtime => createApplication(runtime, handlers),
+  expectedProjection,
+  tenantId, pipelineId, contractVersion, releaseVersion, artifactId, artifactDigest,
+  profiles: {
+    outerEncoding: 'application/tpf-transition-envelope+json',
+    payloadEncoding: 'tpf-polyglot-int32-json/1',
+    executionProfile: 'tpf-polyglot-unary-policy/1',
+    resultProfile: 'tpf-polyglot-failed-result/1',
+  },
+  sharedSecret, key, cert,
+});
+server.listen(port, host);
+```
+
+Supply the pins, PEM `key` and `cert`, and UTF-8 shared secret from deployment
+configuration. The worker accepts signed `GET /pipeline/worker/capabilities` and
+`POST /pipeline/worker/transitions/execute` over TLS. Business-step links stay LOCAL.
+
+The host limits intake to 16 connections, 8 KiB of headers, 16 KiB of body and
+10 seconds for request intake. It allows two minutes of timestamp skew and retains
+up to 10,000 live nonces for the process lifetime. The worker separately limits
+active business invocations to 16. Admitted work continues to occupy its slot
+after an HTTP disconnect until execution settles. If a valid execute request reaches
+the worker at the invocation limit, the worker returns HTTP 503 before starting it.
+The coordinator retains durable dispatch and settlement authority. It records the
+503 as an unknown dispatch outcome and withholds automatic resend. These endpoints
+are for experimental qualification. Deployment, restart and high-availability
+behaviour require separate evidence.
 
 ## Verify or remove
 
@@ -125,6 +162,8 @@ From the runtime repository root:
 ```sh
 npm --prefix experimental/node-local test
 ```
+
+The worker tests use `openssl` to generate disposable localhost TLS credentials.
 
 For an application compiled to JavaScript with source maps, run its entrypoint with
 `node --enable-source-maps --inspect-brk dist/main.js` and set breakpoints in the

@@ -2,6 +2,8 @@ package org.pipelineframework;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -18,22 +20,30 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
+import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Flow;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.smallrye.mutiny.Uni;
+import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -52,19 +62,32 @@ import org.pipelineframework.orchestrator.DeadLetterEnvelope;
 import org.pipelineframework.orchestrator.DynamoAwaitLifecycleTestStores;
 import org.pipelineframework.orchestrator.DynamoExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionCreateCommand;
+import org.pipelineframework.orchestrator.ExecutionAdmissionReceipt;
 import org.pipelineframework.orchestrator.ExecutionDurablePayloadResolver;
+import org.pipelineframework.orchestrator.ExecutionInputShape;
+import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
+import org.pipelineframework.orchestrator.ExecutionResultShapeResolver;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
+import org.pipelineframework.orchestrator.ExecutionWorkItem;
+import org.pipelineframework.orchestrator.HostedExecutionAdmissionResource;
+import org.pipelineframework.orchestrator.HostedPipelineControlPlaneResource;
 import org.pipelineframework.orchestrator.JsonDurablePayloadCodec;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
+import org.pipelineframework.orchestrator.LocalControlPlaneSecretResolver;
+import org.pipelineframework.orchestrator.LocalPipelineReleaseArtifactStore;
 import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding;
 import org.pipelineframework.orchestrator.NativeWorkerReleaseBindingTest.TransportFixture;
 import org.pipelineframework.orchestrator.NativeWorkerReleaseBindingTest;
 import org.pipelineframework.orchestrator.PairedDispatchIntent;
 import org.pipelineframework.orchestrator.PairedTransitionSettlementStore;
+import org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy;
+import org.pipelineframework.orchestrator.OrchestratorMode;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
+import org.pipelineframework.orchestrator.PipelineReleaseIdentityResolver;
+import org.pipelineframework.orchestrator.PipelineTransitionWorker;
 import org.pipelineframework.orchestrator.RemoteTransitionOutcomeUnknownException;
 import org.pipelineframework.orchestrator.RestPipelineTransitionWorker;
 import org.pipelineframework.orchestrator.RestTransitionWorkerProtocol;
@@ -73,11 +96,14 @@ import org.pipelineframework.orchestrator.TransitionCommandEnvelope;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope.PortableFailure;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope.PortableFailure.Code;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope;
+import org.pipelineframework.orchestrator.TransitionWorkerExecutor;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 import org.pipelineframework.orchestrator.release.InMemoryPipelineReleaseRegistry;
 import org.pipelineframework.orchestrator.release.PipelineReleaseRecord;
+import org.pipelineframework.orchestrator.release.PipelineReleaseRegistrar;
 import org.pipelineframework.orchestrator.release.PipelineReleaseStatus;
+import org.pipelineframework.orchestrator.worker.PipelineWorkerCapability;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.localstack.LocalStackContainer;
@@ -153,6 +179,186 @@ class PairedTransitionSettlementIT {
     }, mock(AwaitCoordinator.class), failureHandler, () -> ledger, mock(AwaitContinuations.class),
         new TerminalPublicationBoundary(checkpointPublication, objectPublication, JsonTransitionPayloadCodec::new,
             () -> ledger), ignored -> {});
+  }
+
+  @Test
+  void hostedAdmissionReloadsExactTypedInputAndDispatchesThroughTheOrdinaryQueuePath() throws Exception {
+    var target = fixture.target();
+    var registrar = new PipelineReleaseRegistrar();
+    inject(PipelineReleaseRegistrar.class, registrar, "artifactStore",
+        new LocalPipelineReleaseArtifactStore(fixtureDirectory.resolve("hosted-release-artifacts")));
+    var registry = new InMemoryPipelineReleaseRegistry();
+    registry.register(registrar.validate(target.tenantId(), target.pipelineId(), fixture.descriptorFile().toString(),
+        System.currentTimeMillis())).await().atMost(TIMEOUT);
+
+    var capabilities = new AtomicInteger();
+    var sentCommand = new AtomicReference<TransitionCommandEnvelope>();
+    var advertisedDigest = new AtomicReference<>(target.runnableArtifactDigest());
+    String projectionDigest = "sha256:" + HexFormat.of().formatHex(
+        MessageDigest.getInstance("SHA-256").digest(fixture.binding().projectionBytes()));
+    var http = mock(HttpClient.class);
+    when(http.sendAsync(any(HttpRequest.class), org.mockito.ArgumentMatchers.<HttpResponse.BodyHandler<String>>any()))
+        .thenAnswer(invocation -> {
+          HttpRequest request = invocation.getArgument(0);
+          String body;
+          if ("GET".equals(request.method())) {
+            capabilities.incrementAndGet();
+            assertEquals(RestTransitionWorkerProtocol.CAPABILITIES_PATH, request.uri().getPath());
+            body = PipelineJson.mapper().writeValueAsString(new PipelineWorkerCapability("1", "rest",
+                target.pipelineId(), target.contractVersion(), target.releaseVersion(), target.runnableArtifactId(),
+                advertisedDigest.get(), List.of(target.profiles().outerEncoding()), List.of("rest")));
+          } else {
+            assertEquals(RestTransitionWorkerProtocol.EXECUTE_PATH, request.uri().getPath());
+            var command = PipelineJson.mapper().readValue(requestBody(request), TransitionCommandEnvelope.class);
+            assertTrue(sentCommand.compareAndSet(null, command));
+            var completed = output(fixture.binding().pin(command), 42);
+            body = PipelineJson.mapper().writeValueAsString(Map.of("outcome", "COMPLETED", "outputPayloads",
+                List.of(completed), "terminalOutputPublished", false, "terminalInputPassthrough", false));
+          }
+          @SuppressWarnings("unchecked") HttpResponse<String> response = mock(HttpResponse.class);
+          when(response.uri()).thenReturn(request.uri());
+          when(response.statusCode()).thenReturn(200);
+          when(response.body()).thenReturn(body);
+          if ("GET".equals(request.method())) {
+            when(response.headers()).thenReturn(HttpHeaders.of(
+                Map.of(RestTransitionWorkerProtocol.PROJECTION_DIGEST_HEADER, List.of(projectionDigest)),
+                (name, value) -> true));
+          }
+          return CompletableFuture.completedFuture(response);
+        });
+    var rest = pairedWorker(http);
+    try {
+      @SuppressWarnings("unchecked") Instance<NativeWorkerReleaseBinding> binding = mock(Instance.class);
+      when(binding.get()).thenReturn(fixture.binding());
+      var coordinator = hostedCoordinator(store, registry, binding, rest);
+      var local = new LocalPipelineControlPlane();
+      local.queueAsyncCoordinator = coordinator;
+      local.initializeQueueMode();
+      var hosted = new HostedPipelineControlPlaneResource();
+      inject(HostedPipelineControlPlaneResource.class, hosted, "orchestratorConfig", coordinator.orchestratorConfig);
+      inject(HostedPipelineControlPlaneResource.class, hosted, "controlPlane", local);
+      inject(HostedPipelineControlPlaneResource.class, hosted, "releaseRegistry", registry);
+      inject(HostedPipelineControlPlaneResource.class, hosted, "releaseRegistrar", registrar);
+      inject(HostedPipelineControlPlaneResource.class, hosted, "nativeWorkerBinding", binding);
+      var javaCodec = new JsonTransitionPayloadCodec();
+      inject(HostedPipelineControlPlaneResource.class, hosted, "payloadCodec", javaCodec);
+      inject(HostedPipelineControlPlaneResource.class, hosted, "secretResolver", new LocalControlPlaneSecretResolver());
+      var route = new HostedExecutionAdmissionResource();
+      inject(HostedExecutionAdmissionResource.class, route, "hosted", hosted);
+      inject(HostedExecutionAdmissionResource.class, route, "nativeControlPlane", local);
+      inject(HostedExecutionAdmissionResource.class, route, "pairedRestWorker", rest);
+
+      String tenant = target.tenantId();
+      String pipeline = target.pipelineId();
+      String token = "Bearer hosted-test";
+      String inputType = target.coordinatorContract().steps().getFirst().inputTypeId();
+      var input = new SerializedTransitionPayload(inputType, target.profiles().payloadEncoding(), " { \"\\u0076alue\" : -0 } ");
+      var request = hostedRequest(target, ExecutionInputShape.UNI, input);
+      assertEquals(401, route.admit(tenant, pipeline, "Bearer wrong", request).await().atMost(TIMEOUT).getStatus());
+      assertEquals(404, route.admit("foreign-tenant", pipeline, token, request).await().atMost(TIMEOUT).getStatus());
+      assertEquals(409, route.admit(tenant, pipeline, token, new HostedExecutionAdmissionResource.Request("hosted-native",
+          "wrong-contract", target.releaseVersion(), ExecutionInputShape.UNI, input, false)).await().atMost(TIMEOUT).getStatus());
+      assertEquals(404, route.admit(tenant, pipeline, token, new HostedExecutionAdmissionResource.Request("hosted-native",
+          target.contractVersion(), "wrong-release", ExecutionInputShape.UNI, input, false)).await().atMost(TIMEOUT).getStatus());
+      for (var invalid : List.of(
+          hostedRequest(target, ExecutionInputShape.MULTI, input),
+          hostedRequest(target, ExecutionInputShape.UNI, new SerializedTransitionPayload("java.lang.String", input.payloadEncoding(), input.payload())),
+          hostedRequest(target, ExecutionInputShape.UNI, new SerializedTransitionPayload(inputType, JsonTransitionPayloadCodec.ENCODING, input.payload())),
+          hostedRequest(target, ExecutionInputShape.UNI, new SerializedTransitionPayload(inputType, input.payloadEncoding(), "{\"value\":1.0}")))) {
+        assertEquals(400, route.admit(tenant, pipeline, token, invalid).await().atMost(TIMEOUT).getStatus());
+      }
+      // Each tab is one UTF-8 byte in the inner representation and two bytes in the outer JSON string.
+      var large = new SerializedTransitionPayload(inputType, input.payloadEncoding(), "\t".repeat(9_000) + input.payload());
+      assertEquals(413, route.admit(tenant, pipeline, token, hostedRequest(target, ExecutionInputShape.UNI, large))
+          .await().atMost(TIMEOUT).getStatus());
+      assertEquals(404, route.get(tenant, pipeline, request.clientKey(), token).await().atMost(TIMEOUT).getStatus());
+      registry.activate(tenant, pipeline, target.releaseVersion(), System.currentTimeMillis()).await().atMost(TIMEOUT);
+      assertEquals(409, hosted.submitExecution(tenant, token,
+          new org.pipelineframework.orchestrator.dto.HostedExecutionSubmitRequest(pipeline, ExecutionInputShape.UNI,
+              input, "generic-native", false)).await().atMost(TIMEOUT).getStatus());
+      assertEquals(0, capabilities.get());
+      verify(dispatcher, never()).enqueueNow(any());
+
+      advertisedDigest.set("sha256:" + "9".repeat(64));
+      assertEquals(503, route.admit(tenant, pipeline, token, request).await().atMost(TIMEOUT).getStatus());
+      assertEquals(404, route.get(tenant, pipeline, request.clientKey(), token).await().atMost(TIMEOUT).getStatus());
+      verify(dispatcher, never()).enqueueNow(any());
+      advertisedDigest.set(target.runnableArtifactDigest());
+      var accepted = route.admit(tenant, pipeline, token, request).await().atMost(TIMEOUT);
+      assertEquals(200, accepted.getStatus());
+      var receipt = assertInstanceOf(ExecutionAdmissionReceipt.class, accepted.getEntity());
+      var work = new ExecutionWorkItem(tenant, receipt.executionId());
+      verify(dispatcher).enqueueNow(work);
+      assertEquals(2, capabilities.get());
+
+      when(binding.isUnsatisfied()).thenReturn(true);
+      assertEquals(receipt, route.admit(tenant, pipeline, token, request).await().atMost(TIMEOUT).getEntity());
+      assertEquals(409, route.admit(tenant, pipeline, token, hostedRequest(target, ExecutionInputShape.UNI,
+          new SerializedTransitionPayload(inputType, input.payloadEncoding(), "{\"value\":0}")))
+          .await().atMost(TIMEOUT).getStatus());
+      var forged = javaCodec.encode(new NativeWorkerReleaseBinding.AdmittedInput(input, target.descriptorDigest()));
+      for (var unpaired : List.of(forged, input)) {
+        assertEquals(400, route.admit(tenant, pipeline, token, new HostedExecutionAdmissionResource.Request("unpaired-native",
+            target.contractVersion(), target.releaseVersion(), ExecutionInputShape.UNI, unpaired, false))
+            .await().atMost(TIMEOUT).getStatus());
+      }
+      assertEquals(2, capabilities.get());
+      when(binding.isUnsatisfied()).thenReturn(false);
+
+      var reopened = storeWithResolver();
+      var persisted = reopened.getExecution(tenant, receipt.executionId()).await().atMost(TIMEOUT).orElseThrow();
+      var snapshot = assertInstanceOf(ExecutionInputSnapshot.class, persisted.inputPayload());
+      assertEquals(ExecutionInputShape.UNI, snapshot.shape());
+      assertTrue(snapshot.pipelineContext().isEmpty());
+      assertEquals(new NativeWorkerReleaseBinding.AdmittedInput(input, target.descriptorDigest()), snapshot.payload());
+      // Initial-input retrieval must retain the native marker after reopening the store.
+      assertEquals(snapshot, assertInstanceOf(DynamoExecutionStateStore.class, reopened)
+          .getInitialExecutionInput(persisted).await().atMost(TIMEOUT).orElseThrow());
+      var legacy = mock(PipelineTransitionWorker.class);
+      var replacement = hostedCoordinator(reopened, registry, binding, rest);
+      replacement.processExecutionWorkItem(work, legacy).await().atMost(TIMEOUT);
+      verifyNoInteractions(legacy);
+      assertEquals(3, capabilities.get());
+      var command = sentCommand.get();
+      assertEquals(input, command.serializedPayload());
+      assertEquals(receipt.executionId(), command.executionId());
+      assertEquals(receipt.executionId(), command.traceId());
+      assertEquals(tenant, command.tenantId());
+      assertEquals(pipeline, command.pipelineId());
+      assertEquals(target.contractVersion(), command.contractVersion());
+      assertEquals(target.releaseVersion(), command.releaseVersion());
+      assertEquals(receipt.executionId() + ":0:0", command.transitionKey());
+      assertEquals(1, command.executionVersion());
+      assertEquals(ExecutionResultShape.SINGLE, command.resultShape());
+      assertTrue(command.awaitOccurrenceCause().isEmpty());
+      var result = storeWithResolver().getExecution(tenant, receipt.executionId()).await().atMost(TIMEOUT).orElseThrow();
+      assertEquals(ExecutionStatus.SUCCEEDED, result.status());
+      assertEquals(List.of(output(fixture.binding().pin(command), 42)), result.resultPayload());
+      var read = hosted.getExecutionResult(tenant, receipt.executionId(), token).await().atMost(TIMEOUT);
+      assertEquals(200, read.getStatus());
+      var entity = assertInstanceOf(org.pipelineframework.orchestrator.dto.HostedExecutionResultResponse.class, read.getEntity());
+      assertEquals(output(fixture.binding().pin(command), 42), entity.resultPayload());
+
+      var second = route.admit(tenant, pipeline, token, new HostedExecutionAdmissionResource.Request("hosted-replacement",
+          target.contractVersion(), target.releaseVersion(), ExecutionInputShape.UNI, input, false)).await().atMost(TIMEOUT);
+      assertEquals(200, second.getStatus());
+      var secondReceipt = assertInstanceOf(ExecutionAdmissionReceipt.class, second.getEntity());
+      assertNotEquals(receipt.executionId(), secondReceipt.executionId());
+      var secondWork = new ExecutionWorkItem(tenant, secondReceipt.executionId());
+      var changed = NativeWorkerReleaseBindingTest.transportFixture(Files.createTempDirectory(fixtureDirectory, "changed-descriptor"));
+      assertEquals(target.releaseVersion(), changed.target().releaseVersion());
+      assertFalse(target.descriptorDigest().equals(changed.target().descriptorDigest()));
+      when(binding.get()).thenReturn(changed.binding());
+      replacement.processExecutionWorkItem(secondWork, legacy).await().atMost(TIMEOUT);
+      assertEquals(4, capabilities.get());
+      assertEquals(command, sentCommand.get());
+      verifyNoInteractions(legacy);
+      var rejected = reopened.getExecution(tenant, secondReceipt.executionId()).await().atMost(TIMEOUT).orElseThrow();
+      assertEquals(ExecutionStatus.FAILED, rejected.status());
+      assertNull(rejected.resultPayload());
+    } finally {
+      closeWorker(rest);
+    }
   }
 
   @Test
@@ -464,6 +670,7 @@ class PairedTransitionSettlementIT {
     var rest = mock(PipelineOrchestratorConfig.RestWorkerConfig.class);
     when(config.workerRest()).thenReturn(rest);
     when(rest.path()).thenReturn(RestTransitionWorkerProtocol.EXECUTE_PATH);
+    when(rest.capabilitiesPath()).thenReturn(RestTransitionWorkerProtocol.CAPABILITIES_PATH);
     when(rest.requestTimeout()).thenReturn(TIMEOUT.multipliedBy(4));
     var secrets = mock(ControlPlaneSecretResolver.class);
     when(secrets.resolve(fixture.target().sharedSecretRef())).thenReturn("test-shared-secret");
@@ -472,6 +679,66 @@ class PairedTransitionSettlementIT {
     inject(RestPipelineTransitionWorker.class, worker, "invocationRuntime", new PipelineInvocationRuntime());
     inject(RestPipelineTransitionWorker.class, worker, "pairedHttpClient", client);
     return worker;
+  }
+
+  private QueueAsyncCoordinator hostedCoordinator(ExecutionStateStore state, InMemoryPipelineReleaseRegistry releases,
+      Instance<NativeWorkerReleaseBinding> binding, RestPipelineTransitionWorker rest) {
+    var config = mock(PipelineOrchestratorConfig.class);
+    var control = mock(PipelineOrchestratorConfig.ControlPlaneConfig.class);
+    when(config.mode()).thenReturn(OrchestratorMode.QUEUE_ASYNC);
+    when(config.defaultTenant()).thenReturn(fixture.target().tenantId());
+    when(config.controlPlane()).thenReturn(control);
+    when(control.enabled()).thenReturn(true);
+    when(control.adminToken()).thenReturn(Optional.of("hosted-test"));
+    when(config.idempotencyPolicy()).thenReturn(OrchestratorIdempotencyPolicy.SERVER_KEY_ONLY);
+    when(config.executionTtlDays()).thenReturn(1);
+    when(config.leaseMs()).thenReturn(LEASE_MS);
+    when(dispatcher.enqueueNow(any())).thenReturn(Uni.createFrom().voidItem());
+    var coordinator = new QueueAsyncCoordinator();
+    coordinator.orchestratorConfig = config;
+    coordinator.executionStateStore = state;
+    coordinator.workDispatcher = dispatcher;
+    coordinator.deadLetterPublisher = new org.pipelineframework.orchestrator.LoggingDeadLetterPublisher();
+    coordinator.awaitCoordinator = mock(AwaitCoordinator.class);
+    coordinator.checkpointPublicationService = checkpointPublication;
+    coordinator.objectPublishCompletionService = objectPublication;
+    coordinator.executionInputPolicy = new ExecutionInputPolicy();
+    coordinator.executionInputPolicy.orchestratorConfig = config;
+    coordinator.executionResultShapeResolver = mock(ExecutionResultShapeResolver.class);
+    coordinator.executionFailureHandler = new ExecutionFailureHandler();
+    coordinator.executionFailureHandler.orchestratorConfig = config;
+    coordinator.executionFailureHandler.segmentBoundaryLedger = ledger;
+    coordinator.segmentBoundaryLedger = ledger;
+    coordinator.releaseIdentityResolver = new PipelineReleaseIdentityResolver();
+    coordinator.transitionPayloadCodec = new JsonTransitionPayloadCodec();
+    coordinator.transitionWorkerExecutor = new TransitionWorkerExecutor(config, new PipelineInvocationRuntime());
+    coordinator.releaseRegistry = releases;
+    coordinator.nativeWorkerBinding = binding;
+    coordinator.pairedRestWorker = rest;
+    return coordinator;
+  }
+
+  private static HostedExecutionAdmissionResource.Request hostedRequest(NativeWorkerReleaseBinding.Target target,
+      ExecutionInputShape shape, SerializedTransitionPayload payload) {
+    return new HostedExecutionAdmissionResource.Request("hosted-native", target.contractVersion(), target.releaseVersion(),
+        shape, payload, false);
+  }
+
+  private static byte[] requestBody(HttpRequest request) throws Exception {
+    var body = new CompletableFuture<byte[]>();
+    request.bodyPublisher().orElseThrow().subscribe(new Flow.Subscriber<ByteBuffer>() {
+      private final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+
+      public void onSubscribe(Flow.Subscription subscription) { subscription.request(Long.MAX_VALUE); }
+      public void onNext(ByteBuffer buffer) {
+        byte[] chunk = new byte[buffer.remaining()];
+        buffer.get(chunk);
+        bytes.writeBytes(chunk);
+      }
+      public void onError(Throwable error) { body.completeExceptionally(error); }
+      public void onComplete() { body.complete(bytes.toByteArray()); }
+    });
+    return body.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
   }
 
   private static void closeWorker(RestPipelineTransitionWorker worker) throws ReflectiveOperationException {
