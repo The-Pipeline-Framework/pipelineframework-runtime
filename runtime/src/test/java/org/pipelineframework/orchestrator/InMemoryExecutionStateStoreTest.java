@@ -1,10 +1,13 @@
 package org.pipelineframework.orchestrator;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.pipelineframework.awaitable.AwaitUnitOccurrence;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -41,6 +44,38 @@ class InMemoryExecutionStateStoreTest {
         assertTrue(store.renewLease(
                 "tenant-a", claimed.executionId(), claimed.version(), "worker-1", now + 1_500L, 1_000L)
             .await().indefinitely().isEmpty());
+    }
+
+    @Test
+    void recoversOnlyAfterTheRenewedPairedLeaseExpires(@TempDir Path directory) throws IOException {
+        var fixture = NativeWorkerReleaseBindingTest.transportFixture(directory);
+        var target = fixture.target();
+        var store = new InMemoryExecutionStateStore();
+        long now = System.currentTimeMillis();
+        var created = store.createOrGetExecution(new ExecutionCreateCommand(target.tenantId(), "paired-memory",
+            target.pipelineId(), target.contractVersion(), target.releaseVersion(), "seed", ExecutionResultShape.SINGLE,
+            now, now / 1000 + 600)).await().indefinitely().record();
+        var claim = store.claimLease(created.tenantId(), created.executionId(), "owner", now, 60_000)
+            .await().indefinitely().orElseThrow();
+        String key = claim.executionId() + ":0:0";
+        var retained = fixture.binding().pin(new TransitionCommandEnvelope(claim.tenantId(), claim.executionId(),
+            claim.pipelineId(), claim.contractVersion(), claim.releaseVersion(), 0, -1, 0, claim.resultShape(),
+            claim.version(), key, "trace", "InputValue", target.profiles().payloadEncoding(), "{\"value\":5}"));
+        var intent = PairedDispatchIntent.from(retained, "owner");
+        assertEquals(claim.leaseExpiresEpochMs(), store.beginPairedDispatch(intent).await().indefinitely().orElseThrow());
+        assertTrue(store.beginPairedDispatch(intent).await().indefinitely().isEmpty());
+        long beforeOriginalExpiry = claim.leaseExpiresEpochMs() - 1;
+        var renewed = store.renewLease(claim.tenantId(), claim.executionId(), claim.version(), "owner",
+            beforeOriginalExpiry, 60_000).await().indefinitely().orElseThrow();
+        assertTrue(store.findDueExecutions(claim.leaseExpiresEpochMs(), 10).await().indefinitely().isEmpty());
+        assertEquals(renewed, store.getExecution(claim.tenantId(), claim.executionId()).await().indefinitely().orElseThrow());
+
+        assertTrue(store.findDueExecutions(renewed.leaseExpiresEpochMs(), 10).await().indefinitely().isEmpty());
+        var unknown = store.getExecution(claim.tenantId(), claim.executionId()).await().indefinitely().orElseThrow();
+        assertEquals(ExecutionStatus.REMOTE_OUTCOME_UNKNOWN, unknown.status());
+        assertEquals(key, unknown.lastTransitionKey());
+        assertTrue(store.redriveTerminalExecution(unknown.tenantId(), unknown.executionId(), unknown.version(),
+            true, "operator", renewed.leaseExpiresEpochMs()).await().indefinitely().isEmpty());
     }
 
     @Test
