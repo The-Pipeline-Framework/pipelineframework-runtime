@@ -34,6 +34,7 @@ public final class NativeWorkerReleaseBinding {
     public static final String RESULT_PROFILE = "tpf-polyglot-failed-result/1";
 
     private static final String PROJECTION_RESOURCE = "META-INF/pipeline/native-execution-projection.json";
+    private static final int MAX_PROJECTION_BYTES = 1024 * 1024;
     private static final Pattern SHA256 = Pattern.compile("sha256:[0-9a-f]{64}");
     private static final Set<String> WORKER_CAPABILITIES = Set.of("local", "rest");
     private static final ObjectMapper JSON = PipelineJson.mapper();
@@ -161,7 +162,13 @@ public final class NativeWorkerReleaseBinding {
                 preparation.resolve("release"), resolvers, credentials).resolved();
             var runnable = wholeBundle(target, contract, resolved);
             Path projection = resolved.compiledTruthDirectory().resolve(PROJECTION_RESOURCE);
-            byte[] bytes = Files.readAllBytes(projection);
+            byte[] bytes;
+            try (var input = Files.newInputStream(projection, LinkOption.NOFOLLOW_LINKS)) {
+                bytes = input.readNBytes(MAX_PROJECTION_BYTES + 1);
+            }
+            if (bytes.length > MAX_PROJECTION_BYTES) {
+                throw new IOException("Native worker execution projection exceeds the 1 MiB limit");
+            }
             requireProjection(target, boundaries, contract.steps(), bytes);
             var truth = resolved.descriptor().artifacts().stream()
                 .filter(artifact -> artifact.artifactId().equals(resolved.descriptor().compiledTruthArtifactId()))
@@ -372,6 +379,7 @@ public final class NativeWorkerReleaseBinding {
     }
 
     private static boolean hasContextValue(String value) {
+        // The shared admission profile treats only JSON whitespace as blank.
         return value.chars().anyMatch(character ->
             character != ' ' && character != '\t' && character != '\r' && character != '\n');
     }

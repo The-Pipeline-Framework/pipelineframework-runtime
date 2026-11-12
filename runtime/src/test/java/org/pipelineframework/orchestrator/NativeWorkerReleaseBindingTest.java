@@ -14,6 +14,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -133,6 +134,26 @@ class NativeWorkerReleaseBindingTest {
     }
 
     @Test
+    void rejectsOversizedVerifiedProjectionAndLeavesWorkspaceReusable() throws IOException {
+        int limit = 1024 * 1024;
+        byte[] original = projection(Language.NODE);
+        byte[] oversized = Arrays.copyOf(original, limit + 1);
+        Arrays.fill(oversized, original.length, oversized.length, (byte) ' ');
+        var rejected = fixture(Language.NODE, Map.of(), Set.of(), oversized);
+
+        var failure = assertThrows(IOException.class, () -> prepare(rejected.target(), rejected, "size-limited"));
+        assertEquals("Native worker execution projection exceeds the 1 MiB limit", failure.getMessage());
+        try (var children = Files.list(temp.resolve("size-limited"))) {
+            assertFalse(children.findAny().isPresent());
+        }
+
+        byte[] atLimit = Arrays.copyOf(oversized, limit);
+        var accepted = fixture(Language.NODE, Map.of(), Set.of(), atLimit);
+        var binding = prepare(accepted.target(), accepted, "size-limited");
+        assertArrayEquals(atLimit, binding.projectionBytes());
+    }
+
+    @Test
     void pinsOnlyTheAdmittedScopeRangeContextTypeAndEncoding() throws IOException {
         var fixture = fixture(Language.NODE);
         var binding = prepare(fixture.target(), fixture, "prepared");
@@ -157,6 +178,18 @@ class NativeWorkerReleaseBindingTest {
             "other", PROFILES.resultProfile()));
         assertThrows(IllegalArgumentException.class, () -> new Profiles(PROFILES.outerEncoding(), PROFILES.payloadEncoding(),
             PROFILES.executionProfile(), "legacy"));
+    }
+
+    @Test
+    void preservesNonAsciiWhitespaceInContextIdentifiers() throws IOException {
+        var fixture = fixture(Language.NODE);
+        var binding = prepare(fixture.target(), fixture, "prepared");
+        var command = changed(command(), Map.of("executionId", "\u00a0", "traceId", "\u2003"));
+
+        var retained = binding.pin(command).command();
+
+        assertEquals("\u00a0", retained.executionId());
+        assertEquals("\u2003", retained.traceId());
     }
 
     @Test
@@ -208,9 +241,11 @@ class NativeWorkerReleaseBindingTest {
     }
 
     private Fixture fixture(Language language, Map<String, String> extraFiles, Set<String> omittedFiles) throws IOException {
-        Path directory = Files.createTempDirectory(temp, "fixture-");
-        var contract = newContract();
-        byte[] projection = JSON.writeValueAsBytes(Map.of(
+        return fixture(language, extraFiles, omittedFiles, projection(language));
+    }
+
+    private static byte[] projection(Language language) throws IOException {
+        return JSON.writeValueAsBytes(Map.of(
             "schemaVersion", 1, "kind", language == Language.NODE ? "compiler-node-local" : "compiler-python-local",
             "profile", PROFILES.executionProfile(),
             "pipeline", Map.of("id", PIPELINE, "platform", "COMPUTE", "transport", "LOCAL", "execution", "DIRECT",
@@ -220,6 +255,12 @@ class NativeWorkerReleaseBindingTest {
                 return Map.of("id", name, "inputType", TYPES.get(index), "outputType", TYPES.get(index + 1));
             }).toList(),
             "types", TYPES.stream().map(id -> Map.of("id", id)).toList()));
+    }
+
+    private Fixture fixture(Language language, Map<String, String> extraFiles, Set<String> omittedFiles,
+            byte[] projection) throws IOException {
+        Path directory = Files.createTempDirectory(temp, "fixture-");
+        var contract = newContract();
         var members = new LinkedHashMap<String, byte[]>();
         for (String path : language.requiredArchiveFiles()) {
             if (!omittedFiles.contains(path)) {
