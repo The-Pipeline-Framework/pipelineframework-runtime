@@ -2,9 +2,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
-from http.client import HTTPSConnection
+from http.client import HTTPResponse, HTTPSConnection
 import json
 from pathlib import Path
+import socket
 import ssl
 import subprocess
 from tempfile import TemporaryDirectory
@@ -138,6 +139,38 @@ class WorkerTests(unittest.TestCase):
             clock.return_value = now * 1_000_000
             with self.assertRaises(_RejectedRequest):
                 verify("capacity-0")
+
+    def test_bounds_raw_header_bytes_before_waiting_for_body(self):
+        server = self.listen(**self.options())
+        body = command()
+        request_line = f"POST {EXECUTE_PATH} HTTP/1.1\r\n".encode()
+        headers = (b"Host: localhost\r\nContent-Type: application/json\r\n"
+                   + f"Content-Length: {len(body)}\r\n".encode()
+                   + b"".join(f"{name}: {value}\r\n".encode()
+                              for name, value in signed("POST", EXECUTE_PATH, body).items()))
+
+        def send_raw(payload):
+            with socket.create_connection(("127.0.0.1", server.server_port), timeout=3) as stream:
+                with self.context.wrap_socket(stream, server_hostname="127.0.0.1") as secured:
+                    secured.sendall(request_line + headers + payload)
+                    with HTTPResponse(secured) as response:
+                        response.begin()
+                        return response.status, response.read()
+
+        cases = {
+            "leading whitespace": b"X-Pad:" + b" \t" * 4096 + b"v\r\n\r\n" + body,
+            "cumulative bytes": b"X-First: " + b"a" * 4096 + b"\r\nX-Second: " + b"b" * 4096 + b"\r\n",
+            "unterminated long line": b"X-Pad: " + b"a" * 8192,
+        }
+        for case, payload in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual((431, b""), send_raw(payload))
+
+        field = b"X-Pad: "
+        padding = b"a" * (8192 - len(headers) - len(field) - len(b"\r\n\r\n"))
+        status, response = send_raw(field + padding + b"\r\n\r\n" + body)
+        self.assertEqual(200, status)
+        self.assertEqual("COMPLETED", json.loads(response)["outcome"])
 
     def test_authenticates_capabilities_and_rejects_invalid_commands_before_business_invocation(self):
         calls = []

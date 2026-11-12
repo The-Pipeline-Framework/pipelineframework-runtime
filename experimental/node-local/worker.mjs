@@ -21,6 +21,7 @@ const invocationFields = ['executionId', 'traceId', 'transitionKey', 'attempt', 
   'payloadTypeId', 'payloadEncoding', 'payload'];
 const emptyFields = new Set(['redriveCommandId', 'redriveReason', 'pageContext', 'awaitOccurrenceCause']);
 const bodyLimit = 16 * 1024;
+const invocationLimit = 16;
 const intakeTimeout = 10_000;
 const tolerance = 120_000;
 const nonceLimit = 10_000;
@@ -201,6 +202,7 @@ export function createNativeTransitionWorker({bind, expectedProjection, tenantId
   const capabilities = {protocolVersion: '1', providerName: 'rest', pipelineId, contractVersion, releaseVersion,
     artifactId, artifactDigest, payloadEncodings: [profiles.outerEncoding], workerProtocols: ['local', 'rest']};
   const authenticate = authenticateWith(sharedSecret);
+  let activeInvocations = 0;
 
   const server = createServer({key, cert, minVersion: 'TLSv1.2', maxHeaderSize: 8192,
     requestTimeout: intakeTimeout, headersTimeout: intakeTimeout, handshakeTimeout: intakeTimeout,
@@ -226,12 +228,19 @@ export function createNativeTransitionWorker({bind, expectedProjection, tenantId
       respond(response, 200, capabilities);
       return;
     }
+    if (activeInvocations >= invocationLimit) {
+      respond(response, 503);
+      return;
+    }
+    activeInvocations++;
     try {
       // Once admitted, losing the HTTP client does not cancel or retry business execution.
       const result = await application.run(invocation.input, invocation.context);
       respond(response, 200, wireResult(result, payloads, outputType, steps));
     } catch {
       respond(response, 500);
+    } finally {
+      activeInvocations--;
     }
   });
   server.maxHeadersCount = 0; // The byte limit applies to every header, including duplicates.

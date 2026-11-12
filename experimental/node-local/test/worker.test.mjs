@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash, createHmac, randomUUID } from 'node:crypto';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { request } from 'node:https';
 import { tmpdir } from 'node:os';
@@ -104,6 +104,52 @@ test('startup verifies projection bytes, the pinned pipeline and each selected p
   for (const field of Object.keys(profiles)) {
     assert.throws(() => createNativeTransitionWorker({...options(), profiles: {...profiles, [field]: 'future/2'}}),
       /Invalid native worker deployment binding/);
+  }
+});
+
+test('bounds active invocations after TLS disconnects and releases a slot on failure', {timeout: 10_000}, async t => {
+  const detached = Promise.withResolvers();
+  const failing = Promise.withResolvers();
+  const admissions = new EventEmitter();
+  let calls = 0;
+  const server = await listening(t, options({runA(input) {
+    calls++;
+    admissions.emit('started');
+    if (input.value === 3) return detached.promise;
+    if (input.value === 4) return failing.promise;
+    return value(input.value + 1);
+  }}));
+  const failure = {kind: 'EMPTY'};
+  try {
+    for (let index = 0; index < 15; index++) {
+      const body = command({transitionKey: `detached-${index}`});
+      const admitted = once(admissions, 'started', {signal: t.signal});
+      const closed = once(server, 'secureConnection', {signal: t.signal})
+        .then(([socket]) => new Promise(resolve => socket.once('close', resolve)));
+      const outgoing = request({host: '127.0.0.1', servername: 'localhost', port: server.address().port,
+        method: 'POST', path: executePath, ca: cert, agent: false,
+        headers: {'Content-Type': 'application/json', 'Content-Length': body.length, ...signed('POST', executePath, body)}});
+      outgoing.on('error', () => {}).end(body);
+      await admitted;
+      outgoing.destroy();
+      await closed;
+    }
+
+    const admitted = once(admissions, 'started', {signal: t.signal});
+    const pending = send(server, 'POST', executePath, command({transitionKey: 'in-flight', payload: '{"value":4}'}));
+    await admitted;
+    const overflow = command({transitionKey: 'at-capacity', payload: '{"value":5}'});
+    assert.deepEqual(await send(server, 'POST', executePath, overflow), {status: 503, body: undefined});
+    assert.equal(calls, 16);
+
+    failing.resolve(failure);
+    assert.deepEqual(await pending, {status: 500, body: undefined});
+    const next = command({transitionKey: 'after-failure', payload: '{"value":5}'});
+    assert.equal((await send(server, 'POST', executePath, next)).status, 200);
+    assert.equal(calls, 17);
+  } finally {
+    detached.resolve(value(4));
+    failing.resolve(failure);
   }
 });
 

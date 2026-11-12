@@ -7,10 +7,12 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import io.smallrye.mutiny.Uni;
@@ -40,6 +42,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.ArgumentMatchers;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
@@ -99,6 +102,18 @@ class PairedRestPipelineTransitionWorkerTest {
         assertTrue(failed.getCause() instanceof TimeoutException);
         assertTrue(pending.isCancelled());
         verifyNoInteractions(store, legacyClient);
+    }
+
+    @Test
+    void aStalledExecuteResponseCancelsTheSendAndSettlesTheReservedIntentAsUnknown() {
+        when(worker.orchestratorConfig.workerRest().requestTimeout()).thenReturn(Duration.ofMillis(50));
+        var pending = new CompletableFuture<HttpResponse<String>>();
+        when(pairedClient.sendAsync(any(HttpRequest.class), ArgumentMatchers.<HttpResponse.BodyHandler<String>>any()))
+            .thenReturn(pending);
+
+        assertUnknown();
+
+        assertTrue(pending.isCancelled());
     }
 
     @Test
@@ -223,7 +238,7 @@ class PairedRestPipelineTransitionWorkerTest {
     }
 
     @Test
-    void anErrorStatusAfterSendIsOutcomeUnknown() {
+    void serviceUnavailableAfterSendSettlesAsUnknownWithoutResend() {
         respond(503, "private", Optional.empty());
         assertUnknown();
     }
@@ -271,8 +286,13 @@ class PairedRestPipelineTransitionWorkerTest {
         var failure = assertThrows(RemoteTransitionOutcomeUnknownException.class,
             () -> worker.executeTransition(attempt, OWNER, store).await().atMost(WAIT));
         assertFalse(failure.getCause().getMessage().contains("private"));
-        verify(pairedClient).sendAsync(any(HttpRequest.class), ArgumentMatchers.<HttpResponse.BodyHandler<String>>any());
-        verify(store).settlePairedUnknown(any());
+        var intent = ArgumentCaptor.forClass(PairedDispatchIntent.class);
+        var ordered = inOrder(store, pairedClient);
+        ordered.verify(store).beginPairedDispatch(intent.capture());
+        ordered.verify(pairedClient).sendAsync(any(HttpRequest.class),
+            ArgumentMatchers.<HttpResponse.BodyHandler<String>>any());
+        ordered.verify(store).settlePairedUnknown(same(intent.getValue()));
+        verifyNoMoreInteractions(store, pairedClient);
         verifyNoInteractions(legacyClient);
     }
 

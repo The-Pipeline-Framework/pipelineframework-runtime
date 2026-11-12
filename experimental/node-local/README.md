@@ -146,10 +146,14 @@ configuration. The worker accepts signed `GET /pipeline/worker/capabilities` and
 
 The host limits intake to 16 connections, 8 KiB of headers, 16 KiB of body and
 10 seconds for request intake. It allows two minutes of timestamp skew and retains
-up to 10,000 live nonces for the process lifetime. The coordinator retains durable
-dispatch and settlement authority. HTTP disconnects leave admitted business
-execution running. These endpoints are for experimental qualification. Deployment,
-restart and high-availability behaviour require separate evidence.
+up to 10,000 live nonces for the process lifetime. The worker separately limits
+active business invocations to 16. Admitted work continues to occupy its slot
+after an HTTP disconnect until execution settles. If a valid execute request reaches
+the worker at the invocation limit, the worker returns HTTP 503 before starting it.
+The coordinator retains durable dispatch and settlement authority. It records the
+503 as an unknown dispatch outcome and withholds automatic resend. These endpoints
+are for experimental qualification. Deployment, restart and high-availability
+behaviour require separate evidence.
 
 ## Verify or remove
 
