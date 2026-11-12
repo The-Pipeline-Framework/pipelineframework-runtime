@@ -381,8 +381,8 @@ def create_native_transition_worker(
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Connection", "close")
-                for name, value in headers:
-                    self.send_header(name, value)
+                for header_name, header_value in headers:
+                    self.send_header(header_name, header_value)
                 self.end_headers()
                 self.wfile.write(body)
             except OSError:
