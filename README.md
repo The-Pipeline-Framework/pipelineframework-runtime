@@ -66,6 +66,35 @@ for future host integration and conformance tests.
 
 ## Experimental native worker Release binding
 
+The explicit `RestPipelineTransitionWorker.executeTransition(Attempt)` overload
+uses a prepared binding's HTTPS endpoint, credential reference and result profile.
+It signs the exact request with the existing worker HMAC protocol. Its direct
+HTTP/1.1 client disables proxies and redirects; the request body refuses a second
+subscription, preventing the HTTP implementation from replaying the signed body.
+Connection establishment is not an exactly-once execution guarantee. Responses
+are bounded to 4 KiB and checked against the retained output type or portable
+failure profile. A lost or invalid active response becomes
+`REMOTE_OUTCOME_UNKNOWN`, without a fallback decoder or another invocation.
+
+The existing runtime result model retains the attempt and portable failure code.
+For this bounded pairing, all three portable failures are terminal: local retry
+exhaustion does not grant a new coordinator retry budget. Existing Java failure
+handling is unchanged. `PairedTransitionSettlementStore` is a runtime-local
+capability implemented by the existing in-memory and Dynamo execution stores,
+not another store or ledger. It atomically checks RUNNING status, version, owner
+and lease expiry when recording the result. The bounded serialized output is
+stored in the same update; stale replies cannot overwrite it before a failed
+conditional write. Ledger and DLQ effects follow a successful state update.
+Paired native completion requires checkpoint and object output publication to
+be disabled. With either configured, the coordinator records a non-retryable
+`PAIRED_TERMINAL_PUBLICATION_UNSUPPORTED` failure under the same live lease check.
+
+This overload is not selected by registration or ordinary dispatch. Its caller
+must own durable dispatch intent and current authority before sending. Those
+activation prerequisites, native HTTP hosts, hosted admission and restart-after-send
+recovery remain unqualified. Unit HTTP fixtures and persistent-store tests are
+not deployed Node/Python worker evidence. Pure LOCAL loading remains JVM-free.
+
 The deployment supplies a `NativeWorkerReleaseBinding.Target` with the scoped
 tenant and worker, HTTPS origin, secret reference, native language, generated
 coordinator Contract, and exact Release Descriptor and runnable SHA-256 pins.

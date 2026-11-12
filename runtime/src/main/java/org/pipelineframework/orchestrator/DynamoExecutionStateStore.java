@@ -58,7 +58,8 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
  * DynamoDB-backed async execution state store.
  */
 @ApplicationScoped
-public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExecutionAdmissionStore {
+public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExecutionAdmissionStore,
+        PairedTransitionSettlementStore {
     private static final Logger LOG = Logger.getLogger(DynamoExecutionStateStore.class);
     private static final Logger QUEUE_TRACE = Logger.getLogger("org.pipelineframework.diagnostics.queue");
 
@@ -454,7 +455,15 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             expectedVersion,
             transitionKey,
             resultPayload,
-            nowEpochMs));
+            nowEpochMs,
+            Optional.empty()));
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedSuccess(Lease lease,
+            SerializedTransitionPayload output) {
+        return blocking(() -> markSucceededBlocking(lease.tenantId(), lease.executionId(), lease.version(),
+            lease.transitionKey(), List.of(output), System.currentTimeMillis(), Optional.of(lease.owner())));
     }
 
     @Override
@@ -599,7 +608,27 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             errorMessage,
             failedStepIndex,
             failedCommandId,
-            nowEpochMs));
+            nowEpochMs,
+            Optional.empty()));
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedFailure(Lease lease,
+            TransitionResultEnvelope.PortableFailure failure) {
+        return settlePairedFailure(lease, failure.code().name(), failure.code().diagnostic(), failure.stepIndex());
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedRejection(Lease lease,
+            String errorCode, String diagnostic) {
+        return settlePairedFailure(lease, errorCode, diagnostic, -1);
+    }
+
+    private Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedFailure(Lease lease,
+            String errorCode, String diagnostic, int failedStepIndex) {
+        return blocking(() -> markTerminalFailureBlocking(lease.tenantId(), lease.executionId(), lease.version(),
+            ExecutionStatus.FAILED, lease.transitionKey(), errorCode, diagnostic, failedStepIndex,
+            Optional.empty(), System.currentTimeMillis(), Optional.of(lease.owner())));
     }
 
     @Override
@@ -999,7 +1028,8 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         long expectedVersion,
         String transitionKey,
         Object resultPayload,
-        long nowEpochMs
+        long nowEpochMs,
+        Optional<String> requiredLeaseOwner
     ) {
         Objects.requireNonNull(resultPayload, "resultPayload must not be null");
         Map<String, String> names = new HashMap<>();
@@ -1026,7 +1056,11 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         values.put(":succeeded", avS(ExecutionStatus.SUCCEEDED.name()));
         values.put(":transition", avS(transitionKey == null ? "" : transitionKey));
         StoredPayload storedResult;
-        if (durablePayloadResolver == null) {
+        if (requiredLeaseOwner.isPresent()) {
+            // The paired profile has one validated int32 output. Commit its portable carrier inline with the lease CAS.
+            String portableResult = toJson(resultPayload);
+            storedResult = StoredPayload.inline(portableResult, payloadDigest(portableResult));
+        } else if (durablePayloadResolver == null) {
             storedResult = storeResultPayload(tenantId, executionId, transitionKey, resultPayload, nowEpochMs);
         } else {
             ExecutionRecord<Object, Object> execution = getExecutionBlocking(tenantId, executionId, nowEpochMs)
@@ -1047,7 +1081,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         UpdateItemRequest request = UpdateItemRequest.builder()
             .tableName(executionTable())
             .key(executionPrimaryKey(tenantId, executionId))
-            .conditionExpression("#version = :expected AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)")
+            .conditionExpression(settlementCondition(requiredLeaseOwner, values))
             .updateExpression(storedResult.inlinePayload().isPresent()
                 ? "SET #status = :succeeded, #version = #version + :one, #transition = :transition, " +
                     "#result = :result, #leaseExpires = :zero, #nextDue = :now, #updated = :now " +
@@ -1684,10 +1718,14 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         String errorMessage,
         int failedStepIndex,
         Optional<String> failedCommandId,
-        long nowEpochMs
+        long nowEpochMs,
+        Optional<String> requiredLeaseOwner
     ) {
-        Optional<ExecutionRecord<Object, Object>> current = getExecutionBlocking(tenantId, executionId, nowEpochMs);
-        if (current.isEmpty() || current.orElseThrow().version() != expectedVersion) return Optional.empty();
+        Optional<ExecutionRecord<Object, Object>> current = requiredLeaseOwner.isPresent()
+            ? Optional.empty() : getExecutionBlocking(tenantId, executionId, nowEpochMs);
+        if (requiredLeaseOwner.isEmpty() && current.filter(record -> record.version() == expectedVersion).isEmpty()) {
+            return Optional.empty();
+        }
         Map<String, String> names = Map.ofEntries(
             Map.entry("#status", STATUS),
             Map.entry("#version", VERSION),
@@ -1721,7 +1759,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         UpdateItemRequest request = UpdateItemRequest.builder()
             .tableName(executionTable())
             .key(executionPrimaryKey(tenantId, executionId))
-            .conditionExpression("#version = :expected AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)")
+            .conditionExpression(settlementCondition(requiredLeaseOwner, values))
             .updateExpression(
                 "SET #status = :finalStatus, #version = #version + :one, #nextDue = :now, #transition = :transition, " +
                     "#errorCode = :errorCode, #errorMessage = :errorMessage, #failedStep = :failedStep, " +
@@ -1733,9 +1771,9 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             .expressionAttributeValues(values)
             .returnValues(ReturnValue.ALL_NEW)
             .build();
-        ExecutionRecord<Object, Object> execution = current.orElseThrow();
-        if (execution.status() == ExecutionStatus.WAITING_EXTERNAL
-            && execution.awaitUnitId() != null && !execution.awaitUnitId().isBlank()) {
+        if (current.filter(execution -> execution.status() == ExecutionStatus.WAITING_EXTERNAL
+            && execution.awaitUnitId() != null && !execution.awaitUnitId().isBlank()).isPresent()) {
+            ExecutionRecord<Object, Object> execution = current.orElseThrow();
             return commitAwaitRelease(request, execution, execution.awaitUnitId(),
                 AwaitReleaseDisposition.TERMINAL_FAILED, nowEpochMs);
         }
@@ -1748,6 +1786,16 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         } catch (ConditionalCheckFailedException ignored) {
             return Optional.empty();
         }
+    }
+
+    private static String settlementCondition(Optional<String> requiredLeaseOwner, Map<String, AttributeValue> values) {
+        String condition = "#version = :expected AND (attribute_not_exists(#ttl) OR #ttl > :nowSec)";
+        if (requiredLeaseOwner.isEmpty()) {
+            return condition;
+        }
+        values.put(":running", avS(ExecutionStatus.RUNNING.name()));
+        values.put(":requiredLeaseOwner", avS(requiredLeaseOwner.orElseThrow()));
+        return condition + " AND #status = :running AND #leaseOwner = :requiredLeaseOwner AND #leaseExpires > :now";
     }
 
     private Optional<ExecutionRecord<Object, Object>> redriveTerminalExecutionBlocking(
@@ -2241,6 +2289,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             record.updatedAtEpochMs(),
             record.ttlEpochS());
     }
+
 
     private Object canonicalResultPayload(Object resultPayload) {
         if (resultPayload instanceof Iterable<?> items) {

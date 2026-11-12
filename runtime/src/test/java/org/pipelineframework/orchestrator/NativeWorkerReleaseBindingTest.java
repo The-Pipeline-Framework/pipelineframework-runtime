@@ -34,7 +34,7 @@ import org.pipelineframework.orchestrator.release.PipelineReleaseArtifactDescrip
 import org.pipelineframework.orchestrator.release.PipelineReleaseDescriptor;
 import org.pipelineframework.serialization.PolyglotInt32JsonCodec;
 
-class NativeWorkerReleaseBindingTest {
+public class NativeWorkerReleaseBindingTest {
     private static final com.fasterxml.jackson.databind.ObjectMapper JSON = PipelineJson.mapper();
     private static final String PIPELINE = "native-worker";
     private static final String RELEASE = "release-1";
@@ -49,6 +49,21 @@ class NativeWorkerReleaseBindingTest {
         NativeWorkerReleaseBinding.EXECUTION_PROFILE, NativeWorkerReleaseBinding.RESULT_PROFILE);
 
     @TempDir Path temp;
+
+    public record TransportFixture(NativeWorkerReleaseBinding binding, Target target, PipelineReleaseDescriptor descriptor) {
+    }
+
+    public static TransportFixture transportFixture(Path root) throws IOException {
+        var fixture = fixture(root, Language.NODE, Map.of(), Set.of());
+        Target target = fixture.target();
+        var binding = NativeWorkerReleaseBinding.prepare(target, fixture.descriptor(), root.resolve("prepared"),
+            ResolverProfile.localOnly(), CredentialResolver.NONE);
+        return new TransportFixture(binding, target, JSON.readValue(fixture.descriptor().toFile(), PipelineReleaseDescriptor.class));
+    }
+
+    public static TransitionResultEnvelope decodeResult(NativeWorkerReleaseBinding.Attempt attempt, String body) {
+        return new PairedTransitionResultDecoder(attempt).decode(body);
+    }
 
     @Test
     void preparesBothVerifiedRunnablesAndRetainsExactTruthAndCommand() throws IOException {
@@ -244,6 +259,11 @@ class NativeWorkerReleaseBindingTest {
         return fixture(language, extraFiles, omittedFiles, projection(language));
     }
 
+    private static Fixture fixture(Path root, Language language, Map<String, String> extraFiles,
+            Set<String> omittedFiles) throws IOException {
+        return fixture(root, language, extraFiles, omittedFiles, projection(language));
+    }
+
     private static byte[] projection(Language language) throws IOException {
         return JSON.writeValueAsBytes(Map.of(
             "schemaVersion", 1, "kind", language == Language.NODE ? "compiler-node-local" : "compiler-python-local",
@@ -259,7 +279,12 @@ class NativeWorkerReleaseBindingTest {
 
     private Fixture fixture(Language language, Map<String, String> extraFiles, Set<String> omittedFiles,
             byte[] projection) throws IOException {
-        Path directory = Files.createTempDirectory(temp, "fixture-");
+        return fixture(temp, language, extraFiles, omittedFiles, projection);
+    }
+
+    private static Fixture fixture(Path root, Language language, Map<String, String> extraFiles,
+            Set<String> omittedFiles, byte[] projection) throws IOException {
+        Path directory = Files.createTempDirectory(root, "fixture-");
         var contract = newContract();
         var members = new LinkedHashMap<String, byte[]>();
         for (String path : language.requiredArchiveFiles()) {

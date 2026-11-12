@@ -15,7 +15,7 @@ import org.pipelineframework.orchestrator.TransitionWorkerOutcome;
 /**
  * Pure immutable decision for committing a worker transition result.
  */
-sealed interface SegmentCommitPlan permits CompletedSegment, SuspendedSegment, FailedSegment {
+sealed interface SegmentCommitPlan permits CompletedSegment, SuspendedSegment, FailedSegment, PairedFailedSegment {
 
   ClaimedSegment segment();
 
@@ -45,6 +45,9 @@ sealed interface SegmentCommitPlan permits CompletedSegment, SuspendedSegment, F
     }
     if (result.outcome() == TransitionWorkerOutcome.WAITING_EXTERNAL) {
       return new SuspendedSegment(segment, result.awaitSuspension());
+    }
+    if (result.pairedResult().isPresent()) {
+      return new PairedFailedSegment(segment, result.pairedResult().orElseThrow());
     }
     return new FailedSegment(segment, result.failureException());
   }
