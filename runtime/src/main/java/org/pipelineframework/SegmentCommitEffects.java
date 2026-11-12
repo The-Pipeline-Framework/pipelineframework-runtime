@@ -2,6 +2,7 @@ package org.pipelineframework;
 
 import java.util.Objects;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 import io.smallrye.mutiny.Uni;
@@ -13,7 +14,10 @@ import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.PagedExecutionState;
 import org.pipelineframework.orchestrator.PagedTransitionCompletion;
+import org.pipelineframework.orchestrator.PairedTransitionSettlementStore;
+import org.pipelineframework.orchestrator.PairedTransitionSettlementStore.Lease;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
+import org.pipelineframework.orchestrator.TransitionResultEnvelope.PairedResult;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
@@ -62,10 +66,37 @@ class SegmentCommitEffects {
       SegmentCommitPlan plan,
       AwaitItemContinuationHandler itemContinuationHandler) {
     return switch (plan) {
-      case CompletedSegment completed -> commitCompleted(completed);
+      case CompletedSegment completed -> completed.result().pairedResult()
+          .map(paired -> withPairedLease(completed.segment(), paired, lease -> commitPairedCompleted(completed, lease)))
+          .orElseGet(() -> commitCompleted(completed));
       case SuspendedSegment suspended -> commitSuspended(suspended, itemContinuationHandler);
       case FailedSegment failed -> fail(failed.segment(), failed.failure());
+      case PairedFailedSegment failed -> withPairedLease(failed.segment(), failed.result(),
+          lease -> executionFailureHandler.handlePortableFailure(failed.segment().record(), lease,
+              failed.result().failure().orElseThrow(), pairedStore(), deadLetterPublisher));
     };
+  }
+
+  private Uni<Void> withPairedLease(ClaimedSegment segment, PairedResult paired, Function<Lease, Uni<Void>> settle) {
+    var command = paired.attempt().command();
+    var claimed = segment.record();
+    if (!command.tenantId().equals(claimed.tenantId()) || !command.executionId().equals(claimed.executionId())
+        || !command.pipelineId().equals(claimed.pipelineId()) || !command.contractVersion().equals(claimed.contractVersion())
+        || !command.releaseVersion().equals(claimed.releaseVersion()) || command.executionVersion() != claimed.version()
+        || command.attempt() != claimed.attempt() || !command.transitionKey().equals(segment.transitionKey())
+        || command.currentStepIndex() != claimed.currentStepIndex() || command.resultShape() != claimed.resultShape()
+        || claimed.leaseOwner() == null) {
+      return Uni.createFrom().voidItem();
+    }
+    return settle.apply(new Lease(claimed.tenantId(), claimed.executionId(), claimed.version(),
+        claimed.leaseOwner(), segment.transitionKey()));
+  }
+
+  private PairedTransitionSettlementStore pairedStore() {
+    if (executionStateStore instanceof PairedTransitionSettlementStore paired) {
+      return paired;
+    }
+    throw new UnsupportedOperationException("Execution state store cannot settle an explicitly paired native attempt");
   }
 
   Uni<Void> fail(ClaimedSegment segment, Throwable failure) {
@@ -105,6 +136,15 @@ class SegmentCommitEffects {
                 nowEpochMs))
             .orElseGet(() -> Uni.createFrom().failure(successCommitFailure(completed))))
         .replaceWithVoid();
+  }
+
+  private Uni<Void> commitPairedCompleted(CompletedSegment completed, Lease lease) {
+    ClaimedSegment segment = completed.segment();
+    return pairedStore().settlePairedSuccess(lease, completed.result().outputPayloads().getFirst())
+        .chain(updated -> updated.map(succeeded -> segmentBoundaryLedger.get()
+            .recordSegmentCompleted(segment.record(), segment.transitionKey(), completed.result(), succeeded.updatedAtEpochMs())
+            .chain(() -> segmentBoundaryLedger.get().recordRunSucceeded(succeeded, completed.outputItems(), succeeded.updatedAtEpochMs())))
+            .orElseGet(() -> Uni.createFrom().voidItem()));
   }
   private Uni<Void> advancePage(
       CompletedSegment completed,

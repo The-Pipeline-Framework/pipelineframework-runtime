@@ -17,6 +17,9 @@ import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.RemoteTransitionOutcomeUnknownException;
+import org.pipelineframework.orchestrator.PairedTransitionSettlementStore;
+import org.pipelineframework.orchestrator.PairedTransitionSettlementStore.Lease;
+import org.pipelineframework.orchestrator.TransitionResultEnvelope.PortableFailure;
 import org.pipelineframework.orchestrator.TransitionWorkerFailureException;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
@@ -105,19 +108,61 @@ class ExecutionFailureHandler {
           });
     }
 
+    return terminalFailure(record, transitionKey, classifiedFailure.getClass().getSimpleName(),
+        classifiedFailure.getMessage(), failedStepIndex, failedCommandId, retryableFailure,
+        executionStateStore, deadLetterPublisher, now);
+  }
+
+  /**
+   * The opt-in pairing settles all three reported outcomes as terminal. A worker's exhausted
+   * local retry budget does not itself grant coordinator execution recovery authority.
+   */
+  Uni<Void> handlePortableFailure(
+      ExecutionRecord<Object, Object> record,
+      Lease lease,
+      PortableFailure failure,
+      PairedTransitionSettlementStore executionStateStore,
+      DeadLetterPublisher deadLetterPublisher) {
+    return publishTerminalFailure(executionStateStore.settlePairedFailure(lease, failure),
+        record, lease.transitionKey(), failure.code().name(), failure.code().diagnostic(), false,
+        deadLetterPublisher);
+  }
+
+  private Uni<Void> terminalFailure(
+      ExecutionRecord<Object, Object> record,
+      String transitionKey,
+      String code,
+      String message,
+      int failedStepIndex,
+      Optional<String> failedCommandId,
+      boolean retryable,
+      ExecutionStateStore executionStateStore,
+      DeadLetterPublisher deadLetterPublisher,
+      long now) {
     Uni<Optional<ExecutionRecord<Object, Object>>> terminalUpdate = failedStepIndex >= 0
         ? executionStateStore.markTerminalFailure(
             record.tenantId(), record.executionId(), record.version(), ExecutionStatus.FAILED,
-            transitionKey, classifiedFailure.getClass().getSimpleName(), classifiedFailure.getMessage(),
-            failedStepIndex, failedCommandId, now)
+            transitionKey, code, message, failedStepIndex, failedCommandId, now)
         : executionStateStore.markTerminalFailure(
             record.tenantId(), record.executionId(), record.version(), ExecutionStatus.FAILED,
-            transitionKey, classifiedFailure.getClass().getSimpleName(), classifiedFailure.getMessage(), now);
+            transitionKey, code, message, now);
+    return publishTerminalFailure(terminalUpdate, record, transitionKey, code, message, retryable, deadLetterPublisher);
+  }
+
+  private Uni<Void> publishTerminalFailure(
+      Uni<Optional<ExecutionRecord<Object, Object>>> terminalUpdate,
+      ExecutionRecord<Object, Object> record,
+      String transitionKey,
+      String code,
+      String message,
+      boolean retryable,
+      DeadLetterPublisher deadLetterPublisher) {
     return terminalUpdate
         .onItem().transformToUni(updated -> {
           if (updated.isEmpty()) {
             return Uni.createFrom().voidItem();
           }
+          long now = updated.orElseThrow().updatedAtEpochMs();
           PipelinePlatformResourceLoader.PlatformMetadata platformMetadata = PipelinePlatformResourceLoader
               .loadPlatform()
               .orElse(null);
@@ -132,18 +177,18 @@ class ExecutionFailureHandler {
               .transport(resolveTransport(platformMetadata))
               .platform(resolvePlatform(platformMetadata))
               .terminalStatus(ExecutionStatus.FAILED.name())
-              .terminalReason(retryableFailure ? "retry_exhausted" : "non_retryable")
-              .errorCode(classifiedFailure.getClass().getSimpleName())
-              .errorMessage(classifiedFailure.getMessage())
-              .retryable(retryableFailure)
+              .terminalReason(retryable ? "retry_exhausted" : "non_retryable")
+              .errorCode(code)
+              .errorMessage(message)
+              .retryable(retryable)
               .retriesObserved(record.attempt())
               .createdAtEpochMs(now)
               .build();
           return segmentBoundaryLedger()
               .recordRunFailed(
                   updated.get(),
-                  classifiedFailure.getClass().getSimpleName(),
-                  classifiedFailure.getMessage(),
+                  code,
+                  message,
                   now)
               .chain(() -> deadLetterPublisher.publish(envelope));
         });
