@@ -37,6 +37,23 @@ execution. Incompatible bindings raise `PythonLocalDiagnostic` with a
 checks projection bytes. Build provenance and Release identity are owned by
 their respective workflows.
 
+## Load against verified Compiled Truth
+
+Ordinary LOCAL use can omit `expected_projection`. For Release-bound use, the
+deployment host verifies the runnable, its dependencies and the Release's
+Compiled Truth before loading the generated application. Pass the exact immutable
+`bytes` from that verified carrier to
+`create_python_local_runtime(expected_projection=projection_bytes)`. Preserve
+whitespace and use the Compiled Truth carrier as the source of the expected
+projection.
+
+The runtime captures the bytes at construction and compares them with the generated
+binding during load, before inspecting the handler registry. A different projection
+raises `TRUSTED_PROJECTION_MISMATCH` even when its embedded digest matches.
+Matching bindings still undergo all ordinary LOCAL admission checks. Release
+verification and deployment isolation are host responsibilities. Same-process
+handlers run with the process's privileges.
+
 ## Execution
 
 - A handler receives a fresh instance of the generated frozen input class

@@ -79,4 +79,6 @@ export class PolyglotInt32PayloadBinding {
 
 export function createNodeLocalRuntime(options?: {
   readonly onObservation?: (observation: Observation) => void;
+  /** Exact UTF-8 text from deployment-verified Compiled Truth. */
+  readonly expectedProjectionJson?: string;
 }): NodeLocalRuntime;

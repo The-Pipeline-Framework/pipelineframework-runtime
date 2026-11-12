@@ -133,6 +133,15 @@ class LoaderTests(unittest.TestCase):
             create_python_local_runtime(retry=None)
         self.assertEqual(raised.exception.code, "UNSUPPORTED_RUNTIME_OPTIONS")
 
+    def test_trusted_projection_requires_immutable_bytes(self):
+        class ProjectionBytes(bytes):
+            pass
+
+        for invalid in ("{}", bytearray(b"{}"), memoryview(b"{}"), ProjectionBytes(b"{}"), 42):
+            with self.subTest(invalid=type(invalid)), self.assertRaises(PythonLocalDiagnostic) as raised:
+                create_python_local_runtime(expected_projection=invalid)
+            self.assertEqual(raised.exception.code, "UNSUPPORTED_RUNTIME_OPTIONS")
+
     def test_rejects_incompatible_model_and_carrier_constructors(self):
         keyword_model = make_dataclass("Input", [("value", int)], slots=True, frozen=True, kw_only=True)
         keyword_context = make_dataclass(
@@ -155,6 +164,29 @@ class LoaderTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_trusted_projection_matches_exact_bytes_before_registry_admission(self):
+        class UnreadableRegistry(SimpleNamespace):
+            @property
+            def handlers(self):
+                raise AssertionError("loader inspected handlers before verifying the projection")
+
+        original = binding()
+        expected = bytearray(original.projection_bytes)
+        runtime = create_python_local_runtime(expected_projection=bytes(expected))
+        expected[:] = expected.replace(b'"retryLimit": 1', b'"retryLimit": 2')
+        for candidate in (binding(bytes(expected)), binding(original.projection_bytes + b"\n")):
+            fields = vars(candidate).copy()
+            del fields["handlers"]
+            with self.assertRaises(PythonLocalDiagnostic) as raised:
+                runtime.load(UnreadableRegistry(**fields))
+            self.assertEqual(raised.exception.code, "TRUSTED_PROJECTION_MISMATCH")
+            local = create_python_local_runtime().load(candidate)
+            self.assertEqual(await local.run(Input(3), CONTEXT), Completed(Value(Output(5))))
+        self.assertEqual(await runtime.load(original).run(Input(3), CONTEXT), Completed(Value(Output(5))))
+        with self.assertRaises(PythonLocalDiagnostic) as raised:
+            runtime.load(binding(original.projection_bytes, projection_sha256="0" * 64))
+        self.assertEqual(raised.exception.code, "ARTIFACT_DIGEST_MISMATCH")
+
     async def test_exact_generated_nominal_value_and_context_admission(self):
         app = application()
         wrong_inputs = [None, {"value": 3}, First(3), Input(True), Input(3.0), Input(None),
