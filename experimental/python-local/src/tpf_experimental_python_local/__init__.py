@@ -10,8 +10,16 @@ from types import CoroutineType, MappingProxyType
 from typing import Any, Protocol, cast
 
 from ._admission import Carriers, Projection, PythonLocalDiagnostic, Step, admit
+from ._payload_binding import PolyglotInt32PayloadBinding, SerializedTransitionPayload
 
-__all__ = ["CancellationToken", "PythonLocalDiagnostic", "StructuredFailure", "create_python_local_runtime"]
+__all__ = [
+    "CancellationToken",
+    "PolyglotInt32PayloadBinding",
+    "PythonLocalDiagnostic",
+    "SerializedTransitionPayload",
+    "StructuredFailure",
+    "create_python_local_runtime",
+]
 
 _UNCLASSIFIED = "Unclassified business function failure"
 _FAILURE_KEYS = {"code", "message", "retryable", "owner", "stepId"}
