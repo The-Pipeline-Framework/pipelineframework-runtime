@@ -252,6 +252,10 @@ class QueueAsyncSubmissionFlow {
     try {
       return pagingPlan.apply(submission)
           .onItem().transform(plan -> {
+            if (plan.isPresent() && !executionStateStore.supportsPagedProgress()) {
+              throw new IllegalStateException("ExecutionStateStore(" + executionStateStore.providerName()
+                  + ") does not support fenced paged progress");
+            }
             if (paired && plan.isPresent()) {
               throw new IllegalStateException("Hosted native execution does not support paging");
             }

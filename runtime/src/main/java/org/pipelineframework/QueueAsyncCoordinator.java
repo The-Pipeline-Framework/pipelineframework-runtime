@@ -818,7 +818,7 @@ class QueueAsyncCoordinator {
 
   private Uni<Optional<PipelinePagingPlan>> pagingPlanFor(PipelineRunSubmission submission) {
     if (targetsLocalContract(submission)) {
-      return validatePagingStore(localPagingPlan());
+      return Uni.createFrom().item(localPagingPlan());
     }
     if (releaseRegistry == null) {
       return Uni.createFrom().failure(new IllegalStateException(
@@ -826,29 +826,19 @@ class QueueAsyncCoordinator {
     }
     return releaseRegistry.get(
             submission.tenantId(), submission.pipelineId(), submission.releaseVersion())
-        .onItem().transformToUni(release -> {
+        .onItem().transform(release -> {
           if (release.isEmpty() || release.orElseThrow().contract() == null) {
-            return Uni.createFrom().failure(new IllegalStateException(
+            throw new IllegalStateException(
                 "submitted release contract is unavailable for paging validation: "
-                    + submission.pipelineId() + ":" + submission.releaseVersion()));
+                    + submission.pipelineId() + ":" + submission.releaseVersion());
           }
           var pinned = release.orElseThrow();
           if (!submission.contractVersion().equals(pinned.contractVersion())) {
-            return Uni.createFrom().failure(new IllegalStateException(
-                "submitted contract version does not match the pinned release contract"));
+            throw new IllegalStateException(
+                "submitted contract version does not match the pinned release contract");
           }
-          return validatePagingStore(PipelinePagingPlan.from(pinned.contract()));
+          return PipelinePagingPlan.from(pinned.contract());
         });
-  }
-
-  private Uni<Optional<PipelinePagingPlan>> validatePagingStore(
-      Optional<PipelinePagingPlan> plan) {
-    if (plan.isPresent() && !executionStateStore.supportsPagedProgress()) {
-      return Uni.createFrom().failure(new IllegalStateException(
-          "ExecutionStateStore(" + executionStateStore.providerName()
-              + ") does not support fenced paged progress"));
-    }
-    return Uni.createFrom().item(plan);
   }
 
   private boolean targetsLocalContract(PipelineRunSubmission submission) {
