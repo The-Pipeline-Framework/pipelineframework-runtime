@@ -353,15 +353,28 @@ class _Application:
 @dataclass(frozen=True, slots=True)
 class _Runtime:
     observer: _Observer | None
+    expected_projection: bytes | None
 
     def load(self, binding: object, /) -> _Application:
-        return _Application(admit(binding), self.observer)
+        return _Application(admit(binding, self.expected_projection), self.observer)
 
 
-def create_python_local_runtime(*, on_observation: _Observer | None = None, **options: object) -> _Runtime:
-    """Create the runtime for the compiler-generated create_application entry point."""
-    if options or (on_observation is not None and (
-        not callable(on_observation) or _is_async_callable(on_observation)
-    )):
-        raise PythonLocalDiagnostic("UNSUPPORTED_RUNTIME_OPTIONS", "only synchronous on_observation is supported")
-    return _Runtime(on_observation)
+def create_python_local_runtime(
+    *,
+    on_observation: _Observer | None = None,
+    expected_projection: bytes | None = None,
+    **options: object,
+) -> _Runtime:
+    """Create the runtime, optionally pinning deployment-verified Compiled Truth projection bytes."""
+    if (
+        options
+        or (on_observation is not None and (
+            not callable(on_observation) or _is_async_callable(on_observation)
+        ))
+        or (expected_projection is not None and type(expected_projection) is not bytes)
+    ):
+        raise PythonLocalDiagnostic(
+            "UNSUPPORTED_RUNTIME_OPTIONS",
+            "expected synchronous on_observation and/or trusted bytes in expected_projection",
+        )
+    return _Runtime(on_observation, expected_projection)

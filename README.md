@@ -64,6 +64,49 @@ The deployment host owns Release verification, authorization and selection of
 the expected type and inner encoding for the dispatch. This helper is available
 for future host integration and conformance tests.
 
+## Experimental native worker Release binding
+
+The deployment supplies a `NativeWorkerReleaseBinding.Target` with the scoped
+tenant and worker, HTTPS origin, secret reference, native language, generated
+coordinator Contract, and exact Release Descriptor and runnable SHA-256 pins.
+It selects the outer envelope, inner payload, execution, and failed-result
+profiles explicitly. The four accepted selections are
+`application/tpf-transition-envelope+json`, `tpf-polyglot-int32-json/1`,
+`tpf-polyglot-unary-policy/1`, and `tpf-polyglot-failed-result/1`, respectively.
+
+`prepare` verifies the descriptor bytes before opening artifacts, then uses
+the existing Release resolver to verify the closure and recover Compiled Truth.
+The native Contract must equal the coordinator's generated Contract. The
+selected `application-archive` must cover all three Steps and both `local` and
+`rest` capabilities. The descriptor-named Compiled Truth supplies the exact
+projection bytes and the runnable can carry these resources itself.
+
+Prepare one application archive per language with its generated application
+and models, authored handlers, and the complete unpacked native runtime package.
+
+| Target | Required runnable files |
+| --- | --- |
+| Node | `package.json`, `app/application.js`, `app/models.js`, `app/business.js`, and `package.json`, `index.mjs`, `payload-binding.mjs`, `projection.mjs`, and `records.mjs` in `node_modules/@tpf/experimental-node-local/` |
+| Python | `app/__init__.py`, `app/business.py`, `app/generated/project/application.py`, `app/generated/project/models.py`, and `__init__.py`, `_admission.py`, and `_payload_binding.py` in `tpf_experimental_python_local/` |
+
+The experimental archive accepts up to 512 files and 32 MiB of expanded bytes.
+Additional files belong under `app/`, the target's runtime package, or
+`META-INF/pipeline/`. Preparation materializes archive members as regular
+files into a fresh directory in the supplied deployment workspace.
+
+Call `verifyPreparedTree` immediately before controlled launch. Load the
+application, handlers, and runtime from the returned tree and pass the exact
+`projectionBytes()` to the native runtime's verified projection binding. The
+deployment supplies the trusted interpreter and standard library, controls
+imports, and keeps the prepared files immutable throughout their use.
+
+`pin(command)` checks scoped identity, the whole-bundle `0/-1` SINGLE range,
+explicit execution context, and the expected input type and encoding before
+payload decoding. The resulting attempt retains the exact command and the
+trusted target and profile selection. Use `requireCommand` to compare a
+received command with that retained expectation. Authentication, lease
+authority, and settlement remain with the host and coordinator.
+
 ## Unit coverage
 
 The normal Maven verify lifecycle writes a JaCoCo HTML and XML report for each
