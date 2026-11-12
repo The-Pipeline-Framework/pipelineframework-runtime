@@ -4,6 +4,7 @@ import { createNodeLocalRuntime, NodeLocalDiagnostic, PolyglotInt32PayloadBindin
 
 const executePath = '/pipeline/worker/transitions/execute';
 const capabilitiesPath = '/pipeline/worker/capabilities';
+const projectionDigestHeader = 'X-TPF-Worker-Projection-Digest';
 const profiles = {
   outerEncoding: 'application/tpf-transition-envelope+json',
   payloadEncoding: 'tpf-polyglot-int32-json/1',
@@ -160,10 +161,11 @@ function wireResult(result, payloads, outputType, steps) {
   throw new Error('Unsupported native terminal result');
 }
 
-function respond(response, status, value) {
+function respond(response, status, value, headers = {}) {
   if (response.destroyed) return;
   const body = value === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(value), 'utf8');
-  response.writeHead(status, {'Content-Type': 'application/json', 'Content-Length': body.length, Connection: 'close'});
+  response.writeHead(status, {'Content-Type': 'application/json', 'Content-Length': body.length, Connection: 'close',
+    ...headers});
   response.end(body);
 }
 
@@ -199,6 +201,7 @@ export function createNativeTransitionWorker({bind, expectedProjection, tenantId
   const {inputType, outputType} = projection.pipeline;
   const payloads = new PolyglotInt32PayloadBinding(...projection.types.map(type => type.id));
   const steps = new Set(projection.steps.map(step => step.id));
+  const projectionDigest = `sha256:${createHash('sha256').update(expectedProjectionJson, 'utf8').digest('hex')}`;
   const capabilities = {protocolVersion: '1', providerName: 'rest', pipelineId, contractVersion, releaseVersion,
     artifactId, artifactDigest, payloadEncodings: [profiles.outerEncoding], workerProtocols: ['local', 'rest']};
   const authenticate = authenticateWith(sharedSecret);
@@ -225,7 +228,7 @@ export function createNativeTransitionWorker({bind, expectedProjection, tenantId
       return;
     }
     if (!execute) {
-      respond(response, 200, capabilities);
+      respond(response, 200, capabilities, {[projectionDigestHeader]: projectionDigest});
       return;
     }
     if (activeInvocations >= invocationLimit) {

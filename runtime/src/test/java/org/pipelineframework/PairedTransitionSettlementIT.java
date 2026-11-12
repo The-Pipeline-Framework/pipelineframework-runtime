@@ -3,6 +3,7 @@ package org.pipelineframework;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -22,13 +23,16 @@ import java.io.IOException;
 import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -190,6 +194,8 @@ class PairedTransitionSettlementIT {
     var capabilities = new AtomicInteger();
     var sentCommand = new AtomicReference<TransitionCommandEnvelope>();
     var advertisedDigest = new AtomicReference<>(target.runnableArtifactDigest());
+    String projectionDigest = "sha256:" + HexFormat.of().formatHex(
+        MessageDigest.getInstance("SHA-256").digest(fixture.binding().projectionBytes()));
     var http = mock(HttpClient.class);
     when(http.sendAsync(any(HttpRequest.class), org.mockito.ArgumentMatchers.<HttpResponse.BodyHandler<String>>any()))
         .thenAnswer(invocation -> {
@@ -213,6 +219,11 @@ class PairedTransitionSettlementIT {
           when(response.uri()).thenReturn(request.uri());
           when(response.statusCode()).thenReturn(200);
           when(response.body()).thenReturn(body);
+          if ("GET".equals(request.method())) {
+            when(response.headers()).thenReturn(HttpHeaders.of(
+                Map.of(RestTransitionWorkerProtocol.PROJECTION_DIGEST_HEADER, List.of(projectionDigest)),
+                (name, value) -> true));
+          }
           return CompletableFuture.completedFuture(response);
         });
     var rest = pairedWorker(http);
@@ -330,7 +341,9 @@ class PairedTransitionSettlementIT {
 
       var second = route.admit(tenant, pipeline, token, new HostedExecutionAdmissionResource.Request("hosted-replacement",
           target.contractVersion(), target.releaseVersion(), ExecutionInputShape.UNI, input, false)).await().atMost(TIMEOUT);
+      assertEquals(200, second.getStatus());
       var secondReceipt = assertInstanceOf(ExecutionAdmissionReceipt.class, second.getEntity());
+      assertNotEquals(receipt.executionId(), secondReceipt.executionId());
       var secondWork = new ExecutionWorkItem(tenant, secondReceipt.executionId());
       var changed = NativeWorkerReleaseBindingTest.transportFixture(Files.createTempDirectory(fixtureDirectory, "changed-descriptor"));
       assertEquals(target.releaseVersion(), changed.target().releaseVersion());
@@ -677,7 +690,7 @@ class PairedTransitionSettlementIT {
     when(config.controlPlane()).thenReturn(control);
     when(control.enabled()).thenReturn(true);
     when(control.adminToken()).thenReturn(Optional.of("hosted-test"));
-    when(config.idempotencyPolicy()).thenReturn(OrchestratorIdempotencyPolicy.CLIENT_KEY_REQUIRED);
+    when(config.idempotencyPolicy()).thenReturn(OrchestratorIdempotencyPolicy.SERVER_KEY_ONLY);
     when(config.executionTtlDays()).thenReturn(1);
     when(config.leaseMs()).thenReturn(LEASE_MS);
     when(dispatcher.enqueueNow(any())).thenReturn(Uni.createFrom().voidItem());

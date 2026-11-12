@@ -300,7 +300,8 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
             }
             var target = binding.target();
             Executor signalContext = subscriberSignalContext();
-            return capabilitiesAt(target.endpoint(), targetSecret(target.sharedSecretRef()), signalContext, true)
+            return capabilitiesAt(target.endpoint(), targetSecret(target.sharedSecretRef()), signalContext,
+                    Optional.of(binding.projectionDigest()))
                 .invoke(capability -> {
                     if (!binding.acceptsCapabilities(capability)) {
                         throw new IllegalStateException("Paired worker capabilities do not match its prepared Release binding");
@@ -310,12 +311,13 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
     }
 
     private Uni<PipelineWorkerCapability> capabilitiesAt(URI endpoint, String secret, Executor signalContext) {
-        return capabilitiesAt(endpoint, secret, signalContext, false);
+        return capabilitiesAt(endpoint, secret, signalContext, Optional.empty());
     }
 
-    private Uni<PipelineWorkerCapability> capabilitiesAt(URI endpoint, String secret, Executor signalContext, boolean paired) {
+    private Uni<PipelineWorkerCapability> capabilitiesAt(URI endpoint, String secret, Executor signalContext,
+            Optional<String> expectedProjectionDigest) {
         return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(() -> capabilitiesRequest(endpoint, secret), blockingExecutor)
-            .thenCompose(request -> paired
+            .thenCompose(request -> expectedProjectionDigest.isPresent()
                 ? sendBoundedPaired(pairedHttpClient(), request, orchestratorConfig.workerRest().requestTimeout().toMillis())
                     .thenApply(response -> {
                     if (!request.uri().equals(response.uri()) || response.previousResponse().isPresent()) {
@@ -325,7 +327,7 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
                 })
                 : httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString()))
             .thenCompose(response -> CompletableFuture.supplyAsync(
-                () -> decodeCapabilitiesResponse(response, paired),
+                () -> decodeCapabilitiesResponse(response, expectedProjectionDigest),
                 blockingExecutor)))
             .emitOn(signalContext)
             .onFailure().transform(this::unwrapFailure);
@@ -480,14 +482,20 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
             .build();
     }
 
-    private PipelineWorkerCapability decodeCapabilitiesResponse(HttpResponse<String> response, boolean paired) {
+    private PipelineWorkerCapability decodeCapabilitiesResponse(HttpResponse<String> response,
+            Optional<String> expectedProjectionDigest) {
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             throw new TransitionWorkerFailureException(
                 "REST transition worker capabilities returned HTTP " + response.statusCode()
                     + " with response body omitted");
         }
+        if (expectedProjectionDigest.isPresent()
+                && !response.headers().allValues(RestTransitionWorkerProtocol.PROJECTION_DIGEST_HEADER)
+                    .equals(List.of(expectedProjectionDigest.orElseThrow()))) {
+            throw new TransitionWorkerFailureException("Paired worker projection does not match its prepared Release binding");
+        }
         try {
-            PipelineWorkerCapability capability = paired ? PAIRED_CAPABILITIES.readValue(response.body())
+            PipelineWorkerCapability capability = expectedProjectionDigest.isPresent() ? PAIRED_CAPABILITIES.readValue(response.body())
                 : JSON.readValue(response.body(), PipelineWorkerCapability.class);
             if (capability == null) {
                 throw new TransitionWorkerFailureException(

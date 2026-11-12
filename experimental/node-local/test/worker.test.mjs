@@ -90,7 +90,9 @@ function send(server, method, path, body = empty, headers = signed(method, path,
         const chunks = [];
         for await (const chunk of incoming) chunks.push(chunk);
         const source = Buffer.concat(chunks).toString('utf8');
-        resolve({status: incoming.statusCode, body: source === '' ? undefined : JSON.parse(source)});
+        const projectionDigests = incoming.headersDistinct['x-tpf-worker-projection-digest'];
+        resolve({status: incoming.statusCode, body: source === '' ? undefined : JSON.parse(source),
+          ...(projectionDigests === undefined ? {} : {projectionDigests})});
       } catch (error) { reject(error); }
     });
     outgoing.on('error', reject).end(body);
@@ -188,8 +190,9 @@ test('authenticates capabilities and rejects invalid commands before any busines
   const server = await listening(t, {...options(), onObservation: event => {
     if (event.kind === 'ATTEMPT_STARTED') calls.push([event.stepId, event.context]);
   }});
-  const {status, body} = await send(server, 'GET', capabilitiesPath);
+  const {status, body, projectionDigests} = await send(server, 'GET', capabilitiesPath);
   assert.equal(status, 200);
+  assert.deepEqual(projectionDigests, [`sha256:${hash(projectionJson)}`]);
   assert.deepEqual(body, {protocolVersion: '1', providerName: 'rest', pipelineId: pins.pipelineId,
     contractVersion: pins.contractVersion, releaseVersion: pins.releaseVersion, artifactId: pins.artifactId,
     artifactDigest: pins.artifactDigest, payloadEncodings: [profiles.outerEncoding], workerProtocols: ['local', 'rest']});

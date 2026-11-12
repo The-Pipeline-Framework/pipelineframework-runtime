@@ -20,6 +20,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
@@ -47,6 +48,7 @@ import org.mockito.ArgumentMatchers;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope.PortableFailure;
+import org.pipelineframework.orchestrator.worker.PipelineWorkerCapability;
 
 class PairedRestPipelineTransitionWorkerTest {
     private static final String INPUT_TYPE = "InputValue";
@@ -101,6 +103,31 @@ class PairedRestPipelineTransitionWorkerTest {
             .subscribeAsCompletionStage().get(WAIT.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS));
         assertTrue(failed.getCause() instanceof TimeoutException);
         assertTrue(pending.isCancelled());
+        verifyNoInteractions(store, legacyClient);
+    }
+
+    @Test
+    void acceptsCapabilitiesWithTheExactProjectionDigest() throws IOException {
+        var capability = capability();
+        respond(200, PipelineJson.mapper().writeValueAsString(capability), Optional.empty(),
+            Map.of(RestTransitionWorkerProtocol.PROJECTION_DIGEST_HEADER, List.of(attempt.projectionDigest())));
+
+        assertEquals(capability, worker.pairedCapabilities(fixture.binding()).await().atMost(WAIT));
+        verifyNoInteractions(store, legacyClient);
+    }
+
+    @Test
+    void rejectsAbsentDuplicateMalformedAndDifferentProjectionDigestsBeforeDispatch() throws IOException {
+        String body = PipelineJson.mapper().writeValueAsString(capability());
+        String digest = attempt.projectionDigest();
+        for (List<String> values : List.of(List.<String>of(), List.of(digest, digest), List.of("sha256:invalid"),
+                List.of("sha256:" + "0".repeat(64)))) {
+            var request = respond(200, body, Optional.empty(),
+                Map.of(RestTransitionWorkerProtocol.PROJECTION_DIGEST_HEADER, values));
+            assertThrows(TransitionWorkerFailureException.class, () -> worker.pairedCapabilities(fixture.binding())
+                .chain(() -> worker.executeTransition(attempt, OWNER, store)).await().atMost(WAIT));
+            assertEquals("GET", request.get().method());
+        }
         verifyNoInteractions(store, legacyClient);
     }
 
@@ -257,7 +284,19 @@ class PairedRestPipelineTransitionWorkerTest {
             "execution:0:0", "trace", INPUT_TYPE, target.profiles().payloadEncoding(), payload));
     }
 
+    private PipelineWorkerCapability capability() {
+        var target = fixture.target();
+        return new PipelineWorkerCapability(PipelineWorkerCapability.PROTOCOL_VERSION, "rest", target.pipelineId(),
+            target.contractVersion(), target.releaseVersion(), target.runnableArtifactId(), target.runnableArtifactDigest(),
+            List.of(target.profiles().outerEncoding()), List.of("local", "rest"));
+    }
+
     private AtomicReference<HttpRequest> respond(int status, String body, Optional<URI> responseUri) {
+        return respond(status, body, responseUri, Map.of());
+    }
+
+    private AtomicReference<HttpRequest> respond(int status, String body, Optional<URI> responseUri,
+            Map<String, List<String>> headers) {
         var captured = new AtomicReference<HttpRequest>();
         when(pairedClient.sendAsync(any(HttpRequest.class), ArgumentMatchers.<HttpResponse.BodyHandler<String>>any()))
             .thenAnswer(invocation -> {
@@ -276,6 +315,7 @@ class PairedRestPipelineTransitionWorkerTest {
                     when(response.uri()).thenReturn(responseUri.orElseGet(request::uri));
                     when(response.previousResponse()).thenReturn(Optional.empty());
                     when(response.body()).thenReturn(received);
+                    when(response.headers()).thenReturn(HttpHeaders.of(headers, (name, value) -> true));
                     return response;
                 });
             });
