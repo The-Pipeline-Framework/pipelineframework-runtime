@@ -17,13 +17,13 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionOperation;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
 import org.pipelineframework.orchestrator.ControlPlaneTransitionAdmission;
+import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.PipelineTransitionWorker;
-import org.pipelineframework.orchestrator.TransitionCommandEnvelope;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope;
 import org.pipelineframework.orchestrator.TransitionWorkerExecutor;
@@ -140,21 +140,30 @@ class QueueAsyncSegmentPipeline {
   private Uni<TransitionResultEnvelope> executeTransition(
       ClaimedSegment segment,
       PipelineTransitionWorker worker) {
-    if (isCoordinatorTerminalMaterialization(segment)) {
-      // Keep terminal inputs at the coordinator instead of re-encoding them through a no-op worker.
-      Uni<TransitionResultEnvelope> completed = segment.resumesFromAwait()
-          ? awaitCoordinator.loadResumePayload(segment.record().tenantId(), segment.record().awaitUnitId())
-              .onItem().transform(payload ->
-              TransitionResultEnvelope.completedInProcess(terminalOutputItems(segment, payload)))
-          : Uni.createFrom().item(TransitionResultEnvelope.completedTerminalInputPassthrough());
-      return completed.onItem().transform(result -> segment.record().pagingState()
-          .map(page -> result.withPageCompletion(page.suspendedCompletion().orElseThrow(() ->
-              new IllegalStateException("a terminal paged segment requires retained page completion"))))
-          .orElse(result));
+    boolean atRootEnd = isCoordinatorTerminalMaterialization(segment);
+    if (atRootEnd && !segment.resumesFromAwait()) {
+      return Uni.createFrom().item(withRetainedPageCompletion(
+          segment, TransitionResultEnvelope.completedTerminalInputPassthrough()));
     }
-    return transitionCommand(segment)
-        .onItem().transformToUni(command -> transitionWorkerExecutor.execute(worker, command))
-        .chain(result -> normalizeTerminalAwaitResult(segment, result));
+    return inputPayload(segment).chain(payload -> {
+      // The root cursor can be at the end while an invoked definition still has work.
+      if (atRootEnd && !(payload instanceof ExecutionInputSnapshot snapshot
+          && snapshot.invocationPath().filter(path -> !path.frames().isEmpty()).isPresent())) {
+        Object output = payload instanceof ExecutionInputSnapshot snapshot ? snapshot.payload() : payload;
+        return Uni.createFrom().item(withRetainedPageCompletion(segment,
+            TransitionResultEnvelope.completedInProcess(terminalOutputItems(segment, output))));
+      }
+      return transitionWorkerExecutor.execute(worker, segment.transitionCommand(payload, payloadCodec.get()))
+          .chain(result -> normalizeTerminalAwaitResult(segment, result));
+    });
+  }
+
+  private TransitionResultEnvelope withRetainedPageCompletion(
+      ClaimedSegment segment, TransitionResultEnvelope result) {
+    return segment.record().pagingState()
+        .map(page -> result.withPageCompletion(page.suspendedCompletion().orElseThrow(() ->
+            new IllegalStateException("a terminal paged segment requires retained page completion"))))
+        .orElse(result);
   }
 
   private Uni<TransitionResultEnvelope> normalizeTerminalAwaitResult(
@@ -194,11 +203,6 @@ class QueueAsyncSegmentPipeline {
     }
     return List.of(payload);
   }
-  private Uni<TransitionCommandEnvelope> transitionCommand(ClaimedSegment segment) {
-    return inputPayload(segment)
-        .onItem().transform(payload -> segment.transitionCommand(payload, payloadCodec.get()));
-  }
-
   private Uni<Object> inputPayload(ClaimedSegment segment) {
     if (!segment.resumesFromAwait()) {
       return Uni.createFrom().item(segment.record().inputPayload());

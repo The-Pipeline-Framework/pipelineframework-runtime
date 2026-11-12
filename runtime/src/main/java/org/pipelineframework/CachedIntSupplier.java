@@ -37,4 +37,3 @@ final class CachedIntSupplier implements IntSupplier {
     }
   }
 }
-
