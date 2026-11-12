@@ -57,6 +57,10 @@ class TerminalPublicationBoundary {
     });
   }
 
+  boolean publicationConfigured() {
+    return (checkpointPublicationService != null && checkpointPublicationService.enabled()) || pagedOutputEnabled();
+  }
+
   boolean pagedOutputEnabled() {
     return objectPublishCompletionService != null && objectPublishCompletionService.enabled();
   }

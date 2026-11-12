@@ -21,4 +21,7 @@ public interface PairedTransitionSettlementStore {
     Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedSuccess(Lease lease, SerializedTransitionPayload output);
 
     Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedFailure(Lease lease, PortableFailure failure);
+
+    /** Records a coordinator rejection of a paired result under the same live lease check. */
+    Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedRejection(Lease lease, String errorCode, String diagnostic);
 }

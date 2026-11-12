@@ -85,6 +85,9 @@ not another store or ledger. It atomically checks RUNNING status, version, owner
 and lease expiry when recording the result. The bounded serialized output is
 stored in the same update; stale replies cannot overwrite it before a failed
 conditional write. Ledger and DLQ effects follow a successful state update.
+Paired native completion requires checkpoint and object output publication to
+be disabled. With either configured, the coordinator records a non-retryable
+`PAIRED_TERMINAL_PUBLICATION_UNSUPPORTED` failure under the same live lease check.
 
 This overload is not selected by registration or ordinary dispatch. Its caller
 must own durable dispatch intent and current authority before sending. Those

@@ -2,7 +2,6 @@ package org.pipelineframework;
 
 import java.util.Objects;
 import java.util.function.Consumer;
-import java.util.function.Function;
 import java.util.function.Supplier;
 
 import io.smallrye.mutiny.Uni;
@@ -14,10 +13,7 @@ import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.PagedExecutionState;
 import org.pipelineframework.orchestrator.PagedTransitionCompletion;
-import org.pipelineframework.orchestrator.PairedTransitionSettlementStore;
-import org.pipelineframework.orchestrator.PairedTransitionSettlementStore.Lease;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
-import org.pipelineframework.orchestrator.TransitionResultEnvelope.PairedResult;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
@@ -37,6 +33,7 @@ class SegmentCommitEffects {
   private final Supplier<SegmentBoundaryLedger> segmentBoundaryLedger;
   private final AwaitContinuations awaitContinuations;
   private final TerminalPublicationBoundary terminalPublicationBoundary;
+  private final PairedSegmentSettlement pairedSettlement;
   private final Consumer<AwaitReplayLifecycleEvent> lifecycleRecorder;
 
   SegmentCommitEffects(
@@ -60,6 +57,8 @@ class SegmentCommitEffects {
         terminalPublicationBoundary,
         "terminalPublicationBoundary must not be null");
     this.lifecycleRecorder = Objects.requireNonNull(lifecycleRecorder, "lifecycleRecorder must not be null");
+    this.pairedSettlement = new PairedSegmentSettlement(
+        executionStateStore, executionFailureHandler, deadLetterPublisher, terminalPublicationBoundary, segmentBoundaryLedger);
   }
 
   Uni<Void> commit(
@@ -67,36 +66,12 @@ class SegmentCommitEffects {
       AwaitItemContinuationHandler itemContinuationHandler) {
     return switch (plan) {
       case CompletedSegment completed -> completed.result().pairedResult()
-          .map(paired -> withPairedLease(completed.segment(), paired, lease -> commitPairedCompleted(completed, lease)))
+          .map(paired -> pairedSettlement.complete(completed, paired))
           .orElseGet(() -> commitCompleted(completed));
       case SuspendedSegment suspended -> commitSuspended(suspended, itemContinuationHandler);
       case FailedSegment failed -> fail(failed.segment(), failed.failure());
-      case PairedFailedSegment failed -> withPairedLease(failed.segment(), failed.result(),
-          lease -> executionFailureHandler.handlePortableFailure(failed.segment().record(), lease,
-              failed.result().failure().orElseThrow(), pairedStore(), deadLetterPublisher));
+      case PairedFailedSegment failed -> pairedSettlement.fail(failed);
     };
-  }
-
-  private Uni<Void> withPairedLease(ClaimedSegment segment, PairedResult paired, Function<Lease, Uni<Void>> settle) {
-    var command = paired.attempt().command();
-    var claimed = segment.record();
-    if (!command.tenantId().equals(claimed.tenantId()) || !command.executionId().equals(claimed.executionId())
-        || !command.pipelineId().equals(claimed.pipelineId()) || !command.contractVersion().equals(claimed.contractVersion())
-        || !command.releaseVersion().equals(claimed.releaseVersion()) || command.executionVersion() != claimed.version()
-        || command.attempt() != claimed.attempt() || !command.transitionKey().equals(segment.transitionKey())
-        || command.currentStepIndex() != claimed.currentStepIndex() || command.resultShape() != claimed.resultShape()
-        || claimed.leaseOwner() == null) {
-      return Uni.createFrom().voidItem();
-    }
-    return settle.apply(new Lease(claimed.tenantId(), claimed.executionId(), claimed.version(),
-        claimed.leaseOwner(), segment.transitionKey()));
-  }
-
-  private PairedTransitionSettlementStore pairedStore() {
-    if (executionStateStore instanceof PairedTransitionSettlementStore paired) {
-      return paired;
-    }
-    throw new UnsupportedOperationException("Execution state store cannot settle an explicitly paired native attempt");
   }
 
   Uni<Void> fail(ClaimedSegment segment, Throwable failure) {
@@ -108,6 +83,7 @@ class SegmentCommitEffects {
         workDispatcher,
         deadLetterPublisher);
   }
+
   private Uni<Void> commitCompleted(CompletedSegment completed) {
     ClaimedSegment segment = completed.segment();
     long nowEpochMs = System.currentTimeMillis();
@@ -134,18 +110,9 @@ class SegmentCommitEffects {
                 succeeded,
                 completed.outputItems(),
                 nowEpochMs))
-            .orElseGet(() -> Uni.createFrom().failure(successCommitFailure(completed))))
-        .replaceWithVoid();
+            .orElseGet(() -> Uni.createFrom().failure(successCommitFailure(segment))));
   }
 
-  private Uni<Void> commitPairedCompleted(CompletedSegment completed, Lease lease) {
-    ClaimedSegment segment = completed.segment();
-    return pairedStore().settlePairedSuccess(lease, completed.result().outputPayloads().getFirst())
-        .chain(updated -> updated.map(succeeded -> segmentBoundaryLedger.get()
-            .recordSegmentCompleted(segment.record(), segment.transitionKey(), completed.result(), succeeded.updatedAtEpochMs())
-            .chain(() -> segmentBoundaryLedger.get().recordRunSucceeded(succeeded, completed.outputItems(), succeeded.updatedAtEpochMs())))
-            .orElseGet(() -> Uni.createFrom().voidItem()));
-  }
   private Uni<Void> advancePage(
       CompletedSegment completed,
       PagedTransitionCompletion completion,
@@ -170,8 +137,7 @@ class SegmentCommitEffects {
         .onItem().transformToUni(updated -> updated
             .map(queued -> workDispatcher.enqueueNow(new ExecutionWorkItem(
                 queued.tenantId(), queued.executionId())))
-            .orElseGet(() -> reconcilePageCommit(completed, successor)))
-        .replaceWithVoid();
+            .orElseGet(() -> reconcilePageCommit(completed, successor)));
   }
 
   private Uni<Void> reconcilePageCommit(
@@ -265,26 +231,19 @@ class SegmentCommitEffects {
   }
 
   private IllegalStateException waitingExternalFailure(SuspendedSegment suspended) {
+    ClaimedSegment segment = suspended.segment();
+    var suspension = suspended.suspension();
     return new IllegalStateException(
-        "Failed to persist WAITING_EXTERNAL state for execution "
-            + suspended.segment().record().executionId()
-            + " at step "
-            + suspended.suspension().stepIndex()
-            + " (expectedVersion="
-            + suspended.segment().record().version()
-            + ", awaitUnitId="
-            + suspended.suspension().unitId()
-            + ")");
+        "Failed to persist WAITING_EXTERNAL state for execution " + segment.record().executionId()
+            + " at step " + suspension.stepIndex()
+            + " (expectedVersion=" + segment.record().version()
+            + ", awaitUnitId=" + suspension.unitId() + ")");
   }
 
-  private IllegalStateException successCommitFailure(CompletedSegment completed) {
+  private IllegalStateException successCommitFailure(ClaimedSegment segment) {
     return new IllegalStateException(
-        "Failed to persist SUCCEEDED state for execution "
-            + completed.segment().record().executionId()
-            + " (expectedVersion="
-            + completed.segment().record().version()
-            + ", transitionKey="
-            + completed.segment().transitionKey()
-            + ")");
+        "Failed to persist SUCCEEDED state for execution " + segment.record().executionId()
+            + " (expectedVersion=" + segment.record().version()
+            + ", transitionKey=" + segment.transitionKey() + ")");
   }
 }
