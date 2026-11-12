@@ -123,11 +123,13 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
     }
 
     /**
-     * Dispatches an explicitly paired, deployment-verified native attempt over its pinned HTTPS origin.
-     * The caller owns current lease authority and durable dispatch intent before invoking this method.
+     * Dispatches an explicitly paired native attempt only when the durable store reserves its current lease.
+     * An empty result means the attempt was not authorized to send.
      */
-    public Uni<TransitionResultEnvelope> executeTransition(NativeWorkerReleaseBinding.Attempt attempt) {
+    public Uni<Optional<TransitionResultEnvelope>> executeTransition(NativeWorkerReleaseBinding.Attempt attempt,
+            String leaseOwner, PairedTransitionSettlementStore store) {
         Objects.requireNonNull(attempt, "attempt");
+        Objects.requireNonNull(store, "store");
         var runtime = invocationRuntime();
         return Uni.createFrom().deferred(() -> {
             Executor signalContext = subscriberSignalContext();
@@ -138,10 +140,40 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
                 }
                 var decoder = new PairedTransitionResultDecoder(attempt);
                 decoder.validateCommand();
-                return executeRequest(attempt.command(), target.endpoint(), targetSecret(target.sharedSecretRef()),
-                    signalContext, Optional.of(decoder));
+                String secret = targetSecret(target.sharedSecretRef());
+                PairedDispatchIntent intent = PairedDispatchIntent.from(attempt, leaseOwner);
+                return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(
+                        () -> request(attempt.command(), target.endpoint(), secret, true), blockingExecutor))
+                    .emitOn(signalContext)
+                    .chain(request -> store.beginPairedDispatch(intent)
+                        .emitOn(signalContext)
+                        .chain(permit -> permit.isPresent()
+                            ? executePairedRequest(request, target.endpoint(), decoder, intent, store, signalContext,
+                                permit.orElseThrow())
+                            : Uni.createFrom().item(Optional.empty())));
             }));
         });
+    }
+
+    private Uni<Optional<TransitionResultEnvelope>> executePairedRequest(HttpRequest request, URI endpoint,
+            PairedTransitionResultDecoder decoder, PairedDispatchIntent intent, PairedTransitionSettlementStore store,
+            Executor signalContext, long leaseExpiresEpochMs) {
+        HttpClient client = pairedHttpClient();
+        if (leaseExpiresEpochMs <= System.currentTimeMillis()) {
+            // The durable intent stays outstanding even if its authorization arrived too late to send.
+            return Uni.createFrom().item(Optional.empty());
+        }
+        long deadlineMillis = Math.max(1L, orchestratorConfig.workerRest().requestTimeout().toMillis());
+        long startedAtNanos = System.nanoTime();
+        String target = workerTarget(endpoint);
+        ScheduledFuture<?> warning = scheduleDeadlineWarning(intent.command(), target, deadlineMillis);
+        return Uni.createFrom().completionStage(() -> sendPaired(client, request, decoder, target, startedAtNanos, deadlineMillis))
+            .emitOn(signalContext)
+            .onItemOrFailure().invoke((ignored, failure) -> warning.cancel(false))
+            .onFailure().transform(failure -> classifyFailure(failure, target, startedAtNanos, deadlineMillis))
+            .onFailure(RemoteTransitionOutcomeUnknownException.class).call(failure ->
+                store.settlePairedUnknown(intent).replaceWithVoid())
+            .map(Optional::of);
     }
 
     private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command, Executor signalContext) {
@@ -150,33 +182,26 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
 
     private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command, URI endpoint, String secret,
                                                        Executor signalContext) {
-        return executeRequest(command, endpoint, secret, signalContext, Optional.empty());
-    }
-
-    private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command, URI endpoint, String secret,
-            Executor signalContext, Optional<PairedTransitionResultDecoder> paired) {
-        Duration deadline = orchestratorConfig.workerRest().requestTimeout();
-        long deadlineMillis = Math.max(1L, deadline.toMillis());
+        long deadlineMillis = Math.max(1L, orchestratorConfig.workerRest().requestTimeout().toMillis());
         long startedAtNanos = System.nanoTime();
         String target = workerTarget(endpoint);
         ScheduledFuture<?> warning = scheduleDeadlineWarning(command, target, deadlineMillis);
         return Uni.createFrom().completionStage(() -> CompletableFuture
-                .supplyAsync(() -> request(command, endpoint, secret, paired.isPresent()), blockingExecutor)
-                .thenCompose(request -> paired
-                    .map(decoder -> sendPaired(request, decoder, target, startedAtNanos, deadlineMillis))
-                    .orElseGet(() -> httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                        .thenApplyAsync(response -> decodeResponse(response, command), blockingExecutor))))
+                .supplyAsync(() -> request(command, endpoint, secret, false), blockingExecutor)
+                .thenCompose(request -> httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                    .thenApplyAsync(response -> decodeResponse(response, command), blockingExecutor)))
             .emitOn(signalContext)
             .onItemOrFailure().invoke((ignored, failure) -> warning.cancel(false))
             .onFailure().transform(failure -> classifyFailure(failure, target, startedAtNanos, deadlineMillis));
     }
 
-    private CompletableFuture<TransitionResultEnvelope> sendPaired(HttpRequest request, PairedTransitionResultDecoder decoder,
+    private CompletableFuture<TransitionResultEnvelope> sendPaired(HttpClient client, HttpRequest request,
+            PairedTransitionResultDecoder decoder,
             String target, long startedAtNanos, long deadlineMillis) {
         return CompletableFuture.completedFuture(request)
             .thenCompose(sent -> {
                 CompletableFuture<HttpResponse<String>> response =
-                    pairedHttpClient().sendAsync(sent, ignored -> new BoundedPairedResponse());
+                    client.sendAsync(sent, ignored -> new BoundedPairedResponse());
                 return response.copy().orTimeout(deadlineMillis, TimeUnit.MILLISECONDS)
                     .whenComplete((received, failure) -> {
                         if (failure instanceof TimeoutException) {
