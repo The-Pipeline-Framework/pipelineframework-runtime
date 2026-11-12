@@ -145,8 +145,9 @@ and `POST /pipeline/worker/transitions/execute` over TLS. Business-step links st
 Each admitted invocation runs on its own event-loop thread. A shared deployment
 observer must support calls from those threads.
 
-The host limits intake to 16 connections, 8 KiB of headers, 16 KiB of body and
-10 seconds for request intake. It allows two minutes of timestamp skew and retains
+The host limits intake to 16 connections, 8 KiB of raw headers, 16 KiB of body and
+10 seconds for request intake. It returns HTTP 431 when the raw header section
+exceeds the limit. It allows two minutes of timestamp skew and retains
 up to 10,000 live nonces for the process lifetime. The coordinator retains durable
 dispatch and settlement authority. HTTP disconnects leave admitted business
 execution running. These endpoints are for experimental qualification. Deployment,
