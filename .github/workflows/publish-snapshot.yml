@@ -40,13 +40,15 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Verify effective publication flags
         run: |
-          ./mvnw -q -DskipTests help:effective-pom -Doutput=target/runtime-effective-pom.xml -Dmaven.repo.local="$GITHUB_WORKSPACE/.m2/repository"
+          ./mvnw -q -Dtpf.central.publishing.extension=false -DskipTests help:effective-pom -Doutput=target/runtime-effective-pom.xml -Dmaven.repo.local="$GITHUB_WORKSPACE/.m2/repository"
           node scripts/verify-runtime-publication.mjs target/runtime-effective-pom.xml
       - name: Verify and publish
-        # Central can throttle the deferred snapshot artifact uploads and metadata requests.
+        # Maven Deploy groups each project’s artifacts in a single deployment request.
         run: >-
           ./mvnw -B clean deploy -U --no-transfer-progress
           -Dspotless.skip=true -Dgpg.skip=false
+          -Dtpf.central.publishing.extension=false
+          -DaltSnapshotDeploymentRepository=central::https://central.sonatype.com/repository/maven-snapshots/
           -Daether.connector.http.retryHandler.count.central=5
           -Daether.connector.http.retryHandler.interval.central=30000
           -Dmaven.repo.local="$GITHUB_WORKSPACE/.m2/repository"
