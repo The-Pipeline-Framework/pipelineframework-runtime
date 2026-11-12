@@ -43,7 +43,13 @@ jobs:
           ./mvnw -q -DskipTests help:effective-pom -Doutput=target/runtime-effective-pom.xml -Dmaven.repo.local="$GITHUB_WORKSPACE/.m2/repository"
           node scripts/verify-runtime-publication.mjs target/runtime-effective-pom.xml
       - name: Verify and publish
-        run: ./mvnw -B clean deploy -U --no-transfer-progress -Dspotless.skip=true -Dgpg.skip=false -Dmaven.repo.local="$GITHUB_WORKSPACE/.m2/repository"
+        # Central can throttle the deferred snapshot artifact uploads and metadata requests.
+        run: >-
+          ./mvnw -B clean deploy -U --no-transfer-progress
+          -Dspotless.skip=true -Dgpg.skip=false
+          -Daether.connector.http.retryHandler.count.central=5
+          -Daether.connector.http.retryHandler.interval.central=30000
+          -Dmaven.repo.local="$GITHUB_WORKSPACE/.m2/repository"
         env:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
           CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
