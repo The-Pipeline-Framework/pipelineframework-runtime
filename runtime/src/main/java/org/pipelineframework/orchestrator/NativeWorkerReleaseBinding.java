@@ -259,6 +259,10 @@ public final class NativeWorkerReleaseBinding {
         return target;
     }
 
+    String projectionDigest() {
+        return projectionDigest;
+    }
+
     /** Runtime-owned durable input. Hosted request bodies cannot deserialize this marker. */
     public record AdmittedInput(SerializedTransitionPayload payload, String descriptorDigest) {
         public AdmittedInput {
