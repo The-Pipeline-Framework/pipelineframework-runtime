@@ -34,6 +34,11 @@ executing project or fork code.
 
 Fork pull requests require `safe-to-system-test`. Candidate publication uses the coordination GitHub App and the
 workflow package token; it uses no Maven Central credentials or GPG key.
+
+For a missing `main` candidate, check the candidate build and publisher against the exact source SHA. The
+publisher's workflow-run page can display the default-branch SHA even when its candidate event identifies a pull
+request. Check the published event's `source_sha` and `pull_request_number` before retrying downstream verification.
+
 ## Coordinator Maven Release admission
 
 The existing private, default-disabled release admin registration endpoint accepts canonical `maven:`
