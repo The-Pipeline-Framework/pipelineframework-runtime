@@ -98,6 +98,64 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
     }
 
     @Test
+    void transitionWorkerStartsWithOnlyAWorkerSigningReference() {
+        var secrets = new ArrayList<GetSecretValueRequest>();
+        var parameters = new ArrayList<GetParameterRequest>();
+        var config = buildSsm(transitionWorkerConfiguration(), secrets, parameters, this::validParameterResponse);
+        var runtime = config.getConfigMapping(PipelineOrchestratorConfig.class);
+        assertThat(runtime.mode().name()).isEqualTo("SYNC");
+        assertThat(runtime.processLoopsDisabled()).isTrue();
+        assertThat(runtime.workerSqs().requestQueueUrl()).isEmpty();
+        assertThat(runtime.workerSqs().responseQueueUrl()).contains("https://sqs.eu-west-1.amazonaws.com/123456789012/replies");
+        assertThat(runtime.workerSqs().sharedSecretRef()).contains("env:TRANSITION_SIGNING_KEY");
+        assertThat(secrets).isEmpty();
+        assertThat(parameters).isEmpty();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+        "quarkus.lambda.handler, aws-durable-action",
+        "pipeline.orchestrator.mode, QUEUE_ASYNC",
+        "pipeline.orchestrator.process-loops-disabled, false",
+        "tpf.aws.durable.configuration, {}",
+        "tpf.aws.durable.deployment-validation, validated",
+        "tpf.aws.durable.entry-id, retained-transition",
+        "tpf.aws.durable.worker-secret-arn, unexpected-secret",
+        "pipeline.orchestrator.resume-token-secret, unexpected-secret",
+        "pipeline.orchestrator.worker.sqs.shared-secret, unexpected-secret",
+        "pipeline.orchestrator.worker.sqs.request-queue-url, https://unexpected.example/queue",
+        "pipeline.orchestrator.queue-url, https://unexpected.example/work"})
+    void rejectsMixedTransitionWorkerConfigurationBeforeAnySecretRead(String key, String value) {
+        var config = transitionWorkerConfiguration();
+        config.put(key, value);
+        assertNoProviderRead(config);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {
+        "pipeline.orchestrator.pipeline-id", "pipeline.orchestrator.release-version",
+        "pipeline.orchestrator.sqs.region", "pipeline.orchestrator.worker.sqs.response-queue-url",
+        "pipeline.orchestrator.worker.sqs.shared-secret-ref"})
+    void requiresExplicitTransitionWorkerSettings(String key) {
+        var config = transitionWorkerConfiguration();
+        config.remove(key);
+        assertNoProviderRead(config);
+    }
+
+    private Map<String, String> transitionWorkerConfiguration() {
+        return new HashMap<>(Map.of(
+            "tpf.aws.durable.transition-worker-only", "true",
+            "quarkus.lambda.handler", "aws-durable-transition-worker",
+            "pipeline.orchestrator.mode", "SYNC",
+            "pipeline.orchestrator.process-loops-disabled", "true",
+            "pipeline.orchestrator.pipeline-id", "test-pipeline",
+            "pipeline.orchestrator.release-version", "test-release",
+            "pipeline.orchestrator.sqs.region", "eu-west-1",
+            "pipeline.orchestrator.worker.sqs.response-queue-url", "https://sqs.eu-west-1.amazonaws.com/123456789012/replies",
+            "pipeline.orchestrator.worker.sqs.shared-secret-ref", "env:TRANSITION_SIGNING_KEY"));
+    }
+
+    @Test
     void httpAdmissionRequiresValidatedDeploymentAndUnqualifiedTrustedFamily() {
         String family = "arn:aws:lambda:eu-west-1:123456789012:function:coordinator";
         var values = validConfiguration();

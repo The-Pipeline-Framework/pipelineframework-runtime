@@ -27,6 +27,7 @@ import software.amazon.awssdk.services.ssm.model.ParameterType;
 /** Validates the deployment-owned Lambda configuration before resolving pinned signing keys. */
 public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSourceFactory {
     private static final String PREFIX = "tpf.aws.durable.";
+    private static final String ORCHESTRATOR = "pipeline.orchestrator.";
     private static final int PINNED_SOURCE_ORDINAL = 500;
     private final Function<GetSecretValueRequest, GetSecretValueResponse> secrets;
     private final Function<GetParameterRequest, GetParameterResponse> parameters;
@@ -61,6 +62,10 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
 
     @Override
     public Iterable<ConfigSource> getConfigSources(ConfigSourceContext originalContext) {
+        if (value(originalContext, PREFIX + "transition-worker-only").filter("true"::equals).isPresent()) {
+            validateTransitionWorkerOnly(originalContext);
+            return List.of();
+        }
         Map<String, String> settings = deploymentSettings(originalContext);
         ConfigSourceContext context = new ConfigSourceContext() {
             @Override public ConfigValue getValue(String name) {
@@ -195,6 +200,34 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         resolved.put("pipeline.orchestrator.resume-token-secret", resume);
         resolved.put("pipeline.orchestrator.worker.sqs.shared-secret", worker);
         return List.of(new PinnedSecrets(resolved));
+    }
+
+    private void validateTransitionWorkerOnly(ConfigSourceContext context) {
+        requireEqual(context, "quarkus.lambda.handler", "aws-durable-transition-worker");
+        requireEqual(context, ORCHESTRATOR + "mode", "SYNC");
+        requireEqual(context, ORCHESTRATOR + "process-loops-disabled", "true");
+        for (String name : List.of("pipeline-id", "release-version", "sqs.region",
+            "worker.sqs.response-queue-url", "worker.sqs.shared-secret-ref")) {
+            required(context, ORCHESTRATOR + name);
+        }
+        for (String suffix : List.of("configuration", "deployment-validation", "transition-worker-placement",
+            "http.enabled", "http.coordinator-function-family", "entry-id", "release-isolation-mode",
+            "retained-validation", "binding-table", "action-function-family", "continuation-entry-id",
+            "command-effect-table", "query-capture-table", "signing-source", "resume-token-secret-arn",
+            "resume-token-secret-version", "resume-token-parameter-arn", "resume-token-parameter-version",
+            "worker-secret-arn", "worker-secret-version", "worker-parameter-arn", "worker-parameter-version")) {
+            rejectTransitionWorkerSetting(context, PREFIX + suffix);
+        }
+        for (String suffix : List.of("queue-url", "dlq-url", "resume-token-secret", "worker.sqs.shared-secret",
+            "worker.sqs.request-queue-url", "releases.storage.s3.bucket")) {
+            rejectTransitionWorkerSetting(context, ORCHESTRATOR + suffix);
+        }
+    }
+
+    private void rejectTransitionWorkerSetting(ConfigSourceContext context, String name) {
+        if (value(context, name).filter(setting -> !setting.isBlank()).isPresent()) {
+            throw new IllegalArgumentException("Transition-only worker configuration forbids " + name);
+        }
     }
 
     private void validateTransitionPlacement(ConfigSourceContext context, ConfigSourceContext original) {
