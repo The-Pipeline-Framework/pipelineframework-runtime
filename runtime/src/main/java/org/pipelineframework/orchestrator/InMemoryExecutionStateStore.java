@@ -907,10 +907,20 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
     @Override
     public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedFailure(Lease lease,
             TransitionResultEnvelope.PortableFailure failure) {
+        return settlePairedFailure(lease, failure.code().name(), failure.code().diagnostic(), failure.stepIndex());
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedRejection(Lease lease,
+            String errorCode, String diagnostic) {
+        return settlePairedFailure(lease, errorCode, diagnostic, -1);
+    }
+
+    private Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedFailure(Lease lease,
+            String errorCode, String diagnostic, int failedStepIndex) {
         return Uni.createFrom().deferred(() -> markTerminalFailure(lease.tenantId(), lease.executionId(),
-            lease.version(), ExecutionStatus.FAILED, lease.transitionKey(), failure.code().name(),
-            failure.code().diagnostic(), failure.stepIndex(), Optional.empty(), System.currentTimeMillis(),
-            Optional.of(lease.owner())));
+            lease.version(), ExecutionStatus.FAILED, lease.transitionKey(), errorCode, diagnostic, failedStepIndex,
+            Optional.empty(), System.currentTimeMillis(), Optional.of(lease.owner())));
     }
 
     private Uni<Optional<ExecutionRecord<Object, Object>>> markTerminalFailure(
