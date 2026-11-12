@@ -11,12 +11,14 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 import io.smallrye.common.annotation.Blocking;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.GET;
@@ -72,6 +74,9 @@ public class HostedPipelineControlPlaneResource {
 
     @Inject
     PipelineWorkerAvailability workerAvailability;
+
+    @Inject
+    Instance<NativeWorkerReleaseBinding> nativeWorkerBinding;
 
     @Inject
     TransitionPayloadCodec payloadCodec;
@@ -131,6 +136,10 @@ public class HostedPipelineControlPlaneResource {
                 }
                 PipelineReleaseRecord release = active.get();
                 try {
+                    if (pairedBinding(release).isPresent()) {
+                        return Uni.createFrom().item(Response.status(Response.Status.CONFLICT)
+                            .entity("Paired native execution requires expected-Release admission").build());
+                    }
                     registrar().verify(release);
                 } catch (IllegalArgumentException | IllegalStateException e) {
                     LOG.warnf("Active hosted release is unavailable: %s", e.getMessage());
@@ -442,6 +451,10 @@ public class HostedPipelineControlPlaneResource {
             }
         }
         return fallback;
+    }
+
+    Optional<NativeWorkerReleaseBinding> pairedBinding(PipelineReleaseRecord release) {
+        return NativeWorkerReleaseBinding.configured(nativeWorkerBinding).filter(binding -> binding.matchesScope(release));
     }
 
     private int clampPendingLimit(Integer limit) {

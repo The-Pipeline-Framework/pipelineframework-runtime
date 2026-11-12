@@ -50,7 +50,8 @@ public class NativeWorkerReleaseBindingTest {
 
     @TempDir Path temp;
 
-    public record TransportFixture(NativeWorkerReleaseBinding binding, Target target, PipelineReleaseDescriptor descriptor) {
+    public record TransportFixture(NativeWorkerReleaseBinding binding, Target target, PipelineReleaseDescriptor descriptor,
+            Path descriptorFile) {
     }
 
     public static TransportFixture transportFixture(Path root) throws IOException {
@@ -63,7 +64,8 @@ public class NativeWorkerReleaseBindingTest {
         Target target = selectTarget.apply(fixture.target());
         var binding = NativeWorkerReleaseBinding.prepare(target, fixture.descriptor(), root.resolve("prepared"),
             ResolverProfile.localOnly(), CredentialResolver.NONE);
-        return new TransportFixture(binding, target, JSON.readValue(fixture.descriptor().toFile(), PipelineReleaseDescriptor.class));
+        return new TransportFixture(binding, target, JSON.readValue(fixture.descriptor().toFile(), PipelineReleaseDescriptor.class),
+            fixture.descriptor());
     }
 
     public static TransitionResultEnvelope decodeResult(NativeWorkerReleaseBinding.Attempt attempt, String body) {
