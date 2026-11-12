@@ -218,11 +218,15 @@ def _steps(raw: Any, pipeline: dict[str, Any], models: dict[str, type], handlers
     return tuple(steps)
 
 
-def admit(binding: Any) -> Projection:
+def admit(binding: Any, expected_projection: bytes | None) -> Projection:
     version = getattr(binding, "schema_version", None)
     if type(version) is not int or version != 1:
         raise PythonLocalDiagnostic("UNSUPPORTED_SCHEMA", "expected binding schema 1")
     source = getattr(binding, "projection_bytes", None)
+    if expected_projection is not None and (type(source) is not bytes or source != expected_projection):
+        raise PythonLocalDiagnostic(
+            "TRUSTED_PROJECTION_MISMATCH", "load the generated application matching verified Compiled Truth",
+        )
     digest = getattr(binding, "projection_sha256", None)
     if type(source) is not bytes or not _matches(digest, _DIGEST) or hashlib.sha256(source).hexdigest() != digest:
         raise PythonLocalDiagnostic("ARTIFACT_DIGEST_MISMATCH", "retrieve matching generated outputs")
