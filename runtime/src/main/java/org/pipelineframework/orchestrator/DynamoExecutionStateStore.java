@@ -98,6 +98,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
     private static final String INPUT_PAYLOAD_DIGEST = "input_payload_digest";
     private static final String INPUT_PAYLOAD_TYPE_ID = "input_payload_type_id";
     private static final String INPUT_PAYLOAD_ENCODING = "input_payload_encoding";
+    private static final String INPUT_NATIVE_DESCRIPTOR_DIGEST = "input_native_descriptor_digest";
     private static final String INPUT_PIPELINE_VERSION = "input_pipeline_version";
     private static final String INPUT_PIPELINE_REPLAY_MODE = "input_pipeline_replay_mode";
     private static final String INPUT_PIPELINE_CACHE_POLICY = "input_pipeline_cache_policy";
@@ -107,6 +108,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
     private static final String INITIAL_INPUT_PAYLOAD_DIGEST = "initial_input_payload_digest";
     private static final String INITIAL_INPUT_PAYLOAD_TYPE_ID = "initial_input_payload_type_id";
     private static final String INITIAL_INPUT_PAYLOAD_ENCODING = "initial_input_payload_encoding";
+    private static final String INITIAL_INPUT_NATIVE_DESCRIPTOR_DIGEST = "initial_input_native_descriptor_digest";
     private static final String INITIAL_INPUT_PIPELINE_VERSION = "initial_input_pipeline_version";
     private static final String INITIAL_INPUT_PIPELINE_REPLAY_MODE = "initial_input_pipeline_replay_mode";
     private static final String INITIAL_INPUT_PIPELINE_CACHE_POLICY = "initial_input_pipeline_cache_policy";
@@ -117,6 +119,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             Map.entry(INPUT_PAYLOAD_DIGEST, INITIAL_INPUT_PAYLOAD_DIGEST),
             Map.entry(INPUT_PAYLOAD_TYPE_ID, INITIAL_INPUT_PAYLOAD_TYPE_ID),
             Map.entry(INPUT_PAYLOAD_ENCODING, INITIAL_INPUT_PAYLOAD_ENCODING),
+            Map.entry(INPUT_NATIVE_DESCRIPTOR_DIGEST, INITIAL_INPUT_NATIVE_DESCRIPTOR_DIGEST),
             Map.entry(INPUT_PIPELINE_VERSION, INITIAL_INPUT_PIPELINE_VERSION),
             Map.entry(INPUT_PIPELINE_REPLAY_MODE, INITIAL_INPUT_PIPELINE_REPLAY_MODE),
             Map.entry(INPUT_PIPELINE_CACHE_POLICY, INITIAL_INPUT_PIPELINE_CACHE_POLICY));
@@ -2339,6 +2342,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         copyAttribute(item, INPUT_PAYLOAD_DIGEST, INITIAL_INPUT_PAYLOAD_DIGEST);
         copyAttribute(item, INPUT_PAYLOAD_TYPE_ID, INITIAL_INPUT_PAYLOAD_TYPE_ID);
         copyAttribute(item, INPUT_PAYLOAD_ENCODING, INITIAL_INPUT_PAYLOAD_ENCODING);
+        copyAttribute(item, INPUT_NATIVE_DESCRIPTOR_DIGEST, INITIAL_INPUT_NATIVE_DESCRIPTOR_DIGEST);
         copyAttribute(item, INPUT_PIPELINE_VERSION, INITIAL_INPUT_PIPELINE_VERSION);
         copyAttribute(item, INPUT_PIPELINE_REPLAY_MODE, INITIAL_INPUT_PIPELINE_REPLAY_MODE);
         copyAttribute(item, INPUT_PIPELINE_CACHE_POLICY, INITIAL_INPUT_PIPELINE_CACHE_POLICY);
@@ -2365,15 +2369,19 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         Object originalInput,
         Object inputPayload
     ) {
-        SerializedTransitionPayload legacyPayload = null;
+        SerializedTransitionPayload transitionPayload = null;
         String serialized;
-        if (writesTypedDurablePayloads(record)) {
+        if (inputPayload instanceof NativeWorkerReleaseBinding.AdmittedInput paired) {
+            transitionPayload = paired.payload();
+            serialized = transitionPayload.payload();
+            item.put(INPUT_NATIVE_DESCRIPTOR_DIGEST, avS(paired.descriptorDigest()));
+        } else if (writesTypedDurablePayloads(record)) {
             serialized = serializePayload(record, inputCanonicalTypeId, inputWriteSlot(record), inputPayload);
         } else {
             // Schema-v1 releases still own the external input representation at their worker boundary.
             // Preserve its concrete identity instead of collapsing it into an untyped JSON object.
-            legacyPayload = transitionPayloadCodec.encode(inputPayload);
-            serialized = legacyPayload.payload();
+            transitionPayload = transitionPayloadCodec.encode(inputPayload);
+            serialized = transitionPayload.payload();
         }
         StoredPayload storedInput = storeInputPayload(
             record.tenantId(),
@@ -2384,9 +2392,9 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             record.updatedAtEpochMs(),
             record.ttlEpochS());
         putStoredPayload(item, INPUT_PAYLOAD_JSON, INPUT_PAYLOAD_REFERENCE, INPUT_PAYLOAD_DIGEST, storedInput);
-        if (legacyPayload != null) {
-            putIfPresent(item, INPUT_PAYLOAD_TYPE_ID, legacyPayload.payloadTypeId());
-            putIfPresent(item, INPUT_PAYLOAD_ENCODING, legacyPayload.payloadEncoding());
+        if (transitionPayload != null) {
+            putIfPresent(item, INPUT_PAYLOAD_TYPE_ID, transitionPayload.payloadTypeId());
+            putIfPresent(item, INPUT_PAYLOAD_ENCODING, transitionPayload.payloadEncoding());
         } else if (isTypedDurablePayload(serialized)) {
             putIfPresent(item, INPUT_PAYLOAD_TYPE_ID, "typed-durable");
             putIfPresent(item, INPUT_PAYLOAD_ENCODING, JsonDurablePayloadCodec.ENCODING);
@@ -2758,6 +2766,9 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             }
         }
         if (payload == null || payload.isBlank()) {
+            if (item.containsKey(INPUT_NATIVE_DESCRIPTOR_DIGEST)) {
+                throw new IllegalStateException("Stored native input is missing its payload");
+            }
             return null;
         }
         Object decodedPayload = readSerializedInputPayload(execution, item, payload);
@@ -2792,6 +2803,15 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
     private Object readSerializedInputPayload(ExecutionRecord<Object, Object> execution, Map<String, AttributeValue> item, String payload) {
         String payloadTypeId = readString(item, INPUT_PAYLOAD_TYPE_ID);
         String payloadEncoding = readString(item, INPUT_PAYLOAD_ENCODING);
+        if (item.containsKey(INPUT_NATIVE_DESCRIPTOR_DIGEST)) {
+            if (!ExecutionInputShape.UNI.name().equals(readString(item, INPUT_SHAPE))
+                || isBlank(payloadTypeId) || isBlank(payloadEncoding)) {
+                throw new IllegalStateException("Stored native input is missing its unary payload binding");
+            }
+            return new NativeWorkerReleaseBinding.AdmittedInput(
+                new SerializedTransitionPayload(payloadTypeId, payloadEncoding, payload),
+                readString(item, INPUT_NATIVE_DESCRIPTOR_DIGEST));
+        }
         if (payloadTypeId == null || payloadTypeId.isBlank()
             || payloadEncoding == null || payloadEncoding.isBlank()) {
             return durablePayloadResolver == null || !durablePayloadResolver.supportsTypedPayloads(execution)

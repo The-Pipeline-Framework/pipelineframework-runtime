@@ -784,6 +784,8 @@ class QueueAsyncSegmentPipelineTest {
         awaitCoordinator,
         executor,
         admissionPolicy,
+        Optional::empty,
+        Optional::empty,
         () -> payloadCodec,
         () -> segmentBoundaryLedger,
         () -> Duration.ofMillis(25),

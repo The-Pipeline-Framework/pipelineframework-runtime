@@ -1,6 +1,6 @@
 package org.pipelineframework.orchestrator;
 
-/** The complete retained native Dynamo admission row cannot fit in the provider's atomic item limit. */
+/** A retained admission or its paired worker command cannot fit its size limit. */
 public final class ExecutionAdmissionTooLargeException extends IllegalArgumentException {
     public ExecutionAdmissionTooLargeException() {
         super("Complete retained execution admission exceeds the DynamoDB item limit");

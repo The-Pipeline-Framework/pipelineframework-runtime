@@ -6,6 +6,7 @@ import java.util.Optional;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
 import org.pipelineframework.orchestrator.ExecutionRedriveIntent;
+import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding.AdmittedInput;
 import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 import org.pipelineframework.orchestrator.TransitionCommandEnvelope;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
@@ -47,6 +48,15 @@ record ClaimedSegment(
         && record.inputPayload() instanceof ExecutionInputSnapshot original
         ? new ExecutionInputSnapshot(resumed.shape(), resumed.payload(), original.pipelineContext(), resumed.invocationPath())
         : payload;
+    var paired = AdmittedInput.fromSnapshot(workerInput);
+    var occurrence = record.awaitOccurrenceCause();
+    if (paired.isPresent()) {
+      if (record.awaitUnitId() != null) {
+        throw new IllegalStateException("A paired native root cannot carry an Await unit");
+      }
+      // The coordinator seeds this value on every root. A native root cannot admit Await occurrences.
+      occurrence = occurrence.filter(cause -> !"initial-v1".equals(cause));
+    }
     TransitionWorkerCommand command = new TransitionWorkerCommand(
         record.tenantId(),
         record.executionId(),
@@ -64,14 +74,15 @@ record ClaimedSegment(
             : record.failedCommandId(),
         retryCompleted ? Optional.empty() : record.redriveReason(),
         record.pagingState().map(org.pipelineframework.orchestrator.PagedExecutionState::toTransitionContext),
-        record.awaitOccurrenceCause());
-    SerializedTransitionPayload encodedPayload = payloadCodec.encode(workerInput);
+        occurrence);
+    SerializedTransitionPayload encodedPayload = paired.map(AdmittedInput::payload)
+        .orElseGet(() -> payloadCodec.encode(workerInput));
     return TransitionCommandEnvelope.from(
         command,
         record.pipelineId(),
         record.contractVersion(),
         record.releaseVersion(),
-        transitionKey,
+        paired.isPresent() ? record.executionId() : transitionKey,
         encodedPayload);
   }
 

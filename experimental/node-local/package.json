@@ -11,6 +11,10 @@
     ".": {
       "types": "./index.d.mts",
       "import": "./index.mjs"
+    },
+    "./worker": {
+      "types": "./worker.d.mts",
+      "import": "./worker.mjs"
     }
   },
   "files": [
@@ -18,7 +22,9 @@
     "index.mjs",
     "payload-binding.mjs",
     "projection.mjs",
-    "records.mjs"
+    "records.mjs",
+    "worker.d.mts",
+    "worker.mjs"
   ],
   "scripts": {
     "test": "node --test"

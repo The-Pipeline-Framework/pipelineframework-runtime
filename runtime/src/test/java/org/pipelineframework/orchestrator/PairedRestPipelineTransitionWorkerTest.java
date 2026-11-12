@@ -31,6 +31,7 @@ import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Flow;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -73,6 +74,7 @@ class PairedRestPipelineTransitionWorkerTest {
         var rest = mock(PipelineOrchestratorConfig.RestWorkerConfig.class);
         when(worker.orchestratorConfig.workerRest()).thenReturn(rest);
         when(rest.path()).thenReturn(RestTransitionWorkerProtocol.EXECUTE_PATH);
+        when(rest.capabilitiesPath()).thenReturn(RestTransitionWorkerProtocol.CAPABILITIES_PATH);
         when(rest.requestTimeout()).thenReturn(WAIT);
         worker.secretResolver = mock(ControlPlaneSecretResolver.class);
         when(worker.secretResolver.resolve(fixture.target().sharedSecretRef())).thenReturn(SECRET);
@@ -83,6 +85,20 @@ class PairedRestPipelineTransitionWorkerTest {
         if (worker != null) {
             worker.close();
         }
+    }
+
+    @Test
+    void aStalledCapabilityResponseCancelsTheReadWithoutDispatching() {
+        when(worker.orchestratorConfig.workerRest().requestTimeout()).thenReturn(Duration.ofMillis(50));
+        var pending = new CompletableFuture<HttpResponse<String>>();
+        when(pairedClient.sendAsync(any(HttpRequest.class), ArgumentMatchers.<HttpResponse.BodyHandler<String>>any()))
+            .thenReturn(pending);
+
+        var failed = assertThrows(java.util.concurrent.ExecutionException.class, () -> worker.pairedCapabilities(fixture.binding())
+            .subscribeAsCompletionStage().get(WAIT.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS));
+        assertTrue(failed.getCause() instanceof TimeoutException);
+        assertTrue(pending.isCancelled());
+        verifyNoInteractions(store, legacyClient);
     }
 
     @Test
@@ -140,6 +156,23 @@ class PairedRestPipelineTransitionWorkerTest {
         assertThrows(IllegalArgumentException.class,
             () -> worker.executeTransition(attempt("{\"value\":3.0}"), OWNER, store).await().atMost(WAIT));
         verifyNoInteractions(pairedClient, legacyClient, worker.secretResolver, store);
+    }
+
+    @Test
+    void oversizedPairedCommandDoesNotReserveOrSendButTheExactLimitCanReserve() throws IOException {
+        String payload = attempt.command().payload();
+        int baseLength = PipelineJson.mapper().writeValueAsBytes(attempt.command()).length;
+        String atLimit = payload + " ".repeat(16 * 1024 - baseLength);
+        assertEquals(16 * 1024, PipelineJson.mapper().writeValueAsBytes(attempt(atLimit).command()).length);
+
+        assertThrows(ExecutionAdmissionTooLargeException.class,
+            () -> worker.executeTransition(attempt(atLimit + " "), OWNER, store).await().atMost(WAIT));
+        verifyNoInteractions(store, pairedClient, legacyClient);
+
+        when(store.beginPairedDispatch(any())).thenReturn(Uni.createFrom().item(OptionalLong.empty()));
+        assertTrue(worker.executeTransition(attempt(atLimit), OWNER, store).await().atMost(WAIT).isEmpty());
+        verify(store).beginPairedDispatch(any());
+        verifyNoInteractions(pairedClient, legacyClient);
     }
 
     @Test

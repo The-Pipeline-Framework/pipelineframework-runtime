@@ -20,8 +20,12 @@ import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
+import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding;
+import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding.AdmittedInput;
+import org.pipelineframework.orchestrator.PairedTransitionSettlementStore;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.PipelineTransitionWorker;
+import org.pipelineframework.orchestrator.RestPipelineTransitionWorker;
 import org.pipelineframework.orchestrator.TransitionCommandEnvelope;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope;
@@ -37,10 +41,13 @@ class QueueAsyncSegmentPipeline {
   private static final Logger LOG = Logger.getLogger(QueueAsyncSegmentPipeline.class);
 
   private final QueueAsyncExecutionLease executionLease;
+  private final ExecutionStateStore executionStateStore;
   private final WorkDispatcher workDispatcher;
   private final AwaitCoordinator awaitCoordinator;
   private final TransitionWorkerExecutor transitionWorkerExecutor;
   private final ControlPlaneAdmissionPolicy admissionPolicy;
+  private final Supplier<Optional<NativeWorkerReleaseBinding>> nativeWorkerBinding;
+  private final Supplier<Optional<RestPipelineTransitionWorker>> pairedRestWorker;
   private final Supplier<TransitionPayloadCodec> payloadCodec;
   private final Supplier<SegmentBoundaryLedger> segmentBoundaryLedger;
   private final Supplier<Duration> saturatedDelay;
@@ -54,6 +61,8 @@ class QueueAsyncSegmentPipeline {
       AwaitCoordinator awaitCoordinator,
       TransitionWorkerExecutor transitionWorkerExecutor,
       ControlPlaneAdmissionPolicy admissionPolicy,
+      Supplier<Optional<NativeWorkerReleaseBinding>> nativeWorkerBinding,
+      Supplier<Optional<RestPipelineTransitionWorker>> pairedRestWorker,
       Supplier<TransitionPayloadCodec> payloadCodec,
       Supplier<SegmentBoundaryLedger> segmentBoundaryLedger,
       Supplier<Duration> saturatedDelay,
@@ -61,10 +70,13 @@ class QueueAsyncSegmentPipeline {
       SegmentCommitEffects segmentCommitEffects,
       String queueWorkerId) {
     this.executionLease = new QueueAsyncExecutionLease(executionStateStore, orchestratorConfig, queueWorkerId);
+    this.executionStateStore = executionStateStore;
     this.workDispatcher = Objects.requireNonNull(workDispatcher, "workDispatcher must not be null");
     this.awaitCoordinator = Objects.requireNonNull(awaitCoordinator, "awaitCoordinator must not be null");
     this.transitionWorkerExecutor = Objects.requireNonNull(transitionWorkerExecutor, "transitionWorkerExecutor must not be null");
     this.admissionPolicy = Objects.requireNonNull(admissionPolicy, "admissionPolicy must not be null");
+    this.nativeWorkerBinding = Objects.requireNonNull(nativeWorkerBinding, "nativeWorkerBinding must not be null");
+    this.pairedRestWorker = Objects.requireNonNull(pairedRestWorker, "pairedRestWorker must not be null");
     this.payloadCodec = Objects.requireNonNull(payloadCodec, "payloadCodec must not be null");
     this.segmentBoundaryLedger = Objects.requireNonNull(segmentBoundaryLedger, "segmentBoundaryLedger must not be null");
     this.saturatedDelay = Objects.requireNonNull(saturatedDelay, "saturatedDelay must not be null");
@@ -127,13 +139,37 @@ class QueueAsyncSegmentPipeline {
         record.awaitUnitId() == null ? "<none>" : record.awaitUnitId());
     return segmentBoundaryLedger.get()
         .recordSegmentAttemptStarted(record, segment.transitionKey(), claimedAtEpochMs)
-        .chain(() -> executeTransition(segment, worker))
-        .onItem().transform(result -> SegmentCommitPlan.from(segment, result, payloadCodec.get()))
-        .onItem().transformToUni(plan -> segmentCommitEffects.commit(plan, itemContinuationHandler))
+        .chain(() -> AdmittedInput.fromSnapshot(record.inputPayload())
+            .map(paired -> executePaired(segment, paired, itemContinuationHandler))
+            .orElseGet(() -> executeTransition(segment, worker)
+                .chain(result -> commitTransition(segment, result, itemContinuationHandler))))
         .onFailure(AwaitThrowableSupport::containsAwaitSuspension)
         .recoverWithUni(failure -> suspendedPlan(segment, failure)
             .onItem().transformToUni(plan -> segmentCommitEffects.commit(plan, itemContinuationHandler)))
         .onFailure().recoverWithUni(failure -> segmentCommitEffects.fail(segment, failure));
+  }
+
+  private Uni<Void> executePaired(ClaimedSegment segment, AdmittedInput input,
+      AwaitItemContinuationHandler itemContinuationHandler) {
+    var binding = nativeWorkerBinding.get()
+        .orElseThrow(() -> new IllegalStateException("The admitted native worker binding is unavailable"));
+    if (!(executionStateStore instanceof PairedTransitionSettlementStore pairedStore)) {
+      throw new IllegalStateException("Paired native dispatch is unavailable on this coordinator");
+    }
+    var rest = pairedRestWorker.get()
+        .orElseThrow(() -> new IllegalStateException("The paired REST worker is unavailable"));
+    return transitionCommand(segment).chain(command -> {
+      var attempt = binding.pin(command, input);
+      return rest.pairedCapabilities(binding)
+          .chain(() -> rest.executeTransition(attempt, segment.record().leaseOwner(), pairedStore));
+    }).chain(result -> result
+        .map(value -> commitTransition(segment, value, itemContinuationHandler))
+        .orElseGet(() -> Uni.createFrom().voidItem()));
+  }
+
+  private Uni<Void> commitTransition(ClaimedSegment segment, TransitionResultEnvelope result,
+      AwaitItemContinuationHandler itemContinuationHandler) {
+    return segmentCommitEffects.commit(SegmentCommitPlan.from(segment, result, payloadCodec.get()), itemContinuationHandler);
   }
 
   private Uni<TransitionResultEnvelope> executeTransition(

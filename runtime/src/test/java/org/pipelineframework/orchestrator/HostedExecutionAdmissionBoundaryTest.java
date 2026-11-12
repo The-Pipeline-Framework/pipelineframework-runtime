@@ -71,6 +71,9 @@ class HostedExecutionAdmissionBoundaryTest {
             hosted.releaseRegistrar = mock(org.pipelineframework.orchestrator.release.PipelineReleaseRegistrar.class);
             hosted.workerAvailability = mock(org.pipelineframework.orchestrator.worker.PipelineWorkerAvailability.class);
             var release = mock(org.pipelineframework.orchestrator.release.PipelineReleaseRecord.class);
+            when(release.tenantId()).thenReturn("tenant");
+            when(release.pipelineId()).thenReturn("pipeline");
+            when(release.releaseVersion()).thenReturn("release");
             when(release.contractVersion()).thenReturn("contract");
             when(hosted.releaseRegistry.get("tenant", "pipeline", "release"))
                 .thenReturn(Uni.createFrom().item(Optional.of(release)));
@@ -96,6 +99,9 @@ class HostedExecutionAdmissionBoundaryTest {
         hosted.releaseRegistrar = mock(org.pipelineframework.orchestrator.release.PipelineReleaseRegistrar.class);
         hosted.workerAvailability = mock(org.pipelineframework.orchestrator.worker.PipelineWorkerAvailability.class);
         var release = mock(org.pipelineframework.orchestrator.release.PipelineReleaseRecord.class);
+        when(release.tenantId()).thenReturn("tenant");
+        when(release.pipelineId()).thenReturn("pipeline");
+        when(release.releaseVersion()).thenReturn("release");
         when(release.contractVersion()).thenReturn("contract");
         when(hosted.releaseRegistry.get("tenant", "pipeline", "release"))
             .thenReturn(Uni.createFrom().item(Optional.of(release)));
