@@ -4,6 +4,9 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.EnumMap;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.regex.Pattern;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
 import org.pipelineframework.orchestrator.release.PipelineReleaseArtifactResolver;
@@ -11,10 +14,37 @@ import org.pipelineframework.orchestrator.release.PipelineReleaseArtifactUri;
 import org.pipelineframework.orchestrator.release.PipelineReleaseClosureResolver;
 
 public final class ReleaseVerifier {
+    private static final Pattern DESCRIPTOR_DIGEST = Pattern.compile("sha256:[0-9a-f]{64}");
+
     private final ReleaseLoader loader = new ReleaseLoader();
 
     public VerifiedRelease verify(
         Path descriptorFile,
+        Path destination,
+        ResolverProfile profile,
+        CredentialResolver credentials
+    ) throws IOException {
+        return verify(descriptorFile, Optional.empty(), destination, profile, credentials);
+    }
+
+    /** Verifies the deployment's exact descriptor bytes before opening any artifact. */
+    public VerifiedRelease verify(
+        Path descriptorFile,
+        String expectedDescriptorDigest,
+        Path destination,
+        ResolverProfile profile,
+        CredentialResolver credentials
+    ) throws IOException {
+        Objects.requireNonNull(expectedDescriptorDigest, "expectedDescriptorDigest");
+        if (!DESCRIPTOR_DIGEST.matcher(expectedDescriptorDigest).matches()) {
+            throw new IllegalArgumentException("Expected Release descriptor digest must use sha256:<64 lowercase hex>");
+        }
+        return verify(descriptorFile, Optional.of(expectedDescriptorDigest), destination, profile, credentials);
+    }
+
+    private VerifiedRelease verify(
+        Path descriptorFile,
+        Optional<String> expectedDescriptorDigest,
         Path destination,
         ResolverProfile profile,
         CredentialResolver credentials
@@ -25,6 +55,11 @@ public final class ReleaseVerifier {
         } catch (IOException | IllegalArgumentException e) {
             throw new ReleaseVerificationException(
                 ReleaseVerificationException.Category.DESCRIPTOR, "Invalid Pipeline Release Descriptor", e);
+        }
+        if (expectedDescriptorDigest.filter(digest -> !digest.equals(loaded.descriptorDigest())).isPresent()) {
+            var mismatch = new IllegalArgumentException("Release descriptor digest mismatch");
+            throw new ReleaseVerificationException(
+                ReleaseVerificationException.Category.DESCRIPTOR, mismatch.getMessage(), mismatch);
         }
         Map<PipelineReleaseArtifactUri.Scheme, PipelineReleaseArtifactResolver> resolvers =
             new EnumMap<>(PipelineReleaseArtifactUri.Scheme.class);

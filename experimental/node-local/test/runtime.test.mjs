@@ -103,6 +103,34 @@ test('load rejects incompatible features and mismatched nominal identity even wi
   assertDiagnostic(() => createNodeLocalRuntime(null), 'UNSUPPORTED_RUNTIME_OPTIONS');
 });
 
+test('trusted projection text is captured at construction and compared before registry admission', async () => {
+  const original = binding();
+  const changed = projection();
+  changed.steps[1].retryLimit = 2;
+  const replacement = binding({}, changed);
+  const reencoded = binding({}, original.projectionJson + '\n');
+  const options = {expectedProjectionJson: original.projectionJson};
+  const runtime = createNodeLocalRuntime(options);
+  options.expectedProjectionJson = replacement.projectionJson;
+
+  for (const candidate of [replacement, reencoded]) {
+    const registry = new Proxy(candidate.handlers, {
+      ownKeys: () => assert.fail('loader inspected handlers before verifying the projection'),
+    });
+    assertDiagnostic(() => runtime.load({...candidate, handlers: registry}), 'TRUSTED_PROJECTION_MISMATCH');
+    assert.deepEqual(await createNodeLocalRuntime().load(candidate).run({value: 3}, context), completed(5));
+  }
+  assert.deepEqual(await runtime.load(original).run({value: 3}, context), completed(5));
+  assertDiagnostic(() => runtime.load({...original, projectionSha256: '0'.repeat(64)}),
+    'ARTIFACT_DIGEST_MISMATCH');
+});
+
+test('trusted projection options require well-formed primitive text', () => {
+  for (const invalid of [null, Buffer.from('{}'), new String('{}'), 42, '\ud800']) {
+    assertDiagnostic(() => createNodeLocalRuntime({expectedProjectionJson: invalid}), 'UNSUPPORTED_RUNTIME_OPTIONS');
+  }
+});
+
 test('the registry must contain exactly the declared own data properties, and is captured at load', async () => {
   const runtime = createNodeLocalRuntime();
   assertDiagnostic(() => runtime.load(binding({scale: undefined})), 'MISSING_HANDLER');

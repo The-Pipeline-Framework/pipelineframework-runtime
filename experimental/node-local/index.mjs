@@ -159,11 +159,14 @@ async function run({pipelineId, steps}, observe, input, callerContext, signal) {
 
 /** Construct the Node LOCAL runtime for a compiler-generated createApplication call. */
 export function createNodeLocalRuntime(options = {}) {
-  const settings = snapshot(options, 'UNSUPPORTED_RUNTIME_OPTIONS', 'only onObservation is supported');
-  const {onObservation} = settings;
-  if (Object.keys(settings).some(key => key !== 'onObservation')
-      || (onObservation !== undefined && typeof onObservation !== 'function')) {
-    throw new NodeLocalDiagnostic('UNSUPPORTED_RUNTIME_OPTIONS', 'only onObservation is supported');
+  const detail = 'expected onObservation and/or trusted UTF-8 projection text in expectedProjectionJson';
+  const settings = snapshot(options, 'UNSUPPORTED_RUNTIME_OPTIONS', detail);
+  const {onObservation, expectedProjectionJson} = settings;
+  if (Object.keys(settings).some(key => key !== 'onObservation' && key !== 'expectedProjectionJson')
+      || (onObservation !== undefined && typeof onObservation !== 'function')
+      || (expectedProjectionJson !== undefined
+        && (typeof expectedProjectionJson !== 'string' || !expectedProjectionJson.isWellFormed()))) {
+    throw new NodeLocalDiagnostic('UNSUPPORTED_RUNTIME_OPTIONS', detail);
   }
 
   const observe = onObservation === undefined ? () => {} : event => {
@@ -180,7 +183,7 @@ export function createNodeLocalRuntime(options = {}) {
   };
   return Object.freeze({
     load(binding) {
-      const admission = admitBinding(binding);
+      const admission = admitBinding(binding, expectedProjectionJson);
       return Object.freeze({
         run: (input, context, signal) => run(admission, observe, input, context, signal),
       });
