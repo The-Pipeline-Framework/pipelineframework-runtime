@@ -559,9 +559,8 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
           if (terminalInputPassthrough.get()
               && transitionCodec instanceof org.pipelineframework.orchestrator.CompiledTransitionBoundaryCodec) {
             var terminalItems = canonicalTerminalItems(decodedCommand);
-            boolean publish = terminalObjectPublish != null && terminalObjectPublish.enabled();
-            result = (publish ? publishTypedTerminalItems(command, terminalItems) : Uni.createFrom().voidItem())
-                .replaceWith(() -> TransitionResultEnvelope.completed(transitionCodec, terminalItems, publish));
+            result = TerminalPublicationBoundary.publishTypedWorkerOutput(terminalObjectPublish, command, terminalItems)
+                .map(publishedByWorker -> TransitionResultEnvelope.completed(transitionCodec, terminalItems, publishedByWorker));
           } else {
             TransitionResultEnvelope completed = terminalInputPassthrough.get()
                 ? TransitionResultEnvelope.completedTerminalInputPassthrough()
@@ -875,14 +874,6 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
     TerminalOutputOwnership terminalOutputOwnership() {
       return terminalOutputOwnership;
     }
-  }
-
-  private Uni<Void> publishTypedTerminalItems(TransitionCommandEnvelope command, List<?> items) {
-    return command.pageContext()
-        .map(page -> terminalObjectPublish.publishIfConfigured(() -> items, command.executionId(),
-            new org.pipelineframework.orchestrator.PagedExecutionState(page.pageIndex(), page.sourceIdentity(),
-                page.startCheckpoint(), page.maxRecords(), page.suspendedCompletion())))
-        .orElseGet(() -> terminalObjectPublish.publishIfConfigured(items));
   }
 
   private static List<?> canonicalTerminalItems(TransitionWorkerCommand command) {
