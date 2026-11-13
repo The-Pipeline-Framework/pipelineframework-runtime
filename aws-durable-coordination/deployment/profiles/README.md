@@ -247,3 +247,28 @@ the numbered HTTP Lambda ARN.
 A Query-capable Release binds the existing append-only Dynamo Query capture
 store through its exact `QueryCaptureTable`. The table uses `capture_key` (S)
 and `revision` (N). Semantic functions select Dynamo for Await admission.
+
+## Independent pinned worker attachment (R2 implementation in progress)
+
+`aws-durable-pinned-worker.yaml` selects `aws-durable-pinned-worker` in a separately
+augmented typed application ZIP. The handler uses the existing authenticated SQS
+transition action, and the runtime validates the command's compiled application
+and Release identity. Startup resolves the exact worker secret version without
+requesting the Coordinator's resume-token secret or semantic-store configuration.
+
+The template contains five explicit resources and uses no CloudFormation transform.
+They are the worker function, numbered version, execution role, log group and event
+source mapping. Request and response queues, the signing secret and versioned code
+object are externally supplied resources and are additional to this count. The
+attachment role grants access only to those lanes, its worker secret and logs.
+
+Create an attachment per immutable application Release. Preserve its code version,
+role, secret generation and queues while any execution retains that Release. A
+retained Lambda version alone cannot preserve execution after deletion of its
+function or removal of its role's permissions. Lifecycle integration must drain or
+retain these dependencies before deleting an attachment.
+
+This first increment verifies configuration, signed scalar transition execution and
+static resource ownership locally. Release-producer selection, application-free
+shared packaging, remote Await lifecycle wiring, packaged cold-start under denied
+store permissions and the complete processed resource inventory remain R2 work.

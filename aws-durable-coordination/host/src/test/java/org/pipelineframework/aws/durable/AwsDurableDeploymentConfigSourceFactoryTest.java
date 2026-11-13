@@ -391,6 +391,35 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
         }
     }
 
+    @Test
+    void independentWorkerResolvesOnlyItsPinnedCredentialWithoutSemanticTables() {
+        var values = validConfiguration();
+        values.keySet().removeIf(key -> key.startsWith("pipeline.orchestrator.dynamo.")
+            || key.startsWith("pipeline.orchestrator.releases.")
+            || key.contains("resume-token") || key.equals("tpf.aws.durable.binding-table")
+            || key.equals("pipeline.orchestrator.state-provider"));
+        values.put("quarkus.lambda.handler", "aws-durable-pinned-worker");
+        values.put("pipeline.orchestrator.state-provider", "memory");
+        values.put("pipeline.orchestrator.releases.registry.provider", "memory");
+        values.put("pipeline.orchestrator.releases.storage.provider", "local");
+        values.put("pipeline.orchestrator.mode", "SYNC");
+        values.put("tpf.aws.durable.signing-source", "SECRETS_MANAGER");
+        var requests = new ArrayList<GetSecretValueRequest>();
+        var config = build(values, requests);
+        assertThat(requests).hasSize(1);
+        assertThat(requests.getFirst().secretId()).isEqualTo(values.get("tpf.aws.durable.worker-secret-arn"));
+        assertThat(config.getOptionalValue("pipeline.orchestrator.resume-token-secret", String.class)).isEmpty();
+        assertThat(config.getValue("pipeline.orchestrator.worker.sqs.shared-secret", String.class)).isEqualTo(SECRET);
+        requests.clear();
+        values.put("tpf.aws.durable.resume-token-secret-arn", "forbidden");
+        assertThatThrownBy(() -> build(values, requests)).isInstanceOf(IllegalArgumentException.class);
+        assertThat(requests).isEmpty();
+        values.remove("tpf.aws.durable.resume-token-secret-arn");
+        values.put("pipeline.orchestrator.state-provider", "dynamo");
+        assertThatThrownBy(() -> build(values, requests)).isInstanceOf(IllegalArgumentException.class);
+        assertThat(requests).isEmpty();
+    }
+
     private SmallRyeConfig build(Map<String, String> values, List<GetSecretValueRequest> requests, org.eclipse.microprofile.config.spi.ConfigSource... overrides) {
         return new SmallRyeConfigBuilder().withMapping(PipelineOrchestratorConfig.class).withSources(new PropertiesConfigSource(values, "deployment", 300))
             .withSources(overrides)

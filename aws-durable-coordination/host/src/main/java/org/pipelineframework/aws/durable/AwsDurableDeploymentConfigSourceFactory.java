@@ -86,6 +86,9 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             return List.of(); // Plain coordinator packages and ordinary builds do not load application secrets.
         }
         requireEqual(context, PREFIX + "deployment-validation", "validated");
+        if (value(context, "quarkus.lambda.handler").filter("aws-durable-pinned-worker"::equals).isPresent()) {
+            return pinnedWorkerSettings(context, settings);
+        }
         requireEqual(context, "pipeline.orchestrator.mode", "QUEUE_ASYNC");
         requireEqual(context, "pipeline.orchestrator.coordination-host", "AWS_DURABLE");
         requireEqual(context, "pipeline.orchestrator.process-loops-disabled", "true");
@@ -194,6 +197,38 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         resolved.putAll(querySettings);
         resolved.put("pipeline.orchestrator.resume-token-secret", resume);
         resolved.put("pipeline.orchestrator.worker.sqs.shared-secret", worker);
+        return List.of(new PinnedSecrets(resolved));
+    }
+
+    private Iterable<ConfigSource> pinnedWorkerSettings(ConfigSourceContext context, Map<String, String> settings) {
+        requireEqual(context, "pipeline.orchestrator.mode", "SYNC");
+        requireEqual(context, "pipeline.orchestrator.process-loops-disabled", "true");
+        requireEqual(context, PREFIX + "signing-source", "SECRETS_MANAGER");
+        requireEqual(context, "pipeline.orchestrator.state-provider", "memory");
+        requireEqual(context, "pipeline.orchestrator.releases.registry.provider", "memory");
+        requireEqual(context, "pipeline.orchestrator.releases.storage.provider", "local");
+        rejectConfigured(context, "resume-token-secret-arn", "resume-token-secret-version",
+            "resume-token-parameter-arn", "resume-token-parameter-version", "worker-parameter-arn",
+            "worker-parameter-version", "binding-table", "entry-id");
+        for (String property : List.of("pipeline.orchestrator.resume-token-secret",
+            "pipeline.orchestrator.worker.sqs.shared-secret", "pipeline.orchestrator.worker.sqs.shared-secret-ref",
+            "pipeline.orchestrator.releases.storage.s3.bucket")) {
+            if (value(context, property).isPresent()) {
+                throw new IllegalArgumentException("Pinned worker must not also configure " + property);
+            }
+        }
+        for (String property : List.of("pipeline.orchestrator.pipeline-id", "pipeline.orchestrator.release-version",
+            "pipeline.orchestrator.worker.sqs.contract-version", "pipeline.orchestrator.worker.sqs.artifact-id",
+            "pipeline.orchestrator.worker.sqs.artifact-digest", "pipeline.orchestrator.worker.sqs.request-queue-url",
+            "pipeline.orchestrator.worker.sqs.response-queue-url")) {
+            required(context, property);
+        }
+        requireEqual(context, "pipeline.orchestrator.worker.sqs.pipeline-id",
+            required(context, "pipeline.orchestrator.pipeline-id"));
+        requireEqual(context, "pipeline.orchestrator.worker.sqs.release-version",
+            required(context, "pipeline.orchestrator.release-version"));
+        var resolved = new java.util.HashMap<>(settings);
+        resolved.put("pipeline.orchestrator.worker.sqs.shared-secret", resolve(request(context, "worker")));
         return List.of(new PinnedSecrets(resolved));
     }
 

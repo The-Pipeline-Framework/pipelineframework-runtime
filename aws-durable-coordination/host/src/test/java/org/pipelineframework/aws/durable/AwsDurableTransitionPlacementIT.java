@@ -18,7 +18,7 @@ import io.smallrye.config.PropertiesConfigSource;
 import io.smallrye.config.SmallRyeConfigBuilder;
 import io.smallrye.mutiny.Uni;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.pipelineframework.RetainedReleaseApplicationFixture;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
@@ -33,19 +33,25 @@ import software.amazon.awssdk.services.sqs.model.*;
  */
 class AwsDurableTransitionPlacementIT {
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void executesInWorkOrThroughTheSignedTransitionHandler(boolean separateTransition) throws Exception {
+    @CsvSource({"false, false", "true, false", "true, true"})
+    void executesInWorkOrThroughTheSignedTransitionHandler(boolean separateTransition, boolean independentWorker) throws Exception {
         String version = "release-a";
         var contract = AwsDurableRetainedReleaseRoutingIT.contract(version);
         var config = config(version, separateTransition);
         var workRuntime = RetainedReleaseApplicationFixture.application(config, contract, "work");
-        var remoteRuntime = RetainedReleaseApplicationFixture.application(config, contract, "remote");
+        var workerConfig = config(version, separateTransition, independentWorker ? "SYNC" : "QUEUE_ASYNC");
+        var remoteRuntime = RetainedReleaseApplicationFixture.application(workerConfig, contract, "remote");
         var sqs = mock(SqsClient.class);
-        var remote = new AwsDurableTransitionWorkerHandler();
-        remote.action = new SqsTransitionWorkerAction();
-        set(remote.action, "orchestratorConfig", config);
-        set(remote.action, "executionService", remoteRuntime);
-        set(remote.action, "client", sqs);
+        var workerAction = new SqsTransitionWorkerAction();
+        set(workerAction, "orchestratorConfig", workerConfig);
+        set(workerAction, "executionService", remoteRuntime);
+        set(workerAction, "client", sqs);
+        var routed = new AwsDurableTransitionWorkerHandler();
+        routed.action = workerAction;
+        var pinned = new AwsDurablePinnedWorkerHandler();
+        pinned.action = workerAction;
+        com.amazonaws.services.lambda.runtime.RequestHandler<SQSEvent,
+            com.amazonaws.services.lambda.runtime.events.SQSBatchResponse> remote = independentWorker ? pinned : routed;
 
         var reply = new AtomicReference<String>();
         when(sqs.sendMessage(any(SendMessageRequest.class))).thenAnswer(call -> {
@@ -121,8 +127,12 @@ class AwsDurableTransitionPlacementIT {
     }
 
     private static PipelineOrchestratorConfig config(String version, boolean separate) {
+        return config(version, separate, "QUEUE_ASYNC");
+    }
+
+    private static PipelineOrchestratorConfig config(String version, boolean separate, String mode) {
         var values = new java.util.HashMap<>(Map.of(
-            "pipeline.orchestrator.mode", "QUEUE_ASYNC", "pipeline.orchestrator.coordination-host", "AWS_DURABLE",
+            "pipeline.orchestrator.mode", mode, "pipeline.orchestrator.coordination-host", "AWS_DURABLE",
             "pipeline.orchestrator.pipeline-id", "pipeline", "pipeline.orchestrator.release-version", version));
         if (separate) values.putAll(Map.of(
             "pipeline.orchestrator.worker.sqs.request-queue-url", "https://sqs.example/request",
