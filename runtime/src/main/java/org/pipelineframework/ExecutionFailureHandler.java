@@ -18,7 +18,7 @@ import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.RemoteTransitionOutcomeUnknownException;
 import org.pipelineframework.orchestrator.PairedTransitionSettlementStore;
-import org.pipelineframework.orchestrator.PairedTransitionSettlementStore.Lease;
+import org.pipelineframework.orchestrator.PairedDispatchIntent;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope.PortableFailure;
 import org.pipelineframework.orchestrator.TransitionWorkerFailureException;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
@@ -119,24 +119,24 @@ class ExecutionFailureHandler {
    */
   Uni<Void> handlePortableFailure(
       ExecutionRecord<Object, Object> record,
-      Lease lease,
+      PairedDispatchIntent intent,
       PortableFailure failure,
       PairedTransitionSettlementStore executionStateStore,
       DeadLetterPublisher deadLetterPublisher) {
-    return publishTerminalFailure(executionStateStore.settlePairedFailure(lease, failure),
-        record, lease.transitionKey(), failure.code().name(), failure.code().diagnostic(), false,
+    return publishTerminalFailure(executionStateStore.settlePairedFailure(intent, failure),
+        record, intent.transitionKey(), failure.code().name(), failure.code().diagnostic(), false,
         deadLetterPublisher);
   }
 
   Uni<Void> rejectPairedTerminalPublication(
       ExecutionRecord<Object, Object> record,
-      Lease lease,
+      PairedDispatchIntent intent,
       PairedTransitionSettlementStore executionStateStore,
       DeadLetterPublisher deadLetterPublisher) {
     String code = "PAIRED_TERMINAL_PUBLICATION_UNSUPPORTED";
     String message = "Paired native completion requires checkpoint and object output publication to be disabled";
-    return publishTerminalFailure(executionStateStore.settlePairedRejection(lease, code, message),
-        record, lease.transitionKey(), code, message, false, deadLetterPublisher);
+    return publishTerminalFailure(executionStateStore.settlePairedRejection(intent, code, message),
+        record, intent.transitionKey(), code, message, false, deadLetterPublisher);
   }
 
   private Uni<Void> terminalFailure(

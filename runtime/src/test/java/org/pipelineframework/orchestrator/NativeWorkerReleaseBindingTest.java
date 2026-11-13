@@ -54,8 +54,13 @@ public class NativeWorkerReleaseBindingTest {
     }
 
     public static TransportFixture transportFixture(Path root) throws IOException {
+        return transportFixture(root, java.util.function.UnaryOperator.identity());
+    }
+
+    public static TransportFixture transportFixture(Path root, java.util.function.UnaryOperator<Target> selectTarget)
+            throws IOException {
         var fixture = fixture(root, Language.NODE, Map.of(), Set.of());
-        Target target = fixture.target();
+        Target target = selectTarget.apply(fixture.target());
         var binding = NativeWorkerReleaseBinding.prepare(target, fixture.descriptor(), root.resolve("prepared"),
             ResolverProfile.localOnly(), CredentialResolver.NONE);
         return new TransportFixture(binding, target, JSON.readValue(fixture.descriptor().toFile(), PipelineReleaseDescriptor.class));

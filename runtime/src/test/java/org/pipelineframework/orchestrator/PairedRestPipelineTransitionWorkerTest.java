@@ -7,11 +7,13 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+import io.smallrye.mutiny.Uni;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
@@ -25,6 +27,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Flow;
@@ -45,6 +48,7 @@ class PairedRestPipelineTransitionWorkerTest {
     private static final String INPUT_TYPE = "InputValue";
     private static final String OUTPUT_TYPE = "OutputValue";
     private static final String SECRET = "scoped-secret";
+    private static final String OWNER = "coordinator";
     private static final Duration WAIT = Duration.ofSeconds(5);
 
     @TempDir Path temporary;
@@ -52,6 +56,7 @@ class PairedRestPipelineTransitionWorkerTest {
     private NativeWorkerReleaseBinding.Attempt attempt;
     private HttpClient pairedClient;
     private HttpClient legacyClient;
+    private PairedTransitionSettlementStore store;
     private RestPipelineTransitionWorker worker;
 
     @BeforeEach
@@ -60,6 +65,9 @@ class PairedRestPipelineTransitionWorkerTest {
         attempt = attempt("{\"value\":3}");
         pairedClient = mock(HttpClient.class);
         legacyClient = mock(HttpClient.class);
+        store = mock(PairedTransitionSettlementStore.class);
+        when(store.beginPairedDispatch(any())).thenAnswer(ignored -> Uni.createFrom().item(OptionalLong.of(System.currentTimeMillis() + WAIT.toMillis())));
+        when(store.settlePairedUnknown(any())).thenReturn(Uni.createFrom().item(Optional.empty()));
         worker = new RestPipelineTransitionWorker(legacyClient, Optional.of(pairedClient), new PipelineInvocationRuntime());
         worker.orchestratorConfig = mock(PipelineOrchestratorConfig.class);
         var rest = mock(PipelineOrchestratorConfig.RestWorkerConfig.class);
@@ -85,8 +93,12 @@ class PairedRestPipelineTransitionWorkerTest {
             TransitionWorkerOutcome.COMPLETED, List.of(output), null, null, false, false, Optional.empty()));
         var sent = respond(200, releasedResult, Optional.empty());
 
-        var result = worker.executeTransition(attempt).await().atMost(WAIT);
+        var result = worker.executeTransition(attempt, OWNER, store).await().atMost(WAIT).orElseThrow();
 
+        var ordered = inOrder(store, pairedClient);
+        ordered.verify(store).beginPairedDispatch(any());
+        ordered.verify(pairedClient).sendAsync(any(HttpRequest.class),
+            ArgumentMatchers.<HttpResponse.BodyHandler<String>>any());
         assertEquals(List.of(output), result.outputPayloads());
         assertSame(attempt, result.pairedResult().orElseThrow().attempt());
         assertEquals(Optional.empty(), result.pairedResult().orElseThrow().failure());
@@ -114,7 +126,7 @@ class PairedRestPipelineTransitionWorkerTest {
             "resultProfile", fixture.target().profiles().resultProfile(), "outcome", "FAILED",
             "failure", Map.of("code", code.name(), "stepId", "B", "diagnostic", code.diagnostic()))), Optional.empty());
 
-        var result = worker.executeTransition(attempt).await().atMost(WAIT);
+        var result = worker.executeTransition(attempt, OWNER, store).await().atMost(WAIT).orElseThrow();
 
         assertEquals(TransitionWorkerOutcome.FAILED, result.outcome());
         assertEquals(new PortableFailure(code, 1), result.pairedResult().orElseThrow().failure().orElseThrow());
@@ -126,8 +138,29 @@ class PairedRestPipelineTransitionWorkerTest {
     @Test
     void rejectsInvalidInputBeforeAnyRequestOrSecretLookup() {
         assertThrows(IllegalArgumentException.class,
-            () -> worker.executeTransition(attempt("{\"value\":3.0}")).await().atMost(WAIT));
-        verifyNoInteractions(pairedClient, legacyClient, worker.secretResolver);
+            () -> worker.executeTransition(attempt("{\"value\":3.0}"), OWNER, store).await().atMost(WAIT));
+        verifyNoInteractions(pairedClient, legacyClient, worker.secretResolver, store);
+    }
+
+    @Test
+    void aDeclinedIntentDoesNotSendOrSettle() {
+        when(store.beginPairedDispatch(any())).thenReturn(Uni.createFrom().item(OptionalLong.empty()));
+        assertTrue(worker.executeTransition(attempt, OWNER, store).await().atMost(WAIT).isEmpty());
+        verifyNoInteractions(pairedClient, legacyClient);
+    }
+
+    @Test
+    void aPermitThatArrivesAfterLeaseExpiryDoesNotSend() {
+        when(store.beginPairedDispatch(any())).thenReturn(Uni.createFrom().item(OptionalLong.of(1L)));
+        assertTrue(worker.executeTransition(attempt, OWNER, store).await().atMost(WAIT).isEmpty());
+        verifyNoInteractions(pairedClient, legacyClient);
+    }
+
+    @Test
+    void anUnconfirmedReservationDoesNotSend() {
+        when(store.beginPairedDispatch(any())).thenReturn(Uni.createFrom().failure(new IOException("commit reply lost")));
+        assertThrows(RuntimeException.class, () -> worker.executeTransition(attempt, OWNER, store).await().atMost(WAIT));
+        verifyNoInteractions(pairedClient, legacyClient);
     }
 
     @ParameterizedTest
@@ -203,9 +236,10 @@ class PairedRestPipelineTransitionWorkerTest {
 
     private void assertUnknown() {
         var failure = assertThrows(RemoteTransitionOutcomeUnknownException.class,
-            () -> worker.executeTransition(attempt).await().atMost(WAIT));
+            () -> worker.executeTransition(attempt, OWNER, store).await().atMost(WAIT));
         assertFalse(failure.getCause().getMessage().contains("private"));
         verify(pairedClient).sendAsync(any(HttpRequest.class), ArgumentMatchers.<HttpResponse.BodyHandler<String>>any());
+        verify(store).settlePairedUnknown(any());
         verifyNoInteractions(legacyClient);
     }
 
