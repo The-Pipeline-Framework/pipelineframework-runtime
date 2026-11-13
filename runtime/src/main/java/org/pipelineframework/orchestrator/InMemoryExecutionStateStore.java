@@ -23,7 +23,8 @@ import org.pipelineframework.awaitable.AwaitUnitReleaseAcknowledgement;
  * In-memory execution state store intended for development and tests.
  */
 @ApplicationScoped
-public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeExecutionAdmissionStore {
+public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeExecutionAdmissionStore,
+        PairedTransitionSettlementStore {
 
     private final Object lock = new Object();
     private final Map<String, ExecutionRecord<Object, Object>> executionsByScopedId = new HashMap<>();
@@ -360,11 +361,30 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
         String transitionKey,
         Object resultPayload,
         long nowEpochMs) {
+        return markSucceeded(tenantId, executionId, expectedVersion, transitionKey, resultPayload,
+            nowEpochMs, Optional.empty());
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedSuccess(Lease lease,
+            SerializedTransitionPayload output) {
+        return Uni.createFrom().deferred(() -> markSucceeded(lease.tenantId(), lease.executionId(), lease.version(),
+            lease.transitionKey(), List.of(output), System.currentTimeMillis(), Optional.of(lease.owner())));
+    }
+
+    private Uni<Optional<ExecutionRecord<Object, Object>>> markSucceeded(
+        String tenantId,
+        String executionId,
+        long expectedVersion,
+        String transitionKey,
+        Object resultPayload,
+        long nowEpochMs,
+        Optional<String> requiredLeaseOwner) {
         return Uni.createFrom().item(() -> {
             synchronized (lock) {
                 String scopedId = scopedExecutionId(tenantId, executionId);
                 ExecutionRecord<Object, Object> current = getActiveRecord(scopedId, nowEpochMs);
-                if (current == null || current.version() != expectedVersion) {
+                if (!canSettle(current, expectedVersion, requiredLeaseOwner, nowEpochMs)) {
                     return Optional.empty();
                 }
                 ExecutionRecord<Object, Object> updated = new ExecutionRecord<>(
@@ -880,6 +900,41 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
         int failedStepIndex,
         Optional<String> failedCommandId,
         long nowEpochMs) {
+        return markTerminalFailure(tenantId, executionId, expectedVersion, finalStatus, transitionKey,
+            errorCode, errorMessage, failedStepIndex, failedCommandId, nowEpochMs, Optional.empty());
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedFailure(Lease lease,
+            TransitionResultEnvelope.PortableFailure failure) {
+        return settlePairedFailure(lease, failure.code().name(), failure.code().diagnostic(), failure.stepIndex());
+    }
+
+    @Override
+    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedRejection(Lease lease,
+            String errorCode, String diagnostic) {
+        return settlePairedFailure(lease, errorCode, diagnostic, -1);
+    }
+
+    private Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedFailure(Lease lease,
+            String errorCode, String diagnostic, int failedStepIndex) {
+        return Uni.createFrom().deferred(() -> markTerminalFailure(lease.tenantId(), lease.executionId(),
+            lease.version(), ExecutionStatus.FAILED, lease.transitionKey(), errorCode, diagnostic, failedStepIndex,
+            Optional.empty(), System.currentTimeMillis(), Optional.of(lease.owner())));
+    }
+
+    private Uni<Optional<ExecutionRecord<Object, Object>>> markTerminalFailure(
+        String tenantId,
+        String executionId,
+        long expectedVersion,
+        ExecutionStatus finalStatus,
+        String transitionKey,
+        String errorCode,
+        String errorMessage,
+        int failedStepIndex,
+        Optional<String> failedCommandId,
+        long nowEpochMs,
+        Optional<String> requiredLeaseOwner) {
         if (finalStatus != ExecutionStatus.FAILED && finalStatus != ExecutionStatus.DLQ) {
             return Uni.createFrom().item(Optional.empty());
         }
@@ -887,7 +942,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
             synchronized (lock) {
                 String scopedId = scopedExecutionId(tenantId, executionId);
                 ExecutionRecord<Object, Object> current = getActiveRecord(scopedId, nowEpochMs);
-                if (current == null || current.version() != expectedVersion) {
+                if (!canSettle(current, expectedVersion, requiredLeaseOwner, nowEpochMs)) {
                     return Optional.empty();
                 }
                 ExecutionRecord<Object, Object> updated = new ExecutionRecord<>(
@@ -931,6 +986,14 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                 return Optional.of(updated);
             }
         });
+    }
+
+    private static boolean canSettle(ExecutionRecord<?, ?> current, long expectedVersion,
+            Optional<String> requiredLeaseOwner, long nowEpochMs) {
+        return current != null && current.version() == expectedVersion
+            && (requiredLeaseOwner.isEmpty() || (current.status() == ExecutionStatus.RUNNING
+                && requiredLeaseOwner.orElseThrow().equals(current.leaseOwner())
+                && current.leaseExpiresEpochMs() > nowEpochMs));
     }
 
     @Override
