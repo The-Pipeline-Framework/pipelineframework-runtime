@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Independently pinned TPF application worker attached to an existing coordination installation
+Parameters:
+  CodeBucket: {Type: String}
+  CodeKey: {Type: String}
+  CodeObjectVersion: {Type: String}
+  CodeSha256: {Type: String}
+  PipelineId: {Type: String, AllowedPattern: '[A-Za-z0-9_./:@+%=-]+'}
+  ContractVersion: {Type: String, AllowedPattern: '[A-Za-z0-9_./:@+%=-]+'}
+  ReleaseVersion: {Type: String, AllowedPattern: '[A-Za-z0-9_./:@+%=-]+'}
+  ArtifactId: {Type: String, AllowedPattern: '[A-Za-z0-9_./:@+%=-]+'}
+  ArtifactDigest: {Type: String, AllowedPattern: '[A-Za-z0-9_./:@+%=-]+'}
+  RequestQueueArn: {Type: String}
+  RequestQueueUrl: {Type: String, AllowedPattern: '[A-Za-z0-9_./:@+%=-]+'}
+  ResponseQueueArn: {Type: String}
+  ResponseQueueUrl: {Type: String, AllowedPattern: '[A-Za-z0-9_./:@+%=-]+'}
+  WorkerSecretArn: {Type: String}
+  WorkerSecretVersion: {Type: String}
+Resources:
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-worker'
+      RetentionInDays: 30
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker-lane
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !Ref RequestQueueArn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Ref ResponseQueueArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref WorkerSecretArn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt WorkerLogs.Arn
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-worker'
+      Runtime: java21
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt WorkerRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+        S3ObjectVersion: !Ref CodeObjectVersion
+      Environment:
+        Variables:
+          QUARKUS_LAMBDA_HANDLER: aws-durable-pinned-worker
+          TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: validated
+          TPF_AWS_DURABLE_SIGNING_SOURCE: SECRETS_MANAGER
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !Ref WorkerSecretArn
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !Ref WorkerSecretVersion
+          TPF_AWS_DURABLE_CONFIGURATION: !Sub >-
+            {"mode":"SYNC","process-loops-disabled":"true","state-provider":"memory","releases.registry.provider":"memory","releases.storage.provider":"local","pipeline-id":"${PipelineId}","release-version":"${ReleaseVersion}","worker.sqs.pipeline-id":"${PipelineId}","worker.sqs.contract-version":"${ContractVersion}","worker.sqs.release-version":"${ReleaseVersion}","worker.sqs.artifact-id":"${ArtifactId}","worker.sqs.artifact-digest":"${ArtifactDigest}","worker.sqs.request-queue-url":"${RequestQueueUrl}","worker.sqs.response-queue-url":"${ResponseQueueUrl}"}
+  WorkerVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref WorkerFunction
+      CodeSha256: !Ref CodeSha256
+  WorkerEvents:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref WorkerVersion
+      EventSourceArn: !Ref RequestQueueArn
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+Outputs:
+  WorkerVersionArn:
+    Value: !Ref WorkerVersion
+  WorkerRoleArn:
+    Value: !GetAtt WorkerRole.Arn
