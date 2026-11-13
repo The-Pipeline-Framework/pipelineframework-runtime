@@ -26,7 +26,7 @@ import org.pipelineframework.awaitable.AwaitInteractionCursor;
 import org.pipelineframework.awaitable.AwaitInteractionPage;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.AwaitInteractionTerminalException;
-import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
+import org.pipelineframework.awaitable.spi.FencedAwaitInteractionStore;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 
@@ -35,7 +35,7 @@ import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
  */
 @ApplicationScoped
 public class InMemoryAwaitInteractionStore implements
-    AwaitInteractionStore,
+    FencedAwaitInteractionStore,
     AwaitItemContinuationWorkStore,
     AwaitInteractionExecutionLookup {
 
@@ -428,11 +428,6 @@ public class InMemoryAwaitInteractionStore implements
             && current.deadlineEpochMs() == expected.deadlineEpochMs()
             && Objects.equals(current.assignee(), expected.assignee())
             && Objects.equals(current.group(), expected.group());
-    }
-
-    @Override
-    public boolean supportsFencedCompletion() {
-        return true;
     }
 
     @Override

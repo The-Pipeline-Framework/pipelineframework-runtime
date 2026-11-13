@@ -33,7 +33,7 @@ import org.pipelineframework.awaitable.AwaitInteractionCursor;
 import org.pipelineframework.awaitable.AwaitInteractionPage;
 import org.pipelineframework.awaitable.AwaitInteractionStatus;
 import org.pipelineframework.awaitable.AwaitInteractionTerminalException;
-import org.pipelineframework.awaitable.spi.AwaitInteractionStore;
+import org.pipelineframework.awaitable.spi.FencedAwaitInteractionStore;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
@@ -66,7 +66,7 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
  */
 @ApplicationScoped
 public class DynamoAwaitInteractionStore implements
-    AwaitInteractionStore,
+    FencedAwaitInteractionStore,
     AwaitItemContinuationWorkStore,
     AwaitInteractionExecutionLookup {
     private static final Logger LOG = Logger.getLogger(DynamoAwaitInteractionStore.class);
@@ -471,11 +471,6 @@ public class DynamoAwaitInteractionStore implements
             && current.deadlineEpochMs() == expected.deadlineEpochMs()
             && Objects.equals(current.assignee(), expected.assignee())
             && Objects.equals(current.group(), expected.group());
-    }
-
-    @Override
-    public boolean supportsFencedCompletion() {
-        return true;
     }
 
     @Override

@@ -30,7 +30,6 @@ class InMemoryAwaitInteractionStoreTest {
             "completion", "projected", "alice", 15_000L);
         var advanced = store.markDispatching("tenant", original.interactionId(), original.version(), 11_000L)
             .await().indefinitely().orElseThrow();
-        assertTrue(store.supportsFencedCompletion());
         assertTrue(store.complete(original, command).await().indefinitely().isEmpty());
         var accepted = store.complete(advanced, command).await().indefinitely().orElseThrow();
         assertFalse(accepted.duplicate());

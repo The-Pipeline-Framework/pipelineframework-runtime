@@ -59,7 +59,7 @@ class RestAwaitLifecycleTest {
         authority = mock(AwaitTransitionAuthority.class); resource.authority = authority;
         var scope = new AwaitTransitionScope("tenant-a", "execution", "pipeline", "contract", "release-a1", 1, "transition");
         registration = new AwaitRegistrationRequest(scope, "AwaitReview", 8, "execution", "unit", "execution:8",
-            Optional.empty(), new SerializedTransitionPayload("canonical", "json", "{}"), Optional.empty(), Optional.empty(), Optional.empty(), Map.of());
+            Optional.empty(), new SerializedTransitionPayload("canonical", "json", "{}"), Optional.empty(), Optional.empty(), Optional.empty());
         when(resource.workers.lifecycleCredentialRef(any(), anyString(), anyString())).thenAnswer(call -> {
             AwaitTransitionScope requested = call.getArgument(0);
             return scope.equals(requested) && "worker-a".equals(call.getArgument(1)) && "entry-a".equals(call.getArgument(2))

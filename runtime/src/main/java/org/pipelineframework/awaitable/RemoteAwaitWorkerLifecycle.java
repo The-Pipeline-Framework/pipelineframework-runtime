@@ -51,8 +51,7 @@ public class RemoteAwaitWorkerLifecycle {
             var registration = new AwaitRegistrationRequest(scope, descriptor.stepId(), context.currentStepIndex(),
                 context.identityScope(), unitId, causationId, itemIndex, codec.encode(request),
                 Optional.ofNullable(assignee).filter(value -> !value.isBlank()),
-                Optional.ofNullable(group).filter(value -> !value.isBlank()), context.invocationPathForAwait(),
-                context.traceMetadata());
+                Optional.ofNullable(group).filter(value -> !value.isBlank()), context.invocationPathForAwait());
             var settings = config.worker().awaitAuthority();
             return client.register(URI.create(settings.baseUrl().orElseThrow()), secretRef(),
                 settings.workerId().orElseThrow(), settings.entryId().orElseThrow(), registration);

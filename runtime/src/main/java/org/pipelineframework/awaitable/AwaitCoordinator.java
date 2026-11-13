@@ -449,7 +449,7 @@ public class AwaitCoordinator {
     }
 
     private Uni<AwaitCompletionResult> completeSerialized(AwaitCompletionCommand command, int remainingRaces) {
-        if (!interactionStore().supportsFencedCompletion()) {
+        if (!(interactionStore() instanceof org.pipelineframework.awaitable.spi.FencedAwaitInteractionStore fenced)) {
             return Uni.createFrom().failure(new IllegalStateException("Serialized Await requires fenced completion"));
         }
         if (remainingRaces <= 0) {
@@ -468,7 +468,7 @@ public class AwaitCoordinator {
                 projected = executeValueOperation(record, admitted, AwaitValueOperation.NORMALIZE_AND_PROJECT_COMPLETION)
                     .map(value -> withResponsePayload(admitted, value));
             }
-            return projected.chain(value -> interactionStore().complete(record, value))
+            return projected.chain(value -> fenced.complete(record, value))
                 .chain(committed -> committed.map(Uni.createFrom()::item)
                     .orElseGet(() -> completeSerialized(command, remainingRaces - 1)));
         }));
@@ -587,7 +587,7 @@ public class AwaitCoordinator {
             + request.itemIndex().map(index -> ":item=" + index).orElse("");
         String correlation = deriveCorrelationId(descriptor.stepId(), descriptor.correlationStrategy(),
             scope.tenantId(), completionScope, idempotency);
-        var trace = new java.util.LinkedHashMap<String, Object>(request.traceMetadata());
+        var trace = new java.util.LinkedHashMap<String, Object>(context.traceMetadata());
         for (String reserved : List.of("completionMode", "callbackSelection", "commandCompletionMode",
             "commandAcknowledgementType", COMPLETION_PROJECTOR_METADATA)) trace.remove(reserved);
         descriptor.callbackContract().ifPresent(callback -> {

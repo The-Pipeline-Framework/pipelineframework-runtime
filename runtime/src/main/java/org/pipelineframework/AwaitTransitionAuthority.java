@@ -50,7 +50,8 @@ public class AwaitTransitionAuthority {
     public Uni<AwaitCreateResult> register(AwaitRegistrationRequest request) {
         return Uni.createFrom().deferred(() -> authorize(request.scope()).chain(authorized -> {
             PinnedAwaitDescriptor descriptor = PinnedAwaitDescriptor.resolve(authorized.release().contract(), request.stepId());
-            AwaitExecutionContext context = context(authorized.execution(), request.stepIndex(), request.invocationPath(), request.traceMetadata());
+            AwaitExecutionContext context = context(authorized.execution(), request.stepIndex(), request.invocationPath(),
+                org.pipelineframework.telemetry.PipelineTracingSupport.captureCurrentContext());
             descriptor.validatePosition(request.stepIndex(), request.invocationPath());
             validateOccurrence(authorized.execution(), context, request.stepId(), request.identityScope(), request.unitId(),
                 request.causationId(), request.itemIndex());
@@ -238,10 +239,6 @@ public class AwaitTransitionAuthority {
 
     private static AwaitExecutionContext context(ExecutionRecord<Object, Object> execution, int stepIndex,
         Optional<org.pipelineframework.invocation.PipelineInvocationPath> path, Map<String, Object> trace) {
-        for (var entry : trace.entrySet()) {
-            if (!List.of("tpf.trace.id", "tpf.trace.span_id", "tpf.trace.flags").contains(entry.getKey())
-                || !(entry.getValue() instanceof String)) throw new IllegalArgumentException("Only trace context may be proposed as metadata");
-        }
         if (stepIndex < execution.currentStepIndex()) throw new IllegalArgumentException("Await precedes the claimed segment");
         path.ifPresent(value -> {
             value.requireResumable();

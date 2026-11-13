@@ -46,7 +46,7 @@ class AwaitTransitionAuthorityTest {
         }
         var request = f.request();
         var foreignUnit = new AwaitRegistrationRequest(request.scope(), request.stepId(), request.stepIndex(), request.identityScope(),
-            "foreign-unit", request.causationId(), request.itemIndex(), request.canonicalRequest(), request.assignee(), request.group(), request.invocationPath(), request.traceMetadata());
+            "foreign-unit", request.causationId(), request.itemIndex(), request.canonicalRequest(), request.assignee(), request.group(), request.invocationPath());
         assertThrows(IllegalArgumentException.class, () -> f.authority.register(foreignUnit).await().indefinitely());
         verifyNoInteractions(f.authority.coordinator);
     }
@@ -115,7 +115,7 @@ class AwaitTransitionAuthorityTest {
         var original = f.request();
         var forged = new AwaitRegistrationRequest(original.scope(), original.stepId(), original.stepIndex(), original.identityScope(),
             original.unitId(), original.causationId(), Optional.empty(), original.canonicalRequest(), Optional.empty(), Optional.empty(),
-            Optional.of(path), Map.of());
+            Optional.of(path));
         assertThrows(IllegalArgumentException.class, () -> f.authority.register(forged).await().indefinitely());
         verifyNoInteractions(f.authority.coordinator);
     }
@@ -163,7 +163,7 @@ class AwaitTransitionAuthorityTest {
         var scalar = f.request();
         var item = new AwaitRegistrationRequest(scalar.scope(), scalar.stepId(), scalar.stepIndex(), scalar.identityScope(),
             scalar.unitId(), scalar.causationId() + ":0", Optional.of(0), scalar.canonicalRequest(),
-            Optional.empty(), Optional.empty(), Optional.empty(), Map.of());
+            Optional.empty(), Optional.empty(), Optional.empty());
         f.authority.register(item).await().indefinitely();
         var unitStore = new org.pipelineframework.awaitable.store.InMemoryAwaitUnitStore();
         var unit = unitStore.createOrGet(new AwaitUnitCreateCommand("tenant", item.unitId(), "execution", item.stepId(),
@@ -234,7 +234,7 @@ class AwaitTransitionAuthorityTest {
         AwaitRegistrationRequest request(AwaitTransitionScope scope, SerializedTransitionPayload payload, int index) {
             String unit = new AwaitUnitOccurrence("tenant", "execution", "execution", "AwaitReview", index, "occurrence").unitId();
             return new AwaitRegistrationRequest(scope, "AwaitReview", index, "execution", unit, "execution:" + index,
-                Optional.empty(), payload, Optional.empty(), Optional.empty(), Optional.empty(), Map.of());
+                Optional.empty(), payload, Optional.empty(), Optional.empty(), Optional.empty());
         }
     }
 }
