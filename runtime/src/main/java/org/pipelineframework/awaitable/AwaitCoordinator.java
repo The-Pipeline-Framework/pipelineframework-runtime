@@ -29,6 +29,7 @@ import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.TransitionAwaitSuspension;
 import org.pipelineframework.orchestrator.TypedDurablePayload;
+import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 import org.pipelineframework.telemetry.AwaitReplayLifecycleEvent;
 import org.pipelineframework.telemetry.PipelineReplayTelemetry;
 
@@ -65,12 +66,26 @@ public class AwaitCoordinator {
     AwaitDurablePayloadResolver durablePayloadResolver;
 
     @Inject
+    org.pipelineframework.orchestrator.RegisteredRestWorkerTargets registeredWorkers;
+
+    @Inject
+    org.pipelineframework.orchestrator.TransitionPayloadCodec transitionPayloadCodec;
+
+    @Inject
     PipelineReplayTelemetry telemetry;
 
     @Inject
     AwaitTelemetry awaitTelemetry = AwaitTelemetry.disabled();
 
     /** Focused Await telemetry seam for runtime collaborators that already own this coordinator. */
+    @Inject RemoteAwaitWorkerLifecycle remoteLifecycle;
+
+    private boolean remoteAwait() { return remoteLifecycle != null && remoteLifecycle.enabled(); }
+
+    boolean acceptsRemoteAwaitContext(AwaitExecutionContext context) {
+        return remoteAwait() && context != null && context.transitionScope().isPresent();
+    }
+
     public AwaitTelemetry awaitTelemetry() {
         return awaitTelemetry == null ? AwaitTelemetry.disabled() : awaitTelemetry;
     }
@@ -125,6 +140,10 @@ public class AwaitCoordinator {
     ) {
         var invocationPath = executionContext.flatMap(AwaitExecutionContext::invocationPathForAwait);
         String unitId = unitIdFor(descriptor, tenantId, executionId, identityScope, stepIndex, executionContext);
+        if (remoteAwait()) {
+            return remoteLifecycle.register(descriptor, executionContext.orElseThrow(), unitId, causationId,
+                Optional.empty(), requestPayload, assignee, group).map(AwaitWorkerRegistrationResult::creation);
+        }
         return registerDescriptor(descriptor)
             .onItem().transformToUni(registered -> createOrGetUnit(
                 registered, tenantId, unitId, executionId, stepIndex)
@@ -186,6 +205,9 @@ public class AwaitCoordinator {
         String group,
         Map<String, Object> traceMetadata
     ) {
+        if (remoteAwait()) return remoteLifecycle.register(descriptor,
+            Objects.requireNonNull(AwaitExecutionContextHolder.get(), "Await execution context"), unitId, causationId,
+            Optional.of(itemIndex), requestPayload, assignee, group).map(AwaitWorkerRegistrationResult::creation);
         return registerDescriptor(descriptor)
             .onItem().transformToUni(registered -> {
                 if (itemIndex < 0) {
@@ -256,6 +278,21 @@ public class AwaitCoordinator {
 
     @SuppressWarnings("unchecked")
     public Uni<AwaitInteractionRecord> dispatch(AwaitCompletionDescriptor descriptor, AwaitInteractionRecord interaction) {
+        if (remoteAwait()) {
+            AwaitExecutionContext context = Objects.requireNonNull(AwaitExecutionContextHolder.get(), "Await execution context");
+            @SuppressWarnings("unchecked") AwaitTransportAdapter<Object> selected = (AwaitTransportAdapter<Object>) adapter(descriptor.transportType());
+            return remoteLifecycle.claim(context, interaction).chain(grant -> {
+                Object canonical = remoteLifecycle.canonicalRequest(descriptor, grant);
+                return selected.dispatch(new AwaitTransportAdapter.AwaitDispatchRequest<>(descriptor, grant,
+                        AwaitPayloadSupport.normalize(descriptor.inputToTransport().apply(canonical))))
+                    .onFailure().call(failure -> remoteLifecycle.report(context, grant, AwaitDispatchReportKind.FAILED,
+                        Map.of(), Optional.ofNullable(failure.getMessage()).filter(value -> !value.isBlank()).or(() -> Optional.of("Dispatch failed")),
+                        Optional.empty(), Optional.empty()).replaceWithVoid())
+                    .chain(result -> remoteLifecycle.report(context, grant, AwaitDispatchReportKind.DISPATCHED,
+                        result.metadata(), Optional.empty(), Optional.empty(), Optional.empty()))
+                    .map(AwaitDispatchReportResult::record);
+            });
+        }
         return registerDescriptor(descriptor)
             .onItem().transformToUni(ignored -> dispatchRegistered(interaction));
     }
@@ -377,7 +414,7 @@ public class AwaitCoordinator {
      */
     public boolean supportsLiveAwaitWindow(AwaitCompletionDescriptor descriptor) {
         Objects.requireNonNull(descriptor, "descriptor must not be null");
-        return adapter(descriptor.transportType()).supportsLiveAwaitWindow(descriptor);
+        return !remoteAwait() && adapter(descriptor.transportType()).supportsLiveAwaitWindow(descriptor);
     }
 
     private Uni<AwaitInteractionRecord> resolvedAfterDispatchMetadataRace(AwaitInteractionRecord claimedInteraction) {
@@ -393,20 +430,298 @@ public class AwaitCoordinator {
 
     public Uni<AwaitCompletionResult> complete(AwaitCompletionCommand command) {
         AwaitCompletionCommand normalized = normalizeCompletionCommand(command);
+        if (durablePayloadResolver != null && durablePayloadResolver.serializedMode()) {
+            return completeSerialized(normalized, 8).invoke(this::recordCompletionObservation);
+        }
         return resolveForCompletion(normalized)
             .onItem().transformToUni(record -> validateCompletionAdmission(record, normalized)
                 .onItem().transformToUni(safeCommand -> record.acknowledgementAwareCommandCallback()
                     ? completeAcknowledgedCommand(record, safeCommand, 8)
                     : Uni.createFrom().item(completionContract(record, safeCommand))
                         .chain(validated -> interactionStore().complete(validated.command()))))
-            .invoke(result -> {
-                if (!result.duplicate() && result.record().status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
-                    recordAdmissionLifecycle(AwaitReplayLifecycleEvent.COMPLETION_OBSERVED, result.record());
+            .invoke(this::recordCompletionObservation);
+    }
+
+    private void recordCompletionObservation(AwaitCompletionResult result) {
+        if (!result.duplicate() && result.record().status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
+            recordAdmissionLifecycle(AwaitReplayLifecycleEvent.COMPLETION_OBSERVED, result.record());
+        }
+    }
+
+    private Uni<AwaitCompletionResult> completeSerialized(AwaitCompletionCommand command, int remainingRaces) {
+        if (!(interactionStore() instanceof org.pipelineframework.awaitable.spi.FencedAwaitInteractionStore fenced)) {
+            return Uni.createFrom().failure(new IllegalStateException("Serialized Await requires fenced completion"));
+        }
+        if (remainingRaces <= 0) {
+            return Uni.createFrom().failure(new IllegalStateException("Await completion exceeded concurrent update limit"));
+        }
+        return resolveForCompletion(command).chain(record -> validateCompletionAdmission(record, command).chain(admitted -> {
+            if (record.acknowledgementAwareCommandCallback()) {
+                return completeAcknowledgedSerialized(record, admitted, remainingRaces);
+            }
+            Uni<AwaitCompletionCommand> projected;
+            if (record.status() == AwaitInteractionStatus.COMPLETED
+                || record.status() == AwaitInteractionStatus.COMPLETION_OBSERVED) {
+                // An authoritative committed completion wins without re-running typed conversion or projection.
+                projected = Uni.createFrom().item(admitted);
+            } else {
+                projected = executeValueOperation(record, admitted, AwaitValueOperation.NORMALIZE_AND_PROJECT_COMPLETION)
+                    .map(value -> withResponsePayload(admitted, value));
+            }
+            return projected.chain(value -> fenced.complete(record, value))
+                .chain(committed -> committed.map(Uni.createFrom()::item)
+                    .orElseGet(() -> completeSerialized(command, remainingRaces - 1)));
+        }));
+    }
+
+    private Uni<AwaitCompletionResult> completeAcknowledgedSerialized(AwaitInteractionRecord current,
+        AwaitCompletionCommand command, int remainingRaces) {
+        return executeValueOperation(current, command, AwaitValueOperation.NORMALIZE_COMPLETION).chain(callback -> {
+            if (current.stagedCompletionPayload().isPresent()) {
+                if (!PipelineJson.mapper().valueToTree(current.stagedCompletionPayload().orElseThrow())
+                    .equals(PipelineJson.mapper().valueToTree(callback))) {
+                    return Uni.createFrom().failure(new CommandCompletionRejectedException(
+                        "Callback contradicts an admitted completion"));
                 }
+                if (current.status() == AwaitInteractionStatus.COMPLETION_OBSERVED
+                    && current.commandAcknowledgement().isPresent()
+                    && Boolean.TRUE.equals(current.transportMetadata().get("completionProjectionPending"))) {
+                    return settleAcknowledgedCommand(current, CommandDispatchSettlement.SUCCEEDED,
+                        Optional.empty(), remainingRaces)
+                        .map(settled -> new AwaitCompletionResult(settled.record(), false));
+                }
+                return Uni.createFrom().item(new AwaitCompletionResult(current, true));
+            }
+            if (current.status() == AwaitInteractionStatus.COMPLETED) {
+                return Uni.createFrom().failure(new CommandCompletionRejectedException(
+                    "Completed interaction has no matching callback evidence"));
+            }
+            if (current.deadlineEpochMs() <= command.nowEpochMs()) {
+                return Uni.createFrom().failure(new AwaitInteractionTerminalException("Await interaction timed out before completion"));
+            }
+            if (current.status() != AwaitInteractionStatus.DISPATCHING
+                && current.status() != AwaitInteractionStatus.DISPATCHED
+                && current.status() != AwaitInteractionStatus.COMPLETION_OBSERVED) {
+                return Uni.createFrom().failure(new CommandCompletionRejectedException(
+                    "Callback cannot be admitted while Command interaction is " + current.status()));
+            }
+            boolean acknowledged = current.commandAcknowledgement().isPresent();
+            Uni<Object> projection = acknowledged
+                ? executeValueOperation(current, withResponsePayload(command, callback), AwaitValueOperation.PROJECT_COMPLETION)
+                    .map(value -> (Object) value)
+                : Uni.createFrom().item(current.responsePayload());
+            return projection.chain(response -> {
+                AwaitInteractionRecord next = commandState(current,
+                    acknowledged ? AwaitInteractionStatus.COMPLETED : AwaitInteractionStatus.COMPLETION_OBSERVED,
+                    response, command.actor(), current.transportMetadata(), current.commandAcknowledgement(),
+                    Optional.of(callback), command.nowEpochMs());
+                return interactionStore().compareAndSetCommandCompletion(current, next)
+                    .chain(updated -> updated.map(record -> Uni.createFrom().item(new AwaitCompletionResult(record, false)))
+                        .orElseGet(() -> completeSerialized(command, remainingRaces - 1)));
+            });
+        });
+    }
+
+    private Uni<TypedDurablePayload> executeValueOperation(AwaitInteractionRecord record,
+        AwaitCompletionCommand command, AwaitValueOperation operation) {
+        return executeValueOperation(record, command, operation, record.commandAcknowledgement());
+    }
+
+    private Uni<TypedDurablePayload> executeValueOperation(AwaitInteractionRecord record,
+        AwaitCompletionCommand command, AwaitValueOperation operation, Optional<Object> acknowledgement) {
+        PinnedAwaitDescriptor pinned = durablePayloadResolver.pinnedDescriptor(record);
+        var coordinate = durablePayloadResolver.coordinateFor(record);
+        AwaitValueOperationRequest request = new AwaitValueOperationRequest(operation, UUID.randomUUID().toString(),
+            record.tenantId(), record.executionId(), record.interactionId(), record.unitId(), record.stepId(), record.version(),
+            coordinate.pipelineId(), coordinate.contractVersion(), coordinate.releaseVersion(), pinned.completionProjectorId(),
+            pinned.callbackContract().map(AwaitValueOperationExecutor::callbackFingerprint),
+            Optional.of(transitionPayloadCodec.encode(record.requestPayload())),
+            operation == AwaitValueOperation.NORMALIZE_ACKNOWLEDGEMENT
+                ? Optional.of(valueOperationSlot(command.responsePayload()))
+                : acknowledgement.map(transitionPayloadCodec::encode),
+            operation == AwaitValueOperation.NORMALIZE_ACKNOWLEDGEMENT ? Optional.empty()
+                : Optional.of(valueOperationSlot(command.responsePayload())),
+            command.actor() == null ? "" : command.actor(), command.nowEpochMs());
+        return registeredWorkers.executeAwaitValueOperation(request).map(result -> {
+            if (!result.matches(request)) throw new IllegalArgumentException("Await value response does not match request");
+            Object value = transitionPayloadCodec.decode(result.value());
+            TypedDurablePayload envelope = TypedDurablePayload.fromDurableValue(value)
+                .orElseThrow(() -> new IllegalArgumentException("Await worker did not return a canonical envelope"));
+            return (TypedDurablePayload) durablePayloadResolver.decodeEnvelope(record,
+                operation == AwaitValueOperation.NORMALIZE_COMPLETION
+                    ? AwaitDurablePayloadResolver.Slot.STAGED_COMPLETION
+                    : operation == AwaitValueOperation.NORMALIZE_ACKNOWLEDGEMENT
+                        ? AwaitDurablePayloadResolver.Slot.COMMAND_ACKNOWLEDGEMENT
+                        : AwaitDurablePayloadResolver.Slot.RESPONSE,
+                envelope);
+        });
+    }
+
+    /**
+     * Persists an already authorized worker occurrence using immutable compiled facts.
+     * The scoped authority must validate the parent claim, canonical request and occurrence first.
+     * This path never resolves an application class or performs an external dispatch.
+     */
+    public Uni<AwaitCreateResult> createAuthoritativeRegistration(AwaitRegistrationRequest request,
+        PinnedAwaitDescriptor descriptor, TypedDurablePayload canonicalRequest, AwaitExecutionContext context) {
+        var scope = request.scope();
+        String expectedUnit = unitIdFor(descriptor.stepId(), scope.tenantId(), scope.executionId(),
+            request.identityScope(), request.stepIndex(), Optional.of(context));
+        if (!expectedUnit.equals(request.unitId())) {
+            return Uni.createFrom().failure(new IllegalArgumentException("Await proposal differs from execution occurrence"));
+        }
+        long now = System.currentTimeMillis();
+        long deadline = Math.addExact(now, descriptor.timeout().toMillis());
+        long ttl = Instant.ofEpochMilli(deadline).plusSeconds(86_400).getEpochSecond();
+        String completionScope = AwaitUnitOccurrence.fromUnitId(request.unitId()).isPresent()
+            ? request.unitId() : request.identityScope();
+        JsonNode body;
+        try {
+            body = PipelineJson.mapper().readTree(canonicalRequest.payload());
+        } catch (java.io.IOException failure) {
+            return Uni.createFrom().failure(failure);
+        }
+        String idempotency = deriveIdempotencyKey(descriptor.stepId(), descriptor.idempotencyKeyFields(),
+            scope.executionId(), completionScope, body)
+            + (descriptor.callbackContract().isPresent() ? ":step=" + request.stepIndex() : "")
+            + request.itemIndex().map(index -> ":item=" + index).orElse("");
+        String correlation = deriveCorrelationId(descriptor.stepId(), descriptor.correlationStrategy(),
+            scope.tenantId(), completionScope, idempotency);
+        var trace = new java.util.LinkedHashMap<String, Object>(context.traceMetadata());
+        for (String reserved : List.of("completionMode", "callbackSelection", "commandCompletionMode",
+            "commandAcknowledgementType", COMPLETION_PROJECTOR_METADATA)) trace.remove(reserved);
+        descriptor.callbackContract().ifPresent(callback -> {
+            trace.put("completionMode", "CONNECTOR_CALLBACK");
+            trace.put("callbackSelection", callback);
+        });
+        descriptor.commandAcknowledgementTypeId().ifPresent(type -> {
+            trace.put("commandCompletionMode", "ACKNOWLEDGEMENT_REQUIRED");
+            trace.put("commandAcknowledgementType", type);
+        });
+        descriptor.completionProjectorId().ifPresent(projector -> trace.put(COMPLETION_PROJECTOR_METADATA, projector));
+        AwaitCreateCommand command = new AwaitCreateCommand(scope.tenantId(), scope.executionId(), descriptor.stepId(),
+            request.stepIndex(), descriptor.outputTypeId(), descriptor.transportOutputTypeId(), request.causationId(),
+            idempotency, correlation, canonicalRequest, request.assignee().orElse(""), request.group().orElse(""),
+            descriptor.transportType(), request.unitId(), request.itemIndex().orElse(null), Map.copyOf(trace),
+            now, deadline, ttl).withInvocationPath(request.invocationPath());
+        return unitStore().createOrGet(new AwaitUnitCreateCommand(scope.tenantId(), request.unitId(), scope.executionId(),
+            descriptor.stepId(), request.stepIndex(), descriptor.cardinality(), now, ttl)).chain(unit -> {
+                if (!unit.executionId().equals(scope.executionId()) || !unit.stepId().equals(descriptor.stepId())
+                    || unit.stepIndex() != request.stepIndex()) {
+                    return Uni.createFrom().failure(new IllegalArgumentException("Await unit belongs to another occurrence"));
+                }
+                if (AwaitUnitOccurrence.fromUnitId(request.unitId()).isPresent()
+                    && (unit.status().terminal() || unit.dispatchComplete())) {
+                    return interactionStore().findByCorrelation(scope.tenantId(), correlation).map(found -> found
+                        .filter(record -> request.unitId().equals(record.unitId()) && idempotency.equals(record.idempotencyKey()))
+                        .map(record -> new AwaitCreateResult(record, true))
+                        .orElseThrow(() -> new IllegalStateException("Await occurrence is sealed against new members")));
+                }
+                Optional<String> endpoint = Optional.empty();
+                if (awaitAdmissionCoordinator != null && awaitAdmissionCoordinator.enabled()) {
+                    endpoint = descriptor.callbackContract().map(callback -> (String) callback.get("binding"));
+                    if (endpoint.isEmpty() && !"interaction-api".equals(descriptor.transportType())) {
+                        return Uni.createFrom().failure(new IllegalStateException(
+                            "Remote Await endpoint admission requires a trusted endpoint binding"));
+                    }
+                }
+                Uni<Optional<AwaitAdmissionCoordinator.AdmissionLease>> admission = awaitAdmissionCoordinator == null
+                    ? Uni.createFrom().item(Optional.empty())
+                    : awaitAdmissionCoordinator.acquire(scope.pipelineId(), descriptor.stepId(), endpoint,
+                        scope.tenantId(), request.unitId(), request.itemIndex().orElse(null), scope.executionId(), deadline);
+                return admission.chain(lease -> interactionStore().createOrGet(command)
+                    .chain(created -> bindOrReleaseAdmission(created, lease))
+                    .invoke(created -> { if (!created.duplicate()) awaitTelemetry.recordInteractionCreated(created.record()); })
+                    .onFailure().call(ignored -> releaseAdmissionAfterDefiniteCreateFailure(lease, scope.tenantId(), correlation)));
+            }).chain(created -> {
+                if (request.itemIndex().isPresent()) return Uni.createFrom().item(created);
+                return unitStore().attachPrimaryInteraction(scope.tenantId(), request.unitId(),
+                    created.record().interactionId(), System.currentTimeMillis()).map(attached -> {
+                        if (AwaitUnitOccurrence.fromUnitId(request.unitId()).isPresent()
+                            && (attached.isEmpty() || !created.record().interactionId()
+                                .equals(attached.orElseThrow().primaryInteractionId()))) {
+                            throw new IllegalStateException("Await occurrence rejected primary attachment");
+                        }
+                        return created;
+                    });
             });
     }
 
     /** Registers callback completion before any effect is attempted. */
+    private SerializedTransitionPayload valueOperationSlot(Object value) {
+        return value instanceof SerializedTransitionPayload payload ? payload : transitionPayloadCodec.encode(value);
+    }
+
+    public Uni<AwaitUnitRecord> prepareAuthoritativeUnit(AwaitWorkerUnitRequest request, PinnedAwaitDescriptor descriptor) {
+        long now = System.currentTimeMillis();
+        long ttl = Instant.ofEpochMilli(now + descriptor.timeout().toMillis()).plusSeconds(86_400).getEpochSecond();
+        return unitStore().createOrGet(new AwaitUnitCreateCommand(request.scope().tenantId(), request.unitId(),
+            request.scope().executionId(), descriptor.stepId(), request.stepIndex(), descriptor.cardinality(), now, ttl));
+    }
+
+    public Uni<AwaitDispatchReportResult> applyAuthoritativeDispatchReport(AwaitInteractionRecord interaction,
+        AwaitDispatchReportRequest report) {
+        durablePayloadResolver.pinnedDescriptor(interaction);
+        if (report.kind() == AwaitDispatchReportKind.COMMAND_SETTLEMENT) {
+            if (!interaction.commandCallback()) return Uni.createFrom().failure(new IllegalArgumentException("Interaction is not a Command callback"));
+            return settleCommandDispatch(interaction, report.settlement().orElseThrow(),
+                report.acknowledgement().map(value -> (Object) value))
+                .call(result -> result.record().status().terminal() || result.completedByDispatch()
+                    ? recordCompletion(result.record(), System.currentTimeMillis())
+                        .chain(() -> releaseAdmission(result.record())) : Uni.createFrom().voidItem())
+                .map(result -> new AwaitDispatchReportResult(result.record(), result.completedByDispatch()));
+        }
+        if (interaction.commandCallback()) return Uni.createFrom().failure(new IllegalArgumentException("Command requires settlement evidence"));
+        if (interaction.status() == AwaitInteractionStatus.COMPLETED || interaction.status() == AwaitInteractionStatus.DISPATCHED
+            || interaction.status() == AwaitInteractionStatus.TIMED_OUT || interaction.status() == AwaitInteractionStatus.FAILED) {
+            return Uni.createFrom().item(new AwaitDispatchReportResult(interaction, false));
+        }
+        if (interaction.status() != AwaitInteractionStatus.DISPATCHING) {
+            return Uni.createFrom().failure(new IllegalStateException("Interaction has no admitted dispatch"));
+        }
+        long now = System.currentTimeMillis();
+        Uni<Optional<AwaitInteractionRecord>> update = report.kind() == AwaitDispatchReportKind.DISPATCHED
+            ? interactionStore().markDispatched(interaction.tenantId(), interaction.interactionId(), interaction.version(),
+                dispatchMetadata(interaction, report.transportMetadata()), now)
+            : interactionStore().fail(interaction.tenantId(), interaction.interactionId(), interaction.version(), report.failureMessage().orElseThrow(), now);
+        return update.chain(changed -> {
+            if (changed.isEmpty()) return resolvedAfterDispatchMetadataRace(interaction)
+                .map(record -> new AwaitDispatchReportResult(record, false));
+            var record = changed.orElseThrow();
+            if (report.kind() == AwaitDispatchReportKind.FAILED) return releaseAdmission(record)
+                .replaceWith(new AwaitDispatchReportResult(record, false));
+            recordInteractionDispatched(record);
+            return Uni.createFrom().item(new AwaitDispatchReportResult(record, false));
+        });
+    }
+
+    /** Issues only opaque callback authority for an already registered, pinned interaction. */
+    public Optional<String> issueRegisteredCallbackToken(AwaitInteractionRecord record) {
+        if (durablePayloadResolver == null || !durablePayloadResolver.serializedMode()) {
+            throw new IllegalStateException("Remote callback issuance requires serialized coordination");
+        }
+        return durablePayloadResolver.pinnedDescriptor(record).callbackContract()
+            .map(ignored -> resumeTokenService.sign(record, record.createdAtEpochMs()));
+    }
+
+    public Uni<AwaitWorkerRegistrationResult> registerCommandCompletionWithAuthority(
+        AwaitCompletionDescriptor descriptor, AwaitExecutionContext context, Object input) {
+        if (!remoteAwait()) return registerCommandCompletion(descriptor, context, input)
+            .map(created -> new AwaitWorkerRegistrationResult(created, Optional.empty()));
+        if (descriptor.callback().isEmpty()) return Uni.createFrom().failure(
+            new IllegalStateException("Command completion requires its compiled callback contract"));
+        String unit = unitIdFor(descriptor, context.tenantId(), context.executionId(), context.identityScope(),
+            context.currentStepIndex(), Optional.of(context));
+        return remoteLifecycle.register(descriptor, context, unit,
+            context.identityScope() + ":" + context.currentStepIndex(), Optional.empty(), input, "", "");
+    }
+
+    public Uni<Optional<AwaitInteractionRecord>> claimCommandDispatch(AwaitInteractionRecord expected,
+        AwaitExecutionContext context) {
+        return remoteAwait() ? remoteLifecycle.claim(context, expected).map(Optional::of)
+            : claimCommandDispatch(expected);
+    }
+
     public Uni<AwaitCreateResult> registerCommandCompletion(AwaitCompletionDescriptor descriptor,
         AwaitExecutionContext context, Object input) {
         if (descriptor.callback().isEmpty() || !interactionStore().supportsCommandCompletion()) {
@@ -423,6 +738,22 @@ public class AwaitCoordinator {
                     throw new IllegalStateException("Command completion occurrence has incompatible canonical input");
                 }
             });
+    }
+
+    public Uni<CommandCompletionSettlementResult> settleCommandDispatch(AwaitInteractionRecord expected,
+        CommandDispatchSettlement settlement, Optional<Object> acknowledgement, AwaitExecutionContext context) {
+        if (!remoteAwait()) return settleCommandDispatch(expected, settlement, acknowledgement);
+        return remoteLifecycle.report(context, expected, AwaitDispatchReportKind.COMMAND_SETTLEMENT, Map.of(),
+            Optional.empty(), Optional.of(settlement), acknowledgement)
+            .map(result -> new CommandCompletionSettlementResult(result.record(), result.completedByDispatch()));
+    }
+
+    public Uni<AwaitUnitRecord> sealRemoteUnit(AwaitExecutionContext context, String unitId, int count) {
+        return remoteLifecycle.seal(context, unitId, count);
+    }
+
+    public Uni<Object> resumeRemoteUnit(AwaitExecutionContext context, String unitId) {
+        return remoteLifecycle.resume(context, unitId);
     }
 
     public Uni<Optional<AwaitInteractionRecord>> claimCommandDispatch(AwaitInteractionRecord expected) {
@@ -451,8 +782,10 @@ public class AwaitCoordinator {
         return interactionStore().get(expected.tenantId(), expected.interactionId()).chain(found -> {
             AwaitInteractionRecord current = found.orElseThrow(() ->
                 new AwaitInteractionNotFoundException("Command interaction disappeared"));
-            AwaitCompletionDescriptor descriptor = descriptorFor(current);
-            validateDurableOutputContract(current, descriptor);
+            boolean serialized = durablePayloadResolver != null && durablePayloadResolver.serializedMode();
+            AwaitCompletionDescriptor descriptor = serialized ? null : descriptorFor(current);
+            if (serialized) durablePayloadResolver.pinnedDescriptor(current);
+            else validateDurableOutputContract(current, descriptor);
             if (current.status().terminal() || current.status() == AwaitInteractionStatus.DISPATCHED
                 || current.status() == AwaitInteractionStatus.WAITING) {
                 return Uni.createFrom().item(new CommandCompletionSettlementResult(current, false));
@@ -461,61 +794,79 @@ public class AwaitCoordinator {
                 && current.status() != AwaitInteractionStatus.COMPLETION_OBSERVED) {
                 return Uni.createFrom().failure(new IllegalStateException("Invalid Command acknowledgement state"));
             }
-            Map<String, Object> metadata = new java.util.LinkedHashMap<>(current.transportMetadata());
-            Optional<Object> acceptedAcknowledgement = current.commandAcknowledgement().isPresent()
-                ? current.commandAcknowledgement()
-                : settlement == CommandDispatchSettlement.SUCCEEDED
-                    ? acknowledgement.map(value -> coerceCommandAcknowledgement(descriptor, value))
-                    : Optional.empty();
-            boolean accepted = acceptedAcknowledgement.isPresent();
-            metadata.put("commandSettlement", accepted ? CommandDispatchSettlement.SUCCEEDED.name() : settlement.name());
-            Optional<Object> staged = current.stagedCompletionPayload();
-            Object response = current.responsePayload();
-            AwaitInteractionStatus status;
-            long nowEpochMs = System.currentTimeMillis();
-            if (current.deadlineEpochMs() <= nowEpochMs) {
-                status = AwaitInteractionStatus.TIMED_OUT;
-            } else if (accepted && staged.isPresent()) {
-                try {
-                    response = projectAcknowledgedCompletion(current, descriptor, acceptedAcknowledgement.orElseThrow(),
-                        staged.orElseThrow(), completionMetadata(current));
-                    status = AwaitInteractionStatus.COMPLETED;
-                    metadata.put("completionDelivery", "dispatch");
-                } catch (CommandCompletionRejectedException invalidEarlyCallback) {
-                    // Authenticated but identity-incompatible early evidence is discarded; later valid
-                    // delivery may still complete against the durable acknowledgement.
-                    staged = Optional.empty();
-                    status = AwaitInteractionStatus.DISPATCHED;
-                    metadata.put("rejectedEarlyCallback", true);
-                } catch (RuntimeException projectionUnavailable) {
-                    // Keep both evidence slots durable so redrive can retry projection without
-                    // redispatching the effect or asking the provider to resend its callback.
-                    status = AwaitInteractionStatus.COMPLETION_OBSERVED;
-                    metadata.put("completionProjectionPending", true);
+            Uni<Optional<Object>> accepted;
+            if (current.commandAcknowledgement().isPresent()) {
+                accepted = Uni.createFrom().item(current.commandAcknowledgement());
+            } else if (settlement == CommandDispatchSettlement.SUCCEEDED && acknowledgement.isPresent()) {
+                if (serialized) {
+                    AwaitCompletionCommand valueCommand = new AwaitCompletionCommand(current.tenantId(), current.interactionId(),
+                        null, null, current.idempotencyKey(), acknowledgement.orElseThrow(), current.actor(), System.currentTimeMillis());
+                    accepted = executeValueOperation(current, valueCommand, AwaitValueOperation.NORMALIZE_ACKNOWLEDGEMENT)
+                        .map(value -> Optional.<Object>of(value));
+                } else {
+                    accepted = Uni.createFrom().item(() -> Optional.of(coerceCommandAcknowledgement(descriptor,
+                        acknowledgement.orElseThrow())));
                 }
-            } else if (accepted) {
-                status = AwaitInteractionStatus.DISPATCHED;
-            } else if (settlement == CommandDispatchSettlement.AMBIGUOUS) {
-                status = staged.isEmpty() ? AwaitInteractionStatus.DISPATCHED : AwaitInteractionStatus.COMPLETION_OBSERVED;
-            } else if (settlement == CommandDispatchSettlement.RETRYABLE && staged.isEmpty()) {
-                status = AwaitInteractionStatus.WAITING;
             } else {
-                status = AwaitInteractionStatus.FAILED;
-                if (staged.isPresent()) {
-                    metadata.put("completionFailure", "contradictory-provider-evidence");
-                }
+                accepted = Uni.createFrom().item(Optional.empty());
             }
-            AwaitInteractionRecord next = commandState(current, status, response, current.actor(), metadata,
-                acceptedAcknowledgement, staged, nowEpochMs);
-            return interactionStore().compareAndSetCommandCompletion(current, next)
-                .chain(updated -> updated.map(record -> {
-                    if (record.status() == AwaitInteractionStatus.DISPATCHED
-                        || record.status() == AwaitInteractionStatus.COMPLETED) {
-                        recordInteractionDispatched(record);
+            return accepted.chain(acceptedAcknowledgement -> {
+                Map<String, Object> metadata = new java.util.LinkedHashMap<>(current.transportMetadata());
+                boolean hasAcknowledgement = acceptedAcknowledgement.isPresent();
+                metadata.put("commandSettlement", hasAcknowledgement ? CommandDispatchSettlement.SUCCEEDED.name() : settlement.name());
+                Optional<Object> staged = current.stagedCompletionPayload();
+                long now = System.currentTimeMillis();
+                Uni<AwaitInteractionRecord> proposal;
+                if (current.deadlineEpochMs() > now && hasAcknowledgement && staged.isPresent()) {
+                    Uni<Object> projection;
+                    if (serialized) {
+                        AwaitCompletionCommand valueCommand = new AwaitCompletionCommand(current.tenantId(), current.interactionId(),
+                            null, null, current.idempotencyKey(), staged.orElseThrow(), current.actor(), current.updatedAtEpochMs());
+                        projection = executeValueOperation(current, valueCommand, AwaitValueOperation.PROJECT_COMPLETION,
+                            acceptedAcknowledgement).map(value -> (Object) value);
+                    } else {
+                        projection = Uni.createFrom().item(() -> projectAcknowledgedCompletion(current, descriptor,
+                            acceptedAcknowledgement.orElseThrow(), staged.orElseThrow(), completionMetadata(current)));
                     }
-                    return Uni.createFrom().item(new CommandCompletionSettlementResult(record,
-                        record.status() == AwaitInteractionStatus.COMPLETED));
-                }).orElseGet(() -> settleAcknowledgedCommand(current, settlement, acknowledgement, remainingRaces - 1)));
+                    proposal = projection.map(response -> {
+                        metadata.remove("completionProjectionPending");
+                        metadata.put("completionDelivery", "dispatch");
+                        return commandState(current, AwaitInteractionStatus.COMPLETED, response, current.actor(), metadata,
+                            acceptedAcknowledgement, staged, now);
+                    }).onFailure(CommandCompletionRejectedException.class).recoverWithItem(failure -> {
+                        metadata.remove("completionProjectionPending");
+                        metadata.put("rejectedEarlyCallback", true);
+                        return commandState(current, AwaitInteractionStatus.DISPATCHED, current.responsePayload(), current.actor(),
+                            metadata, acceptedAcknowledgement, Optional.empty(), now);
+                    }).onFailure().recoverWithItem(failure -> {
+                        metadata.put("completionProjectionPending", true);
+                        return commandState(current, AwaitInteractionStatus.COMPLETION_OBSERVED, current.responsePayload(), current.actor(),
+                            metadata, acceptedAcknowledgement, staged, now);
+                    });
+                } else {
+                    AwaitInteractionStatus status;
+                    if (current.deadlineEpochMs() <= now) status = AwaitInteractionStatus.TIMED_OUT;
+                    else if (hasAcknowledgement) status = AwaitInteractionStatus.DISPATCHED;
+                    else if (settlement == CommandDispatchSettlement.AMBIGUOUS) {
+                        status = staged.isEmpty() ? AwaitInteractionStatus.DISPATCHED : AwaitInteractionStatus.COMPLETION_OBSERVED;
+                    } else if (settlement == CommandDispatchSettlement.RETRYABLE && staged.isEmpty()) {
+                        status = AwaitInteractionStatus.WAITING;
+                    } else {
+                        status = AwaitInteractionStatus.FAILED;
+                        if (staged.isPresent()) metadata.put("completionFailure", "contradictory-provider-evidence");
+                    }
+                    proposal = Uni.createFrom().item(commandState(current, status, current.responsePayload(), current.actor(),
+                        metadata, acceptedAcknowledgement, staged, now));
+                }
+                return proposal.chain(next -> interactionStore().compareAndSetCommandCompletion(current, next))
+                    .chain(updated -> updated.map(record -> {
+                        if (record.status() == AwaitInteractionStatus.DISPATCHED || record.status() == AwaitInteractionStatus.COMPLETED) {
+                            recordInteractionDispatched(record);
+                        }
+                        return Uni.createFrom().item(new CommandCompletionSettlementResult(record,
+                            record.status() == AwaitInteractionStatus.COMPLETED));
+                    }).orElseGet(() -> settleAcknowledgedCommand(current, settlement, acknowledgement, remainingRaces - 1)));
+            });
         });
     }
 
@@ -878,7 +1229,7 @@ public class AwaitCoordinator {
 
     /** Preloads release-pinned payload metadata before concurrent item dispatch begins. */
     public Uni<Void> preloadDurablePayloads(String tenantId, String executionId) {
-        return durablePayloadResolver == null
+        return remoteAwait() || durablePayloadResolver == null
             ? Uni.createFrom().voidItem()
             : durablePayloadResolver.preload(tenantId, executionId);
     }
@@ -920,7 +1271,28 @@ public class AwaitCoordinator {
             .orElseThrow(() -> new IllegalStateException("Await typed snapshot encoding failed for " + interaction.interactionId()));
     }
 
+    public boolean requiresAuthoritativeSuspension() {
+        return durablePayloadResolver != null && durablePayloadResolver.serializedMode();
+    }
+
+    /** A remote worker may identify an admitted Await but cannot import authoritative state. */
+    public Uni<TransitionAwaitSuspension> authoritativeSuspension(TransitionAwaitSuspension proposed) {
+        return getUnit(proposed.tenantId(), proposed.unitId()).chain(unit -> {
+            if (!unit.tenantId().equals(proposed.tenantId()) || !unit.executionId().equals(proposed.executionId())
+                || unit.stepIndex() != proposed.stepIndex()) {
+                throw new IllegalStateException("Worker suspension differs from admitted Await unit");
+            }
+            return suspensionSnapshot(new AwaitSuspendedException(proposed.tenantId(), proposed.executionId(),
+                proposed.unitId(), proposed.stepIndex())).map(retained -> proposed.pageCompletion()
+                    .map(retained::withPageCompletion).orElse(retained));
+        });
+    }
+
     public Uni<Void> importSuspension(TransitionAwaitSuspension suspension) {
+        if (requiresAuthoritativeSuspension()) {
+            if (suspension == null) return Uni.createFrom().failure(new IllegalArgumentException("Await suspension is absent"));
+            return authoritativeSuspension(suspension).replaceWithVoid();
+        }
         if (suspension == null || suspension.unit() == null) {
             return Uni.createFrom().voidItem();
         }
@@ -1463,6 +1835,11 @@ public class AwaitCoordinator {
 
     /** Reuses durable descriptor compatibility checks before ingress authenticates or maps a payload. */
     public AwaitCompletionDescriptor callbackDescriptor(AwaitInteractionRecord record) {
+        if (durablePayloadResolver != null && durablePayloadResolver.serializedMode()) {
+            throw new UnsupportedOperationException(
+                "Typed connector callback ingress is unavailable in serialized Coordinator mode; "
+                    + "use the authenticated completion boundary");
+        }
         AwaitCompletionDescriptor descriptor = descriptorFor(record);
         validateDurableOutputContract(record, descriptor);
         if (descriptor.callback().isEmpty()) {
@@ -1484,14 +1861,17 @@ public class AwaitCoordinator {
             () -> new AwaitInteractionNotFoundException("No await interaction matches completion")));
     }
 
-    private static AwaitCompletionCommand normalizeCompletionCommand(AwaitCompletionCommand command) {
+    private AwaitCompletionCommand normalizeCompletionCommand(AwaitCompletionCommand command) {
         return new AwaitCompletionCommand(
             command.tenantId(),
             command.interactionId(),
             command.correlationId(),
             command.resumeToken(),
             command.idempotencyKey(),
-            AwaitPayloadSupport.normalize(command.responsePayload()),
+            requiresAuthoritativeSuspension()
+                && (command.responsePayload() instanceof TypedDurablePayload
+                    || command.responsePayload() instanceof SerializedTransitionPayload)
+                ? command.responsePayload() : AwaitPayloadSupport.normalize(command.responsePayload()),
             command.actor(),
             command.nowEpochMs());
     }
@@ -1507,6 +1887,12 @@ public class AwaitCoordinator {
      * @return canonical pipeline payload
      */
     public Object resumePayload(AwaitInteractionRecord record) {
+        if (remoteAwait()) return remoteLifecycle.canonicalCompletion(record);
+        if (durablePayloadResolver != null && durablePayloadResolver.serializedMode()) {
+            TypedDurablePayload payload = TypedDurablePayload.fromDurableValue(record.responsePayload())
+                .orElseThrow(() -> new IllegalStateException("Serialized Await completion has no canonical envelope"));
+            return durablePayloadResolver.decodeEnvelope(record, AwaitDurablePayloadResolver.Slot.RESPONSE, payload);
+        }
         try {
             AwaitCompletionDescriptor descriptor = descriptorFor(record);
             validateDurableOutputContract(record, descriptor);
@@ -1790,12 +2176,15 @@ public class AwaitCoordinator {
         String tenantId,
         String executionId,
         String idempotencyKey) {
-        String basis = tenantId + ":" + executionId + ":" + descriptor.stepId() + ":" + idempotencyKey;
-        return switch (descriptor.correlationStrategy()) {
-            case "interactionId", "signedResumeToken" -> java.util.UUID.nameUUIDFromBytes(
-                basis.getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
-            default -> java.util.UUID.nameUUIDFromBytes(
-                (descriptor.correlationStrategy() + ":" + basis).getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
+        return deriveCorrelationId(descriptor.stepId(), descriptor.correlationStrategy(), tenantId, executionId, idempotencyKey);
+    }
+
+    private static String deriveCorrelationId(String stepId, String strategy, String tenantId,
+        String executionId, String idempotencyKey) {
+        String basis = tenantId + ":" + executionId + ":" + stepId + ":" + idempotencyKey;
+        return switch (strategy) {
+            case "interactionId", "signedResumeToken" -> UUID.nameUUIDFromBytes(basis.getBytes(StandardCharsets.UTF_8)).toString();
+            default -> UUID.nameUUIDFromBytes((strategy + ":" + basis).getBytes(StandardCharsets.UTF_8)).toString();
         };
     }
 
@@ -1805,16 +2194,22 @@ public class AwaitCoordinator {
         String identityScope,
         Object requestPayload
     ) {
-        if (descriptor.idempotencyKeyFields().isEmpty()) {
-            return identityScope + ":" + descriptor.stepId();
+        return deriveIdempotencyKey(descriptor.stepId(), descriptor.idempotencyKeyFields(), executionId,
+            identityScope, requestPayload);
+    }
+
+    private static String deriveIdempotencyKey(String stepId, List<String> fields, String executionId,
+        String identityScope, Object requestPayload) {
+        if (fields.isEmpty()) {
+            return identityScope + ":" + stepId;
         }
         JsonNode node = PipelineJson.mapper().valueToTree(requestPayload);
         StringBuilder builder = new StringBuilder();
         if (!identityScope.equals(executionId)) {
             builder.append(identityScope).append(':');
         }
-        builder.append(descriptor.stepId());
-        for (String field : descriptor.idempotencyKeyFields()) {
+        builder.append(stepId);
+        for (String field : fields) {
             builder.append(':').append(field).append('=');
             JsonNode value = node == null ? null : node.get(field);
             builder.append(value == null || value.isNull() ? "<null>" : value.asText());
@@ -1838,15 +2233,20 @@ public class AwaitCoordinator {
 
     private static String unitIdFor(AwaitCompletionDescriptor descriptor, String tenantId, String executionId,
         String identityScope, int stepIndex, Optional<AwaitExecutionContext> executionContext) {
+        return unitIdFor(descriptor.stepId(), tenantId, executionId, identityScope, stepIndex, executionContext);
+    }
+
+    public static String unitIdFor(String stepId, String tenantId, String executionId,
+        String identityScope, int stepIndex, Optional<AwaitExecutionContext> executionContext) {
         return executionContext.filter(context -> context.awaitOccurrenceCause().isPresent()).map(context -> {
             if (!tenantId.equals(context.tenantId()) || !executionId.equals(context.executionId())
                 || !identityScope.equals(context.identityScope())) {
                 throw new IllegalStateException("Await creation context differs from its semantic owner");
             }
-            var occurrence = new AwaitUnitOccurrence(tenantId, executionId, identityScope, descriptor.stepId(),
+            var occurrence = new AwaitUnitOccurrence(tenantId, executionId, identityScope, stepId,
                 stepIndex, context.awaitOccurrenceCause().orElseThrow());
             return context.invocationPath().map(occurrence::withInvocationPath).orElse(occurrence).unitId();
-        }).orElseGet(() -> deriveUnitId(tenantId, identityScope, descriptor.stepId(), stepIndex));
+        }).orElseGet(() -> deriveUnitId(tenantId, identityScope, stepId, stepIndex));
     }
 
     private static String deriveUnitId(String tenantId, String executionId, String stepId, int stepIndex) {

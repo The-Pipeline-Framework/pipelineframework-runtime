@@ -21,6 +21,10 @@ import io.smallrye.mutiny.Uni;
 import io.smallrye.common.annotation.Blocking;
 import org.pipelineframework.PipelineExecutionService;
 import org.pipelineframework.config.pipeline.PipelineJson;
+import org.pipelineframework.awaitable.AwaitValueOperationExecutor;
+import org.pipelineframework.awaitable.AwaitValueOperationRequest;
+import org.pipelineframework.awaitable.AwaitValueOperationFailure;
+import org.pipelineframework.awaitable.CommandCompletionRejectedException;
 
 /**
  * Default-disabled REST endpoint for executing transition worker commands.
@@ -47,6 +51,9 @@ public class RestTransitionWorkerResource {
 
     @Inject
     ControlPlaneSecretResolver secretResolver;
+
+    @Inject
+    AwaitValueOperationExecutor awaitValueOperations;
 
     private final TransitionWorkerNonceReplayGuard nonceReplayGuard = new TransitionWorkerNonceReplayGuard();
 
@@ -120,6 +127,47 @@ public class RestTransitionWorkerResource {
             .onItem().transform(result -> Response.ok(result.toWireResult()).build());
     }
 
+    /** Executes typed value conversion only; this endpoint cannot admit or commit completion. */
+    @POST
+    @Path(RestTransitionWorkerProtocol.AWAIT_VALUE_OPERATION_RESOURCE_PATH)
+    @Blocking
+    public Uni<Response> executeAwaitValueOperation(
+        @HeaderParam(TransitionWorkerSignature.TIMESTAMP_HEADER) String timestamp,
+        @HeaderParam(TransitionWorkerSignature.NONCE_HEADER) String nonce,
+        @HeaderParam(TransitionWorkerSignature.SIGNATURE_HEADER) String signature,
+        byte[] body
+    ) {
+        if (!orchestratorConfig.workerRest().serverEnabled()) {
+            return Uni.createFrom().item(Response.status(Response.Status.NOT_FOUND).build());
+        }
+        Response authFailure = authenticate(RestTransitionWorkerProtocol.AWAIT_VALUE_OPERATION_METHOD,
+            RestTransitionWorkerProtocol.AWAIT_VALUE_OPERATION_PATH, timestamp, nonce, signature, body);
+        if (authFailure != null) return Uni.createFrom().item(authFailure);
+        if (!awaitValueOperations.supported()) {
+            return Uni.createFrom().item(Response.status(Response.Status.NOT_FOUND).build());
+        }
+        AwaitValueOperationRequest request;
+        try {
+            request = JSON.readerFor(AwaitValueOperationRequest.class)
+                .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                .readValue(body == null ? new byte[0] : body);
+        } catch (IOException failure) {
+            return Uni.createFrom().item(Response.status(Response.Status.BAD_REQUEST).build());
+        }
+        if (request == null) return Uni.createFrom().item(Response.status(Response.Status.BAD_REQUEST).build());
+        java.util.concurrent.Executor responseContext =
+            org.pipelineframework.runtime.RuntimeAdapterBootstrap.captureRequestExecutor(
+                requestThreadContext.currentContextExecutor());
+        return awaitValueOperations.execute(request).emitOn(responseContext)
+            .map(result -> Response.ok(result).build())
+            .onFailure(CommandCompletionRejectedException.class)
+            .recoverWithItem(failure -> Response.status(422).entity(new AwaitValueOperationFailure(
+                request.operation(), request.operationId(), request.requestDigest(),
+                AwaitValueOperationFailure.Code.COMMAND_COMPLETION_REJECTED)).build())
+            .onFailure(IllegalArgumentException.class)
+            .recoverWithItem(Response.status(Response.Status.BAD_REQUEST).build());
+    }
+
     @GET
     @Path(RestTransitionWorkerProtocol.CAPABILITIES_RESOURCE_PATH)
     @Blocking
@@ -146,6 +194,17 @@ public class RestTransitionWorkerResource {
 
     private PipelineWorkerCapability capability() {
         PipelineBundleCapabilities capabilities = identityResolver.capabilities();
+        List<String> protocols = capabilities.transitionWorkerProtocols();
+        if (awaitValueOperations.supported()) {
+            protocols = java.util.stream.Stream.concat(protocols.stream(),
+                java.util.stream.Stream.of(AwaitValueOperationRequest.CAPABILITY)).distinct().toList();
+        }
+        if (executionService.supportsCanonicalTransitions()) {
+            protocols = java.util.stream.Stream.concat(protocols.stream(), java.util.stream.Stream.of("canonical-transition-values-v1")).distinct().toList();
+        }
+        if (executionService.supportsRemoteAwaitAuthority()) {
+            protocols = java.util.stream.Stream.concat(protocols.stream(), java.util.stream.Stream.of("await-authority-v1")).distinct().toList();
+        }
         return new PipelineWorkerCapability(
             PipelineWorkerCapability.PROTOCOL_VERSION,
             "rest",
@@ -155,7 +214,7 @@ public class RestTransitionWorkerResource {
             identityResolver.artifactId(orchestratorConfig),
             identityResolver.artifactDigest(orchestratorConfig),
             List.of(TransitionPayloadEncoding.JSON),
-            capabilities.transitionWorkerProtocols());
+            protocols);
     }
 
     private Response authenticate(

@@ -1,0 +1,33 @@
+package org.pipelineframework.orchestrator.release;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.List;
+import org.pipelineframework.config.pipeline.PipelineJson;
+
+/** Run only with the frozen pre-rootBoundary artifact closure documented in provenance.json. */
+public final class GenerateLegacyEvidence {
+    public static void main(String[] args) throws Exception {
+        if (Arrays.stream(PipelineContractDescriptor.class.getRecordComponents())
+            .anyMatch(component -> component.getName().equals("rootBoundary"))) {
+            throw new IllegalStateException("Generator must use the actual old contract artifact");
+        }
+        if (!PipelineReleaseEvidence.class.getProtectionDomain().getCodeSource().getLocation().toString().contains("1541")
+            || !PipelineContractDescriptor.class.getProtectionDomain().getCodeSource().getLocation().toString().contains("150119")) {
+            throw new IllegalStateException("Generator artifact closure does not match pinned provenance");
+        }
+        var contract = PipelineJson.mapper().readValue(Files.readAllBytes(Path.of(args[0])), PipelineContractDescriptor.class);
+        String digest = "sha256:" + "a".repeat(64);
+        var descriptor = new PipelineReleaseDescriptor(1, contract.pipelineId(), contract.contractVersion(), "frozen-release", "frozen-worker",
+            List.of(new PipelineReleaseArtifactDescriptor("frozen-worker", "jar", "file:/frozen-worker.jar", digest, List.of("Prepare", "Finish"), List.of("local"))));
+        var record = new PipelineReleaseRecord("frozen-tenant", contract.pipelineId(), contract.contractVersion(), "frozen-release",
+            PipelineReleaseStatus.REGISTERED, descriptor, "frozen-worker", digest, "file:/frozen-worker.jar", 1234,
+            "a".repeat(64), contract, 1_700_000_000_000L, 1_700_000_000_000L, 0);
+        var evidence = PipelineReleaseEvidence.from(record);
+        byte[] bytes = PipelineJson.mapper().writer().with(com.fasterxml.jackson.databind.SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS)
+            .writeValueAsBytes(evidence);
+        Files.write(Path.of(args[1]), bytes);
+        System.out.println(evidence.metadataFingerprint());
+    }
+}

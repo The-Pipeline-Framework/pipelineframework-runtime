@@ -14,6 +14,7 @@ public final class AwaitExecutionContext {
     private final Optional<PagedTransitionContext> pageContext;
     private final Optional<String> awaitOccurrenceCause;
     private final Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath;
+    private final Optional<AwaitTransitionScope> transitionScope;
     private int currentStepIndex;
 
     public AwaitExecutionContext(String tenantId, String executionId, int currentStepIndex) {
@@ -81,6 +82,22 @@ public final class AwaitExecutionContext {
         Optional<String> awaitOccurrenceCause,
         Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath
     ) {
+        this(tenantId, executionId, currentStepIndex, continuationMode, terminalOutputOwnership,
+            traceMetadata, pageContext, awaitOccurrenceCause, invocationPath, Optional.empty());
+    }
+
+    public AwaitExecutionContext(String tenantId, String executionId, int currentStepIndex,
+        AwaitContinuationMode continuationMode, TerminalOutputOwnership terminalOutputOwnership,
+        Map<String, Object> traceMetadata, Optional<PagedTransitionContext> pageContext,
+        Optional<String> awaitOccurrenceCause,
+        Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath,
+        Optional<AwaitTransitionScope> transitionScope) {
+        this.transitionScope = java.util.Objects.requireNonNull(transitionScope, "transitionScope");
+        transitionScope.ifPresent(scope -> {
+            if (!tenantId.equals(scope.tenantId()) || !executionId.equals(scope.executionId())) {
+                throw new IllegalArgumentException("Await transition scope differs from execution context");
+            }
+        });
         if (tenantId == null || tenantId.isBlank()) {
             throw new IllegalArgumentException("tenantId must not be blank");
         }
@@ -105,6 +122,8 @@ public final class AwaitExecutionContext {
             if (value.isBlank()) throw new IllegalArgumentException("awaitOccurrenceCause must not be blank");
         });
     }
+
+    public Optional<AwaitTransitionScope> transitionScope() { return transitionScope; }
 
     public Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocationPath() { return invocationPath; }
 

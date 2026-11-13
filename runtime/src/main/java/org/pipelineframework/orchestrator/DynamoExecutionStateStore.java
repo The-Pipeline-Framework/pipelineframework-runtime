@@ -134,6 +134,8 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
     private static final String REDRIVE_TARGET_COMMAND_ID = "redrive_target_command_id";
     private static final String REDRIVE_REASON = "redrive_reason";
     private static final String AWAIT_OCCURRENCE_CAUSE = "await_occurrence_cause";
+    private static final String DISPATCH_ENTRY_ID = "dispatch_entry_id";
+    private static final String DISPATCH_DEPLOYMENT_OPERATION_ID = "dispatch_deployment_operation_id";
     private static final String ENCODED_TYPE = "_tpf_type";
     private static final String ENCODED_MESSAGE_CLASS = "protobuf";
     private static final String ENCODED_MESSAGE_NAME = "_tpf_message";
@@ -363,7 +365,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             ExecutionStatus.QUEUED, 0L, command.initialStepIndex(), 0, null, 0L, command.nowEpochMs(), null,
             command.inputPayload(), null, null, null, null, command.nowEpochMs(), command.nowEpochMs(),
             command.ttlEpochS(), 0L, 0, "", ExecutionRedriveIntent.REPLAY, -1, Optional.empty(),
-            Optional.empty(), Optional.empty(), command.pagingState(), Optional.of("initial-v1"));
+            Optional.empty(), Optional.empty(), command.pagingState(), Optional.of("initial-v1"), command.dispatchPin());
     }
 
     private static void requireAdmissionKeyBytes(String value, int limit, String role) {
@@ -743,7 +745,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             Optional.empty(),
             Optional.empty(),
             command.pagingState(),
-            Optional.of("initial-v1"));
+            Optional.of("initial-v1"), command.dispatchPin());
 
         try {
             writeNewExecution(scopedExecutionKey, created, command.inputCanonicalTypeId(), command.nowEpochMs(), command.ttlEpochS());
@@ -2073,6 +2075,10 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         record.redriveTargetCommandId().ifPresent(value -> putIfPresent(item, REDRIVE_TARGET_COMMAND_ID, value));
         record.redriveReason().ifPresent(value -> putIfPresent(item, REDRIVE_REASON, value));
         record.awaitOccurrenceCause().ifPresent(value -> putIfPresent(item, AWAIT_OCCURRENCE_CAUSE, value));
+        record.dispatchPin().ifPresent(pin -> {
+            item.put(DISPATCH_ENTRY_ID, avS(pin.entryId()));
+            item.put(DISPATCH_DEPLOYMENT_OPERATION_ID, avS(pin.deploymentOperationId()));
+        });
         record.pagingState().ifPresent(page -> {
             item.put(PAGE_INDEX, avN(page.pageIndex()));
             item.put(PAGE_SOURCE_IDENTITY, avS(page.sourceIdentity()));
@@ -2389,6 +2395,18 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         item.put(key, avS(value));
     }
 
+    private static Optional<ExecutionDispatchPin> readDispatchPin(Map<String, AttributeValue> item) {
+        if (!item.containsKey(DISPATCH_ENTRY_ID) && !item.containsKey(DISPATCH_DEPLOYMENT_OPERATION_ID)) {
+            return Optional.empty();
+        }
+        String entry = readString(item, DISPATCH_ENTRY_ID);
+        String operation = readString(item, DISPATCH_DEPLOYMENT_OPERATION_ID);
+        if (entry == null || operation == null) {
+            throw new IllegalStateException("Retained execution dispatch pin is incomplete");
+        }
+        return Optional.of(new ExecutionDispatchPin(entry, operation));
+    }
+
     private ExecutionRecord<Object, Object> toRecord(Map<String, AttributeValue> item) {
         String tenantId = readString(item, TENANT_ID);
         String executionId = readString(item, EXECUTION_ID);
@@ -2493,7 +2511,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             redriveTargetCommandId,
             redriveReason,
             pagingState,
-            awaitOccurrenceCause);
+            awaitOccurrenceCause, readDispatchPin(item));
         return withPayloads(stored, readInputPayload(stored, item), readResultPayload(stored, item));
     }
 
@@ -2505,7 +2523,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             stored.createdAtEpochMs(), stored.updatedAtEpochMs(), stored.ttlEpochS(), stored.firstCircuitDeferredAtEpochMs(),
             stored.circuitDeferralCount(), stored.circuitIdentity(), stored.redriveIntent(), stored.failedStepIndex(),
             stored.failedCommandId(), stored.redriveTargetCommandId(), stored.redriveReason(), stored.pagingState(),
-            stored.awaitOccurrenceCause());
+            stored.awaitOccurrenceCause(), stored.dispatchPin());
     }
 
     private ExecutionRecord<Object, Object> withCurrentStepIndex(ExecutionRecord<Object, Object> stored, int currentStepIndex) {
@@ -2516,7 +2534,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             stored.errorMessage(), stored.createdAtEpochMs(), stored.updatedAtEpochMs(), stored.ttlEpochS(),
             stored.firstCircuitDeferredAtEpochMs(), stored.circuitDeferralCount(), stored.circuitIdentity(),
             stored.redriveIntent(), stored.failedStepIndex(), stored.failedCommandId(),
-            stored.redriveTargetCommandId(), stored.redriveReason(), stored.pagingState(), stored.awaitOccurrenceCause());
+            stored.redriveTargetCommandId(), stored.redriveReason(), stored.pagingState(), stored.awaitOccurrenceCause(), stored.dispatchPin());
     }
 
     private ExecutionRedriveIntent readRedriveIntent(Map<String, AttributeValue> item) {
@@ -2592,7 +2610,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
                 throw new IllegalStateException("Typed execution input requires the pinned-release durable payload resolver: executionId="
                     + execution.executionId());
             }
-            return durablePayloadResolver.decode(execution, ExecutionDurablePayloadResolver.Slot.INPUT, payload);
+            return durablePayloadResolver.decode(execution, inputWriteSlot(execution), payload);
         }
         return transitionPayloadCodec.decode(new SerializedTransitionPayload(
             payloadTypeId,
@@ -2639,7 +2657,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
                 throw new IllegalStateException("Typed execution result requires the pinned-release durable payload resolver: executionId="
                     + execution.executionId());
             }
-            return durablePayloadResolver.decode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, serialized);
+            return durablePayloadResolver.decodeResultItems(execution, serialized);
         }
         Object payload = fromJson(serialized);
         Optional<Object> serializedPayload = readSerializedResultPayload(payload);

@@ -9,6 +9,28 @@ import org.pipelineframework.orchestrator.release.*;
 
 class NativeMemoryExecutionAdmissionTest {
     @Test
+    void nativeAdmissionRetainsOriginalDispatchPinWhenSelectionChangesOnReplay() {
+        var store = new InMemoryExecutionStateStore();
+        var intent = intent("dispatch-pin", "original");
+        var evidence = evidence();
+        var input = ExecutionDispatchPinPersistenceTest.command("dispatch-pin", ExecutionDispatchPinPersistenceTest.PIN);
+        var pinned = new ExecutionCreateCommand(input.tenantId(), input.executionKey(), input.pipelineId(), input.contractVersion(),
+            "release", input.inputPayload(), input.resultShape(), input.inputCanonicalTypeId(), input.initialStepIndex(),
+            input.pagingState(), input.nowEpochMs(), input.ttlEpochS(), input.dispatchPin());
+        var original = new ExecutionAdmissionCreateCommand(pinned, intent, evidence.metadataFingerprint(), evidence.primaryArtifactId(), evidence.primaryArtifactDigest());
+        var created = store.createOrGetNativeAdmittedExecution(original, evidence).await().indefinitely();
+        var changed = new ExecutionCreateCommand(pinned.tenantId(), pinned.executionKey(), pinned.pipelineId(), pinned.contractVersion(),
+            pinned.releaseVersion(), pinned.inputPayload(), pinned.resultShape(), pinned.inputCanonicalTypeId(), pinned.initialStepIndex(),
+            pinned.pagingState(), pinned.nowEpochMs(), pinned.ttlEpochS(), Optional.of(new ExecutionDispatchPin("changed", "changed")));
+        var replay = store.createOrGetNativeAdmittedExecution(new ExecutionAdmissionCreateCommand(changed, intent,
+            evidence.metadataFingerprint(), evidence.primaryArtifactId(), evidence.primaryArtifactDigest()), evidence).await().indefinitely();
+        assertFalse(replay.newlyCreated());
+        assertEquals(created.receipt(), replay.receipt());
+        assertEquals(Optional.of(ExecutionDispatchPinPersistenceTest.PIN), store.getExecution("tenant", created.receipt().executionId())
+            .await().indefinitely().orElseThrow().dispatchPin());
+    }
+
+    @Test
     void expiryNeverExpiresAdmissionOrRecreatesItsExecution() {
         var store = new InMemoryExecutionStateStore();
         var intent = intent("key", "original");

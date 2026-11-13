@@ -41,6 +41,7 @@ class QueueAsyncSubmissionFlow {
   private final Supplier<SegmentBoundaryLedger> segmentBoundaryLedger;
   private final Function<PipelineRunSubmission, Uni<Void>> releaseActivation;
   private final Function<PipelineRunSubmission, Uni<Optional<PipelinePagingPlan>>> pagingPlan;
+  private final Function<ExecutionCreateCommand, Uni<ExecutionCreateCommand>> dispatchPin;
 
   QueueAsyncSubmissionFlow(
       PipelineOrchestratorConfig orchestratorConfig,
@@ -98,6 +99,21 @@ class QueueAsyncSubmissionFlow {
       Supplier<SegmentBoundaryLedger> segmentBoundaryLedger,
       Function<PipelineRunSubmission, Uni<Void>> releaseActivation,
       Function<PipelineRunSubmission, Uni<Optional<PipelinePagingPlan>>> pagingPlan) {
+    this(orchestratorConfig, executionInputPolicy, executionResultShapeResolver, executionStateStore,
+        workDispatcher, admissionPolicy, pipelineId, contractVersion, releaseVersion,
+        segmentBoundaryLedger, releaseActivation, pagingPlan, command -> Uni.createFrom().item(command));
+  }
+
+  QueueAsyncSubmissionFlow(PipelineOrchestratorConfig orchestratorConfig,
+      ExecutionInputPolicy executionInputPolicy, ExecutionResultShapeResolver executionResultShapeResolver,
+      ExecutionStateStore executionStateStore, WorkDispatcher workDispatcher,
+      ControlPlaneAdmissionPolicy admissionPolicy, Supplier<String> pipelineId,
+      Supplier<String> contractVersion, Supplier<String> releaseVersion,
+      Supplier<SegmentBoundaryLedger> segmentBoundaryLedger,
+      Function<PipelineRunSubmission, Uni<Void>> releaseActivation,
+      Function<PipelineRunSubmission, Uni<Optional<PipelinePagingPlan>>> pagingPlan,
+      Function<ExecutionCreateCommand, Uni<ExecutionCreateCommand>> dispatchPin) {
+    this.dispatchPin = Objects.requireNonNull(dispatchPin, "dispatchPin");
     this.orchestratorConfig = Objects.requireNonNull(orchestratorConfig, "orchestratorConfig must not be null");
     this.executionInputPolicy = Objects.requireNonNull(executionInputPolicy, "executionInputPolicy must not be null");
     this.executionResultShapeResolver =
@@ -166,6 +182,7 @@ class QueueAsyncSubmissionFlow {
           .chain(() -> executionInputPolicy.resolveExecutionInputPayload(executionInput, pipelineContext))
           .onItem().transformToUni(snapshot -> createPlan(submission, snapshot, now, ttlEpochS))
           .onItem().transform(PipelineRunSubmissionPlan::createCommand)
+          .chain(command -> dispatchPin.apply(command))
           .onItem().transformToUni(command -> executionStateStore.createOrGetExecution(command)
               .onItem().transformToUni(created -> accept(created, command, now)));
     });
@@ -208,8 +225,8 @@ class QueueAsyncSubmissionFlow {
       // Expected Release admission is not activation and must not execute the local activation hook.
       return executionInputPolicy.resolveExecutionInputPayload(executionInput, context)
           .flatMap(snapshot -> createPlan(submission, snapshot, now, ttlEpochS(now)))
-          .flatMap(plan -> {
-            var command = plan.createCommand();
+          .chain(plan -> dispatchPin.apply(plan.createCommand()))
+          .flatMap(command -> {
             var wrapper = new org.pipelineframework.orchestrator.ExecutionAdmissionCreateCommand(command, intent,
                 evidence.metadataFingerprint(), evidence.primaryArtifactId(), evidence.primaryArtifactDigest());
             return nativeStore.createOrGetNativeAdmittedExecution(wrapper, evidence).flatMap(result -> {
@@ -236,9 +253,15 @@ class QueueAsyncSubmissionFlow {
     } catch (IllegalArgumentException e) {
       return Uni.createFrom().failure(new BadRequestException(e.getMessage()));
     }
-    ExecutionResultShape resultShape = executionResultShapeResolver.resolve();
     try {
-      return pagingPlan.apply(submission)
+      boolean serialized = orchestratorConfig.controlPlane() != null
+          && orchestratorConfig.controlPlane().payloadMaterialization()
+              == PipelineOrchestratorConfig.ControlPlaneConfig.PayloadMaterialization.SERIALIZED;
+      Uni<ExecutionResultShape> shape = serialized
+          ? executionResultShapeResolver.resolvePinned(submission.tenantId(), submission.pipelineId(),
+              submission.contractVersion(), submission.releaseVersion())
+          : Uni.createFrom().item(executionResultShapeResolver.resolve());
+      return shape.chain(resultShape -> pagingPlan.apply(submission)
           .onItem().transform(plan -> new PipelineRunSubmissionPlan(
               submission,
               snapshot,
@@ -246,7 +269,7 @@ class QueueAsyncSubmissionFlow {
               resultShape,
               plan,
               now,
-              ttlEpochS));
+              ttlEpochS)));
     } catch (IllegalArgumentException e) {
       return Uni.createFrom().failure(new BadRequestException(e.getMessage()));
     }

@@ -134,10 +134,11 @@ public class AwaitCompletionSupport {
     }
 
     private AwaitExecutionContext captureExecutionContext() {
-        if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
-            throw new IllegalStateException("Await steps require pipeline.orchestrator.mode=QUEUE_ASYNC.");
-        }
         AwaitExecutionContext context = AwaitExecutionContextHolder.get();
+        if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC
+            && !awaitCoordinator.acceptsRemoteAwaitContext(context)) {
+            throw new IllegalStateException("Await steps require pipeline.orchestrator.mode=QUEUE_ASYNC or a scoped remote Await authority.");
+        }
         if (context == null) {
             throw new IllegalStateException("Await step executed without queue-async execution context.");
         }
@@ -149,7 +150,7 @@ public class AwaitCompletionSupport {
             context.terminalOutputOwnership(),
             context.traceMetadata(),
             context.pageContext(),
-            context.awaitOccurrenceCause(), context.invocationPath());
+            context.awaitOccurrenceCause(), context.invocationPath(), context.transitionScope());
     }
 
     @SuppressWarnings("unchecked")
@@ -322,17 +323,13 @@ public class AwaitCompletionSupport {
                 if (itemIndex.get() == 0) {
                     return Multi.createFrom().empty();
                 }
-                return awaitCoordinator.reconcileCompletedItemInteractions(
-                    context.tenantId(),
-                    unitId,
-                    System.currentTimeMillis())
-                    .chain(() -> awaitCoordinator.markDispatchComplete(
-                        context.tenantId(),
-                        unitId,
-                        itemIndex.get(),
-                        System.currentTimeMillis()))
-                    .onItem().transformToMulti(unit -> unit.status() == AwaitUnitStatus.COMPLETED
-                        ? awaitCoordinator.loadResumePayload(context.tenantId(), unitId)
+                Uni<AwaitUnitRecord> sealed = context.transitionScope().isPresent()
+                    ? awaitCoordinator.sealRemoteUnit(context, unitId, itemIndex.get())
+                    : awaitCoordinator.reconcileCompletedItemInteractions(context.tenantId(), unitId, System.currentTimeMillis())
+                        .chain(() -> awaitCoordinator.markDispatchComplete(context.tenantId(), unitId, itemIndex.get(), System.currentTimeMillis()));
+                return sealed.onItem().transformToMulti(unit -> unit.status() == AwaitUnitStatus.COMPLETED
+                        ? (context.transitionScope().isPresent() ? awaitCoordinator.resumeRemoteUnit(context, unitId)
+                            : awaitCoordinator.loadResumePayload(context.tenantId(), unitId))
                             .toMulti()
                             .onItem().transformToMultiAndConcatenate(payload -> {
                                 if (payload instanceof Iterable) {
