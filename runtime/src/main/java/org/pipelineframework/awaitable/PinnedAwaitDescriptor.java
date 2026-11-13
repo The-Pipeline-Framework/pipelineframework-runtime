@@ -37,7 +37,12 @@ public record PinnedAwaitDescriptor(Map<String, Object> metadata) {
                 var facts = new java.util.LinkedHashMap<String, Object>(step.deferredCompletion());
                 facts.remove("runtimeDescriptor");
                 facts.put("cardinality", step.cardinality());
-                facts.putAll(cast(step.deferredCompletion().get("runtimeDescriptor")));
+                var descriptor = cast(step.deferredCompletion().get("runtimeDescriptor"));
+                Object declared = step.deferredCompletion().get("runtimeStepId");
+                if (declared != null && !declared.equals(descriptor.get("stepId"))) {
+                    throw new IllegalArgumentException("Await descriptor differs from its containing step identity");
+                }
+                facts.putAll(descriptor);
                 return facts;
             })
             .filter(value -> stepId.equals(value.get("stepId")))
@@ -46,6 +51,21 @@ public record PinnedAwaitDescriptor(Map<String, Object> metadata) {
             throw new IllegalStateException("Pinned Release requires one exact Await descriptor for " + stepId);
         }
         return matches.getFirst();
+    }
+
+    public void validatePosition(int rootIndex, Optional<org.pipelineframework.invocation.PipelineInvocationPath> invocation) {
+        if (!(metadata.get("positions") instanceof List<?> positions)) {
+            throw new IllegalArgumentException("Pinned Await descriptor has no compiled physical position");
+        }
+        var path = invocation.filter(value -> !value.frames().isEmpty());
+        int physicalIndex = path.map(org.pipelineframework.invocation.PipelineInvocationPath::stepIndex).orElse(rootIndex);
+        var frame = path.map(value -> value.frames().getLast());
+        boolean matched = positions.stream().map(PinnedAwaitDescriptor::cast).anyMatch(position ->
+            Integer.valueOf(physicalIndex).equals(position.get("stepIndex"))
+                && frame.map(value -> value.definitionId().equals(position.get("definitionId"))
+                    && value.callsiteId().equals(position.get("callsiteId")))
+                .orElseGet(() -> !position.containsKey("definitionId") && !position.containsKey("callsiteId")));
+        if (!matched) throw new IllegalArgumentException("Await position differs from the pinned compiled order");
     }
 
     public String stepId() { return required(metadata, "stepId"); }
@@ -79,18 +99,6 @@ public record PinnedAwaitDescriptor(Map<String, Object> metadata) {
         }
         return fields.stream().map(String.class::cast).toList();
     }
-    public Map<String, Object> transportConfig() {
-        Object value = metadata.get("transportConfig");
-        if (value == null) throw new IllegalStateException("Pinned Await transport configuration is unavailable");
-        return Map.copyOf(cast(value));
-    }
-
-    /** Metadata view used solely by existing adapter admission-endpoint policy. */
-    AwaitCompletionDescriptor admissionPolicyDescriptor() {
-        return new AwaitCompletionDescriptor(stepId(), inputTypeId(), outputTypeId(), cardinality(), timeout(),
-            correlationStrategy(), transportType(), transportConfig(), idempotencyKeyFields());
-    }
-
     private Optional<String> optional(String name) {
         return metadata.get(name) == null ? Optional.empty() : Optional.of(required(metadata, name));
     }

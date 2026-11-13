@@ -483,6 +483,13 @@ public class AwaitCoordinator {
                     return Uni.createFrom().failure(new CommandCompletionRejectedException(
                         "Callback contradicts an admitted completion"));
                 }
+                if (current.status() == AwaitInteractionStatus.COMPLETION_OBSERVED
+                    && current.commandAcknowledgement().isPresent()
+                    && Boolean.TRUE.equals(current.transportMetadata().get("completionProjectionPending"))) {
+                    return settleAcknowledgedCommand(current, CommandDispatchSettlement.SUCCEEDED,
+                        Optional.empty(), remainingRaces)
+                        .map(settled -> new AwaitCompletionResult(settled.record(), false));
+                }
                 return Uni.createFrom().item(new AwaitCompletionResult(current, true));
             }
             if (current.status() == AwaitInteractionStatus.COMPLETED) {
@@ -612,8 +619,11 @@ public class AwaitCoordinator {
                 }
                 Optional<String> endpoint = Optional.empty();
                 if (awaitAdmissionCoordinator != null && awaitAdmissionCoordinator.enabled()) {
-                    endpoint = descriptor.callbackContract().map(callback -> (String) callback.get("binding"))
-                        .or(() -> adapter(descriptor.transportType()).admissionEndpoint(descriptor.admissionPolicyDescriptor()));
+                    endpoint = descriptor.callbackContract().map(callback -> (String) callback.get("binding"));
+                    if (endpoint.isEmpty() && !"interaction-api".equals(descriptor.transportType())) {
+                        return Uni.createFrom().failure(new IllegalStateException(
+                            "Remote Await endpoint admission requires a trusted endpoint binding"));
+                    }
                 }
                 Uni<Optional<AwaitAdmissionCoordinator.AdmissionLease>> admission = awaitAdmissionCoordinator == null
                     ? Uni.createFrom().item(Optional.empty())
@@ -819,10 +829,12 @@ public class AwaitCoordinator {
                             acceptedAcknowledgement.orElseThrow(), staged.orElseThrow(), completionMetadata(current)));
                     }
                     proposal = projection.map(response -> {
+                        metadata.remove("completionProjectionPending");
                         metadata.put("completionDelivery", "dispatch");
                         return commandState(current, AwaitInteractionStatus.COMPLETED, response, current.actor(), metadata,
                             acceptedAcknowledgement, staged, now);
                     }).onFailure(CommandCompletionRejectedException.class).recoverWithItem(failure -> {
+                        metadata.remove("completionProjectionPending");
                         metadata.put("rejectedEarlyCallback", true);
                         return commandState(current, AwaitInteractionStatus.DISPATCHED, current.responsePayload(), current.actor(),
                             metadata, acceptedAcknowledgement, Optional.empty(), now);

@@ -498,6 +498,8 @@ class QueueAsyncSegmentPipelineTest {
         new ExecutionWorkItem("tenant-1", "remote-terminal"), command -> {
           dispatched.incrementAndGet();
           assertEquals(4, command.currentStepIndex());
+          assertEquals(payloadCodec.encode(canonical),
+              payloadCodec.encode(command.toCommand(payloadCodec).inputPayload()));
           return Uni.createFrom().item(TransitionResultEnvelope.completedTerminalInputPassthrough());
         }, AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER).await().indefinitely();
     assertEquals(1, dispatched.get());

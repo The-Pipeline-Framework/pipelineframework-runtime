@@ -334,17 +334,21 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
         Optional<ExecutionDispatchPin> pin) {
         if (index >= targets.size()) return Uni.createFrom().failure(new IllegalStateException("No verified registered REST worker available"));
         var target = targets.get(index);
-        Uni<Void> bindingCheck = serializedCoordination()
+        Uni<Boolean> requiresAwait = serializedCoordination()
             ? releases.get(target.tenantId(), target.pipelineId(), target.releaseVersion())
-                .chain(release -> retainedBinding(release.orElseThrow(), target)).invoke(binding -> {
-                    if (pin.isPresent() && !pin.orElseThrow().deploymentOperationId().equals(binding.deploymentOperationId())) {
-                        throw new IllegalStateException("Execution dispatch revision differs from retained binding");
-                    }
-                }).replaceWithVoid()
-            : Uni.createFrom().voidItem();
-        return bindingCheck.chain(() -> rest.capabilities(endpoint(target.endpoint()), target.sharedSecretRef())).chain(capability -> {
-            if ((serializedCoordination() && (!capability.workerProtocols().contains("canonical-transition-values-v1")
-                    || !capability.workerProtocols().contains("await-authority-v1")))
+                .chain(found -> {
+                    var release = found.orElseThrow();
+                    return retainedBinding(release, target).map(binding -> {
+                        if (pin.isPresent() && !pin.orElseThrow().deploymentOperationId().equals(binding.deploymentOperationId())) {
+                            throw new IllegalStateException("Execution dispatch revision differs from retained binding");
+                        }
+                        return release.contract().steps().stream().anyMatch(step -> !step.deferredCompletion().isEmpty());
+                    });
+                })
+            : Uni.createFrom().item(false);
+        return requiresAwait.chain(await -> rest.capabilities(endpoint(target.endpoint()), target.sharedSecretRef()).chain(capability -> {
+            if ((serializedCoordination() && !capability.workerProtocols().contains("canonical-transition-values-v1"))
+                || (await && !capability.workerProtocols().contains("await-authority-v1"))
                 || !PipelineWorkerCapability.PROTOCOL_VERSION.equals(capability.protocolVersion())
                 || !"rest".equals(capability.providerName()) || !capability.workerProtocols().contains("rest")
                 || !capability.payloadEncodings().contains(TransitionPayloadEncoding.JSON)
@@ -358,7 +362,7 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
                     if (records.stream().noneMatch(record -> eligibleRecord(record, target))) throw new IllegalStateException("Registered worker became unavailable");
                     return new Selection(target, capability);
                 });
-        }).onFailure().invoke(failure -> LOG.warnf("Registered REST capability probe failed for tenant=%s worker=%s (%s)",
+        })).onFailure().invoke(failure -> LOG.warnf("Registered REST capability probe failed for tenant=%s worker=%s (%s)",
             target.tenantId(), target.workerId(), failure.getClass().getName()))
             .onFailure().recoverWithUni(failure -> probe(targets, index + 1, pin));
     }

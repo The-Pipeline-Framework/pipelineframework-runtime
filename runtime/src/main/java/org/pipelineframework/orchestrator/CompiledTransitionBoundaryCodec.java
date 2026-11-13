@@ -71,8 +71,10 @@ public final class CompiledTransitionBoundaryCodec implements TransitionPayloadC
                 || !contract.canonicalTypes().containsKey(contract.rootBoundary().get("outputCanonicalTypeId"))) return false;
             var nested = PipelineOrderResourceLoader.loadDefinitionBoundaries();
             if (!java.util.stream.Stream.concat(root.orElseThrow().stream(), nested.stream().flatMap(definition -> definition.stepBoundaries().stream()))
-                .allMatch(boundary -> contract.canonicalTypes().containsKey(boundary.inputTypeId())
-                    && contract.canonicalTypes().containsKey(boundary.outputTypeId()))) return false;
+                .allMatch(boundary -> hasCanonicalIdentity(contract, boundary.inputTypeId())
+                    && hasCanonicalIdentity(contract, boundary.outputTypeId()))) return false;
+            if (nested.stream().flatMap(definition -> definition.stepBoundaries().stream())
+                .anyMatch(boundary -> !loadableStep(boundary.stepClass()))) return false;
             if (!contract.composition().present()) return nested.isEmpty();
             record Visit(String definitionId, List<StepBoundary> order) { }
             var pending = new java.util.ArrayDeque<Visit>();
@@ -93,6 +95,20 @@ public final class CompiledTransitionBoundaryCodec implements TransitionPayloadC
             }
             return visitedClasses.size() == nested.size();
         } catch (RuntimeException unavailable) { return false; }
+    }
+
+    private static boolean hasCanonicalIdentity(PipelineContractDescriptor contract, String id) {
+        return contract.canonicalTypes().containsKey(id) || contract.canonicalTypes().values().stream()
+            .filter(definition -> id.equals(definition.get("runtimeClass"))).limit(2).count() == 1;
+    }
+
+    private static boolean loadableStep(String name) {
+        try {
+            Class.forName(name, false, org.pipelineframework.config.pipeline.PipelineResources.resolveClassLoader());
+            return true;
+        } catch (ClassNotFoundException | LinkageError unavailable) {
+            return false;
+        }
     }
 
     private static String rootIdentity(PipelineContractDescriptor contract, boolean input, String fallback) {

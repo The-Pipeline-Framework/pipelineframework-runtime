@@ -117,6 +117,37 @@ class SerializedCommandCompletionTest {
         assertEquals(pending.version(), operations.getFirst().expectedInteractionVersion());
     }
 
+    @Test void duplicateCallbackRetriesPendingProjectionAfterCoordinatorRestart() throws Exception {
+        coordinator.complete(callback("callback")).await().indefinitely();
+        doAnswer(call -> {
+            AwaitValueOperationRequest request = call.getArgument(0);
+            if (request.operation() == AwaitValueOperation.PROJECT_COMPLETION) {
+                operations.add(request);
+                return Uni.createFrom().failure(new IllegalStateException("worker unavailable"));
+            }
+            return successful(request);
+        }).when(workers).executeAwaitValueOperation(any());
+        var pending = coordinator.settleCommandDispatch(dispatching, CommandDispatchSettlement.SUCCEEDED,
+            Optional.of(Map.of("value", "ack"))).await().indefinitely().record();
+        assertEquals(AwaitInteractionStatus.COMPLETION_OBSERVED, pending.status());
+        assertEquals(true, pending.transportMetadata().get("completionProjectionPending"));
+        assertEquals("ack", value(pending.commandAcknowledgement().orElseThrow()));
+        assertEquals("callback", value(pending.stagedCompletionPayload().orElseThrow()));
+        assertNull(pending.responsePayload());
+
+        operations.clear();
+        doAnswer(call -> successful(call.getArgument(0))).when(workers).executeAwaitValueOperation(any());
+        var completed = fresh().complete(callback("callback")).await().indefinitely();
+        assertFalse(completed.duplicate());
+        assertEquals(AwaitInteractionStatus.COMPLETED, completed.record().status());
+        assertFalse(completed.record().transportMetadata().containsKey("completionProjectionPending"));
+        assertEquals("request/ack/callback", value(completed.record().responsePayload()));
+        assertEquals(pending.commandAcknowledgement(), completed.record().commandAcknowledgement());
+        assertEquals(pending.stagedCompletionPayload(), completed.record().stagedCompletionPayload());
+        assertEquals(List.of(AwaitValueOperation.NORMALIZE_COMPLETION, AwaitValueOperation.PROJECT_COMPLETION), kinds());
+        assertEquals(pending.version(), operations.getLast().expectedInteractionVersion());
+    }
+
     @Test void authenticatedIdentityRejectionClearsOnlyRejectedCallbackAndAcceptsCorrectedEvidence() throws Exception {
         coordinator.complete(callback("wrong-callback")).await().indefinitely();
         doAnswer(call -> {

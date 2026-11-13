@@ -23,9 +23,17 @@ import org.pipelineframework.orchestrator.release.PipelineReleaseRecord;
 import org.pipelineframework.orchestrator.release.PipelineReleaseRegistry;
 import org.pipelineframework.type.CanonicalTypeCatalogue;
 
-/** Authorizes registration and a first dispatch grant for an exact leased transition occurrence.
- * The parent read authorizes this request; it is not an atomic transaction with Await storage.
- * A concurrent reclaim does not revoke admitted work; the parent version still fences its later commit.
+/**
+ * Coordinator admission boundary for the worker Await lifecycle.
+ *
+ * <p>The worker encodes a request, registers it, acquires a dispatch grant, sends the external
+ * request, and reports its outcome. Registration binds the canonical request to an interaction.
+ * Claiming changes the interaction version and supplies the grant that a subsequent report must
+ * present. Itemized work seals its unit after registering all items. A resume reads the canonical
+ * value from that retained unit. Completion and projection run independently in AwaitCoordinator.
+ *
+ * <p>The parent read authorizes the request. A subsequent parent reclaim fences progress commits
+ * while an admitted external request can still finish.
  */
 @ApplicationScoped
 public class AwaitTransitionAuthority {
@@ -43,6 +51,7 @@ public class AwaitTransitionAuthority {
         return Uni.createFrom().deferred(() -> authorize(request.scope()).chain(authorized -> {
             PinnedAwaitDescriptor descriptor = PinnedAwaitDescriptor.resolve(authorized.release().contract(), request.stepId());
             AwaitExecutionContext context = context(authorized.execution(), request.stepIndex(), request.invocationPath(), request.traceMetadata());
+            descriptor.validatePosition(request.stepIndex(), request.invocationPath());
             validateOccurrence(authorized.execution(), context, request.stepId(), request.identityScope(), request.unitId(),
                 request.causationId(), request.itemIndex());
             TypedDurablePayload payload = validateCanonicalPayload(authorized.release().contract(),
@@ -90,6 +99,7 @@ public class AwaitTransitionAuthority {
                         throw new IllegalStateException("Retained Await boundary differs from its pinned descriptor");
                     }
                     AwaitExecutionContext context = context(authorized.execution(), interaction.stepIndex(), interaction.invocationPath(), Map.of());
+                    descriptor.validatePosition(interaction.stepIndex(), interaction.invocationPath());
                     validateOccurrence(authorized.execution(), context, interaction.stepId(), context.identityScope(), interaction.unitId(),
                         interaction.causationId(), Optional.ofNullable(interaction.itemIndex()));
                     var metadata = new java.util.LinkedHashMap<String, Object>(interaction.transportMetadata());
@@ -176,7 +186,8 @@ public class AwaitTransitionAuthority {
     }
 
     private static void validateUnitRequest(Authorized authorized, AwaitWorkerUnitRequest request) {
-        PinnedAwaitDescriptor.resolve(authorized.release().contract(), request.stepId());
+        PinnedAwaitDescriptor.resolve(authorized.release().contract(), request.stepId())
+            .validatePosition(request.stepIndex(), request.invocationPath());
         var context = context(authorized.execution(), request.stepIndex(), request.invocationPath(), Map.of());
         validateOccurrence(authorized.execution(), context, request.stepId(), request.identityScope(), request.unitId(),
             request.identityScope() + ":" + request.stepIndex(), Optional.empty());

@@ -48,7 +48,9 @@ class DynamoAwaitInteractionStoreTest {
         when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(waiting).build());
         var expected = store.get("tenant-a", "interaction-1").await().indefinitely().orElseThrow();
         when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
-            .thenThrow(ConditionalCheckFailedException.builder().message("concurrent version change").build());
+            .thenThrow(software.amazon.awssdk.services.dynamodb.model.TransactionCanceledException.builder()
+                .cancellationReasons(software.amazon.awssdk.services.dynamodb.model.CancellationReason.builder()
+                    .code("ConditionalCheckFailed").build()).build());
         assertTrue(store.supportsFencedCompletion());
         assertTrue(store.complete(expected, new AwaitCompletionCommand("tenant-a", "interaction-1", null,
             "completion", "projected", "alice", 2_000L)).await().indefinitely().isEmpty());

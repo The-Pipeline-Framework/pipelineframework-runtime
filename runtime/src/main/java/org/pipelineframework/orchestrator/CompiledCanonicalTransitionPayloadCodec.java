@@ -150,7 +150,7 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
         if (catalog == null || catalog.isBlank()) throw new IllegalArgumentException("Compiled canonical catalog fingerprint is required");
         try {
             Class<?> type = CanonicalPayloadRuntimeClassLoader.load(required(definition, "runtimeClass"),
-                Thread.currentThread().getContextClassLoader());
+                org.pipelineframework.config.pipeline.PipelineResources.resolveClassLoader());
             var scalar = new CanonicalPayloadBinding(identity, fingerprint, catalog, type);
             var collection = new CanonicalPayloadBinding("List<" + identity + ">", fingerprint("List<" + fingerprint + ">"),
                 catalog, List.class, TypeFactory.defaultInstance().constructCollectionType(List.class, type));

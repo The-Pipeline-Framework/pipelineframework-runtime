@@ -20,6 +20,12 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 class AwaitTransitionAuthorityTest {
+    @Test void leasedWorkerCannotRegisterAtAnUncompiledPosition() {
+        var f = new Fixture();
+        var forged = f.request(f.scope(), f.payload("{\"approved\":true}"), 9);
+        assertThrows(IllegalArgumentException.class, () -> f.authority.register(forged).await().indefinitely());
+    }
+
     @Test void rejectsStaleForeignAndExpiredClaimsBeforeAnyRegistration() {
         var f = new Fixture();
         for (var scope : List.of(new AwaitTransitionScope("foreign", "execution", "pipeline", "contract", "release", 1, "execution:0:1"),
@@ -201,6 +207,7 @@ class AwaitTransitionAuthorityTest {
             var step = mock(PipelineBundleStepDescriptor.class);
             var descriptor = new java.util.HashMap<String,Object>();
             descriptor.put("schemaVersion", 1); descriptor.put("stepId", "AwaitReview");
+            descriptor.put("positions", List.of(Map.of("stepIndex", 8)));
             for (String key : List.of("inputTypeId", "outputTypeId", "transportInputTypeId", "transportOutputTypeId", "canonicalInputTypeId", "canonicalOutputTypeId", "completionPayloadTypeId")) descriptor.put(key, "Request");
             descriptor.put("requestAwareCompletion", false);
             when(step.deferredCompletion()).thenReturn(Map.of("runtimeDescriptor", descriptor, "timeout", "PT5M"));

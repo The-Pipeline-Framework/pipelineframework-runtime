@@ -126,6 +126,7 @@ class RestAwaitLifecycleTest {
         var grant = client.claimDispatch(origin, "env:worker-a", "worker-a", "entry-a", registration.scope(), record.interactionId(), record.version()).await().indefinitely();
         assertEquals(AwaitInteractionStatus.DISPATCHING, grant.status());
         assertThrows(IllegalStateException.class, () -> client.claimDispatch(origin, "env:worker-a", "worker-a", "entry-a", registration.scope(), record.interactionId(), record.version()).await().indefinitely());
+        verify(authority, times(2)).claimDispatch(registration.scope(), record.interactionId(), record.version());
         assertEquals(2, calls.get());
     }
 

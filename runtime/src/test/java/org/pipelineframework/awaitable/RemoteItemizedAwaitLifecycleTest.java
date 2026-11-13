@@ -30,6 +30,7 @@ class RemoteItemizedAwaitLifecycleTest {
         when(config.workerRest().sharedSecretRef()).thenReturn(Optional.of("sys:test.secret"));
         var metadata = new HashMap<String,Object>();
         metadata.put("schemaVersion", 1); metadata.put("stepId", "Review");
+        metadata.put("positions", List.of(Map.of("stepIndex", 8)));
         for (String field : List.of("inputTypeId", "outputTypeId", "transportInputTypeId", "transportOutputTypeId")) metadata.put(field, Value.class.getName());
         for (String field : List.of("canonicalInputTypeId", "canonicalOutputTypeId", "completionPayloadTypeId")) metadata.put(field, "Value");
         metadata.put("requestAwareCompletion", false);

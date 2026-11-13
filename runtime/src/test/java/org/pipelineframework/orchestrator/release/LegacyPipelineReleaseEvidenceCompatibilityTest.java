@@ -23,20 +23,30 @@ class LegacyPipelineReleaseEvidenceCompatibilityTest {
         assertArrayEquals(frozen, PipelineJson.mapper().writer().with(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS).writeValueAsBytes(evidence));
     }
 
-    @Test void oldFingerprintDoesNotBlessAlteredArtifactOrAddedCanonicalRootBoundary() throws Exception {
-        for (String change : java.util.List.of("artifact", "rootBoundary")) {
-            var tampered = PipelineJson.mapper().readTree(frozen()).deepCopy();
-            if (change.equals("artifact")) {
-                ((com.fasterxml.jackson.databind.node.ObjectNode) tampered).put("primaryArtifactDigest", "sha256:" + "b".repeat(64));
-            } else {
-                ((com.fasterxml.jackson.databind.node.ObjectNode) tampered.path("contract")).put("schemaVersion", 3).putObject("rootBoundary")
-                    .put("schemaVersion", 1).put("inputCanonicalTypeId", "Request").put("outputCanonicalTypeId", "Receipt");
-            }
-            assertEquals(FINGERPRINT, tampered.path("metadataFingerprint").asText());
-            var failure = assertThrows(com.fasterxml.jackson.databind.JsonMappingException.class,
-                () -> PipelineJson.mapper().treeToValue(tampered, PipelineReleaseEvidence.class));
-            assertTrue(failure.getMessage().contains("fingerprint mismatch"), failure.getMessage());
-        }
+    @Test void fingerprintBindsArtifactAndRootBoundaryIndependently() throws Exception {
+        var mapper = PipelineJson.mapper();
+        var legacy = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(frozen());
+        var artifactTamper = legacy.deepCopy();
+        artifactTamper.put("primaryArtifactDigest", "sha256:" + "b".repeat(64));
+        assertFingerprintMismatch(mapper, artifactTamper);
+
+        var current = legacy.deepCopy();
+        ((com.fasterxml.jackson.databind.node.ObjectNode) current.path("contract")).put("schemaVersion", 3);
+        var snapshot = current.deepCopy();
+        snapshot.remove("metadataFingerprint");
+        byte[] bytes = mapper.writer().with(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS).writeValueAsBytes(snapshot);
+        current.put("metadataFingerprint", HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)));
+        assertEquals(3, mapper.treeToValue(current, PipelineReleaseEvidence.class).contract().schemaVersion());
+        ((com.fasterxml.jackson.databind.node.ObjectNode) current.path("contract")).putObject("rootBoundary")
+            .put("schemaVersion", 1).put("inputCanonicalTypeId", "Request").put("outputCanonicalTypeId", "Receipt");
+        assertFingerprintMismatch(mapper, current);
+    }
+
+    private static void assertFingerprintMismatch(com.fasterxml.jackson.databind.ObjectMapper mapper,
+        com.fasterxml.jackson.databind.JsonNode tampered) {
+        var failure = assertThrows(com.fasterxml.jackson.databind.JsonMappingException.class,
+            () -> mapper.treeToValue(tampered, PipelineReleaseEvidence.class));
+        assertTrue(failure.getMessage().contains("fingerprint mismatch"), failure.getMessage());
     }
 
     private byte[] frozen() throws Exception {

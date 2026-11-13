@@ -175,6 +175,10 @@ class QueueAsyncSegmentPipeline {
     if (result == null || !result.terminalInputPassthrough() || !segment.resumesFromAwait()) {
       return Uni.createFrom().item(result);
     }
+    if (awaitCoordinator.requiresAuthoritativeSuspension()) {
+      return Uni.createFrom().failure(new IllegalStateException(
+          "Serialized Await requires the worker to return a canonical terminal result"));
+    }
     // The worker establishes the terminal cursor using its generated execution order.
     // The authoritative completed Await value, not the execution's original input, is the result.
     return awaitCoordinator.loadResumePayload(segment.record().tenantId(), segment.record().awaitUnitId())

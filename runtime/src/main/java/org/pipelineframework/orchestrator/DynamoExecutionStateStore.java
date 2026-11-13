@@ -2610,7 +2610,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
                 throw new IllegalStateException("Typed execution input requires the pinned-release durable payload resolver: executionId="
                     + execution.executionId());
             }
-            return durablePayloadResolver.decode(execution, ExecutionDurablePayloadResolver.Slot.INPUT, payload);
+            return durablePayloadResolver.decode(execution, inputWriteSlot(execution), payload);
         }
         return transitionPayloadCodec.decode(new SerializedTransitionPayload(
             payloadTypeId,

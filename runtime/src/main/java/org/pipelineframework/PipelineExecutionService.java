@@ -107,6 +107,9 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
   protected PipelineRunner pipelineRunner;
 
   @Inject
+  org.pipelineframework.objectpublish.ObjectPublishCompletionService terminalObjectPublish;
+
+  @Inject
   PipelineStepOrderer stepOrderer;
 
   /** Health check service to verify dependent services. */
@@ -552,18 +555,24 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
         })
         .onItem().transformToUni(items -> {
           boolean published = terminalOutputPublished.get();
-          TransitionResultEnvelope completed = terminalInputPassthrough.get()
-              ? transitionCodec instanceof org.pipelineframework.orchestrator.CompiledTransitionBoundaryCodec
-                  ? TransitionResultEnvelope.completed(transitionCodec, canonicalTerminalItems(decodedCommand), false)
-                  : TransitionResultEnvelope.completedTerminalInputPassthrough()
-              : policy.encodeOutputs()
-                  ? TransitionResultEnvelope.completed(transitionCodec, published ? List.of() : items, published)
-                  : TransitionResultEnvelope.completedInProcess(items, published);
-          if (command.pageContext().isEmpty()) {
-            return Uni.createFrom().item(completed);
+          Uni<TransitionResultEnvelope> result;
+          if (terminalInputPassthrough.get()
+              && transitionCodec instanceof org.pipelineframework.orchestrator.CompiledTransitionBoundaryCodec) {
+            var terminalItems = canonicalTerminalItems(decodedCommand);
+            boolean publish = terminalObjectPublish != null && terminalObjectPublish.enabled();
+            result = (publish ? publishTypedTerminalItems(command, terminalItems) : Uni.createFrom().voidItem())
+                .replaceWith(() -> TransitionResultEnvelope.completed(transitionCodec, terminalItems, publish));
+          } else {
+            TransitionResultEnvelope completed = terminalInputPassthrough.get()
+                ? TransitionResultEnvelope.completedTerminalInputPassthrough()
+                : policy.encodeOutputs()
+                    ? TransitionResultEnvelope.completed(transitionCodec, published ? List.of() : items, published)
+                    : TransitionResultEnvelope.completedInProcess(items, published);
+            result = Uni.createFrom().item(completed);
           }
-          return validatedPageCompletion(decodedCommand, command, pageCompletion)
-              .onItem().transform(completed::withPageCompletion);
+          if (command.pageContext().isEmpty()) return result;
+          return result.chain(completed -> validatedPageCompletion(decodedCommand, command, pageCompletion)
+              .onItem().transform(completed::withPageCompletion));
         })
         .onFailure(AwaitThrowableSupport::containsAwaitSuspension).recoverWithUni(failure -> {
           AwaitSuspendedException suspended = AwaitThrowableSupport.extractAwaitSuspension(failure);
@@ -866,6 +875,14 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
     TerminalOutputOwnership terminalOutputOwnership() {
       return terminalOutputOwnership;
     }
+  }
+
+  private Uni<Void> publishTypedTerminalItems(TransitionCommandEnvelope command, List<?> items) {
+    return command.pageContext()
+        .map(page -> terminalObjectPublish.publishIfConfigured(() -> items, command.executionId(),
+            new org.pipelineframework.orchestrator.PagedExecutionState(page.pageIndex(), page.sourceIdentity(),
+                page.startCheckpoint(), page.maxRecords(), page.suspendedCompletion())))
+        .orElseGet(() -> terminalObjectPublish.publishIfConfigured(items));
   }
 
   private static List<?> canonicalTerminalItems(TransitionWorkerCommand command) {
