@@ -138,10 +138,14 @@ function admitSteps(steps, pipeline, typeIds) {
   return handlerNames;
 }
 
-export function admitBinding(binding) {
+export function admitBinding(binding, expectedProjectionJson) {
   const bound = snapshot(binding, 'UNSUPPORTED_BINDING');
   requireKeys(bound, ['schemaVersion', 'projectionJson', 'projectionSha256', 'handlers'], 'UNSUPPORTED_BINDING');
   if (bound.schemaVersion !== 1) throw new NodeLocalDiagnostic('UNSUPPORTED_SCHEMA', 'expected binding schema 1');
+  if (expectedProjectionJson !== undefined && bound.projectionJson !== expectedProjectionJson) {
+    throw new NodeLocalDiagnostic('TRUSTED_PROJECTION_MISMATCH',
+      'load the generated application matching verified Compiled Truth');
+  }
   if (typeof bound.projectionJson !== 'string' || !matches(bound.projectionSha256, digest)
       || createHash('sha256').update(bound.projectionJson, 'utf8').digest('hex') !== bound.projectionSha256) {
     throw new NodeLocalDiagnostic('ARTIFACT_DIGEST_MISMATCH', 'retrieve a matching generated application and projection');
