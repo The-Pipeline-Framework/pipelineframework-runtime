@@ -21,7 +21,55 @@ public record TransitionResultEnvelope(
     @JsonIgnore List<?> decodedOutputItems,
     boolean terminalOutputPublished,
     boolean terminalInputPassthrough,
-    Optional<PagedTransitionCompletion> pageCompletion) {
+    Optional<PagedTransitionCompletion> pageCompletion,
+    @JsonIgnore Optional<PairedResult> pairedResult) {
+
+    /** Local coordinator context retained from the authenticated request. */
+    public record PairedResult(NativeWorkerReleaseBinding.Attempt attempt, Optional<PortableFailure> failure) {
+        public PairedResult {
+            Objects.requireNonNull(attempt, "attempt");
+            Objects.requireNonNull(failure, "failure");
+        }
+    }
+
+    /** Validated outcome data with the logical step resolved against the pinned Contract. */
+    public record PortableFailure(Code code, int stepIndex) {
+        public PortableFailure {
+            Objects.requireNonNull(code, "code");
+            if (stepIndex < 0) {
+                throw new IllegalArgumentException("Portable failure requires a Contract step index");
+            }
+        }
+
+        public enum Code {
+            TRANSIENT_EXHAUSTED("Local retry budget exhausted"),
+            BUSINESS_REJECTION("Business function rejected input"),
+            UNCLASSIFIED("Unclassified business function failure");
+
+            private final String diagnostic;
+
+            Code(String diagnostic) {
+                this.diagnostic = diagnostic;
+            }
+
+            public String diagnostic() {
+                return diagnostic;
+            }
+        }
+    }
+
+    public TransitionResultEnvelope(
+        TransitionWorkerOutcome outcome,
+        List<SerializedTransitionPayload> outputPayloads,
+        TransitionAwaitSuspension awaitSuspension,
+        TransitionFailureEnvelope failure,
+        List<?> decodedOutputItems,
+        boolean terminalOutputPublished,
+        boolean terminalInputPassthrough,
+        Optional<PagedTransitionCompletion> pageCompletion) {
+        this(outcome, outputPayloads, awaitSuspension, failure, decodedOutputItems,
+            terminalOutputPublished, terminalInputPassthrough, pageCompletion, Optional.empty());
+    }
     public TransitionResultEnvelope(
         TransitionWorkerOutcome outcome,
         List<SerializedTransitionPayload> outputPayloads,
@@ -55,10 +103,20 @@ public record TransitionResultEnvelope(
         outputPayloads = outputPayloads == null ? List.of() : List.copyOf(outputPayloads);
         decodedOutputItems = decodedOutputItems == null ? null : List.copyOf(decodedOutputItems);
         pageCompletion = Optional.ofNullable(pageCompletion).orElseGet(Optional::empty);
+        pairedResult = Optional.ofNullable(pairedResult).orElseGet(Optional::empty);
+        if (pairedResult.isPresent()) {
+            boolean pairedFailure = pairedResult.orElseThrow().failure().isPresent();
+            if (awaitSuspension != null || failure != null || decodedOutputItems != null
+                || terminalOutputPublished || terminalInputPassthrough || pageCompletion.isPresent()
+                || (pairedFailure && (outcome != TransitionWorkerOutcome.FAILED || !outputPayloads.isEmpty()))
+                || (!pairedFailure && (outcome != TransitionWorkerOutcome.COMPLETED || outputPayloads.size() != 1))) {
+                throw new IllegalArgumentException("Invalid paired transition result");
+            }
+        }
         if (outcome == TransitionWorkerOutcome.WAITING_EXTERNAL && awaitSuspension == null) {
             throw new IllegalArgumentException("WAITING_EXTERNAL transition envelope requires awaitSuspension");
         }
-        if (outcome == TransitionWorkerOutcome.FAILED && failure == null) {
+        if (outcome == TransitionWorkerOutcome.FAILED && failure == null && pairedResult.isEmpty()) {
             throw new IllegalArgumentException("FAILED transition envelope requires failure");
         }
         if (outcome == TransitionWorkerOutcome.COMPLETED && !outputPayloads.isEmpty() && decodedOutputItems != null) {
@@ -151,7 +209,7 @@ public record TransitionResultEnvelope(
         }
         return new TransitionResultEnvelope(outcome, outputPayloads, awaitSuspension, failure,
             decodedOutputItems, terminalOutputPublished, terminalInputPassthrough,
-            Optional.of(Objects.requireNonNull(completion, "completion must not be null")));
+            Optional.of(Objects.requireNonNull(completion, "completion must not be null")), pairedResult);
     }
 
     /**
@@ -221,12 +279,26 @@ public record TransitionResultEnvelope(
             failure);
     }
 
+    static TransitionResultEnvelope pairedCompleted(NativeWorkerReleaseBinding.Attempt attempt,
+            SerializedTransitionPayload output) {
+        return new TransitionResultEnvelope(TransitionWorkerOutcome.COMPLETED, List.of(output), null, null, null,
+            false, false, Optional.empty(), Optional.of(new PairedResult(attempt, Optional.empty())));
+    }
+
+    static TransitionResultEnvelope pairedFailed(NativeWorkerReleaseBinding.Attempt attempt, PortableFailure failure) {
+        return new TransitionResultEnvelope(TransitionWorkerOutcome.FAILED, List.of(), null, null, null,
+            false, false, Optional.empty(), Optional.of(new PairedResult(attempt, Optional.of(failure))));
+    }
+
     /**
      * Converts this runtime-local result to its portable transport representation.
      *
      * @return portable transition result
      */
     public TransitionWireResult toWireResult() {
+        if (pairedResult.flatMap(PairedResult::failure).isPresent()) {
+            throw new IllegalStateException("A portable failure requires its paired result profile");
+        }
         if (decodedOutputItems != null) {
             throw new IllegalStateException(
                 "A transition result with decoded output items cannot cross a remote worker boundary");
@@ -268,6 +340,9 @@ public record TransitionResultEnvelope(
     public RuntimeException failureException() {
         if (outcome != TransitionWorkerOutcome.FAILED) {
             throw new IllegalStateException("Only FAILED transition results contain a runtime failure");
+        }
+        if (pairedResult.isPresent()) {
+            throw new IllegalStateException("A portable failure carries a coordinator outcome");
         }
         return TransitionFailureRuntimeAdapter.toException(failure);
     }
