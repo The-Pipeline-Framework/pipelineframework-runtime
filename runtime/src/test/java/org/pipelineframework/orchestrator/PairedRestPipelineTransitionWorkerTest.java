@@ -7,10 +7,12 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import io.smallrye.mutiny.Uni;
@@ -18,6 +20,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
@@ -31,6 +34,7 @@ import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Flow;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -39,10 +43,12 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.ArgumentMatchers;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope.PortableFailure;
+import org.pipelineframework.orchestrator.worker.PipelineWorkerCapability;
 
 class PairedRestPipelineTransitionWorkerTest {
     private static final String INPUT_TYPE = "InputValue";
@@ -73,6 +79,7 @@ class PairedRestPipelineTransitionWorkerTest {
         var rest = mock(PipelineOrchestratorConfig.RestWorkerConfig.class);
         when(worker.orchestratorConfig.workerRest()).thenReturn(rest);
         when(rest.path()).thenReturn(RestTransitionWorkerProtocol.EXECUTE_PATH);
+        when(rest.capabilitiesPath()).thenReturn(RestTransitionWorkerProtocol.CAPABILITIES_PATH);
         when(rest.requestTimeout()).thenReturn(WAIT);
         worker.secretResolver = mock(ControlPlaneSecretResolver.class);
         when(worker.secretResolver.resolve(fixture.target().sharedSecretRef())).thenReturn(SECRET);
@@ -83,6 +90,57 @@ class PairedRestPipelineTransitionWorkerTest {
         if (worker != null) {
             worker.close();
         }
+    }
+
+    @Test
+    void aStalledCapabilityResponseCancelsTheReadWithoutDispatching() {
+        when(worker.orchestratorConfig.workerRest().requestTimeout()).thenReturn(Duration.ofMillis(50));
+        var pending = new CompletableFuture<HttpResponse<String>>();
+        when(pairedClient.sendAsync(any(HttpRequest.class), ArgumentMatchers.<HttpResponse.BodyHandler<String>>any()))
+            .thenReturn(pending);
+
+        var failed = assertThrows(java.util.concurrent.ExecutionException.class, () -> worker.pairedCapabilities(fixture.binding())
+            .subscribeAsCompletionStage().get(WAIT.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS));
+        assertTrue(failed.getCause() instanceof TimeoutException);
+        assertTrue(pending.isCancelled());
+        verifyNoInteractions(store, legacyClient);
+    }
+
+    @Test
+    void acceptsCapabilitiesWithTheExactProjectionDigest() throws IOException {
+        var capability = capability();
+        respond(200, PipelineJson.mapper().writeValueAsString(capability), Optional.empty(),
+            Map.of(RestTransitionWorkerProtocol.PROJECTION_DIGEST_HEADER, List.of(attempt.projectionDigest())));
+
+        assertEquals(capability, worker.pairedCapabilities(fixture.binding()).await().atMost(WAIT));
+        verifyNoInteractions(store, legacyClient);
+    }
+
+    @Test
+    void rejectsAbsentDuplicateMalformedAndDifferentProjectionDigestsBeforeDispatch() throws IOException {
+        String body = PipelineJson.mapper().writeValueAsString(capability());
+        String digest = attempt.projectionDigest();
+        for (List<String> values : List.of(List.<String>of(), List.of(digest, digest), List.of("sha256:invalid"),
+                List.of("sha256:" + "0".repeat(64)))) {
+            var request = respond(200, body, Optional.empty(),
+                Map.of(RestTransitionWorkerProtocol.PROJECTION_DIGEST_HEADER, values));
+            assertThrows(TransitionWorkerFailureException.class, () -> worker.pairedCapabilities(fixture.binding())
+                .chain(() -> worker.executeTransition(attempt, OWNER, store)).await().atMost(WAIT));
+            assertEquals("GET", request.get().method());
+        }
+        verifyNoInteractions(store, legacyClient);
+    }
+
+    @Test
+    void aStalledExecuteResponseCancelsTheSendAndSettlesTheReservedIntentAsUnknown() {
+        when(worker.orchestratorConfig.workerRest().requestTimeout()).thenReturn(Duration.ofMillis(50));
+        var pending = new CompletableFuture<HttpResponse<String>>();
+        when(pairedClient.sendAsync(any(HttpRequest.class), ArgumentMatchers.<HttpResponse.BodyHandler<String>>any()))
+            .thenReturn(pending);
+
+        assertUnknown();
+
+        assertTrue(pending.isCancelled());
     }
 
     @Test
@@ -143,6 +201,23 @@ class PairedRestPipelineTransitionWorkerTest {
     }
 
     @Test
+    void oversizedPairedCommandDoesNotReserveOrSendButTheExactLimitCanReserve() throws IOException {
+        String payload = attempt.command().payload();
+        int baseLength = PipelineJson.mapper().writeValueAsBytes(attempt.command()).length;
+        String atLimit = payload + " ".repeat(16 * 1024 - baseLength);
+        assertEquals(16 * 1024, PipelineJson.mapper().writeValueAsBytes(attempt(atLimit).command()).length);
+
+        assertThrows(ExecutionAdmissionTooLargeException.class,
+            () -> worker.executeTransition(attempt(atLimit + " "), OWNER, store).await().atMost(WAIT));
+        verifyNoInteractions(store, pairedClient, legacyClient);
+
+        when(store.beginPairedDispatch(any())).thenReturn(Uni.createFrom().item(OptionalLong.empty()));
+        assertTrue(worker.executeTransition(attempt(atLimit), OWNER, store).await().atMost(WAIT).isEmpty());
+        verify(store).beginPairedDispatch(any());
+        verifyNoInteractions(pairedClient, legacyClient);
+    }
+
+    @Test
     void aDeclinedIntentDoesNotSendOrSettle() {
         when(store.beginPairedDispatch(any())).thenReturn(Uni.createFrom().item(OptionalLong.empty()));
         assertTrue(worker.executeTransition(attempt, OWNER, store).await().atMost(WAIT).isEmpty());
@@ -190,7 +265,7 @@ class PairedRestPipelineTransitionWorkerTest {
     }
 
     @Test
-    void anErrorStatusAfterSendIsOutcomeUnknown() {
+    void serviceUnavailableAfterSendSettlesAsUnknownWithoutResend() {
         respond(503, "private", Optional.empty());
         assertUnknown();
     }
@@ -209,7 +284,19 @@ class PairedRestPipelineTransitionWorkerTest {
             "execution:0:0", "trace", INPUT_TYPE, target.profiles().payloadEncoding(), payload));
     }
 
+    private PipelineWorkerCapability capability() {
+        var target = fixture.target();
+        return new PipelineWorkerCapability(PipelineWorkerCapability.PROTOCOL_VERSION, "rest", target.pipelineId(),
+            target.contractVersion(), target.releaseVersion(), target.runnableArtifactId(), target.runnableArtifactDigest(),
+            List.of(target.profiles().outerEncoding()), List.of("local", "rest"));
+    }
+
     private AtomicReference<HttpRequest> respond(int status, String body, Optional<URI> responseUri) {
+        return respond(status, body, responseUri, Map.of());
+    }
+
+    private AtomicReference<HttpRequest> respond(int status, String body, Optional<URI> responseUri,
+            Map<String, List<String>> headers) {
         var captured = new AtomicReference<HttpRequest>();
         when(pairedClient.sendAsync(any(HttpRequest.class), ArgumentMatchers.<HttpResponse.BodyHandler<String>>any()))
             .thenAnswer(invocation -> {
@@ -228,6 +315,7 @@ class PairedRestPipelineTransitionWorkerTest {
                     when(response.uri()).thenReturn(responseUri.orElseGet(request::uri));
                     when(response.previousResponse()).thenReturn(Optional.empty());
                     when(response.body()).thenReturn(received);
+                    when(response.headers()).thenReturn(HttpHeaders.of(headers, (name, value) -> true));
                     return response;
                 });
             });
@@ -238,8 +326,13 @@ class PairedRestPipelineTransitionWorkerTest {
         var failure = assertThrows(RemoteTransitionOutcomeUnknownException.class,
             () -> worker.executeTransition(attempt, OWNER, store).await().atMost(WAIT));
         assertFalse(failure.getCause().getMessage().contains("private"));
-        verify(pairedClient).sendAsync(any(HttpRequest.class), ArgumentMatchers.<HttpResponse.BodyHandler<String>>any());
-        verify(store).settlePairedUnknown(any());
+        var intent = ArgumentCaptor.forClass(PairedDispatchIntent.class);
+        var ordered = inOrder(store, pairedClient);
+        ordered.verify(store).beginPairedDispatch(intent.capture());
+        ordered.verify(pairedClient).sendAsync(any(HttpRequest.class),
+            ArgumentMatchers.<HttpResponse.BodyHandler<String>>any());
+        ordered.verify(store).settlePairedUnknown(same(intent.getValue()));
+        verifyNoMoreInteractions(store, pairedClient);
         verifyNoInteractions(legacyClient);
     }
 

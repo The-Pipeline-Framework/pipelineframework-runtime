@@ -111,10 +111,47 @@ value = binding.decode("InputValue", envelope)
 
 `tpf-polyglot-int32-json/1` encodes only the application value as a JSON object
 with a single required integer field, `value`. The REST worker command and result
-use `application/tpf-transition-envelope+json` as their outer encoding. A future
-worker host must select the inner encoding and expected type from its trusted,
-verified Release binding and pin them to the dispatch. This helper is available
-for future host integration and conformance tests.
+use `application/tpf-transition-envelope+json` as their outer encoding. The
+worker selects the inner encoding and expected type from its verified Release binding.
+
+## Opt in to a whole-bundle HTTPS worker
+
+Import `create_native_transition_worker` from `tpf_experimental_python_local.worker`
+in a deployment-owned entry point. Verify the pinned Release, runnable inventory
+and Compiled Truth before importing the generated application or authored handlers.
+Import the application, handlers and runtime from that prepared tree and keep it
+immutable during use. Use the exact verified projection bytes as `expected_projection`.
+
+```python
+with create_native_transition_worker(
+    bind=lambda runtime: create_application(runtime, handlers),
+    expected_projection=expected_projection,
+    tenant_id=tenant_id, pipeline_id=pipeline_id, contract_version=contract_version,
+    release_version=release_version, artifact_id=artifact_id, artifact_digest=artifact_digest,
+    profiles={
+        "outerEncoding": "application/tpf-transition-envelope+json",
+        "payloadEncoding": "tpf-polyglot-int32-json/1",
+        "executionProfile": "tpf-polyglot-unary-policy/1",
+        "resultProfile": "tpf-polyglot-failed-result/1",
+    },
+    shared_secret=shared_secret, certfile=certfile, keyfile=keyfile, address=(host, port),
+) as server:
+    server.serve_forever()
+```
+
+Supply the pins, PEM certificate and key files, and UTF-8 shared secret from
+deployment configuration. The worker accepts signed `GET /pipeline/worker/capabilities`
+and `POST /pipeline/worker/transitions/execute` over TLS. Business-step links stay LOCAL.
+Each admitted invocation runs on its own event-loop thread. A shared deployment
+observer must support calls from those threads.
+
+The host limits intake to 16 connections, 8 KiB of raw headers, 16 KiB of body and
+10 seconds for request intake. It returns HTTP 431 when the raw header section
+exceeds the limit. It allows two minutes of timestamp skew and retains
+up to 10,000 live nonces for the process lifetime. The coordinator retains durable
+dispatch and settlement authority. HTTP disconnects leave admitted business
+execution running. These endpoints are for experimental qualification. Deployment,
+restart and high-availability behaviour require separate evidence.
 
 ## Verify or remove
 
@@ -127,6 +164,8 @@ python -m venv /path/to/venv
 /path/to/venv/bin/python -m pip install --no-deps --force-reinstall /path/to/wheels/tpf_experimental_python_local-0.0.0-py3-none-any.whl
 /path/to/venv/bin/python -W error -m unittest discover -s tests -v
 ```
+
+The worker tests use `openssl` to generate disposable localhost TLS credentials.
 
 To remove the experiment, delete `experimental/python-local/` and
 `.github/workflows/experimental-python-local.yml` and remove the opt-in

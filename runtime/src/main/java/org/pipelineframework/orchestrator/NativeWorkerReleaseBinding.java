@@ -15,8 +15,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
+import jakarta.enterprise.inject.Instance;
 import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.deployment.release.CredentialResolver;
 import org.pipelineframework.deployment.release.ReleaseVerifier;
@@ -24,8 +26,11 @@ import org.pipelineframework.deployment.release.ResolverProfile;
 import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
 import org.pipelineframework.orchestrator.release.PipelineReleaseArtifactDescriptor;
 import org.pipelineframework.orchestrator.release.PipelineReleaseArtifactKind;
+import org.pipelineframework.orchestrator.release.PipelineReleaseDescriptor;
+import org.pipelineframework.orchestrator.release.PipelineReleaseRecord;
 import org.pipelineframework.orchestrator.release.ResolvedPipelineRelease;
 import org.pipelineframework.orchestrator.release.ResolvedPipelineReleaseArtifact;
+import org.pipelineframework.orchestrator.worker.PipelineWorkerCapability;
 import org.pipelineframework.serialization.PolyglotInt32JsonCodec;
 
 /** Deployment-owned preparation and attempt selection for the experimental native whole-bundle profile. */
@@ -44,17 +49,20 @@ public final class NativeWorkerReleaseBinding {
     private final Path projectionFile;
     private final byte[] projectionBytes;
     private final String projectionDigest;
+    private final PipelineReleaseDescriptor descriptor;
     private final PipelineReleaseArtifactDescriptor compiledTruth;
     private final String inputTypeId;
     private final String outputTypeId;
 
     private NativeWorkerReleaseBinding(Target target, NativeWorkerArchive archive, Path projectionFile,
-            byte[] projectionBytes, PipelineReleaseArtifactDescriptor compiledTruth, List<String> boundaries) {
+            byte[] projectionBytes, PipelineReleaseDescriptor descriptor, PipelineReleaseArtifactDescriptor compiledTruth,
+            List<String> boundaries) {
         this.target = target;
         this.archive = archive;
         this.projectionFile = projectionFile;
         this.projectionBytes = projectionBytes.clone();
         this.projectionDigest = NativeWorkerArchive.sha256(projectionBytes);
+        this.descriptor = descriptor;
         this.compiledTruth = compiledTruth;
         this.inputTypeId = boundaries.getFirst();
         this.outputTypeId = boundaries.getLast();
@@ -174,7 +182,7 @@ public final class NativeWorkerReleaseBinding {
                 .filter(artifact -> artifact.artifactId().equals(resolved.descriptor().compiledTruthArtifactId()))
                 .findFirst().orElseThrow();
             var archive = NativeWorkerArchive.materialize(runnable.file(), preparation.resolve("runnable"), target.language());
-            return new NativeWorkerReleaseBinding(target, archive, projection, bytes, truth, boundaries);
+            return new NativeWorkerReleaseBinding(target, archive, projection, bytes, resolved.descriptor(), truth, boundaries);
         } catch (IOException | RuntimeException failure) {
             try {
                 NativeWorkerArchive.deleteTree(preparation);
@@ -206,6 +214,78 @@ public final class NativeWorkerReleaseBinding {
         return projectionBytes.clone();
     }
 
+    /** An optional prepared binding supplied by the coordinator deployment. */
+    public static Optional<NativeWorkerReleaseBinding> configured(Instance<NativeWorkerReleaseBinding> bindings) {
+        if (bindings == null || bindings.isUnsatisfied()) {
+            return Optional.empty();
+        }
+        if (bindings.isAmbiguous()) {
+            throw new IllegalStateException("Hosted native execution requires one prepared deployment binding");
+        }
+        return Optional.of(bindings.get());
+    }
+
+    boolean matchesScope(PipelineReleaseRecord release) {
+        return target.tenantId().equals(release.tenantId()) && target.pipelineId().equals(release.pipelineId())
+            && target.releaseVersion().equals(release.releaseVersion());
+    }
+
+    AdmittedInput admitInput(PipelineReleaseRecord release, ExecutionInputShape shape,
+            SerializedTransitionPayload payload, boolean outputStreaming) {
+        if (!matchesScope(release) || !target.contractVersion().equals(release.contractVersion())
+            || !descriptor.equals(release.descriptor()) || !target.coordinatorContract().equals(release.contract())
+            || !compiledTruth.artifactId().equals(release.primaryArtifactId())
+            || !compiledTruth.digest().equals(release.primaryArtifactDigest())) {
+            throw new IllegalStateException("Registered Release differs from the prepared native worker binding");
+        }
+        if (shape != ExecutionInputShape.UNI || outputStreaming) {
+            throw new IllegalArgumentException("Hosted native execution requires unary input and output");
+        }
+        requireInputBinding(payload);
+        new PolyglotInt32JsonCodec().decode(payload.payload());
+        return new AdmittedInput(payload, target.descriptorDigest());
+    }
+
+    boolean acceptsCapabilities(PipelineWorkerCapability capability) {
+        return PipelineWorkerCapability.PROTOCOL_VERSION.equals(capability.protocolVersion())
+            && "rest".equals(capability.providerName()) && capability.workerProtocols().contains("rest")
+            && capability.payloadEncodings().contains(target.profiles().outerEncoding())
+            && target.pipelineId().equals(capability.pipelineId()) && target.contractVersion().equals(capability.contractVersion())
+            && target.releaseVersion().equals(capability.releaseVersion()) && target.runnableArtifactId().equals(capability.artifactId())
+            && target.runnableArtifactDigest().equals(capability.artifactDigest());
+    }
+
+    Target target() {
+        return target;
+    }
+
+    String projectionDigest() {
+        return projectionDigest;
+    }
+
+    /** Runtime-owned durable input. Hosted request bodies cannot deserialize this marker. */
+    public record AdmittedInput(SerializedTransitionPayload payload, String descriptorDigest) {
+        public AdmittedInput {
+            Objects.requireNonNull(payload, "payload");
+            requireDigest(descriptorDigest, "Release Descriptor digest");
+            if (!PolyglotInt32JsonCodec.ENCODING.equals(payload.payloadEncoding())) {
+                throw new IllegalArgumentException("Admitted native input requires the selected payload encoding");
+            }
+        }
+
+        public static Optional<AdmittedInput> fromSnapshot(Object input) {
+            return input instanceof ExecutionInputSnapshot snapshot && snapshot.payload() instanceof AdmittedInput paired
+                ? Optional.of(paired) : Optional.empty();
+        }
+    }
+
+    public Attempt pin(TransitionCommandEnvelope command, AdmittedInput input) {
+        if (!target.descriptorDigest().equals(input.descriptorDigest()) || !input.payload().equals(command.serializedPayload())) {
+            throw new IllegalStateException("Claimed native input does not match the admitted Release or payload");
+        }
+        return pin(command);
+    }
+
     /** Checks typed envelope metadata before reading its application payload and retains the admitted command. */
     public Attempt pin(TransitionCommandEnvelope command) {
         Objects.requireNonNull(command, "command");
@@ -224,11 +304,14 @@ public final class NativeWorkerReleaseBinding {
         if (!hasContextValue(command.executionId()) || !hasContextValue(command.traceId())) {
             throw new IllegalArgumentException("Native worker requires explicit executionId and traceId");
         }
-        if (!target.profiles().payloadEncoding().equals(command.payloadEncoding())
-            || !inputTypeId.equals(command.payloadTypeId())) {
-            throw new IllegalArgumentException("Transition command does not match the pinned native input binding");
-        }
+        requireInputBinding(command.serializedPayload());
         return new Attempt(target, command, compiledTruth, projectionDigest, inputTypeId, outputTypeId);
+    }
+
+    private void requireInputBinding(SerializedTransitionPayload payload) {
+        if (!target.profiles().payloadEncoding().equals(payload.payloadEncoding()) || !inputTypeId.equals(payload.payloadTypeId())) {
+            throw new IllegalArgumentException("Transition input does not match the pinned native input binding");
+        }
     }
 
     /** Retained dispatch expectation. The coordinator still owns active lease and settlement decisions. */
