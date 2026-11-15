@@ -236,17 +236,22 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
                 }
                 String reference = targetValue.substring("config:".length());
                 if (!resolved.containsKey(reference)) {
-                    String[] coordinate = reference.substring((PREFIX + "rest-credential.").length()).split("@", -1);
-                    if (coordinate.length != 2) {
-                        throw new IllegalArgumentException("Shared REST credential requires an ARN and version");
-                    }
-                    resolved.put(reference, resolve(secretRequest(coordinate[0], coordinate[1], "REST worker")));
+                    resolved.put(reference, resolve(restWorkerSecretRequest(reference)));
                 }
             }
             resolved.put(key, targetValue);
         }
         resolved.put("pipeline.orchestrator.resume-token-secret", resolve(request(context, "resume-token")));
         return List.of(new PinnedSecrets(resolved));
+    }
+
+    static GetSecretValueRequest restWorkerSecretRequest(String reference) {
+        int start = (PREFIX + "rest-credential.").length();
+        int separator = reference.lastIndexOf('@');
+        if (separator <= start) {
+            throw new IllegalArgumentException("Shared REST credential requires an ARN and version");
+        }
+        return secretRequest(reference.substring(start, separator), reference.substring(separator + 1), "REST worker");
     }
 
     private String readTargetProperties(ConfigSourceContext context) throws java.io.IOException {

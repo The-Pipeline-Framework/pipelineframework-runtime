@@ -1,4 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::LanguageExtensions
 Description: Shared AWS Durable coordination for independently deployed REST workers
 Parameters:
   CodeBucket: {Type: String}
@@ -22,6 +23,16 @@ Parameters:
   WorkerVersionArns: {Type: CommaDelimitedList, Default: ''}
   WorkerTargetKey: {Type: String, Default: ''}
   WorkerTargetVersion: {Type: String, Default: ''}
+  RetainedWorkerTargetGrantSlots:
+    Type: CommaDelimitedList
+    Default: '0'
+    AllowedPattern: '[0-9]+'
+    Description: Zero-based indices of retained routing objects, in order
+  RetainedWorkerTargetGrants:
+    Type: CommaDelimitedList
+    Default: ''
+    AllowedPattern: '^$|^tpf/rest-targets/[A-Za-z0-9._-]+[.]properties[|][^|]+$'
+    Description: Retained routing object key and exact version pairs separated by a vertical bar
   ReleaseArtifactBucket: {Type: String}
   SemanticDynamoResourceArns: {Type: CommaDelimitedList}
   ExecutionTable: {Type: String}
@@ -38,7 +49,28 @@ Parameters:
   ExecutionStateStreamArn: {Type: String}
 Conditions:
   HasWorkerTargets: !Not [!Equals [!Join ['', !Ref WorkerAliasArns], '']]
+  HasRetainedWorkerTargets: !Not [!Equals [!Join ['', !Ref RetainedWorkerTargetGrants], '']]
 Resources:
+  'Fn::ForEach::RetainedWorkerTargetReadPolicies':
+    - Slot
+    - !Ref RetainedWorkerTargetGrantSlots
+    - 'RetainedWorkerTargetReadPolicy${Slot}':
+        Type: AWS::IAM::Policy
+        Condition: HasRetainedWorkerTargets
+        Properties:
+          PolicyName: !Sub '${AWS::StackName}-retained-routing-${Slot}'
+          Roles: [!Ref CoordinationRole]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObjectVersion
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:s3:::${ReleaseArtifactBucket}/${ObjectKey}'
+                  - ObjectKey: !Select [0, !Split ['|', !Select [!Ref Slot, !Ref RetainedWorkerTargetGrants]]]
+                Condition:
+                  StringEquals:
+                    s3:VersionId: !Select [1, !Split ['|', !Select [!Ref Slot, !Ref RetainedWorkerTargetGrants]]]
   CallbackBindingTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Retain

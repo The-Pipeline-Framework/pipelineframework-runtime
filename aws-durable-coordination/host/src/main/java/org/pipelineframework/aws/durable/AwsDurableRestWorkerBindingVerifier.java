@@ -1,6 +1,5 @@
 package org.pipelineframework.aws.durable;
 
-import java.net.URI;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -10,6 +9,7 @@ import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.pipelineframework.orchestrator.RegisteredRestWorkerTargets;
 import org.pipelineframework.orchestrator.RestWorkerBindingVerifier;
 import org.pipelineframework.orchestrator.release.PipelineReleaseEntryBinding;
 import org.pipelineframework.orchestrator.release.PipelineReleaseRegistry;
@@ -79,14 +79,11 @@ public class AwsDurableRestWorkerBindingVerifier implements RestWorkerBindingVer
         if (!version.equals(alias.functionVersion())
             || alias.routingConfig() != null && !alias.routingConfig().additionalVersionWeights().isEmpty()
             || url.authType() != FunctionUrlAuthType.AWS_IAM
-            || url.functionUrl() == null || !origin(url.functionUrl()).equals(origin(dispatch.endpoint()))
+            || url.functionUrl() == null || !RegisteredRestWorkerTargets.normalizeOrigin(url.functionUrl(), false)
+                .equals(RegisteredRestWorkerTargets.normalizeOrigin(dispatch.endpoint(), false))
             || !version.equals(observed.version()) || !binding.codeDigest().equals(observed.codeSha256())
             || !expectedConfigurationSha256.equals(observed.configSha256())) {
             throw new IllegalStateException("REST worker alias, URL or numbered version differs from trusted publication");
         }
-    }
-
-    private static URI origin(String endpoint) {
-        return URI.create(endpoint).resolve("/");
     }
 }

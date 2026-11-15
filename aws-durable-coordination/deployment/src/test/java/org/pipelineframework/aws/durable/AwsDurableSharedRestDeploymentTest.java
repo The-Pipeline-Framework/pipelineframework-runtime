@@ -12,14 +12,16 @@ class AwsDurableSharedRestDeploymentTest {
     void sharedAndAttachmentOwnershipProduceIndependentInventories() throws Exception {
         JsonNode shared = template("aws-durable-shared-rest.yaml");
         JsonNode worker = template("aws-durable-pinned-worker.yaml");
-        assertFalse(shared.has("Transform"));
+        assertEquals("AWS::LanguageExtensions", shared.path("Transform").asText());
         assertFalse(worker.has("Transform"));
         var resources = shared.required("Resources");
         var attachment = worker.required("Resources");
+        int platformResources = resources.size() - 1; // The retained-grant loop adds policies only for retained publications.
+        assertTrue(resources.has("Fn::ForEach::RetainedWorkerTargetReadPolicies"));
         assertEquals(Map.of("platform", 58, "expense", 66, "both", 74, "retained", 82),
-            Map.of("platform", resources.size(), "expense", resources.size() + attachment.size(),
-                "both", resources.size() + 2 * attachment.size(),
-                "retained", resources.size() + 3 * attachment.size()));
+            Map.of("platform", platformResources, "expense", platformResources + attachment.size(),
+                "both", platformResources + 2 * attachment.size(),
+                "retained", platformResources + 3 * attachment.size()));
         assertFalse(resources.has("TransitionWorkerFunction"));
         assertFalse(resources.has("TransitionRequestQueue"));
         assertFalse(shared.path("Parameters").has("PipelineId"));

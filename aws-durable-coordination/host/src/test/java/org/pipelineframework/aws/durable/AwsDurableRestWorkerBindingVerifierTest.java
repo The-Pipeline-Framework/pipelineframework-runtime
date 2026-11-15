@@ -11,15 +11,17 @@ import org.pipelineframework.orchestrator.release.PipelineReleaseRegistry;
 import software.amazon.awssdk.services.lambda.LambdaClient;
 import software.amazon.awssdk.services.lambda.model.*;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
 class AwsDurableRestWorkerBindingVerifierTest {
+    private static final String FUNCTION = "arn:aws:lambda:us-east-1:123456789012:function:worker";
     private static final String ORIGIN = "https://worker.lambda-url.us-east-1.on.aws";
     private static final PipelineReleaseEntryBinding BINDING = new PipelineReleaseEntryBinding(
         "tenant", "pipeline", "contract", "release", "entry", "artifact", "artifact-digest", "aws",
-        "arn:aws:lambda:us-east-1:123456789012:function:worker:3", "code-digest", "deployment",
+        FUNCTION + ":3", "code-digest", "deployment",
         Optional.of(new PipelineReleaseDispatchBinding("rest", ORIGIN, "config:worker", "worker")), Optional.of("configuration"));
 
     @Test
@@ -63,14 +65,38 @@ class AwsDurableRestWorkerBindingVerifierTest {
         AwsDurableRestWorkerBindingVerifier.verifyPublication(lambda, "us-east-1", BINDING);
     }
 
-    @SuppressWarnings("unchecked")
     private static LambdaClient lambda(GetAliasResponse alias, String configDigest) {
         var client = mock(LambdaClient.class);
-        when(client.getAlias(any(Consumer.class))).thenReturn(alias);
-        when(client.getFunctionUrlConfig(any(Consumer.class))).thenReturn(GetFunctionUrlConfigResponse.builder()
-            .functionUrl(ORIGIN + "/").authType(FunctionUrlAuthType.AWS_IAM).build());
-        when(client.getFunctionConfiguration(any(Consumer.class))).thenReturn(GetFunctionConfigurationResponse.builder()
-            .version("3").codeSha256("code-digest").configSha256(configDigest).build());
+        when(client.getAlias(org.mockito.ArgumentMatchers.<Consumer<GetAliasRequest.Builder>>any()))
+            .thenAnswer(invocation -> {
+                var builder = GetAliasRequest.builder();
+                invocation.<Consumer<GetAliasRequest.Builder>>getArgument(0).accept(builder);
+                var request = builder.build();
+                assertEquals(FUNCTION, request.functionName());
+                assertEquals("release", request.name());
+                return alias;
+            });
+        when(client.getFunctionUrlConfig(org.mockito.ArgumentMatchers.<Consumer<GetFunctionUrlConfigRequest.Builder>>any()))
+            .thenAnswer(invocation -> {
+                var builder = GetFunctionUrlConfigRequest.builder();
+                invocation.<Consumer<GetFunctionUrlConfigRequest.Builder>>getArgument(0).accept(builder);
+                var request = builder.build();
+                assertEquals(FUNCTION, request.functionName());
+                assertEquals("release", request.qualifier());
+                return GetFunctionUrlConfigResponse.builder()
+                    .functionUrl("HTTPS://WORKER.lambda-url.us-east-1.on.aws:443/")
+                    .authType(FunctionUrlAuthType.AWS_IAM).build();
+            });
+        when(client.getFunctionConfiguration(org.mockito.ArgumentMatchers.<Consumer<GetFunctionConfigurationRequest.Builder>>any()))
+            .thenAnswer(invocation -> {
+                var builder = GetFunctionConfigurationRequest.builder();
+                invocation.<Consumer<GetFunctionConfigurationRequest.Builder>>getArgument(0).accept(builder);
+                var request = builder.build();
+                assertEquals(FUNCTION, request.functionName());
+                assertEquals("3", request.qualifier());
+                return GetFunctionConfigurationResponse.builder()
+                    .version("3").codeSha256("code-digest").configSha256(configDigest).build();
+            });
         return client;
     }
 }

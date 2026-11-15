@@ -297,7 +297,13 @@ For each `shared-secret-ref` use
 The trusted shared host resolves those exact generations using the explicit
 worker secret allowlist. Keep all retained worker target properties and IAM
 references when adding a new worker. Update the platform publication identity
-whenever its versioned configuration changes.
+whenever its versioned configuration changes. Keep each previously published
+routing object's `key|version` in `RetainedWorkerTargetGrants` while retained
+functions can cold-start with that configuration. Supply the corresponding
+zero-based indices in `RetainedWorkerTargetGrantSlots` (for example, `0,1`).
+Add the outgoing grant before switching the current key and version so there
+is no gap during the stack update. Remove the grant after its functions drain.
+Each grant authorizes one exact routing key and version.
 
 | Static inventory | Resource count |
 | --- | ---: |
@@ -306,9 +312,9 @@ whenever its versioned configuration changes.
 | Platform, expense A1 and parcel B | 74 |
 | Platform, expense A1 and A2, and parcel B | 82 |
 
-Both templates use explicit CloudFormation resources. These totals exclude the
-supplied tables, code and Release buckets, secret generations and previously
-retained platform versions. Live resource and IAM acceptance belong to the
+These totals exclude the supplied tables, code and Release buckets, secret
+generations and previously retained platform versions. The shared template
+adds one IAM policy per retained routing-object grant. Live resource and IAM acceptance belong to the
 deployment proof.
 
 

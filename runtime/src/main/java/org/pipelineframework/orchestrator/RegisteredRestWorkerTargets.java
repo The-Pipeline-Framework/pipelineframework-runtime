@@ -69,12 +69,17 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
     }
 
     private URI endpoint(String value) {
+        return normalizeOrigin(value, config.worker().allowLoopbackHttp());
+    }
+
+    /** Validates and canonicalizes a registered worker origin. */
+    public static URI normalizeOrigin(String value, boolean allowLoopbackHttp) {
         URI uri;
         try { uri = URI.create(value).normalize(); }
         catch (IllegalArgumentException failure) { throw new IllegalArgumentException("Invalid registered worker endpoint"); }
         boolean loopback = Set.of("127.0.0.1", "[::1]", "::1").contains(Optional.ofNullable(uri.getHost()).orElse(""));
         boolean secure = "https".equalsIgnoreCase(uri.getScheme());
-        boolean local = "http".equalsIgnoreCase(uri.getScheme()) && loopback && config.worker().allowLoopbackHttp();
+        boolean local = "http".equalsIgnoreCase(uri.getScheme()) && loopback && allowLoopbackHttp;
         if ((!secure && !local) || uri.getHost() == null || uri.getUserInfo() != null
             || uri.getQuery() != null || uri.getFragment() != null
             || (!uri.getPath().isEmpty() && !"/".equals(uri.getPath()))) {

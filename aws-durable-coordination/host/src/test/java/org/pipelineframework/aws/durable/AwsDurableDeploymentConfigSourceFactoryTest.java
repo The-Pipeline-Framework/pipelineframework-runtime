@@ -392,6 +392,16 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
     }
 
     @Test
+    void sharedWorkerSecretReferenceAllowsAtSignsInTheSecretName() {
+        String arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:worker@app-aB1234";
+        String version = "12345678-1234-1234-1234-123456789012";
+        var request = AwsDurableDeploymentConfigSourceFactory.restWorkerSecretRequest(
+            "tpf.aws.durable.rest-credential." + arn + "@" + version);
+        assertThat(request.secretId()).isEqualTo(arn);
+        assertThat(request.versionId()).isEqualTo(version);
+    }
+
+    @Test
     void sharedCoordinatorStartsWithoutApplicationCoordinatesOrWorkerSigningKey() {
         var values = validConfiguration();
         values.keySet().removeIf(key -> key.startsWith("pipeline.orchestrator.worker.sqs.")
