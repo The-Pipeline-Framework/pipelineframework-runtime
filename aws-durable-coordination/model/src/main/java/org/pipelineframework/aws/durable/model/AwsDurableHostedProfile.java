@@ -13,6 +13,8 @@ import org.pipelineframework.orchestrator.PipelineBundleStepDescriptor;
 public final class AwsDurableHostedProfile {
     public static final String PROFILE_ID = "aws-durable-java21-v1";
     public static final String IN_PROCESS_PROFILE_ID = "aws-durable-java21-in-process-v1";
+    public static final String REST_WORKER_PROFILE_ID = "aws-durable-java21-rest-worker-v1";
+    public static final String REST_WORKER_TRIGGER = "AWS_DURABLE_REST_WORKER";
     public enum TransitionPlacement { FUNCTION, IN_PROCESS }
     public static final String RETAINED_ISOLATION_MODE = "RETAINED_RELEASE_VERSIONS";
     /** Original coordinator and action code, with a separately augmented optional HTTP application. */
@@ -273,6 +275,29 @@ public final class AwsDurableHostedProfile {
     }
     /** Checks that the compiler emitted an explicit empty list. */
     private static boolean emptyList(Object value) { return value instanceof List<?> list && list.isEmpty(); }
+
+    /** Checks the application-side package for an independently provisioned shared host. */
+    public static void requireRestWorkerRelease(
+        org.pipelineframework.orchestrator.release.PipelineReleaseDescriptor release,
+        org.pipelineframework.orchestrator.release.PipelineContractDescriptor contract) {
+        var deployment = release.deployment();
+        require(release.schemaVersion() == 2 && deployment != null && REST_WORKER_PROFILE_ID.equals(deployment.profile()),
+            "Unsupported REST worker Release profile");
+        require(release.pipelineId().equals(contract.pipelineId()) && release.contractVersion().equals(contract.contractVersion()),
+            "Release/Contract identity mismatch");
+        require(!contract.canonicalTypes().isEmpty() && contract.capabilities().localTransitionExecution(),
+            "REST workers require compiled local execution and canonical types");
+        require(deployment.entries().size() == 1, "REST worker Release requires exactly one deployable entry");
+        var entry = deployment.entries().getFirst();
+        require(REST_WORKER_TRIGGER.equals(entry.trigger()) && HTTP_ENTRY.entryClass().equals(entry.entryClass())
+            && contract.module().equals(entry.runtimeId()), "REST worker Release requires the Lambda HTTP bridge entry");
+        var artifact = release.artifacts().stream().filter(item -> entry.artifactId().equals(item.artifactId()))
+            .findFirst().orElseThrow(() -> new UnsupportedOperationException("REST worker artifact is absent"));
+        require("lambda-zip".equals(artifact.kind())
+            && new HashSet<>(artifact.stepIds()).equals(contract.steps().stream()
+                .map(PipelineBundleStepDescriptor::authoredName).collect(java.util.stream.Collectors.toSet())),
+            "The REST worker Lambda ZIP must own the entire compiled pipeline");
+    }
 
     /** Resolves owner SAM code groups from immutable Release entries. */
     public static Map<CodeGroup, String> codeGroupArtifacts(

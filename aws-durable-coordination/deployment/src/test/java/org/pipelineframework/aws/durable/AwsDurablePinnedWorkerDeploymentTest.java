@@ -17,13 +17,20 @@ class AwsDurablePinnedWorkerDeploymentTest {
             var types = new HashSet<String>();
             resources.forEach(resource -> types.add(resource.required("Type").asText()));
             assertEquals(Set.of("AWS::Logs::LogGroup", "AWS::IAM::Role", "AWS::Lambda::Function",
-                "AWS::Lambda::Version", "AWS::Lambda::EventSourceMapping"), types);
-            assertEquals(5, resources.size());
-            assertEquals("aws-durable-pinned-worker", resources.path("WorkerFunction").path("Properties")
-                .path("Environment").path("Variables").path("QUARKUS_LAMBDA_HANDLER").asText());
-            assertEquals("WorkerVersion", resources.path("WorkerEvents").path("Properties")
-                .path("FunctionName").asText());
+                "AWS::Lambda::Version", "AWS::Lambda::Alias", "AWS::Lambda::Url", "AWS::Lambda::Permission"), types);
+            assertEquals(8, resources.size());
+            assertEquals("AWS_IAM", resources.path("WorkerUrl").path("Properties").path("AuthType").asText());
+            assertFalse(resources.path("WorkerAlias").path("Properties").has("RoutingConfig"));
+            assertEquals("ConfigurationDigest", resources.path("WorkerVersion").path("Properties")
+                .path("Description").asText());
             assertEquals("Retain", resources.path("WorkerVersion").path("DeletionPolicy").asText());
+            for (String name : Set.of("CoordinatorUrlPermission", "CoordinatorInvokePermission")) {
+                var permission = resources.path(name).path("Properties");
+                assertEquals("CoordinatorInvokerRoleArn", permission.path("Principal").asText());
+                assertEquals("WorkerAlias", permission.path("FunctionName").asText());
+            }
+            assertTrue(resources.path("CoordinatorInvokePermission").path("Properties")
+                .path("InvokedViaFunctionUrl").asBoolean());
             var actions = new HashSet<String>();
             resources.path("WorkerRole").path("Properties").path("Policies").get(0)
                 .path("PolicyDocument").path("Statement").forEach(statement -> {
@@ -31,8 +38,13 @@ class AwsDurablePinnedWorkerDeploymentTest {
                     if (action.isArray()) action.forEach(value -> actions.add(value.asText()));
                     else actions.add(action.asText());
                 });
-            assertEquals(Set.of("sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes",
-                "sqs:SendMessage", "secretsmanager:GetSecretValue", "logs:CreateLogStream", "logs:PutLogEvents"), actions);
+            assertEquals(Set.of("lambda:InvokeFunctionUrl", "lambda:InvokeFunction",
+                "secretsmanager:GetSecretValue", "logs:CreateLogStream", "logs:PutLogEvents"), actions);
+            var callbackPolicy = resources.path("WorkerRole").path("Properties").path("Policies").get(0)
+                .path("PolicyDocument").path("Statement").get(4);
+            assertEquals("CoordinatorLifecycleAliasArn", callbackPolicy.path("Resource").asText());
+            assertEquals("true", callbackPolicy.path("Condition").path("Bool")
+                .path("lambda:InvokedViaFunctionUrl").asText());
         }
     }
 }

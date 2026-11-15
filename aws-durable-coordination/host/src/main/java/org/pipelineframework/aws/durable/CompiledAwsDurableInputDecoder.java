@@ -1,6 +1,7 @@
 package org.pipelineframework.aws.durable;
 
 import java.util.Map;
+import java.nio.charset.StandardCharsets;
 
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -17,8 +18,15 @@ import org.pipelineframework.orchestrator.release.PipelineContractDescriptorLoad
 public class CompiledAwsDurableInputDecoder implements AwsDurableInputDecoder {
     @Inject PipelineContractDescriptorLoader contracts;
     @Inject TransitionPayloadCodec codec;
+    @Inject org.pipelineframework.orchestrator.PipelineOrchestratorConfig config;
     /** Decodes a typed payload only when it matches the compiled pipeline entry contract. */
     @Override public Object decode(String inputJson) {
+        if (config != null && config.controlPlane().payloadMaterialization()
+            == org.pipelineframework.orchestrator.PipelineOrchestratorConfig.ControlPlaneConfig.PayloadMaterialization.SERIALIZED) {
+            return org.pipelineframework.orchestrator.TypedDurablePayload.fromSerializedBytes(
+                inputJson.getBytes(StandardCharsets.UTF_8)).orElseThrow(() ->
+                    new IllegalArgumentException("Input is not a canonical TPF payload"));
+        }
         var contract = contracts.load().orElseThrow(() -> new IllegalStateException("Compiled input Contract is unavailable"));
         String entryType = entryType(contract);
         try {

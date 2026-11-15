@@ -392,13 +392,37 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
     }
 
     @Test
+    void sharedCoordinatorStartsWithoutApplicationCoordinatesOrWorkerSigningKey() {
+        var values = validConfiguration();
+        values.keySet().removeIf(key -> key.startsWith("pipeline.orchestrator.worker.sqs.")
+            || key.equals("pipeline.orchestrator.pipeline-id") || key.equals("pipeline.orchestrator.release-version")
+            || key.startsWith("tpf.aws.durable.worker-secret-"));
+        values.put("tpf.aws.durable.shared-rest-coordination", "true");
+        values.put("tpf.aws.durable.rest-signing-region", "us-east-1");
+        values.put("pipeline.orchestrator.control-plane.enabled", "true");
+        values.put("pipeline.orchestrator.control-plane.require-remote-worker", "true");
+        values.put("pipeline.orchestrator.control-plane.payload-materialization", "SERIALIZED");
+        values.put("pipeline.orchestrator.worker.targeting-mode", "registered-rest");
+
+        var requests = new ArrayList<GetSecretValueRequest>();
+        var config = build(values, requests);
+        assertThat(requests).hasSize(1);
+        assertThat(requests.getFirst().secretId()).isEqualTo(values.get("tpf.aws.durable.resume-token-secret-arn"));
+        assertThat(config.getOptionalValue("pipeline.orchestrator.worker.sqs.shared-secret", String.class)).isEmpty();
+    }
+
+    @Test
     void independentWorkerResolvesOnlyItsPinnedCredentialWithoutSemanticTables() {
         var values = validConfiguration();
         values.keySet().removeIf(key -> key.startsWith("pipeline.orchestrator.dynamo.")
             || key.startsWith("pipeline.orchestrator.releases.")
             || key.contains("resume-token") || key.equals("tpf.aws.durable.binding-table")
             || key.equals("pipeline.orchestrator.state-provider"));
-        values.put("quarkus.lambda.handler", "aws-durable-pinned-worker");
+        values.put("tpf.aws.durable.pinned-rest-worker", "true");
+        values.put("tpf.aws.durable.rest-signing-region", "us-east-1");
+        values.put("pipeline.orchestrator.worker.rest.server-enabled", "true");
+        values.put("pipeline.orchestrator.worker.artifact-id", "artifact");
+        values.put("pipeline.orchestrator.worker.artifact-digest", "digest");
         values.put("pipeline.orchestrator.state-provider", "memory");
         values.put("pipeline.orchestrator.releases.registry.provider", "memory");
         values.put("pipeline.orchestrator.releases.storage.provider", "local");
@@ -409,7 +433,7 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
         assertThat(requests).hasSize(1);
         assertThat(requests.getFirst().secretId()).isEqualTo(values.get("tpf.aws.durable.worker-secret-arn"));
         assertThat(config.getOptionalValue("pipeline.orchestrator.resume-token-secret", String.class)).isEmpty();
-        assertThat(config.getValue("pipeline.orchestrator.worker.sqs.shared-secret", String.class)).isEqualTo(SECRET);
+        assertThat(config.getValue("tpf.aws.durable.worker-signing-key", String.class)).isEqualTo(SECRET);
         requests.clear();
         values.put("tpf.aws.durable.resume-token-secret-arn", "forbidden");
         assertThatThrownBy(() -> build(values, requests)).isInstanceOf(IllegalArgumentException.class);

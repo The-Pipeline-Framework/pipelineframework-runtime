@@ -9,7 +9,8 @@ public record PipelineReleaseEntryBinding(
     String tenantId, String pipelineId, String contractVersion, String releaseVersion, String entryId,
     String artifactId, String artifactDigest, String provider, String resourceId, String codeDigest,
     String deploymentOperationId,
-    @JsonInclude(JsonInclude.Include.NON_ABSENT) Optional<PipelineReleaseDispatchBinding> dispatchBinding
+    @JsonInclude(JsonInclude.Include.NON_ABSENT) Optional<PipelineReleaseDispatchBinding> dispatchBinding,
+    @JsonInclude(JsonInclude.Include.NON_ABSENT) Optional<String> configurationDigest
 ) {
     /** Retains the original observation constructor and wire shape for entries without worker dispatch. */
     public PipelineReleaseEntryBinding(String tenantId, String pipelineId, String contractVersion, String releaseVersion,
@@ -19,7 +20,18 @@ public record PipelineReleaseEntryBinding(
             resourceId, codeDigest, deploymentOperationId, Optional.empty());
     }
 
+    public PipelineReleaseEntryBinding(String tenantId, String pipelineId, String contractVersion, String releaseVersion,
+        String entryId, String artifactId, String artifactDigest, String provider, String resourceId, String codeDigest,
+        String deploymentOperationId, Optional<PipelineReleaseDispatchBinding> dispatchBinding) {
+        this(tenantId, pipelineId, contractVersion, releaseVersion, entryId, artifactId, artifactDigest, provider,
+            resourceId, codeDigest, deploymentOperationId, dispatchBinding, Optional.empty());
+    }
+
     public PipelineReleaseEntryBinding {
+        configurationDigest = java.util.Objects.requireNonNullElse(configurationDigest, Optional.empty());
+        if (configurationDigest.filter(value -> value.isBlank() || !value.equals(value.trim())).isPresent()) {
+            throw new IllegalArgumentException("Configuration digest must be canonical");
+        }
         dispatchBinding = java.util.Objects.requireNonNullElse(dispatchBinding, Optional.empty());
         for (String field : List.of(tenantId, pipelineId, contractVersion, releaseVersion, entryId,
             artifactId, artifactDigest, provider, resourceId, codeDigest, deploymentOperationId)) {
