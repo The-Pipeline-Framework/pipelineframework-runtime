@@ -48,7 +48,7 @@ class AwsDurableRestEndpointFilterTest {
         var uri = mock(UriInfo.class);
         when(request.getMethod()).thenReturn(method);
         when(request.getUriInfo()).thenReturn(uri);
-        when(uri.getPath()).thenReturn(path.substring(1));
+        when(uri.getRequestUri()).thenReturn(java.net.URI.create("https://localhost" + path));
         return request;
     }
 }

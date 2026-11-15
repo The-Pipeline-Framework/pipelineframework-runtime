@@ -40,7 +40,7 @@ public class AwsDurableRestEndpointFilter implements ContainerRequestFilter {
         if (!worker && !lifecycle) {
             return;
         }
-        String path = "/" + request.getUriInfo().getPath();
+        String path = request.getUriInfo().getRequestUri().getRawPath();
         String method = request.getMethod();
         boolean workerRoute = "POST".equals(method) && WORKER_POSTS.contains(path)
             || "GET".equals(method) && RestTransitionWorkerProtocol.CAPABILITIES_PATH.equals(path);
