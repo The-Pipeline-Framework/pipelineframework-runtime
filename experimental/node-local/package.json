@@ -16,6 +16,7 @@
   "files": [
     "index.d.mts",
     "index.mjs",
+    "payload-binding.mjs",
     "projection.mjs",
     "records.mjs"
   ],
