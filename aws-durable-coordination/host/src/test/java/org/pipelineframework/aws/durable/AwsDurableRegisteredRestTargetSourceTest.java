@@ -122,6 +122,26 @@ class AwsDurableRegisteredRestTargetSourceTest {
         }
     }
 
+    @Test
+    void abortsOversizedRoutingReadBeforeClosingTheStream() throws Exception {
+        var s3 = mock(S3Client.class);
+        var source = new AwsDurableRegisteredRestTargetSource(s3, null, System::nanoTime);
+        source.bucket = Optional.of("routing-bucket");
+        source.key = Optional.of("tpf/rest-targets/regional.properties");
+        source.parameterArnPrefix = Optional.of(PREFIX);
+        @SuppressWarnings("unchecked")
+        ResponseInputStream<GetObjectResponse> stream = mock(ResponseInputStream.class);
+        when(stream.response()).thenReturn(GetObjectResponse.builder().versionId("oversized").build());
+        when(stream.readNBytes(262145)).thenReturn(new byte[262145]);
+        when(s3.getObject(any(GetObjectRequest.class))).thenReturn(stream);
+
+        assertThrows(IllegalStateException.class, () -> source.snapshot().await().atMost(Duration.ofSeconds(5)));
+        var order = inOrder(stream);
+        order.verify(stream).readNBytes(262145);
+        order.verify(stream).abort();
+        order.verify(stream).close();
+    }
+
     private static ResponseInputStream<GetObjectResponse> object(byte[] data, String digest) {
         var response = GetObjectResponse.builder().versionId("S3Version").metadata(Map.of("digest", digest)).build();
         return new ResponseInputStream<>(response, AbortableInputStream.create(new ByteArrayInputStream(data)));

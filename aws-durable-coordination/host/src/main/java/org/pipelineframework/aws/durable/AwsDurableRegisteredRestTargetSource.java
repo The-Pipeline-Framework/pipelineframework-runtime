@@ -121,8 +121,12 @@ public class AwsDurableRegisteredRestTargetSource implements RegisteredRestWorke
             .key(AwsDurableDeploymentConfigSourceFactory.routingKey(key.orElseThrow())).build();
         try (var stream = s3.getObject(coordinate)) {
             var response = stream.response();
-            return parse(stream.readNBytes(MAX_BYTES + 1), response.versionId(), response.metadata().get("digest"),
-                parameterArnPrefix.orElseThrow());
+            byte[] bytes = stream.readNBytes(MAX_BYTES + 1);
+            if (bytes.length > MAX_BYTES) {
+                stream.abort();
+                throw new IllegalArgumentException("Shared REST routing properties exceed 256 KiB");
+            }
+            return parse(bytes, response.versionId(), response.metadata().get("digest"), parameterArnPrefix.orElseThrow());
         }
     }
 

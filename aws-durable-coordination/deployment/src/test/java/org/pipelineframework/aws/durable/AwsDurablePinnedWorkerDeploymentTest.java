@@ -1,5 +1,6 @@
 package org.pipelineframework.aws.durable;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import java.util.HashSet;
@@ -31,20 +32,31 @@ class AwsDurablePinnedWorkerDeploymentTest {
             }
             assertTrue(resources.path("CoordinatorInvokePermission").path("Properties")
                 .path("InvokedViaFunctionUrl").asBoolean());
+            var statements = resources.path("WorkerRole").path("Properties").path("Policies").get(0)
+                .path("PolicyDocument").required("Statement");
+            var credential = statements.required(0);
+            assertEquals("WorkerUsesParameter", credential.required(0).asText());
+            assertCredential(credential.required(1), "ssm:GetParameter", "WorkerParameterArn");
+            assertCredential(credential.required(2), "secretsmanager:GetSecretValue", "WorkerSecretArn");
+
             var actions = new HashSet<String>();
-            resources.path("WorkerRole").path("Properties").path("Policies").get(0)
-                .path("PolicyDocument").path("Statement").forEach(statement -> {
-                    var action = statement.required("Action");
-                    if (action.isArray()) action.forEach(value -> actions.add(value.asText()));
-                    else actions.add(action.asText());
-                });
+            for (int i = 1; i < statements.size(); i++) {
+                var action = statements.required(i).required("Action");
+                if (action.isArray()) action.forEach(value -> actions.add(value.asText()));
+                else actions.add(action.asText());
+            }
             assertEquals(Set.of("lambda:InvokeFunctionUrl", "lambda:InvokeFunction",
-                "secretsmanager:GetSecretValue", "logs:CreateLogStream", "logs:PutLogEvents"), actions);
-            var callbackPolicy = resources.path("WorkerRole").path("Properties").path("Policies").get(0)
-                .path("PolicyDocument").path("Statement").get(4);
+                "logs:CreateLogStream", "logs:PutLogEvents"), actions);
+            var callbackPolicy = statements.get(4);
             assertEquals("CoordinatorLifecycleAliasArn", callbackPolicy.path("Resource").asText());
             assertEquals("true", callbackPolicy.path("Condition").path("Bool")
                 .path("lambda:InvokedViaFunctionUrl").asText());
         }
+    }
+
+    private static void assertCredential(JsonNode statement, String action, String resource) {
+        assertEquals("Allow", statement.required("Effect").asText());
+        assertEquals(action, statement.required("Action").asText());
+        assertEquals(resource, statement.required("Resource").asText());
     }
 }
