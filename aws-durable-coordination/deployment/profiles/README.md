@@ -305,6 +305,32 @@ Add the outgoing grant before switching the current key and version so there
 is no gap during the stack update. Remove the grant after its functions drain.
 Each grant authorizes one exact routing key and version.
 
+### Refreshable routing on an installed Coordinator
+
+For independently published worker attachments, set `RefreshableWorkerTargets`
+to `true` and supply one stable `WorkerTargetKey` in a versioned Release bucket.
+Supply dedicated `WorkerFunctionNamePrefix` and `WorkerSigningSecretNamePrefix`
+namespaces managed by the same deployment authority. Leave `WorkerTargetVersion`
+and the per-worker lists empty. This selects refreshable routing at platform
+installation. Later attachments update the routing object and their own
+alias-scoped permissions without publishing Coordinator function versions.
+
+Every version at the stable key contains a complete worker-target properties
+snapshot with its SHA-256 in S3 object metadata `digest`. Publish the next
+version conditionally against the observed ETag and retain the history needed
+to reconcile publication attempts. The host validates the object version,
+digest, size, and credential coordinates and refreshes on demand after five
+seconds. An invalid or unavailable refresh prevents routing. Release and
+execution pins, alias checks and signed worker capability checks still apply.
+Scale-to-zero workers with elapsed heartbeat timestamps must pass a live
+capability check before dispatch. An authenticated typed Await callback uses the
+exact pinned worker credential even after the worker has been idle.
+
+The numbered Action Lambda supports the IAM-authorized
+`CHECK_REGISTERED_WORKER` action. It validates the exact tenant, pipeline,
+contract, Release, entry and binding operation before reporting readiness.
+Wait for it to report ready before admitting traffic to the new attachment.
+
 | Static inventory | Resource count |
 | --- | ---: |
 | Shared platform | 58 |

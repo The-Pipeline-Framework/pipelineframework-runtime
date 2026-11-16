@@ -95,13 +95,17 @@ public class HostedWorkerLifecycleAdminResource {
             request.artifactId(),
             request.artifactDigest());
         if (RegisteredRestWorkerTargets.enabled(orchestratorConfig)) {
-            try {
-                registeredTargets.validateRegistration(registration);
-            } catch (IllegalArgumentException failure) {
-                return Uni.createFrom().item(Response.status(Response.Status.CONFLICT)
-                    .entity("Worker registration conflicts with server-owned target binding").build());
-            }
+            return registeredTargets.verifyRegistration(registration)
+                .replaceWith(Optional.<Response>empty())
+                .onFailure(IllegalArgumentException.class).recoverWithItem(failure -> Optional.of(
+                    Response.status(Response.Status.CONFLICT)
+                        .entity("Worker registration conflicts with server-owned target binding").build()))
+                .chain(conflict -> conflict.isPresent() ? Uni.createFrom().item(conflict.get()) : storeRegistration(registration));
         }
+        return storeRegistration(registration);
+    }
+
+    private Uni<Response> storeRegistration(PipelineWorkerRegistration registration) {
         return registry().register(registration, System.currentTimeMillis())
             .onItem().transform(record -> Response.ok(record).build())
             .onFailure(IllegalArgumentException.class).recoverWithItem(failure ->

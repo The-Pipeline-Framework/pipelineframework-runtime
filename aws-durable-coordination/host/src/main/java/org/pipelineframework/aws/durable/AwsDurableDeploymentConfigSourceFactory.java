@@ -219,6 +219,15 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             "worker-secret-arn", "worker-secret-version", "worker-parameter-arn", "worker-parameter-version",
             "resume-token-parameter-arn", "resume-token-parameter-version");
         var resolved = new java.util.HashMap<>(settings);
+        if (value(context, PREFIX + "refreshable-rest-targets").isPresent()) {
+            requireEqual(context, PREFIX + "refreshable-rest-targets", "true");
+            requireEqual(context, PREFIX + "shared-rest-coordination", "true");
+            rejectConfigured(context, "rest-target-version");
+            routingKey(required(context, PREFIX + "rest-target-key"));
+            required(context, PREFIX + "rest-worker-secret-arn-prefix");
+            resolved.put("pipeline.orchestrator.resume-token-secret", resolve(request(context, "resume-token")));
+            return List.of(new PinnedSecrets(resolved));
+        }
         var targetProperties = new java.util.Properties();
         try {
             targetProperties.load(new java.io.StringReader(readTargetProperties(context)));
@@ -254,12 +263,19 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         return secretRequest(reference.substring(start, separator), reference.substring(separator + 1), "REST worker");
     }
 
+    static String routingKey(String key) {
+        if (!key.matches("tpf/rest-targets/[A-Za-z0-9._-]+[.]properties")) {
+            throw new IllegalArgumentException("Invalid shared REST routing object key");
+        }
+        return key;
+    }
+
     private String readTargetProperties(ConfigSourceContext context) throws java.io.IOException {
         var key = value(context, PREFIX + "rest-target-key");
         var version = value(context, PREFIX + "rest-target-version");
         if (key.isEmpty() && version.isEmpty()) return "";
-        String objectKey = key.filter(name -> name.matches("tpf/rest-targets/[A-Za-z0-9._-]+[.]properties"))
-            .orElseThrow(() -> new IllegalArgumentException("Invalid shared REST routing object key"));
+        String objectKey = routingKey(key.orElseThrow(() ->
+            new IllegalArgumentException("Invalid shared REST routing object key")));
         String versionId = version.filter(id -> !id.equals("null"))
             .orElseThrow(() -> new IllegalArgumentException("An immutable REST routing object version is required"));
         String bucket = required(context, "pipeline.orchestrator.releases.storage.s3.bucket");
@@ -448,6 +464,10 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             // Provider errors can contain sensitive request/context values; do not attach or log them.
             throw new IllegalStateException("Pinned deployment signing key could not be loaded");
         }
+        return verifiedSecret(request, response);
+    }
+
+    static String verifiedSecret(GetSecretValueRequest request, GetSecretValueResponse response) {
         if (response == null || !request.secretId().equals(response.arn())
             || !request.versionId().equals(response.versionId())
             || response.secretString() == null || response.secretString().length() < 32) {
