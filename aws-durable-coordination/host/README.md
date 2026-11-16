@@ -63,3 +63,23 @@ locator. An execution can have a locator without registering an Await callback.
 `TYPED_RESULT` requires one successful terminal item and a current locator.
 It returns a `SerializedTransitionPayload` through the existing transition
 codec. The existing raw `RESULT` action still serves native driver replay.
+
+## Standalone transition Lambda
+
+Select `aws-durable-transition-worker` with `QUARKUS_LAMBDA_HANDLER` and opt in
+with `tpf.aws.durable.transition-worker-only=true`. Configure
+`pipeline.orchestrator.mode=SYNC` and
+`pipeline.orchestrator.process-loops-disabled=true`, the compiled pipeline ID
+and release version, the SQS Region and response queue URL, and
+`pipeline.orchestrator.worker.sqs.shared-secret-ref` with a worker-local reference.
+The packaged contract supplies the contract version. Configure the normal
+payload allowlist for application classes when needed.
+
+A Lambda event source mapping supplies requests. Use
+`ReportBatchItemFailures` so the mapping retries failed records. The worker
+runs the existing signed transition action and publishes its result to the
+fixed response queue. The coordinator handles execution claims and commits.
+A plain typed worker needs queue access and its signing material. Keep
+coordinator settings, resume signing keys, and retained Lambda forwarding
+configuration on the coordinator side. Providers used by application steps
+retain their own resource and permission requirements.
