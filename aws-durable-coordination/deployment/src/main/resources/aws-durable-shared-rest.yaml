@@ -16,8 +16,10 @@ Parameters:
   DurableAlias: {Type: String, Default: platform}
   DurableExecutionTimeoutSeconds: {Type: Number, Default: 86400}
   DurableRetentionDays: {Type: Number, Default: 30}
-  ResumeTokenSecretArn: {Type: String}
-  ResumeTokenSecretVersion: {Type: String}
+  ResumeTokenSecretArn: {Type: String, Default: ''}
+  ResumeTokenSecretVersion: {Type: String, Default: ''}
+  ResumeTokenParameterArn: {Type: String, Default: ''}
+  ResumeTokenParameterVersion: {Type: String, Default: '', AllowedPattern: '^$|^[1-9][0-9]*$'}
   WorkerSigningSecretArns: {Type: CommaDelimitedList, Default: ''}
   WorkerAliasArns: {Type: CommaDelimitedList, Default: ''}
   WorkerVersionArns: {Type: CommaDelimitedList, Default: ''}
@@ -25,7 +27,7 @@ Parameters:
   WorkerTargetVersion: {Type: String, Default: ''}
   RefreshableWorkerTargets: {Type: String, Default: 'false', AllowedValues: ['true', 'false']}
   WorkerFunctionNamePrefix: {Type: String, Default: '', AllowedPattern: '^$|^[A-Za-z0-9_-]+-$'}
-  WorkerSigningSecretNamePrefix: {Type: String, Default: '', AllowedPattern: '^$|^tpf/worker-signing/[A-Za-z0-9_-]+/$'}
+  WorkerSigningParameterNamePrefix: {Type: String, Default: '', AllowedPattern: '^$|^tpf/worker-signing/[A-Za-z0-9_-]+/$'}
   RetainedWorkerTargetGrantSlots:
     Type: CommaDelimitedList
     Default: '0'
@@ -58,10 +60,21 @@ Rules:
         AssertDescription: Refreshable routing needs a stable object key
       - Assert: !Not [!Equals [!Ref WorkerFunctionNamePrefix, '']]
         AssertDescription: Refreshable routing needs a dedicated worker function namespace
-      - Assert: !Not [!Equals [!Ref WorkerSigningSecretNamePrefix, '']]
+      - Assert: !Not [!Equals [!Ref WorkerSigningParameterNamePrefix, '']]
         AssertDescription: Refreshable routing needs a dedicated credential namespace
       - Assert: !Equals [!Ref WorkerTargetVersion, '']
         AssertDescription: Refreshable routing uses the versioned head at the configured key
+      - Assert: !And [!Not [!Equals [!Ref ResumeTokenParameterArn, '']], !Not [!Equals [!Ref ResumeTokenParameterVersion, '']]]
+        AssertDescription: Refreshable routing needs a version-pinned resume-token parameter
+      - Assert: !And [!Equals [!Ref ResumeTokenSecretArn, ''], !Equals [!Ref ResumeTokenSecretVersion, '']]
+        AssertDescription: Refreshable routing uses Parameter Store for signing
+  StaticRoutingRequiresResumeSecret:
+    RuleCondition: !Equals [!Ref RefreshableWorkerTargets, 'false']
+    Assertions:
+      - Assert: !And [!Not [!Equals [!Ref ResumeTokenSecretArn, '']], !Not [!Equals [!Ref ResumeTokenSecretVersion, '']]]
+        AssertDescription: Static routing needs a version-pinned resume-token secret
+      - Assert: !And [!Equals [!Ref ResumeTokenParameterArn, ''], !Equals [!Ref ResumeTokenParameterVersion, '']]
+        AssertDescription: Static routing uses the existing Secrets Manager signing configuration
 Conditions:
   RefreshableTargets: !Equals [!Ref RefreshableWorkerTargets, 'true']
   HasWorkerTargets: !And [!Not [!Condition RefreshableTargets], !Not [!Equals [!Join ['', !Ref WorkerAliasArns], '']]]
@@ -209,9 +222,10 @@ Resources:
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*:log-stream:*'
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref ResumeTokenSecretArn
+              - !If
+                - RefreshableTargets
+                - {Effect: Allow, Action: 'ssm:GetParameter', Resource: !Ref ResumeTokenParameterArn}
+                - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref ResumeTokenSecretArn}
               - !If
                 - HasWorkerTargets
                 - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref WorkerSigningSecretArns}
@@ -219,8 +233,8 @@ Resources:
               - !If
                 - RefreshableTargets
                 - Effect: Allow
-                  Action: secretsmanager:GetSecretValue
-                  Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${WorkerSigningSecretNamePrefix}*'
+                  Action: ssm:GetParameter
+                  Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}*'
                 - !Ref 'AWS::NoValue'
               - !If
                 - RefreshableTargets
@@ -393,12 +407,14 @@ Resources:
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
           TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
           TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
-          TPF_AWS_DURABLE_REST_WORKER_SECRET_ARN_PREFIX: !If
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
             - RefreshableTargets
-            - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${WorkerSigningSecretNamePrefix}'
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
             - !Ref 'AWS::NoValue'
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -445,12 +461,14 @@ Resources:
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
           TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
           TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
-          TPF_AWS_DURABLE_REST_WORKER_SECRET_ARN_PREFIX: !If
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
             - RefreshableTargets
-            - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${WorkerSigningSecretNamePrefix}'
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
             - !Ref 'AWS::NoValue'
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -497,12 +515,14 @@ Resources:
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
           TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
           TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
-          TPF_AWS_DURABLE_REST_WORKER_SECRET_ARN_PREFIX: !If
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
             - RefreshableTargets
-            - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${WorkerSigningSecretNamePrefix}'
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
             - !Ref 'AWS::NoValue'
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -549,12 +569,14 @@ Resources:
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
           TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
           TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
-          TPF_AWS_DURABLE_REST_WORKER_SECRET_ARN_PREFIX: !If
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
             - RefreshableTargets
-            - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${WorkerSigningSecretNamePrefix}'
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
             - !Ref 'AWS::NoValue'
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -601,12 +623,14 @@ Resources:
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
           TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
           TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
-          TPF_AWS_DURABLE_REST_WORKER_SECRET_ARN_PREFIX: !If
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
             - RefreshableTargets
-            - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${WorkerSigningSecretNamePrefix}'
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
             - !Ref 'AWS::NoValue'
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -653,12 +677,14 @@ Resources:
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
           TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
           TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
-          TPF_AWS_DURABLE_REST_WORKER_SECRET_ARN_PREFIX: !If
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
             - RefreshableTargets
-            - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${WorkerSigningSecretNamePrefix}'
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
             - !Ref 'AWS::NoValue'
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -705,12 +731,14 @@ Resources:
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
           TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
           TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
-          TPF_AWS_DURABLE_REST_WORKER_SECRET_ARN_PREFIX: !If
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
             - RefreshableTargets
-            - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${WorkerSigningSecretNamePrefix}'
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
             - !Ref 'AWS::NoValue'
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -757,12 +785,14 @@ Resources:
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
           TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
           TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
-          TPF_AWS_DURABLE_REST_WORKER_SECRET_ARN_PREFIX: !If
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
             - RefreshableTargets
-            - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${WorkerSigningSecretNamePrefix}'
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
             - !Ref 'AWS::NoValue'
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable

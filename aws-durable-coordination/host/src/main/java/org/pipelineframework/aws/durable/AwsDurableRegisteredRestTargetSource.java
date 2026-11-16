@@ -20,18 +20,18 @@ import io.smallrye.mutiny.infrastructure.Infrastructure;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.pipelineframework.aws.durable.AwsDurableDeploymentConfigSourceFactory.PinnedParameter;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig.RegisteredRestTargetConfig;
 import org.pipelineframework.orchestrator.RegisteredRestWorkerTargetSource;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
-import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
-import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueRequest;
+import software.amazon.awssdk.services.ssm.SsmClient;
 
 /** Reads complete, immutable versions at a fixed deployment-owned routing key. */
 @ApplicationScoped
 public class AwsDurableRegisteredRestTargetSource implements RegisteredRestWorkerTargetSource {
     private static final String TARGET_PREFIX = "pipeline.orchestrator.worker.targets.";
-    static final String CREDENTIAL_PREFIX = "config:tpf.aws.durable.rest-credential.";
+    static final String CREDENTIAL_PREFIX = "config:tpf.aws.durable.rest-parameter.";
     private static final int MAX_BYTES = 256 * 1024;
     private static final long REFRESH_NANOS = Duration.ofSeconds(5).toNanos();
     private static final long RETRY_NANOS = Duration.ofSeconds(1).toNanos();
@@ -44,8 +44,8 @@ public class AwsDurableRegisteredRestTargetSource implements RegisteredRestWorke
     Optional<String> key;
     @ConfigProperty(name = "pipeline.orchestrator.releases.storage.s3.bucket")
     Optional<String> bucket;
-    @ConfigProperty(name = "tpf.aws.durable.rest-worker-secret-arn-prefix")
-    Optional<String> secretArnPrefix;
+    @ConfigProperty(name = "tpf.aws.durable.rest-worker-parameter-arn-prefix")
+    Optional<String> parameterArnPrefix;
 
     private record Cached(Map<String, RegisteredRestTargetConfig> targets, long expiresAt) {}
     private volatile Cached cached;
@@ -53,14 +53,15 @@ public class AwsDurableRegisteredRestTargetSource implements RegisteredRestWorke
     private final LongSupplier clock;
     private Uni<Map<String, RegisteredRestTargetConfig>> inFlight;
     private S3Client s3;
-    private SecretsManagerClient secrets;
+    private SsmClient parameters;
 
     public AwsDurableRegisteredRestTargetSource() {
-        this(null, System::nanoTime);
+        this(null, null, System::nanoTime);
     }
 
-    AwsDurableRegisteredRestTargetSource(S3Client s3, LongSupplier clock) {
+    AwsDurableRegisteredRestTargetSource(S3Client s3, SsmClient parameters, LongSupplier clock) {
         this.s3 = s3;
+        this.parameters = parameters;
         this.clock = clock;
     }
 
@@ -121,11 +122,11 @@ public class AwsDurableRegisteredRestTargetSource implements RegisteredRestWorke
         try (var stream = s3.getObject(coordinate)) {
             var response = stream.response();
             return parse(stream.readNBytes(MAX_BYTES + 1), response.versionId(), response.metadata().get("digest"),
-                secretArnPrefix.orElseThrow());
+                parameterArnPrefix.orElseThrow());
         }
     }
 
-    static Map<String, RegisteredRestTargetConfig> parse(byte[] bytes, String version, String digest, String secretPrefix)
+    static Map<String, RegisteredRestTargetConfig> parse(byte[] bytes, String version, String digest, String parameterPrefix)
         throws IOException {
         if (version == null || version.isBlank() || "null".equals(version) || bytes.length > MAX_BYTES
             || !sha256(bytes).equals(digest)) {
@@ -159,7 +160,7 @@ public class AwsDurableRegisteredRestTargetSource implements RegisteredRestWorke
             if (!fields.keySet().containsAll(FIELDS) || !"rest".equals(protocol)) {
                 throw new IllegalArgumentException("Incomplete or unsupported REST routing entry");
             }
-            credentialRequest(fields.get("shared-secret-ref"), secretPrefix);
+            credentialRequest(fields.get("shared-secret-ref"), parameterPrefix);
             targets.put(id, new Target(Optional.of(fields.get("entry-id")), fields.get("tenant-id"),
                 fields.get("pipeline-id"), fields.get("contract-version"), fields.get("release-version"),
                 fields.get("worker-id"), protocol, fields.get("endpoint"), fields.get("shared-secret-ref"),
@@ -168,13 +169,17 @@ public class AwsDurableRegisteredRestTargetSource implements RegisteredRestWorke
         return Map.copyOf(targets);
     }
 
-    static GetSecretValueRequest credentialRequest(String reference, String secretPrefix) {
+    static PinnedParameter credentialRequest(String reference, String parameterPrefix) {
         if (!reference.startsWith(CREDENTIAL_PREFIX)) {
             throw new IllegalArgumentException("A pinned REST signing credential is required");
         }
-        var request = AwsDurableDeploymentConfigSourceFactory.restWorkerSecretRequest(
-            reference.substring("config:".length()));
-        if (!request.secretId().startsWith(secretPrefix)) {
+        int separator = reference.lastIndexOf('@');
+        if (separator <= CREDENTIAL_PREFIX.length()) {
+            throw new IllegalArgumentException("A full parameter ARN and pinned version are required");
+        }
+        var request = AwsDurableDeploymentConfigSourceFactory.parameterRequest(
+            reference.substring(CREDENTIAL_PREFIX.length(), separator), reference.substring(separator + 1), "REST worker");
+        if (!request.arn().startsWith(parameterPrefix)) {
             throw new IllegalArgumentException("REST signing credential is outside the configured namespace");
         }
         return request;
@@ -198,18 +203,18 @@ public class AwsDurableRegisteredRestTargetSource implements RegisteredRestWorke
     }
 
     private String readCredential(String reference) {
-        var request = credentialRequest(reference, secretArnPrefix.orElseThrow());
+        var request = credentialRequest(reference, parameterArnPrefix.orElseThrow());
         try {
-            return AwsDurableDeploymentConfigSourceFactory.verifiedSecret(request, secretsClient().getSecretValue(request));
+            return AwsDurableDeploymentConfigSourceFactory.verifiedParameter(request, parameterClient().getParameter(request.read()));
         } catch (RuntimeException failure) {
             throw new IllegalStateException("Pinned REST signing credential could not be loaded");
         }
     }
 
-    private synchronized SecretsManagerClient secretsClient() {
-        if (secrets == null) secrets = SecretsManagerClient.builder().overrideConfiguration(config ->
+    private synchronized SsmClient parameterClient() {
+        if (parameters == null) parameters = SsmClient.builder().overrideConfiguration(config ->
             config.apiCallTimeout(Duration.ofSeconds(10)).apiCallAttemptTimeout(Duration.ofSeconds(4))).build();
-        return secrets;
+        return parameters;
     }
 
     private static String sha256(byte[] bytes) {
@@ -223,7 +228,7 @@ public class AwsDurableRegisteredRestTargetSource implements RegisteredRestWorke
     @PreDestroy
     void close() {
         if (s3 != null) s3.close();
-        if (secrets != null) secrets.close();
+        if (parameters != null) parameters.close();
     }
 
     private record Target(Optional<String> entryId, String tenantId, String pipelineId, String contractVersion,

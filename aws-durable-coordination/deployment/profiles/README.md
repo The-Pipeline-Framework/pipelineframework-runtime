@@ -309,11 +309,22 @@ Each grant authorizes one exact routing key and version.
 
 For independently published worker attachments, set `RefreshableWorkerTargets`
 to `true` and supply one stable `WorkerTargetKey` in a versioned Release bucket.
-Supply dedicated `WorkerFunctionNamePrefix` and `WorkerSigningSecretNamePrefix`
-namespaces managed by the same deployment authority. Leave `WorkerTargetVersion`
+Supply dedicated `WorkerFunctionNamePrefix` and `WorkerSigningParameterNamePrefix`
+namespaces managed by the same deployment authority. Use `ResumeTokenParameterArn`
+and `ResumeTokenParameterVersion` for the Coordinator signing key. Leave `WorkerTargetVersion`
 and the per-worker lists empty. This selects refreshable routing at platform
 installation. Later attachments update the routing object and their own
 alias-scoped permissions without publishing Coordinator function versions.
+
+Use same-account, Standard Parameter Store `SecureString` signing parameters
+with the AWS-managed `aws/ssm` key. Set `WorkerParameterArn` and the exact numeric
+`WorkerParameterVersion` on each worker. Use
+`config:tpf.aws.durable.rest-parameter.<full-parameter-arn>@<numeric-version>`
+for its routing credential reference. Allocate a distinct parameter name per
+immutable attachment. Keep the parameter and its pinned version while any
+work can reference it. Rotate by creating a new name for a new attachment,
+since Parameter Store retains only the 100 most recent versions of a name.
+Static routing continues to accept its Secrets Manager references.
 
 Every version at the stable key contains a complete worker-target properties
 snapshot with its SHA-256 in S3 object metadata `digest`. Publish the next

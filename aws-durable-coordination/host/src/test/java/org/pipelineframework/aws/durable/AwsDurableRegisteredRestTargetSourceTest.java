@@ -19,14 +19,18 @@ import software.amazon.awssdk.http.AbortableInputStream;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.ssm.SsmClient;
+import software.amazon.awssdk.services.ssm.model.GetParameterRequest;
+import software.amazon.awssdk.services.ssm.model.GetParameterResponse;
+import software.amazon.awssdk.services.ssm.model.Parameter;
+import software.amazon.awssdk.services.ssm.model.ParameterType;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
 class AwsDurableRegisteredRestTargetSourceTest {
-    private static final String PREFIX = "arn:aws:secretsmanager:us-east-2:123456789012:secret:tpf/worker-signing/example/";
-    private static final String CREDENTIAL = "config:tpf.aws.durable.rest-credential." + PREFIX
-        + "worker@active-ABC123@11111111-1111-1111-1111-111111111111";
+    private static final String PREFIX = "arn:aws:ssm:us-east-2:123456789012:parameter/tpf/worker-signing/example/";
+    private static final String CREDENTIAL = "config:tpf.aws.durable.rest-parameter." + PREFIX + "worker@7";
     private static final String PROPERTY_PREFIX = "pipeline.orchestrator.worker.targets.release1.";
 
     @Test
@@ -37,8 +41,11 @@ class AwsDurableRegisteredRestTargetSourceTest {
         assertEquals("entry", targets.get("release1").entryId().orElseThrow());
         assertEquals(CREDENTIAL, targets.get("release1").sharedSecretRef());
         assertEquals("rest", targets.get("release1").protocol());
-        assertEquals(PREFIX + "worker@active-ABC123",
-            AwsDurableRegisteredRestTargetSource.credentialRequest(CREDENTIAL, PREFIX).secretId());
+        var request = AwsDurableRegisteredRestTargetSource.credentialRequest(CREDENTIAL, PREFIX);
+        assertEquals(PREFIX + "worker:7", request.read().name());
+        assertTrue(request.read().withDecryption());
+        assertThrows(IllegalArgumentException.class, () ->
+            AwsDurableRegisteredRestTargetSource.credentialRequest(CREDENTIAL.replace("@7", "@latest"), PREFIX));
     }
 
     @Test
@@ -60,10 +67,10 @@ class AwsDurableRegisteredRestTargetSourceTest {
     void coalescesColdReadsAndFailsClosedOnAnInvalidRefresh() throws Exception {
         var clock = new AtomicLong();
         var s3 = mock(S3Client.class);
-        var source = new AwsDurableRegisteredRestTargetSource(s3, clock::get);
+        var source = new AwsDurableRegisteredRestTargetSource(s3, null, clock::get);
         source.bucket = Optional.of("routing-bucket");
         source.key = Optional.of("tpf/rest-targets/regional.properties");
-        source.secretArnPrefix = Optional.of(PREFIX);
+        source.parameterArnPrefix = Optional.of(PREFIX);
         var request = GetObjectRequest.builder().bucket("routing-bucket").key("tpf/rest-targets/regional.properties").build();
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
@@ -88,6 +95,29 @@ class AwsDurableRegisteredRestTargetSourceTest {
             verify(s3, times(2)).getObject(request);
         } finally {
             release.countDown();
+            source.close();
+        }
+    }
+
+    @Test
+    void onlyCachesTheExactSecureStringVersion() {
+        var ssm = mock(SsmClient.class);
+        var source = new AwsDurableRegisteredRestTargetSource(null, ssm, System::nanoTime);
+        source.parameterArnPrefix = Optional.of(PREFIX);
+        var request = GetParameterRequest.builder().name(PREFIX + "worker:7").withDecryption(true).build();
+        var parameter = Parameter.builder().arn(PREFIX + "worker").name("/tpf/worker-signing/example/worker")
+            .type(ParameterType.SECURE_STRING).value("a".repeat(32));
+        when(ssm.getParameter(request))
+            .thenReturn(GetParameterResponse.builder().parameter(parameter.version(8L).build()).build())
+            .thenReturn(GetParameterResponse.builder().parameter(parameter.version(7L).build()).build());
+        try {
+            assertThrows(IllegalStateException.class, () -> source.prepareCredential(CREDENTIAL).await().atMost(Duration.ofSeconds(5)));
+            assertThrows(IllegalStateException.class, () -> source.preparedCredential(CREDENTIAL));
+            source.prepareCredential(CREDENTIAL).await().atMost(Duration.ofSeconds(5));
+            source.prepareCredential(CREDENTIAL).await().atMost(Duration.ofSeconds(5));
+            assertEquals(Optional.of("a".repeat(32)), source.preparedCredential(CREDENTIAL));
+            verify(ssm, times(2)).getParameter(request);
+        } finally {
             source.close();
         }
     }
