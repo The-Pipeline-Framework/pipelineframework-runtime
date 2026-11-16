@@ -5,6 +5,7 @@ public enum AwsDurableOperation {
     STATUS,
     RESULT,
     READ_RUNTIME_IDENTITY,
+    CHECK_REGISTERED_WORKER,
     REDRIVE,
     SWEEP,
     PROCESS_AWAIT_CONTINUATION,

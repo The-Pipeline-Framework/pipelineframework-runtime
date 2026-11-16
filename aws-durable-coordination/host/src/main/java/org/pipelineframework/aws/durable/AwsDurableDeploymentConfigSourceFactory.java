@@ -250,9 +250,17 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         requireEqual(context, "pipeline.orchestrator.worker.targeting-mode", "registered-rest");
         required(context, PREFIX + "rest-signing-region");
         rejectConfigured(context, "release-isolation-mode", "entry-id", "continuation-entry-id",
-            "worker-secret-arn", "worker-secret-version", "worker-parameter-arn", "worker-parameter-version",
-            "resume-token-parameter-arn", "resume-token-parameter-version");
+            "worker-secret-arn", "worker-secret-version", "worker-parameter-arn", "worker-parameter-version");
         var resolved = new java.util.HashMap<>(settings);
+        if (value(context, PREFIX + "refreshable-rest-targets").isPresent()) {
+            requireEqual(context, PREFIX + "refreshable-rest-targets", "true");
+            rejectConfigured(context, "rest-target-version", "resume-token-secret-arn", "resume-token-secret-version");
+            routingKey(required(context, PREFIX + "rest-target-key"));
+            required(context, PREFIX + "rest-worker-parameter-arn-prefix");
+            resolved.put("pipeline.orchestrator.resume-token-secret", resolve(parameterRequest(context, "resume-token")));
+            return List.of(new PinnedSecrets(resolved));
+        }
+        rejectConfigured(context, "resume-token-parameter-arn", "resume-token-parameter-version");
         var targetProperties = new java.util.Properties();
         try {
             targetProperties.load(new java.io.StringReader(readTargetProperties(context)));
@@ -288,12 +296,19 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         return secretRequest(reference.substring(start, separator), reference.substring(separator + 1), "REST worker");
     }
 
+    static String routingKey(String key) {
+        if (!key.matches("tpf/rest-targets/[A-Za-z0-9._-]+[.]properties")) {
+            throw new IllegalArgumentException("Invalid shared REST routing object key");
+        }
+        return key;
+    }
+
     private String readTargetProperties(ConfigSourceContext context) throws java.io.IOException {
         var key = value(context, PREFIX + "rest-target-key");
         var version = value(context, PREFIX + "rest-target-version");
         if (key.isEmpty() && version.isEmpty()) return "";
-        String objectKey = key.filter(name -> name.matches("tpf/rest-targets/[A-Za-z0-9._-]+[.]properties"))
-            .orElseThrow(() -> new IllegalArgumentException("Invalid shared REST routing object key"));
+        String objectKey = routingKey(key.orElseThrow(() ->
+            new IllegalArgumentException("Invalid shared REST routing object key")));
         String versionId = version.filter(id -> !id.equals("null"))
             .orElseThrow(() -> new IllegalArgumentException("An immutable REST routing object version is required"));
         String bucket = required(context, "pipeline.orchestrator.releases.storage.s3.bucket");
@@ -316,8 +331,7 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         requireEqual(context, "pipeline.orchestrator.releases.registry.provider", "memory");
         requireEqual(context, "pipeline.orchestrator.releases.storage.provider", "local");
         rejectConfigured(context, "resume-token-secret-arn", "resume-token-secret-version",
-            "resume-token-parameter-arn", "resume-token-parameter-version", "worker-parameter-arn",
-            "worker-parameter-version", "binding-table", "entry-id");
+            "resume-token-parameter-arn", "resume-token-parameter-version", "binding-table", "entry-id");
         for (String property : List.of("pipeline.orchestrator.resume-token-secret",
             "pipeline.orchestrator.worker.sqs.shared-secret", "pipeline.orchestrator.worker.sqs.shared-secret-ref",
             "pipeline.orchestrator.releases.storage.s3.bucket")) {
@@ -330,7 +344,13 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         required(context, "pipeline.orchestrator.worker.artifact-id");
         required(context, "pipeline.orchestrator.worker.artifact-digest");
         var resolved = new java.util.HashMap<>(settings);
-        resolved.put(PREFIX + "worker-signing-key", resolve(request(context, "worker")));
+        boolean useParameter = value(context, PREFIX + "worker-parameter-arn").isPresent()
+            || value(context, PREFIX + "worker-parameter-version").isPresent();
+        if (useParameter) {
+            rejectConfigured(context, "worker-secret-arn", "worker-secret-version");
+        }
+        resolved.put(PREFIX + "worker-signing-key", useParameter
+            ? resolve(parameterRequest(context, "worker")) : resolve(request(context, "worker")));
         return List.of(new PinnedSecrets(resolved));
     }
 
@@ -431,8 +451,11 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
     }
 
     private PinnedParameter parameterRequest(ConfigSourceContext context, String purpose) {
-        String arn = required(context, PREFIX + purpose + "-parameter-arn");
-        String versionText = required(context, PREFIX + purpose + "-parameter-version");
+        return parameterRequest(required(context, PREFIX + purpose + "-parameter-arn"),
+            required(context, PREFIX + purpose + "-parameter-version"), purpose);
+    }
+
+    static PinnedParameter parameterRequest(String arn, String versionText, String purpose) {
         if (!arn.matches("arn:(aws|aws-us-gov|aws-cn):ssm:[a-z0-9-]+:[0-9]{12}:parameter/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*")
             || !versionText.matches("[1-9][0-9]*")) {
             throw new IllegalArgumentException("A full SSM parameter ARN and exact numeric version are required for " + purpose);
@@ -456,6 +479,10 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             // AWS exceptions may include request context or response bodies; never attach them.
             throw new IllegalStateException("Pinned deployment signing key could not be loaded");
         }
+        return verifiedParameter(request, response);
+    }
+
+    static String verifiedParameter(PinnedParameter request, GetParameterResponse response) {
         var parameter = response == null ? null : response.parameter();
         if (parameter == null || !request.arn().equals(parameter.arn())
             || !matchesParameterName(request.name(), parameter.name()) || parameter.version() == null
@@ -468,11 +495,11 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         return parameter.value();
     }
 
-    private boolean matchesParameterName(String arnResourceName, String returnedName) {
+    private static boolean matchesParameterName(String arnResourceName, String returnedName) {
         return arnResourceName.equals(returnedName) || ("/" + arnResourceName).equals(returnedName);
     }
 
-    private record PinnedParameter(String arn, String name, long version, GetParameterRequest read) {}
+    record PinnedParameter(String arn, String name, long version, GetParameterRequest read) {}
 
     private String resolve(GetSecretValueRequest request) {
         final GetSecretValueResponse response;
@@ -482,6 +509,10 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             // Provider errors can contain sensitive request/context values; do not attach or log them.
             throw new IllegalStateException("Pinned deployment signing key could not be loaded");
         }
+        return verifiedSecret(request, response);
+    }
+
+    private static String verifiedSecret(GetSecretValueRequest request, GetSecretValueResponse response) {
         if (response == null || !request.secretId().equals(response.arn())
             || !request.versionId().equals(response.versionId())
             || response.secretString() == null || response.secretString().length() < 32) {

@@ -4,6 +4,8 @@ import java.util.Optional;
 
 import io.quarkus.arc.DefaultBean;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
+import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.ConfigProvider;
 
 /**
@@ -17,12 +19,21 @@ public class LocalControlPlaneSecretResolver implements ControlPlaneSecretResolv
     private static final String SYS_PREFIX = "sys:";
     private static final String CONFIG_PREFIX = "config:";
 
+    @Inject Instance<RegisteredRestWorkerTargetSource> targetSources;
+
     @Override
     public String resolve(String reference) {
         if (reference == null || reference.isBlank()) {
             throw new IllegalArgumentException("Secret reference must not be blank");
         }
         String trimmed = reference.trim();
+        if (targetSources != null && !targetSources.isUnsatisfied()) {
+            var source = targetSources.get();
+            if (source.enabled()) {
+                Optional<String> prepared = source.preparedCredential(trimmed);
+                if (prepared.isPresent()) return prepared.get();
+            }
+        }
         String value;
         if (trimmed.startsWith(ENV_PREFIX)) {
             value = resolveEnv(trimmed.substring(ENV_PREFIX.length()));

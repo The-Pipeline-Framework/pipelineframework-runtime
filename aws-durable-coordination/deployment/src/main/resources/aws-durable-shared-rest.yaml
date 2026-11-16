@@ -16,13 +16,18 @@ Parameters:
   DurableAlias: {Type: String, Default: platform}
   DurableExecutionTimeoutSeconds: {Type: Number, Default: 86400}
   DurableRetentionDays: {Type: Number, Default: 30}
-  ResumeTokenSecretArn: {Type: String}
-  ResumeTokenSecretVersion: {Type: String}
+  ResumeTokenSecretArn: {Type: String, Default: ''}
+  ResumeTokenSecretVersion: {Type: String, Default: ''}
+  ResumeTokenParameterArn: {Type: String, Default: ''}
+  ResumeTokenParameterVersion: {Type: String, Default: '', AllowedPattern: '^$|^[1-9][0-9]*$'}
   WorkerSigningSecretArns: {Type: CommaDelimitedList, Default: ''}
   WorkerAliasArns: {Type: CommaDelimitedList, Default: ''}
   WorkerVersionArns: {Type: CommaDelimitedList, Default: ''}
   WorkerTargetKey: {Type: String, Default: ''}
   WorkerTargetVersion: {Type: String, Default: ''}
+  RefreshableWorkerTargets: {Type: String, Default: 'false', AllowedValues: ['true', 'false']}
+  WorkerFunctionNamePrefix: {Type: String, Default: '', AllowedPattern: '^$|^[A-Za-z0-9_-]+-$'}
+  WorkerSigningParameterNamePrefix: {Type: String, Default: '', AllowedPattern: '^$|^tpf/worker-signing/[A-Za-z0-9_-]+/$'}
   RetainedWorkerTargetGrantSlots:
     Type: CommaDelimitedList
     Default: '0'
@@ -47,9 +52,33 @@ Parameters:
   WorkerTable: {Type: String}
   AwaitInteractionStreamArn: {Type: String}
   ExecutionStateStreamArn: {Type: String}
+Rules:
+  RefreshableRoutingRequiresFixedScope:
+    RuleCondition: !Equals [!Ref RefreshableWorkerTargets, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref WorkerTargetKey, '']]
+        AssertDescription: Refreshable routing needs a stable object key
+      - Assert: !Not [!Equals [!Ref WorkerFunctionNamePrefix, '']]
+        AssertDescription: Refreshable routing needs a dedicated worker function namespace
+      - Assert: !Not [!Equals [!Ref WorkerSigningParameterNamePrefix, '']]
+        AssertDescription: Refreshable routing needs a dedicated credential namespace
+      - Assert: !Equals [!Ref WorkerTargetVersion, '']
+        AssertDescription: Refreshable routing uses the versioned head at the configured key
+      - Assert: !And [!Not [!Equals [!Ref ResumeTokenParameterArn, '']], !Not [!Equals [!Ref ResumeTokenParameterVersion, '']]]
+        AssertDescription: Refreshable routing needs a version-pinned resume-token parameter
+      - Assert: !And [!Equals [!Ref ResumeTokenSecretArn, ''], !Equals [!Ref ResumeTokenSecretVersion, '']]
+        AssertDescription: Refreshable routing uses Parameter Store for signing
+  StaticRoutingRequiresResumeSecret:
+    RuleCondition: !Equals [!Ref RefreshableWorkerTargets, 'false']
+    Assertions:
+      - Assert: !And [!Not [!Equals [!Ref ResumeTokenSecretArn, '']], !Not [!Equals [!Ref ResumeTokenSecretVersion, '']]]
+        AssertDescription: Static routing needs a version-pinned resume-token secret
+      - Assert: !And [!Equals [!Ref ResumeTokenParameterArn, ''], !Equals [!Ref ResumeTokenParameterVersion, '']]
+        AssertDescription: Static routing uses the existing Secrets Manager signing configuration
 Conditions:
-  HasWorkerTargets: !Not [!Equals [!Join ['', !Ref WorkerAliasArns], '']]
-  HasRetainedWorkerTargets: !Not [!Equals [!Join ['', !Ref RetainedWorkerTargetGrants], '']]
+  RefreshableTargets: !Equals [!Ref RefreshableWorkerTargets, 'true']
+  HasWorkerTargets: !And [!Not [!Condition RefreshableTargets], !Not [!Equals [!Join ['', !Ref WorkerAliasArns], '']]]
+  HasRetainedWorkerTargets: !And [!Not [!Condition RefreshableTargets], !Not [!Equals [!Join ['', !Ref RetainedWorkerTargetGrants], '']]]
 Resources:
   'Fn::ForEach::RetainedWorkerTargetReadPolicies':
     - Slot
@@ -193,12 +222,37 @@ Resources:
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*:log-stream:*'
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref ResumeTokenSecretArn
+              - !If
+                - RefreshableTargets
+                - {Effect: Allow, Action: 'ssm:GetParameter', Resource: !Ref ResumeTokenParameterArn}
+                - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref ResumeTokenSecretArn}
               - !If
                 - HasWorkerTargets
                 - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref WorkerSigningSecretArns}
+                - !Ref 'AWS::NoValue'
+              - !If
+                - RefreshableTargets
+                - Effect: Allow
+                  Action: ssm:GetParameter
+                  Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}*'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - RefreshableTargets
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${ReleaseArtifactBucket}/${WorkerTargetKey}'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - RefreshableTargets
+                - Effect: Allow
+                  Action: [lambda:GetAlias, lambda:GetFunctionUrlConfig]
+                  Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${WorkerFunctionNamePrefix}*:release'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - RefreshableTargets
+                - Effect: Allow
+                  Action: lambda:GetFunctionConfiguration
+                  Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${WorkerFunctionNamePrefix}*:*'
                 - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:ConditionCheckItem, dynamodb:Query, dynamodb:Scan, dynamodb:BatchGetItem, dynamodb:BatchWriteItem]
@@ -351,9 +405,16 @@ Resources:
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: validated
           TPF_AWS_DURABLE_REST_SIGNING_REGION: !Ref AWS::Region
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
-          TPF_AWS_DURABLE_REST_TARGET_VERSION: !Ref WorkerTargetVersion
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
+          TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
+            - RefreshableTargets
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
+            - !Ref 'AWS::NoValue'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -367,6 +428,7 @@ Resources:
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_REQUIRE_REMOTE_WORKER: 'true'
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_PAYLOAD_MATERIALIZATION: SERIALIZED
           PIPELINE_ORCHESTRATOR_WORKER_TARGETING_MODE: registered-rest
+          PIPELINE_ORCHESTRATOR_WORKER_LIFECYCLE_PROVIDER: dynamo
           TPF_AWS_DURABLE_CONFIGURATION: !Sub >-
             {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}"}
   ActionVersion:
@@ -397,9 +459,16 @@ Resources:
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: validated
           TPF_AWS_DURABLE_REST_SIGNING_REGION: !Ref AWS::Region
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
-          TPF_AWS_DURABLE_REST_TARGET_VERSION: !Ref WorkerTargetVersion
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
+          TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
+            - RefreshableTargets
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
+            - !Ref 'AWS::NoValue'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -413,6 +482,7 @@ Resources:
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_REQUIRE_REMOTE_WORKER: 'true'
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_PAYLOAD_MATERIALIZATION: SERIALIZED
           PIPELINE_ORCHESTRATOR_WORKER_TARGETING_MODE: registered-rest
+          PIPELINE_ORCHESTRATOR_WORKER_LIFECYCLE_PROVIDER: dynamo
           TPF_AWS_DURABLE_CONFIGURATION: !Sub >-
             {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}"}
   WorkVersion:
@@ -443,9 +513,16 @@ Resources:
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: validated
           TPF_AWS_DURABLE_REST_SIGNING_REGION: !Ref AWS::Region
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
-          TPF_AWS_DURABLE_REST_TARGET_VERSION: !Ref WorkerTargetVersion
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
+          TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
+            - RefreshableTargets
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
+            - !Ref 'AWS::NoValue'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -459,6 +536,7 @@ Resources:
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_REQUIRE_REMOTE_WORKER: 'true'
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_PAYLOAD_MATERIALIZATION: SERIALIZED
           PIPELINE_ORCHESTRATOR_WORKER_TARGETING_MODE: registered-rest
+          PIPELINE_ORCHESTRATOR_WORKER_LIFECYCLE_PROVIDER: dynamo
           TPF_AWS_DURABLE_CONFIGURATION: !Sub >-
             {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}"}
   AwaitCompletionVersion:
@@ -489,9 +567,16 @@ Resources:
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: validated
           TPF_AWS_DURABLE_REST_SIGNING_REGION: !Ref AWS::Region
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
-          TPF_AWS_DURABLE_REST_TARGET_VERSION: !Ref WorkerTargetVersion
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
+          TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
+            - RefreshableTargets
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
+            - !Ref 'AWS::NoValue'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -505,6 +590,7 @@ Resources:
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_REQUIRE_REMOTE_WORKER: 'true'
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_PAYLOAD_MATERIALIZATION: SERIALIZED
           PIPELINE_ORCHESTRATOR_WORKER_TARGETING_MODE: registered-rest
+          PIPELINE_ORCHESTRATOR_WORKER_LIFECYCLE_PROVIDER: dynamo
           TPF_AWS_DURABLE_CONFIGURATION: !Sub >-
             {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}"}
   AwaitWakeupVersion:
@@ -535,9 +621,16 @@ Resources:
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: validated
           TPF_AWS_DURABLE_REST_SIGNING_REGION: !Ref AWS::Region
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
-          TPF_AWS_DURABLE_REST_TARGET_VERSION: !Ref WorkerTargetVersion
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
+          TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
+            - RefreshableTargets
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
+            - !Ref 'AWS::NoValue'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -551,6 +644,7 @@ Resources:
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_REQUIRE_REMOTE_WORKER: 'true'
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_PAYLOAD_MATERIALIZATION: SERIALIZED
           PIPELINE_ORCHESTRATOR_WORKER_TARGETING_MODE: registered-rest
+          PIPELINE_ORCHESTRATOR_WORKER_LIFECYCLE_PROVIDER: dynamo
           TPF_AWS_DURABLE_CONFIGURATION: !Sub >-
             {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}"}
   ExecutionWakeupVersion:
@@ -581,9 +675,16 @@ Resources:
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: validated
           TPF_AWS_DURABLE_REST_SIGNING_REGION: !Ref AWS::Region
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
-          TPF_AWS_DURABLE_REST_TARGET_VERSION: !Ref WorkerTargetVersion
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
+          TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
+            - RefreshableTargets
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
+            - !Ref 'AWS::NoValue'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -597,6 +698,7 @@ Resources:
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_REQUIRE_REMOTE_WORKER: 'true'
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_PAYLOAD_MATERIALIZATION: SERIALIZED
           PIPELINE_ORCHESTRATOR_WORKER_TARGETING_MODE: registered-rest
+          PIPELINE_ORCHESTRATOR_WORKER_LIFECYCLE_PROVIDER: dynamo
           TPF_AWS_DURABLE_CONFIGURATION: !Sub >-
             {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}"}
   DueWorkVersion:
@@ -627,9 +729,16 @@ Resources:
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: validated
           TPF_AWS_DURABLE_REST_SIGNING_REGION: !Ref AWS::Region
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
-          TPF_AWS_DURABLE_REST_TARGET_VERSION: !Ref WorkerTargetVersion
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
+          TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
+            - RefreshableTargets
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
+            - !Ref 'AWS::NoValue'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -643,6 +752,7 @@ Resources:
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_REQUIRE_REMOTE_WORKER: 'true'
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_PAYLOAD_MATERIALIZATION: SERIALIZED
           PIPELINE_ORCHESTRATOR_WORKER_TARGETING_MODE: registered-rest
+          PIPELINE_ORCHESTRATOR_WORKER_LIFECYCLE_PROVIDER: dynamo
           TPF_AWS_DURABLE_CONFIGURATION: !Sub >-
             {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}"}
   ReconciliationVersion:
@@ -673,9 +783,16 @@ Resources:
           TPF_AWS_DURABLE_DEPLOYMENT_VALIDATION: validated
           TPF_AWS_DURABLE_REST_SIGNING_REGION: !Ref AWS::Region
           TPF_AWS_DURABLE_REST_TARGET_KEY: !Ref WorkerTargetKey
-          TPF_AWS_DURABLE_REST_TARGET_VERSION: !Ref WorkerTargetVersion
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !Ref ResumeTokenSecretArn
-          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !Ref ResumeTokenSecretVersion
+          TPF_AWS_DURABLE_REST_TARGET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref WorkerTargetVersion]
+          TPF_AWS_DURABLE_REFRESHABLE_REST_TARGETS: !If [RefreshableTargets, 'true', !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_REST_WORKER_PARAMETER_ARN_PREFIX: !If
+            - RefreshableTargets
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorkerSigningParameterNamePrefix}'
+            - !Ref 'AWS::NoValue'
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_ARN: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretArn]
+          TPF_AWS_DURABLE_RESUME_TOKEN_SECRET_VERSION: !If [RefreshableTargets, !Ref 'AWS::NoValue', !Ref ResumeTokenSecretVersion]
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_ARN: !If [RefreshableTargets, !Ref ResumeTokenParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_RESUME_TOKEN_PARAMETER_VERSION: !If [RefreshableTargets, !Ref ResumeTokenParameterVersion, !Ref 'AWS::NoValue']
           TPF_AWS_DURABLE_ACTION_TIMEOUT_SECONDS: '30'
           TPF_AWS_DURABLE_CALLBACK_RETENTION_SECONDS: '7776000'
           TPF_AWS_DURABLE_BINDING_TABLE: !Ref CallbackBindingTable
@@ -689,6 +806,7 @@ Resources:
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_REQUIRE_REMOTE_WORKER: 'true'
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_PAYLOAD_MATERIALIZATION: SERIALIZED
           PIPELINE_ORCHESTRATOR_WORKER_TARGETING_MODE: registered-rest
+          PIPELINE_ORCHESTRATOR_WORKER_LIFECYCLE_PROVIDER: dynamo
           TPF_AWS_DURABLE_CONFIGURATION: !Sub >-
             {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}"}
   LifecycleVersion:
@@ -944,3 +1062,4 @@ Outputs:
   CoordinatorInvokerRoleArn: {Value: !GetAtt CoordinationRole.Arn}
   IngressVersionArn: {Value: !Ref IngressVersion}
   DurableVersionArn: {Value: !Ref DurableVersion}
+  ActionVersionArn: {Value: !Ref ActionVersion}

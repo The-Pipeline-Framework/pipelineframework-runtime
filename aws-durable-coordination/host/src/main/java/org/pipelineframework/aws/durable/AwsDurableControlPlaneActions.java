@@ -83,6 +83,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
                 .getExecutionResultPayload(request.tenantId(), required(request.executionId(), "executionId"))
                 .await().atMost(actionTimeout)));
             case READ_RUNTIME_IDENTITY -> runtimeIdentity(request);
+            case CHECK_REGISTERED_WORKER -> throw new IllegalArgumentException("Worker readiness requires the IAM action handler");
             case REDRIVE -> AwsDurableActionResponse.status(controlPlane.redriveExecution(
                     request.tenantId(),
                     required(request.executionId(), "executionId"),

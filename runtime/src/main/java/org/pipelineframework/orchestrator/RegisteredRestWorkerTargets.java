@@ -29,6 +29,9 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
     @Inject PipelineContractDescriptorLoader contractLoader;
     @Inject jakarta.enterprise.inject.Instance<RestWorkerBindingVerifier> bindingVerifier;
 
+    @Inject jakarta.enterprise.inject.Instance<RegisteredRestWorkerTargetSource> targetSources;
+    private volatile Map<String, PipelineOrchestratorConfig.RegisteredRestTargetConfig> validatedSnapshot;
+
     public static boolean enabled(PipelineOrchestratorConfig config) {
         return Optional.ofNullable(config).map(PipelineOrchestratorConfig::worker)
             .map(PipelineOrchestratorConfig.WorkerConfig::targetingMode)
@@ -48,8 +51,37 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
             || !RestTransitionWorkerProtocol.CAPABILITIES_PATH.equals(config.workerRest().capabilitiesPath())) {
             throw new IllegalArgumentException("Registered REST targeting requires native worker routes");
         }
+        if (targetSource().isPresent() && !config.worker().targets().isEmpty()) {
+            throw new IllegalArgumentException("A registered worker source cannot be combined with configured targets");
+        }
+        validateTargets(config.worker().targets());
+    }
+
+    private Optional<RegisteredRestWorkerTargetSource> targetSource() {
+        if (targetSources == null || targetSources.isUnsatisfied()) return Optional.empty();
+        return Optional.of(targetSources.get()).filter(RegisteredRestWorkerTargetSource::enabled);
+    }
+
+    private Uni<Map<String, PipelineOrchestratorConfig.RegisteredRestTargetConfig>> targets() {
+        return Uni.createFrom().deferred(() -> {
+            validateConfiguration();
+            return targetSource().map(source -> source.snapshot().invoke(snapshot -> {
+                if (snapshot != validatedSnapshot) {
+                    validateTargets(snapshot);
+                    validatedSnapshot = snapshot;
+                }
+            })).orElseGet(() -> Uni.createFrom().item(config.worker().targets()));
+        });
+    }
+
+    private Uni<Void> prepareCredential(String reference) {
+        return targetSource().map(source -> source.prepareCredential(reference))
+            .orElseGet(() -> Uni.createFrom().voidItem());
+    }
+
+    private void validateTargets(Map<String, PipelineOrchestratorConfig.RegisteredRestTargetConfig> targets) {
         Set<List<String>> keys = new HashSet<>();
-        for (var target : config.worker().targets().values()) {
+        for (var target : targets.values()) {
             List<String> key = List.of(text(target.tenantId()), text(target.pipelineId()), text(target.workerId()));
             if (!keys.add(key)) throw new IllegalArgumentException("Duplicate scoped registered worker binding");
             text(target.contractVersion()); text(target.releaseVersion()); text(target.artifactId());
@@ -94,7 +126,17 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
     public void validateRegistration(PipelineWorkerRegistration registration) {
         if (!enabled(config)) return;
         validateConfiguration();
-        boolean bound = config.worker().targets().values().stream().anyMatch(target ->
+        requireRegistration(config.worker().targets(), registration);
+    }
+
+    public Uni<Void> verifyRegistration(PipelineWorkerRegistration registration) {
+        if (!enabled(config)) return Uni.createFrom().voidItem();
+        return targets().invoke(snapshot -> requireRegistration(snapshot, registration)).replaceWithVoid();
+    }
+
+    private void requireRegistration(Map<String, PipelineOrchestratorConfig.RegisteredRestTargetConfig> snapshot,
+                                     PipelineWorkerRegistration registration) {
+        boolean bound = snapshot.values().stream().anyMatch(target ->
             target.tenantId().equals(registration.tenantId()) && target.pipelineId().equals(registration.pipelineId())
                 && target.workerId().equals(registration.workerId()) && target.contractVersion().equals(registration.contractVersion())
                 && target.releaseVersion().equals(registration.releaseVersion()) && target.protocol().equals(registration.protocol())
@@ -106,6 +148,11 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
     public Uni<PipelineWorkerAvailabilityResult> check(PipelineWorkerAvailabilityRequest request) {
         return resolve(request).map(selected -> PipelineWorkerAvailabilityResult.available("rest", selected.capability()))
             .onFailure().recoverWithItem(failure -> PipelineWorkerAvailabilityResult.unavailable("rest", "No verified registered REST worker available"));
+    }
+
+    public Uni<Boolean> checkPinned(PipelineWorkerAvailabilityRequest request, ExecutionDispatchPin pin) {
+        if (!enabled(config) || !serializedCoordination()) return Uni.createFrom().item(false);
+        return resolve(request, Optional.of(pin)).replaceWith(true).onFailure().recoverWithItem(false);
     }
 
     @Override public String providerName() { return "rest"; }
@@ -181,8 +228,7 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
             if (!enabled(config) || !serializedCoordination()) {
                 throw new IllegalStateException("Remote Await authority is not enabled");
             }
-            validateConfiguration();
-            return executions().getExecution(scope.tenantId(), scope.executionId()).chain(found -> {
+            return targets().chain(snapshot -> executions().getExecution(scope.tenantId(), scope.executionId()).chain(found -> {
                 var execution = found.orElseThrow(() -> new IllegalStateException("Pinned execution is unavailable"));
                 if (!scope.executionId().equals(execution.executionId()) || !scope.tenantId().equals(execution.tenantId()) || !scope.pipelineId().equals(execution.pipelineId())
                     || !scope.contractVersion().equals(execution.contractVersion())
@@ -191,7 +237,7 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
                 }
                 var pin = execution.dispatchPin().orElseThrow(() -> new IllegalStateException("Execution dispatch pin is absent"));
                 if (!pin.entryId().equals(entryId)) throw new IllegalStateException("Await caller entry differs from execution pin");
-                var candidates = config.worker().targets().values().stream().filter(target ->
+                var candidates = snapshot.values().stream().filter(target ->
                     scope.tenantId().equals(target.tenantId()) && scope.pipelineId().equals(target.pipelineId())
                         && scope.contractVersion().equals(target.contractVersion()) && scope.releaseVersion().equals(target.releaseVersion())
                         && workerId.equals(target.workerId()) && target.entryId().filter(entryId::equals).isPresent()).toList();
@@ -202,16 +248,18 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
                         if (!pin.deploymentOperationId().equals(binding.deploymentOperationId())) {
                             throw new IllegalStateException("Await caller binding differs from execution revision");
                         }
-                        if (!requireHealthyWorker) return Uni.createFrom().item(binding.dispatchBinding().orElseThrow().credentialRef());
+                        String reference = binding.dispatchBinding().orElseThrow().credentialRef();
+                        if (!requireHealthyWorker) return prepareCredential(reference).replaceWith(reference);
                         return workers.list(scope.tenantId(), scope.pipelineId(), System.currentTimeMillis(),
-                            PipelineReleaseRuntimeBeans.workerStaleAfter(config)).map(records -> {
+                            PipelineReleaseRuntimeBeans.workerStaleAfter(config)).chain(records -> {
                                 if (records.stream().noneMatch(record -> eligibleRecord(record, target))) {
                                     throw new IllegalStateException("Await caller worker is unavailable");
                                 }
-                                return binding.dispatchBinding().orElseThrow().credentialRef();
+                                // The lifecycle endpoint authenticates the caller with this exact credential.
+                                return prepareCredential(reference).replaceWith(reference);
                             });
                     });
-            });
+            }));
         });
     }
 
@@ -221,9 +269,8 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
     }
 
     private Uni<Selection> resolve(PipelineWorkerAvailabilityRequest request, Optional<ExecutionDispatchPin> pin) {
-        return Uni.createFrom().deferred(() -> {
-            validateConfiguration();
-            return releases.get(request.tenantId(), request.pipelineId(), request.releaseVersion()).chain(optional -> {
+        return targets().chain(snapshot ->
+            releases.get(request.tenantId(), request.pipelineId(), request.releaseVersion()).chain(optional -> {
                 PipelineReleaseRecord release = optional.orElseThrow(() -> new IllegalArgumentException("Pinned Release is unavailable"));
                 if (!release.tenantId().equals(request.tenantId()) || !release.pipelineId().equals(request.pipelineId())
                     || !release.releaseVersion().equals(request.releaseVersion())
@@ -240,7 +287,7 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
                 }
                 return workers.list(request.tenantId(), request.pipelineId(), System.currentTimeMillis(),
                     PipelineReleaseRuntimeBeans.workerStaleAfter(config)).chain(records -> {
-                        var eligible = config.worker().targets().entrySet().stream().sorted(Map.Entry.comparingByKey())
+                        var eligible = snapshot.entrySet().stream().sorted(Map.Entry.comparingByKey())
                             .map(Map.Entry::getValue).filter(target -> target.tenantId().equals(request.tenantId())
                                 && target.pipelineId().equals(request.pipelineId()) && target.contractVersion().equals(request.contractVersion())
                                 && target.releaseVersion().equals(request.releaseVersion()) && target.artifactId().equals(runnable.artifactId())
@@ -250,8 +297,7 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
                             .toList();
                         return probe(eligible, 0, pin);
                     });
-            });
-        });
+            }));
     }
 
     private Uni<org.pipelineframework.orchestrator.release.PipelineReleaseEntryBinding> retainedBinding(
@@ -326,7 +372,9 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
     }
 
     private boolean eligibleRecord(PipelineWorkerRecord record, PipelineOrchestratorConfig.RegisteredRestTargetConfig target) {
-        return record.state() == PipelineWorkerState.HEALTHY && record.tenantId().equals(target.tenantId())
+        boolean eligibleState = record.state() == PipelineWorkerState.HEALTHY
+            || targetSource().isPresent() && record.state() == PipelineWorkerState.STALE;
+        return eligibleState && record.tenantId().equals(target.tenantId())
             && record.pipelineId().equals(target.pipelineId()) && record.contractVersion().equals(target.contractVersion())
             && record.releaseVersion().equals(target.releaseVersion()) && record.workerId().equals(target.workerId())
             && record.protocol().equals(target.protocol()) && record.artifactId().equals(target.artifactId())
@@ -354,7 +402,8 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
                     });
                 })
             : Uni.createFrom().item(false);
-        return requiresAwait.chain(await -> rest.capabilities(endpoint(target.endpoint()), target.sharedSecretRef()).chain(capability -> {
+        return requiresAwait.chain(await -> prepareCredential(target.sharedSecretRef())
+            .chain(() -> rest.capabilities(endpoint(target.endpoint()), target.sharedSecretRef())).chain(capability -> {
             if ((serializedCoordination() && !capability.workerProtocols().contains("canonical-transition-values-v1"))
                 || (await && !capability.workerProtocols().contains("await-authority-v1"))
                 || !PipelineWorkerCapability.PROTOCOL_VERSION.equals(capability.protocolVersion())

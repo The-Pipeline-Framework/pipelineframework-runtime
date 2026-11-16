@@ -479,6 +479,20 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
         assertThat(requests).hasSize(1);
         assertThat(requests.getFirst().secretId()).isEqualTo(values.get("tpf.aws.durable.resume-token-secret-arn"));
         assertThat(config.getOptionalValue("pipeline.orchestrator.worker.sqs.shared-secret", String.class)).isEmpty();
+
+        values.put("tpf.aws.durable.refreshable-rest-targets", "true");
+        values.put("tpf.aws.durable.rest-target-key", "tpf/rest-targets/regional.properties");
+        values.put("tpf.aws.durable.rest-worker-parameter-arn-prefix", "arn:aws:ssm:us-east-1:123456789012:parameter/tpf/worker-signing/");
+        values.put("tpf.aws.durable.resume-token-parameter-arn", "arn:aws:ssm:us-east-1:123456789012:parameter/tpf/resume-token");
+        values.put("tpf.aws.durable.resume-token-parameter-version", "7");
+        assertNoProviderRead(values);
+        values.remove("tpf.aws.durable.resume-token-secret-arn");
+        values.remove("tpf.aws.durable.resume-token-secret-version");
+        var parameters = new ArrayList<GetParameterRequest>();
+        var refreshable = buildSsm(values, new ArrayList<>(), parameters, this::validParameterResponse);
+        assertThat(parameters).containsExactly(GetParameterRequest.builder()
+            .name(values.get("tpf.aws.durable.resume-token-parameter-arn") + ":7").withDecryption(true).build());
+        assertThat(refreshable.getValue("pipeline.orchestrator.resume-token-secret", String.class)).isEqualTo(SECRET);
     }
 
     @Test
@@ -512,6 +526,18 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
         values.put("pipeline.orchestrator.state-provider", "dynamo");
         assertThatThrownBy(() -> build(values, requests)).isInstanceOf(IllegalArgumentException.class);
         assertThat(requests).isEmpty();
+
+        values.put("pipeline.orchestrator.state-provider", "memory");
+        values.put("tpf.aws.durable.worker-parameter-arn", "arn:aws:ssm:us-east-1:123456789012:parameter/tpf/worker-signing/example/worker");
+        values.put("tpf.aws.durable.worker-parameter-version", "7");
+        assertNoProviderRead(values);
+        values.remove("tpf.aws.durable.worker-secret-arn");
+        values.remove("tpf.aws.durable.worker-secret-version");
+        var parameters = new ArrayList<GetParameterRequest>();
+        var parameterWorker = buildSsm(values, new ArrayList<>(), parameters, this::validParameterResponse);
+        assertThat(parameters).containsExactly(GetParameterRequest.builder()
+            .name(values.get("tpf.aws.durable.worker-parameter-arn") + ":7").withDecryption(true).build());
+        assertThat(parameterWorker.getValue("tpf.aws.durable.worker-signing-key", String.class)).isEqualTo(SECRET);
     }
 
     private SmallRyeConfig build(Map<String, String> values, List<GetSecretValueRequest> requests, org.eclipse.microprofile.config.spi.ConfigSource... overrides) {

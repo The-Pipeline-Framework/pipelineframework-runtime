@@ -15,8 +15,19 @@ Parameters:
   ArtifactDigest: {Type: String}
   WorkerId: {Type: String}
   EntryId: {Type: String}
-  WorkerSecretArn: {Type: String}
-  WorkerSecretVersion: {Type: String}
+  WorkerSecretArn: {Type: String, Default: ''}
+  WorkerSecretVersion: {Type: String, Default: ''}
+  WorkerParameterArn: {Type: String, Default: ''}
+  WorkerParameterVersion: {Type: String, Default: '', AllowedPattern: '^$|^[1-9][0-9]*$'}
+Rules:
+  ExactWorkerSigningSource:
+    Assertions:
+      - Assert: !Or
+          - !And [!Not [!Equals [!Ref WorkerParameterArn, '']], !Not [!Equals [!Ref WorkerParameterVersion, '']], !Equals [!Ref WorkerSecretArn, ''], !Equals [!Ref WorkerSecretVersion, '']]
+          - !And [!Not [!Equals [!Ref WorkerSecretArn, '']], !Not [!Equals [!Ref WorkerSecretVersion, '']], !Equals [!Ref WorkerParameterArn, ''], !Equals [!Ref WorkerParameterVersion, '']]
+        AssertDescription: Supply exactly one complete version-pinned signing source
+Conditions:
+  WorkerUsesParameter: !Not [!Equals [!Ref WorkerParameterArn, '']]
 Resources:
   WorkerLogs:
     Type: AWS::Logs::LogGroup
@@ -37,9 +48,10 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref WorkerSecretArn
+              - !If
+                - WorkerUsesParameter
+                - {Effect: Allow, Action: 'ssm:GetParameter', Resource: !Ref WorkerParameterArn}
+                - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref WorkerSecretArn}
               - Effect: Allow
                 Action: logs:CreateLogStream
                 Resource: !GetAtt WorkerLogs.Arn
@@ -87,8 +99,10 @@ Resources:
           PIPELINE_ORCHESTRATOR_WORKER_AWAIT_AUTHORITY_ENTRY_ID: !Ref EntryId
           TPF_AWS_DURABLE_REST_SIGNING_REGION: !Ref AWS::Region
           TPF_AWS_DURABLE_PINNED_REST_WORKER: 'true'
-          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !Ref WorkerSecretArn
-          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !Ref WorkerSecretVersion
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !If [WorkerUsesParameter, !Ref 'AWS::NoValue', !Ref WorkerSecretArn]
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !If [WorkerUsesParameter, !Ref 'AWS::NoValue', !Ref WorkerSecretVersion]
+          TPF_AWS_DURABLE_WORKER_PARAMETER_ARN: !If [WorkerUsesParameter, !Ref WorkerParameterArn, !Ref 'AWS::NoValue']
+          TPF_AWS_DURABLE_WORKER_PARAMETER_VERSION: !If [WorkerUsesParameter, !Ref WorkerParameterVersion, !Ref 'AWS::NoValue']
   WorkerVersion:
     Type: AWS::Lambda::Version
     DeletionPolicy: Retain

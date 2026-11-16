@@ -1,5 +1,7 @@
 package org.pipelineframework.orchestrator;
 
+import io.smallrye.mutiny.Uni;
+
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -92,12 +94,16 @@ public class RegisteredRestWorkerTargetsTest {
     }
 
     private void configure(Map<String, String> overrides) {
+        configure(overrides, true);
+    }
+
+    private void configure(Map<String, String> overrides, boolean staticTargets) {
         var builder = new SmallRyeConfigBuilder().withMapping(PipelineOrchestratorConfig.class).withValidateUnknown(false)
             .withDefaultValue("pipeline.orchestrator.mode", "QUEUE_ASYNC")
             .withDefaultValue("pipeline.orchestrator.strict-startup", "false")
             .withDefaultValue("pipeline.orchestrator.worker.targeting-mode", "registered-rest")
             .withDefaultValue("pipeline.orchestrator.worker.allow-loopback-http", "true");
-        for (String release : List.of("A", "B")) {
+        for (String release : staticTargets ? List.of("A", "B") : List.<String>of()) {
             String prefix = "pipeline.orchestrator.worker.targets." + release + ".";
             Map.of("tenant-id", "tenant", "pipeline-id", "pipeline", "contract-version", "contract",
                 "release-version", release, "worker-id", release, "endpoint", release.equals("A") ? aEndpoint : bEndpoint,
@@ -276,6 +282,44 @@ public class RegisteredRestWorkerTargetsTest {
             "tenant", "pipeline", "contract", "A", "A", "rest", bEndpoint, "app", "sha256:A")));
         targets.validateRegistration(new PipelineWorkerRegistration("tenant", "pipeline", "contract", "A", "A", "rest",
             aEndpoint + "/", "app", "sha256:A"));
+    }
+
+    @Test void refreshableRoutesAreScopedAndIdleWorkersRequireALiveProbe() {
+        var installed = config.worker().targets();
+        configure(Map.of(), false);
+        var current = new AtomicReference<>(Map.of("A", installed.get("A")));
+        var source = new RegisteredRestWorkerTargetSource() {
+            @Override public boolean enabled() { return true; }
+
+            @Override public Uni<Map<String, PipelineOrchestratorConfig.RegisteredRestTargetConfig>> snapshot() {
+                return Uni.createFrom().item(current.get());
+            }
+
+            @Override public Uni<Void> prepareCredential(String reference) { return Uni.createFrom().voidItem(); }
+        };
+        @SuppressWarnings("unchecked")
+        jakarta.enterprise.inject.Instance<RegisteredRestWorkerTargetSource> sources = org.mockito.Mockito.mock(
+            jakarta.enterprise.inject.Instance.class);
+        org.mockito.Mockito.when(sources.get()).thenReturn(source);
+        targets.targetSources = sources;
+
+        var registrationB = new PipelineWorkerRegistration("tenant", "pipeline", "contract", "B", "B", "rest",
+            bEndpoint, "app", "sha256:B");
+        assertThrows(IllegalArgumentException.class, () -> targets.verifyRegistration(registrationB).await().indefinitely());
+        register("A", "sha256:A", aEndpoint, 1);
+        assertEquals(List.of("A"), execute("A"));
+        capabilityRelease.set("incorrect");
+        assertThrows(RuntimeException.class, () -> execute("A"));
+        assertEquals(1, aCalls.get());
+
+        current.set(installed);
+        targets.verifyRegistration(registrationB).await().indefinitely();
+        assertThrows(IllegalArgumentException.class, () -> targets.verifyRegistration(new PipelineWorkerRegistration(
+            "another-tenant", "pipeline", "contract", "B", "B", "rest", bEndpoint, "app", "sha256:B")).await().indefinitely());
+        assertEquals(List.of("B"), execute("B"));
+        current.set(Map.of("B", installed.get("B")));
+        assertThrows(RuntimeException.class, () -> execute("A"));
+        assertEquals(1, aCalls.get());
     }
 
     @Test void redirectIsNotFollowedAndExecutionFailureDoesNotFailOver() {
