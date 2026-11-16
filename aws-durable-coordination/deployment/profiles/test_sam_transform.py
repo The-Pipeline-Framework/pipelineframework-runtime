@@ -60,6 +60,44 @@ def active_graph(template, values):
 
 
 class SamTransform(unittest.TestCase):
+    def test_shared_routing_grants_retain_exact_keys_and_versions(self):
+        path = TEMPLATE.with_name('aws-durable-shared-rest.yaml')
+        template = p.load_template(path)
+        old_key = 'tpf/rest-targets/first.properties'
+        new_key = 'tpf/rest-targets/second.properties'
+        values = {
+            'ReleaseArtifactBucket': BUCKET,
+            'WorkerAliasArns': ['arn:aws:lambda:us-east-2:123456789012:function:worker:release'],
+            'WorkerTargetKey': old_key,
+            'WorkerTargetVersion': 'version-one',
+        }
+
+        def grants(parameters):
+            resources = p.resources(language(template, parameters), parameters)
+            role_policies = resources['CoordinationRole']['Properties']['Policies']
+            retained = [resource['Properties'] for name, resource in resources.items()
+                        if name.startswith('RetainedWorkerTargetReadPolicy')]
+            for policy in retained:
+                self.assertEqual([{'Ref': 'CoordinationRole'}], policy['Roles'])
+            return {(statement['Resource'], statement['Condition']['StringEquals']['s3:VersionId'])
+                    for policy in role_policies + retained
+                    for statement in policy['PolicyDocument']['Statement']
+                    if statement['Action'] == 's3:GetObjectVersion'}
+
+        def arn(key):
+            return 'arn:${AWS::Partition}:s3:::' + BUCKET + '/' + key
+
+        self.assertEqual({(arn(old_key), 'version-one')}, grants(values))
+        retained = values | {
+            'RetainedWorkerTargetGrantSlots': ['0'],
+            'RetainedWorkerTargetGrants': [old_key + '|version-one'],
+        }
+        for current_key in [old_key, new_key]:
+            with self.subTest(current_key=current_key):
+                current = retained | {'WorkerTargetKey': current_key, 'WorkerTargetVersion': 'version-two'}
+                self.assertEqual({(arn(old_key), 'version-one'), (arn(current_key), 'version-two')},
+                                 grants(current))
+
     def test_language_extensions_must_precede_sam(self):
         self.assertEqual(TRANSFORMS, p.load_template(TEMPLATE)['Transform'])
 

@@ -187,6 +187,25 @@ class QueueAsyncSubmissionFlowTest {
   }
 
   @Test
+  void serializedAdmissionPersistsTheSelectedReleasesShapeWithoutLocalMetadata() {
+    var controlPlane = mock(PipelineOrchestratorConfig.ControlPlaneConfig.class);
+    when(orchestratorConfig.controlPlane()).thenReturn(controlPlane);
+    when(controlPlane.payloadMaterialization()).thenReturn(PipelineOrchestratorConfig.ControlPlaneConfig.PayloadMaterialization.SERIALIZED);
+    when(resultShapeResolver.resolvePinned("tenant-1", "application-b", "contract-b", "release-b"))
+        .thenReturn(Uni.createFrom().item(ExecutionResultShape.MATERIALIZED_MULTI));
+    when(executionStateStore.createOrGetExecution(any()))
+        .thenReturn(Uni.createFrom().item(new CreateExecutionResult(record("exec-1", "key-1", ExecutionResultShape.MATERIALIZED_MULTI), true)));
+
+    flow.submit("input", "tenant-1", "key-1", false, "application-b", "contract-b", "release-b").await().indefinitely();
+
+    var captor = ArgumentCaptor.forClass(ExecutionCreateCommand.class);
+    verify(executionStateStore).createOrGetExecution(captor.capture());
+    assertEquals(ExecutionResultShape.MATERIALIZED_MULTI, captor.getValue().resultShape());
+    assertEquals("release-b", captor.getValue().releaseVersion());
+    verify(resultShapeResolver, never()).resolve();
+  }
+
+  @Test
   void duplicateExecutionSkipsLedgerAndEnqueue() {
     when(executionStateStore.createOrGetExecution(any()))
         .thenReturn(Uni.createFrom().item(new CreateExecutionResult(record("exec-1", "key-1"), true)));

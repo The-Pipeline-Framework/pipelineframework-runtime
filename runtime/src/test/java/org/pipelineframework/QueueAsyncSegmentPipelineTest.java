@@ -21,6 +21,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.pipelineframework.awaitable.AwaitCoordinator;
 import org.pipelineframework.checkpoint.CheckpointPublicationService;
+import org.pipelineframework.invocation.PipelineInvocationPath;
 import org.pipelineframework.invocation.PipelineInvocationRuntime;
 import org.pipelineframework.objectpublish.ObjectPublishCompletionService;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionDecision;
@@ -28,6 +29,8 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ControlPlaneTransitionAdmission;
 import org.pipelineframework.orchestrator.ControlPlaneTransitionPermit;
 import org.pipelineframework.orchestrator.DeadLetterPublisher;
+import org.pipelineframework.orchestrator.ExecutionInputShape;
+import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
@@ -444,7 +447,7 @@ class QueueAsyncSegmentPipelineTest {
     ExecutionRecord<Object, Object> succeeded = withStatus(claimed, ExecutionStatus.SUCCEEDED, 1L);
     when(executionStateStore.claimLease(eq("tenant-1"), eq("exec-terminal-await"), any(), anyLong(), eq(1000L)))
         .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
-    when(awaitCoordinator.loadResumePayload(eq("tenant-1"), eq("unit-terminal-await")))
+    when(awaitCoordinator.loadResumeInput(eq("tenant-1"), eq("unit-terminal-await")))
         .thenReturn(Uni.createFrom().item("canonical-await-output"));
     when(executionStateStore.markSucceeded(
             eq("tenant-1"),
@@ -462,7 +465,7 @@ class QueueAsyncSegmentPipelineTest {
             AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER)
         .await().indefinitely();
 
-    verify(awaitCoordinator).loadResumePayload("tenant-1", "unit-terminal-await");
+    verify(awaitCoordinator).loadResumeInput("tenant-1", "unit-terminal-await");
     verify(executionStateStore).markSucceeded(
         eq("tenant-1"),
         eq("exec-terminal-await"),
@@ -470,6 +473,66 @@ class QueueAsyncSegmentPipelineTest {
         eq("exec-terminal-await:1:0"),
         eq(List.of("canonical-await-output")),
         anyLong());
+  }
+
+  @Test
+  void remoteTerminalAwaitUsesPersistedCompletionInsteadOfOriginalExecutionInput() {
+    var canonical = new org.pipelineframework.orchestrator.TypedDurablePayload(
+        "Approval", "definition", "catalog", "application/tpf-canonical+json", 1,
+        "{\"approved\":true}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    ExecutionRecord<Object, Object> claimed = withAwaitUnitId(
+        withCurrentStep(record("remote-terminal", ExecutionResultShape.SINGLE), 4, "stale-input"),
+        "remote-unit");
+    ExecutionRecord<Object, Object> succeeded = withStatus(claimed, ExecutionStatus.SUCCEEDED, 1L);
+    when(executionStateStore.claimLease(eq("tenant-1"), eq("remote-terminal"), any(), anyLong(), eq(1000L)))
+        .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
+    when(awaitCoordinator.loadResumeInput("tenant-1", "remote-unit"))
+        .thenReturn(Uni.createFrom().item(canonical));
+    when(awaitCoordinator.loadResumePayload("tenant-1", "remote-unit"))
+        .thenReturn(Uni.createFrom().item(canonical));
+    when(executionStateStore.markSucceeded(eq("tenant-1"), eq("remote-terminal"), eq(0L),
+        eq("remote-terminal:4:0"), eq(List.of(canonical)), anyLong()))
+        .thenReturn(Uni.createFrom().item(Optional.of(succeeded)));
+    var dispatched = new java.util.concurrent.atomic.AtomicInteger();
+    pipeline(transitionWorkerExecutor, objectPublishCompletionService, () -> -1).process(
+        new ExecutionWorkItem("tenant-1", "remote-terminal"), command -> {
+          dispatched.incrementAndGet();
+          assertEquals(4, command.currentStepIndex());
+          assertEquals(payloadCodec.encode(canonical),
+              payloadCodec.encode(command.toCommand(payloadCodec).inputPayload()));
+          return Uni.createFrom().item(TransitionResultEnvelope.completedTerminalInputPassthrough());
+        }, AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER).await().indefinitely();
+    assertEquals(1, dispatched.get());
+    verify(executionStateStore).markSucceeded(eq("tenant-1"), eq("remote-terminal"), eq(0L),
+        eq("remote-terminal:4:0"), eq(List.of(canonical)), anyLong());
+  }
+
+  @Test
+  void rootEndStillDispatchesAwaitContinuationInsideInvokedDefinition() {
+    String executionId = "exec-nested-terminal-await";
+    ExecutionRecord<Object, Object> claimed = withAwaitUnitId(
+        withCurrentStep(record(executionId, ExecutionResultShape.SINGLE), 1, "stale-input"),
+        "unit-nested");
+    var path = new PipelineInvocationPath(List.of(
+        new PipelineInvocationPath.Frame("child", "Invoke child", 1, 0, false))).atStep(1);
+    var input = new ExecutionInputSnapshot(ExecutionInputShape.UNI, "child-output",
+        Optional.empty(), Optional.of(path));
+    when(executionStateStore.claimLease(eq("tenant-1"), eq(executionId), any(), anyLong(), eq(1000L)))
+        .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
+    when(awaitCoordinator.loadResumeInput("tenant-1", "unit-nested"))
+        .thenReturn(Uni.createFrom().item(input));
+    when(executionStateStore.markSucceeded(eq("tenant-1"), eq(executionId), eq(0L),
+        eq(executionId + ":1:0"), eq(List.of("pipeline-output")), anyLong()))
+        .thenReturn(Uni.createFrom().item(Optional.of(withStatus(claimed, ExecutionStatus.SUCCEEDED, 1L))));
+
+    pipeline(transitionWorkerExecutor, objectPublishCompletionService, () -> 1).process(
+        new ExecutionWorkItem("tenant-1", executionId), command -> {
+          assertEquals(input, command.toCommand(payloadCodec).inputPayload());
+          return Uni.createFrom().item(TransitionResultEnvelope.completedInProcess(List.of("pipeline-output")));
+        }, AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER).await().indefinitely();
+
+    verify(executionStateStore).markSucceeded(eq("tenant-1"), eq(executionId), eq(0L),
+        eq(executionId + ":1:0"), eq(List.of("pipeline-output")), anyLong());
   }
 
   @ParameterizedTest
@@ -481,7 +544,7 @@ class QueueAsyncSegmentPipelineTest {
     when(executionStateStore.claimLease(eq("tenant-1"), eq(claimed.executionId()), any(), anyLong(), eq(1000L)))
         .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
     if (resumesFromAwait) {
-      when(awaitCoordinator.loadResumePayload("tenant-1", "unit-terminal-page"))
+      when(awaitCoordinator.loadResumeInput("tenant-1", "unit-terminal-page"))
           .thenReturn(Uni.createFrom().item(List.of("canonical-await-output")));
     }
     List<?> outputs = resumesFromAwait ? List.of("canonical-await-output") : List.of();
@@ -524,7 +587,7 @@ class QueueAsyncSegmentPipelineTest {
     when(executionStateStore.claimLease(eq("tenant-1"), eq(claimed.executionId()), any(), anyLong(), eq(1000L)))
         .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
     if (resumesFromAwait) {
-      when(awaitCoordinator.loadResumePayload("tenant-1", "unit-terminal-page"))
+      when(awaitCoordinator.loadResumeInput("tenant-1", "unit-terminal-page"))
           .thenReturn(Uni.createFrom().item(List.of("canonical-await-output")));
     }
     when(objectPublishCompletionService.publishIfConfigured(any(), eq(claimed.executionId()),
@@ -787,7 +850,10 @@ class QueueAsyncSegmentPipelineTest {
         () -> payloadCodec,
         () -> segmentBoundaryLedger,
         () -> Duration.ofMillis(25),
-        pipelineStepCount,
+        ignored -> {
+          int count = pipelineStepCount.getAsInt();
+          return count < 0 ? java.util.OptionalInt.empty() : java.util.OptionalInt.of(count);
+        },
         new SegmentCommitEffects(
             executionStateStore,
             workDispatcher,

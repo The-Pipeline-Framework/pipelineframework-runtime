@@ -159,7 +159,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     Optional.empty(),
                     Optional.empty(),
                     command.pagingState(),
-                    Optional.of("initial-v1"));
+                    Optional.of("initial-v1"), command.dispatchPin());
 
                 executionIdByScopedKey.put(scopedKey, executionId);
                 String scopedId = scopedExecutionId(command.tenantId(), executionId);
@@ -285,7 +285,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.failedStepIndex(),
                     current.failedCommandId(),
                     current.redriveTargetCommandId(),
-                    current.redriveReason(), current.pagingState(), current.awaitOccurrenceCause());
+                    current.redriveReason(), current.pagingState(), current.awaitOccurrenceCause(), current.dispatchPin());
                 executionsByScopedId.put(scopedId, claimed);
                 return Optional.of(claimed);
             }
@@ -345,7 +345,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.failedStepIndex(),
                     current.failedCommandId(),
                     current.redriveTargetCommandId(),
-                    current.redriveReason(), current.pagingState(), current.awaitOccurrenceCause());
+                    current.redriveReason(), current.pagingState(), current.awaitOccurrenceCause(), current.dispatchPin());
                 executionsByScopedId.put(scopedId, renewed);
                 return Optional.of(renewed);
             }
@@ -395,7 +395,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
                     current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
-                    current.awaitOccurrenceCause());
+                    current.awaitOccurrenceCause(), current.dispatchPin());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -434,7 +434,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.createdAtEpochMs(), nowEpochMs, current.ttlEpochS(),
                     current.firstCircuitDeferredAtEpochMs(), current.circuitDeferralCount(),
                     current.circuitIdentity(), ExecutionRedriveIntent.REPLAY, -1, Optional.empty(),
-                    Optional.empty(), Optional.empty(), Optional.of(nextPage), current.awaitOccurrenceCause());
+                    Optional.empty(), Optional.empty(), Optional.of(nextPage), current.awaitOccurrenceCause(), current.dispatchPin());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -507,7 +507,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     pageCompletion.map(completion -> current.pagingState().orElseThrow(() ->
                         new IllegalStateException("page completion requires durable paging state"))
                         .withSuspendedCompletion(completion)).or(() -> current.pagingState()),
-                    current.awaitOccurrenceCause());
+                    current.awaitOccurrenceCause(), current.dispatchPin());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -559,7 +559,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
                     current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
-                    current.awaitOccurrenceCause());
+                    current.awaitOccurrenceCause(), current.dispatchPin());
                 retainAwaitRelease(current, updated, awaitUnitId, AwaitReleaseDisposition.CONTINUATION_QUEUED, nowEpochMs);
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
@@ -618,7 +618,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
                     current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
-                    current.awaitOccurrenceCause());
+                    current.awaitOccurrenceCause(), current.dispatchPin());
                 retainAwaitRelease(current, updated, awaitUnitId, AwaitReleaseDisposition.CONTINUATION_QUEUED, nowEpochMs);
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
@@ -743,7 +743,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
                     current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
-                    current.awaitOccurrenceCause());
+                    current.awaitOccurrenceCause(), current.dispatchPin());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -794,7 +794,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.circuitDeferralCount(),
                     current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
                     current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
-                    current.awaitOccurrenceCause());
+                    current.awaitOccurrenceCause(), current.dispatchPin());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -830,7 +830,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.createdAtEpochMs(), nowEpochMs, current.ttlEpochS(), firstCircuitDeferredAtEpochMs,
                     circuitDeferralCount, circuitIdentity == null ? "" : circuitIdentity,
                     current.redriveIntent(), current.failedStepIndex(), current.failedCommandId(),
-                    current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(), current.awaitOccurrenceCause());
+                    current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(), current.awaitOccurrenceCause(), current.dispatchPin());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
@@ -922,7 +922,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     failedCommandId,
                     Optional.empty(),
                     Optional.empty(),
-                    current.pagingState(), current.awaitOccurrenceCause());
+                    current.pagingState(), current.awaitOccurrenceCause(), current.dispatchPin());
                 if (current.status() == ExecutionStatus.WAITING_EXTERNAL
                     && current.awaitUnitId() != null && !current.awaitUnitId().isBlank()) {
                     retainAwaitRelease(current, updated, current.awaitUnitId(), AwaitReleaseDisposition.TERMINAL_FAILED, nowEpochMs);
@@ -1052,7 +1052,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.pagingState(), reissue
                         ? Optional.of(reissueOccurrenceCause(current.tenantId(), current.executionId(), current.version() + 1,
                             retainedTarget.orElseThrow()))
-                        : current.awaitOccurrenceCause());
+                        : current.awaitOccurrenceCause(), current.dispatchPin());
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }

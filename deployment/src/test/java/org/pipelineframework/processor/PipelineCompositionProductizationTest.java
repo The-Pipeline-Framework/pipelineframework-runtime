@@ -119,7 +119,8 @@ class PipelineCompositionProductizationTest {
         assertTrue(branching.contains("Handle approved"));
         assertTrue(branching.contains("Handle rejected"));
         assertTrue(branching.contains("ApprovedHandled"));
-        String rootOrder = fixture.metadata("order.json");
+        String rootOrder = org.pipelineframework.config.pipeline.PipelineJson.mapper()
+            .readTree(fixture.metadata("order.json")).required("order").toString();
         assertTrue(rootOrder.contains(invocationName));
         assertFalse(rootOrder.contains("ProcessHandleApprovedLocalClientStep"));
         assertFalse(rootOrder.contains("PersistenceApprovedHandledSideEffectLocalClientStep"));
@@ -299,7 +300,8 @@ class PipelineCompositionProductizationTest {
         assertFalse(writer.contains("ProcessWriteItemLocalClientStep"));
         assertTrue(reader.contains("ProcessReadItemQueryClientStep child0"));
         assertFalse(reader.contains("ProcessReadItemLocalClientStep"));
-        String order = fixture.metadata("order.json");
+        String order = org.pipelineframework.config.pipeline.PipelineJson.mapper()
+            .readTree(fixture.metadata("order.json")).required("order").toString();
         assertTrue(order.contains(writerName));
         assertTrue(order.contains(readerName));
         assertFalse(order.contains("CommandClientStep"));

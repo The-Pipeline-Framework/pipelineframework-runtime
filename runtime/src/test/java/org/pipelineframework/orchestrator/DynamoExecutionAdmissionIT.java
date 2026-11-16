@@ -50,16 +50,42 @@ class DynamoExecutionAdmissionIT {
         table(executions, "tenant_id", "execution_id");
         table(keys, "tenant_execution_key", null);
         table(payloads, "payload_id", "payload_part");
+        table(prefix + "-completion", "pk", "sk");
         config = mock(PipelineOrchestratorConfig.class);
         var dynamo = mock(PipelineOrchestratorConfig.DynamoConfig.class);
         when(config.dynamo()).thenReturn(dynamo);
         when(dynamo.executionTable()).thenReturn(executions);
         when(dynamo.executionKeyTable()).thenReturn(keys);
         when(dynamo.executionPayloadTable()).thenReturn(payloads);
+        when(dynamo.awaitCompletionLifecycleTable()).thenReturn(prefix + "-completion");
     }
 
     @AfterEach
     void close() { client.close(); }
+
+    @Test
+    void originalDispatchPinSurvivesNativeAdmissionReplayAndProviderRestart() {
+        var original = command(intent("dispatch-pin", "release-a", "original"), ttl());
+        var input = original.execution();
+        var pinned = new ExecutionCreateCommand(input.tenantId(), input.executionKey(), input.pipelineId(), input.contractVersion(),
+            input.releaseVersion(), input.inputPayload(), input.resultShape(), input.inputCanonicalTypeId(), input.initialStepIndex(),
+            input.pagingState(), input.nowEpochMs(), input.ttlEpochS(), Optional.of(ExecutionDispatchPinPersistenceTest.PIN));
+        var admitted = new ExecutionAdmissionCreateCommand(pinned, original.intent(), original.releaseMetadataFingerprint(),
+            original.primaryArtifactId(), original.primaryArtifactDigest());
+        var created = fresh().createOrGetNativeAdmittedExecution(admitted, evidence("release-a")).await().indefinitely();
+        var changed = new ExecutionCreateCommand(pinned.tenantId(), pinned.executionKey(), pinned.pipelineId(), pinned.contractVersion(),
+            pinned.releaseVersion(), pinned.inputPayload(), pinned.resultShape(), pinned.inputCanonicalTypeId(), pinned.initialStepIndex(),
+            pinned.pagingState(), pinned.nowEpochMs(), pinned.ttlEpochS(), Optional.of(new ExecutionDispatchPin("other", "other-operation")));
+        var replay = fresh().createOrGetNativeAdmittedExecution(new ExecutionAdmissionCreateCommand(changed, original.intent(),
+            original.releaseMetadataFingerprint(), original.primaryArtifactId(), original.primaryArtifactDigest()), evidence("release-a"))
+            .await().indefinitely();
+        assertFalse(replay.newlyCreated());
+        assertEquals(created.receipt(), replay.receipt());
+        var recovered = fresh().getExecution("tenant", created.receipt().executionId()).await().indefinitely().orElseThrow();
+        ExecutionDispatchPinPersistenceTest.exerciseTransitions(fresh(), recovered);
+        assertEquals(Optional.of(ExecutionDispatchPinPersistenceTest.PIN), fresh().getExecution("tenant", recovered.executionId())
+            .await().indefinitely().orElseThrow().dispatchPin());
+    }
 
     @Test
     void committedLostAckInquiryAndReplayRemainReadOnlyAfterExecutionExpiry() {

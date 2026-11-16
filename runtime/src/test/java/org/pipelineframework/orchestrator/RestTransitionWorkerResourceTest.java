@@ -38,6 +38,7 @@ class RestTransitionWorkerResourceTest {
         resource.requestThreadContext = mock(org.eclipse.microprofile.context.ThreadContext.class);
         when(resource.requestThreadContext.currentContextExecutor()).thenReturn(Runnable::run);
         resource.identityResolver = identityResolver;
+        resource.awaitValueOperations = mock(org.pipelineframework.awaitable.AwaitValueOperationExecutor.class);
         when(config.workerRest()).thenReturn(restConfig);
         when(restConfig.path()).thenReturn("/pipeline/worker/transitions/execute");
         when(restConfig.capabilitiesPath()).thenReturn("/pipeline/worker/capabilities");

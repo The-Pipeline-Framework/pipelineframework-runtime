@@ -46,6 +46,34 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.*;
 
 class DynamoExecutionStateStoreTest {
+    @Test
+    void executionCreationPersistsDispatchPinAndFreshReaderRejectsPartialPin() {
+        var client = mock(DynamoDbClient.class);
+        var config = mockConfig("tpf_execution", "tpf_execution_key");
+        when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().build());
+        when(client.transactWriteItems(any(TransactWriteItemsRequest.class)))
+            .thenReturn(TransactWriteItemsResponse.builder().build());
+        var created = new DynamoExecutionStateStore(client, config).createOrGetExecution(
+            ExecutionDispatchPinPersistenceTest.command("persisted-pin", ExecutionDispatchPinPersistenceTest.PIN))
+            .await().indefinitely().record();
+        assertEquals(Optional.of(ExecutionDispatchPinPersistenceTest.PIN), created.dispatchPin());
+        var writes = ArgumentCaptor.forClass(TransactWriteItemsRequest.class);
+        verify(client).transactWriteItems(writes.capture());
+        var persisted = new HashMap<>(writes.getValue().transactItems().stream().filter(item -> item.put() != null)
+            .map(item -> item.put()).filter(put -> "tpf_execution".equals(put.tableName())).findFirst().orElseThrow().item());
+        assertEquals("entry-original", persisted.get("dispatch_entry_id").s());
+        assertEquals("deployment-original", persisted.get("dispatch_deployment_operation_id").s());
+        when(client.getItem(any(GetItemRequest.class))).thenAnswer(ignored -> GetItemResponse.builder().item(persisted).build());
+        assertEquals(created.dispatchPin(), new DynamoExecutionStateStore(client, config)
+            .getExecution("tenant", created.executionId()).await().indefinitely().orElseThrow().dispatchPin());
+        persisted.remove("dispatch_deployment_operation_id");
+        assertThrows(IllegalStateException.class, () -> new DynamoExecutionStateStore(client, config)
+            .getExecution("tenant", created.executionId()).await().indefinitely());
+        persisted.remove("dispatch_entry_id");
+        assertTrue(new DynamoExecutionStateStore(client, config).getExecution("tenant", created.executionId())
+            .await().indefinitely().orElseThrow().dispatchPin().isEmpty());
+    }
+
 
     @Test
     void terminalSingleCommitUsesRealPinnedCodecAtUnchangedCursorAndRestoresRemoteResults() {
@@ -193,7 +221,7 @@ class DynamoExecutionStateStoreTest {
         when(client.getItem(any(GetItemRequest.class))).thenReturn(GetItemResponse.builder().item(persisted).build());
         when(client.updateItem(any(UpdateItemRequest.class))).thenReturn(UpdateItemResponse.builder().attributes(completed).build());
         when(payloads.encode(any(), eq(ExecutionDurablePayloadResolver.Slot.RESULT), eq(outputs))).thenReturn(typedChildren);
-        when(payloads.decode(any(), eq(ExecutionDurablePayloadResolver.Slot.RESULT), eq(typedChildren))).thenReturn(outputs);
+        when(payloads.decodeResultItems(any(), eq(typedChildren))).thenReturn(outputs);
 
         Optional<ExecutionRecord<Object, Object>> restored = store.markSucceeded(
             "tenant-a", "exec-typed", 0L, "typed-transition", outputs, now).await().indefinitely();
@@ -203,7 +231,7 @@ class DynamoExecutionStateStoreTest {
         ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
         verify(client).updateItem(update.capture());
         assertEquals(typedChildren, update.getValue().expressionAttributeValues().get(":result").s());
-        verify(payloads).decode(any(), eq(ExecutionDurablePayloadResolver.Slot.RESULT), eq(typedChildren));
+        verify(payloads).decodeResultItems(any(), eq(typedChildren));
     }
 
     @Test
@@ -261,7 +289,7 @@ class DynamoExecutionStateStoreTest {
         when(payloads.supportsTypedPayloads(any())).thenReturn(true);
         when(payloads.encode(any(), eq(ExecutionDurablePayloadResolver.Slot.RESULT), eq(canonicalOutputs)))
             .thenReturn(typedResult);
-        when(payloads.decode(any(), eq(ExecutionDurablePayloadResolver.Slot.RESULT), eq(typedResult)))
+        when(payloads.decodeResultItems(any(), eq(typedResult)))
             .thenReturn(canonicalOutputs);
 
         Optional<ExecutionRecord<Object, Object>> restored = store.markSucceeded(

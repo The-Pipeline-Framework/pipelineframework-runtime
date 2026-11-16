@@ -108,7 +108,7 @@ class QueueAsyncCoordinatorTest {
   @Test
   void pipelineStepCountIsResolvedOncePerCoordinatorInstance() {
     AtomicInteger resolutions = new AtomicInteger();
-    QueueAsyncCoordinator.CachedIntSupplier count = new QueueAsyncCoordinator.CachedIntSupplier(() -> {
+    CachedIntSupplier count = new CachedIntSupplier(() -> {
       resolutions.incrementAndGet();
       return 7;
     });
@@ -214,6 +214,18 @@ class QueueAsyncCoordinatorTest {
             .thenReturn(Uni.createFrom().voidItem());
         lenient().when(awaitLiveCompletionRegistry.signal(any()))
             .thenReturn(Uni.createFrom().item(false));
+    }
+
+    @Test
+    void remoteExecutionLeavesTerminalPositionToPinnedWorkerWithoutLoadingApplicationMetadata() {
+        var controlPlane = mock(PipelineOrchestratorConfig.ControlPlaneConfig.class);
+        when(orchestratorConfig.controlPlane()).thenReturn(controlPlane);
+        when(controlPlane.enabled()).thenReturn(true);
+        when(controlPlane.requireRemoteWorker()).thenReturn(true);
+        coordinator.releaseIdentityResolver = mock(PipelineReleaseIdentityResolver.class);
+        var execution = mock(ExecutionRecord.class);
+        assertTrue(coordinator.pipelineStepCountFor(execution).isEmpty());
+        verifyNoInteractions(coordinator.releaseIdentityResolver, releaseRegistry, execution);
     }
 
     @Test

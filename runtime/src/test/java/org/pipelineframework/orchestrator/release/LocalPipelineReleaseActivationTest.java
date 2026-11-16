@@ -19,6 +19,29 @@ import io.smallrye.mutiny.Uni;
 class LocalPipelineReleaseActivationTest {
 
     @Test
+    void coordinatorWithoutApplicationDoesNotActivateSyntheticLocalRelease() {
+        var identity = mock(PipelineReleaseIdentityResolver.class);
+        var config = mock(PipelineOrchestratorConfig.class);
+        var controlPlane = mock(PipelineOrchestratorConfig.ControlPlaneConfig.class);
+        when(config.controlPlane()).thenReturn(controlPlane);
+        when(controlPlane.enabled()).thenReturn(true);
+        when(controlPlane.requireRemoteWorker()).thenReturn(true);
+        when(identity.compiledContract()).thenReturn(Optional.empty());
+        var registry = mock(PipelineReleaseRegistry.class);
+        var activation = new LocalPipelineReleaseActivation();
+        activation.releaseIdentity = identity;
+        activation.orchestratorConfig = config;
+        activation.releaseRegistry = registry;
+
+        activation.activate(null);
+        activation.activateForCurrentRelease("tenant", "pipeline", "contract", "release")
+            .await().indefinitely();
+
+        org.mockito.Mockito.verifyNoInteractions(registry);
+        org.mockito.Mockito.verify(identity, org.mockito.Mockito.never()).contract();
+    }
+
+    @Test
     void activatesTheGeneratedContractForTheLocalInMemoryRelease() {
         PipelineContractDescriptor contract = new PipelineContractDescriptor(
             1, "consumer-validation", "1", "contract-hash", null, null, null, false, null,

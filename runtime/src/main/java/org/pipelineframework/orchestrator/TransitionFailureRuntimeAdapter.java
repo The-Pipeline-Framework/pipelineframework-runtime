@@ -15,15 +15,24 @@ final class TransitionFailureRuntimeAdapter {
 
     static TransitionFailureEnvelope from(Throwable failure, int failedStepIndex) {
         Objects.requireNonNull(failure, "failure");
-        Throwable classifiedFailure = findNonRetryable(failure)
+        Throwable classifiedFailure = findRemoteUnknown(failure)
+            .<Throwable>map(unknown -> unknown).orElseGet(() -> findNonRetryable(failure)
             .<Throwable>map(nonRetryable -> nonRetryable)
-            .orElse(failure);
+            .orElse(failure));
         return new TransitionFailureEnvelope(
             classifiedFailure.getClass().getName(),
             Optional.ofNullable(classifiedFailure.getMessage()).orElse(""),
             failedStepIndex,
             CommandRetryableEffectException.find(failure)
                 .map(CommandRetryableEffectException::commandId));
+    }
+
+    private static Optional<RemoteTransitionOutcomeUnknownException> findRemoteUnknown(Throwable failure) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable current = failure; current != null && seen.add(current); current = current.getCause()) {
+            if (current instanceof RemoteTransitionOutcomeUnknownException unknown) return Optional.of(unknown);
+        }
+        return Optional.empty();
     }
 
     private static Optional<NonRetryableException> findNonRetryable(Throwable failure) {
@@ -40,6 +49,11 @@ final class TransitionFailureRuntimeAdapter {
 
     static RuntimeException toException(TransitionFailureEnvelope failure) {
         Objects.requireNonNull(failure, "failure");
+        if (RemoteTransitionOutcomeUnknownException.class.getName().equals(failure.failureClass())) {
+            // This portable failure preserves disposition, not transport measurements.
+            return new RemoteTransitionOutcomeUnknownException("worker-reported", "pinned-worker", -1, -1,
+                new IllegalStateException(failure.message()));
+        }
         if (isNonRetryableFailureClass(failure.failureClass())) {
             return new NonRetryableException(
                 failure.message() == null || failure.message().isBlank()

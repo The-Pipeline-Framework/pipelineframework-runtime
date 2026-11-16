@@ -35,7 +35,8 @@ public class CommandDeferredCompletionSupport {
         Objects.requireNonNull(input, "input");
         Objects.requireNonNull(endpointResolver, "endpointResolver");
         Objects.requireNonNull(command, "command");
-        if (config.mode() != OrchestratorMode.QUEUE_ASYNC) {
+        if (config.mode() != OrchestratorMode.QUEUE_ASYNC
+            && !coordinator.acceptsRemoteAwaitContext(AwaitExecutionContextHolder.get())) {
             return Uni.createFrom().failure(new IllegalStateException("Command callback requires QUEUE_ASYNC"));
         }
         PipelineExecutionContext execution = PipelineExecutionContextHolder.get()
@@ -43,21 +44,32 @@ public class CommandDeferredCompletionSupport {
         AwaitExecutionContext context = Optional.ofNullable(AwaitExecutionContextHolder.get())
             .map(current -> new AwaitExecutionContext(current.tenantId(), current.executionId(),
                 current.currentStepIndex(), current.continuationMode(), current.terminalOutputOwnership(),
-                current.traceMetadata(), current.pageContext(), current.awaitOccurrenceCause(), current.invocationPath()))
+                current.traceMetadata(), current.pageContext(), current.awaitOccurrenceCause(), current.invocationPath(), current.transitionScope()))
             .orElseGet(() -> new AwaitExecutionContext(execution.tenantId(), execution.executionId(),
                 execution.currentStepIndex(), AwaitContinuationMode.LIVE_IF_SUPPORTED,
                 TerminalOutputOwnership.TRANSITION_WORKER, Map.of(), Optional.empty()));
-        return coordinator.registerCommandCompletion(descriptor, context, input)
-            .chain(created -> {
+        Uni<AwaitWorkerRegistrationResult> registrationResult = context.transitionScope().isPresent()
+            ? coordinator.registerCommandCompletionWithAuthority(descriptor, context, input)
+            : coordinator.registerCommandCompletion(descriptor, context, input)
+                .map(created -> new AwaitWorkerRegistrationResult(created, Optional.empty()));
+        return registrationResult.chain(registration -> {
+                var created = registration.creation();
                 AwaitInteractionRecord record = created.record();
                 if (record.status().terminal() || record.status() == AwaitInteractionStatus.DISPATCHED) {
                     return finish(new CommandCompletionSettlementResult(record,
                         record.status() == AwaitInteractionStatus.COMPLETED
                             && "dispatch".equals(record.transportMetadata().get("completionDelivery"))), context);
                 }
+                if (context.transitionScope().isPresent()
+                    && (record.status() == AwaitInteractionStatus.DISPATCHING
+                        || record.status() == AwaitInteractionStatus.COMPLETION_OBSERVED)) {
+                    return suspended(record, context);
+                }
                 ConnectorCallbackContext callback;
                 try {
-                    String token = tokens.sign(record, record.createdAtEpochMs());
+                    String token = context.transitionScope().isPresent()
+                        ? registration.callbackToken().orElseThrow(() -> new IllegalStateException("Coordinator callback token is absent"))
+                        : tokens.sign(record, record.createdAtEpochMs());
                     var selected = descriptor.callback().orElseThrow();
                     var policy = allowHttp ? ConnectorCallbackContext.UriPolicy.LOCAL_HTTP
                         : ConnectorCallbackContext.UriPolicy.HTTPS_ONLY;
@@ -74,7 +86,8 @@ public class CommandDeferredCompletionSupport {
                     return Uni.createFrom().failure(new IllegalStateException("Unable to resolve Command callback endpoint"));
                 }
                 Uni<Optional<AwaitInteractionRecord>> claimed = record.status() == AwaitInteractionStatus.WAITING
-                    ? coordinator.claimCommandDispatch(record) : Uni.createFrom().item(Optional.of(record));
+                    ? (context.transitionScope().isPresent() ? coordinator.claimCommandDispatch(record, context)
+                        : coordinator.claimCommandDispatch(record)) : Uni.createFrom().item(Optional.of(record));
                 return claimed.chain(claim -> {
                     if (claim.isEmpty()) {
                         return suspended(record, context);
@@ -88,8 +101,9 @@ public class CommandDeferredCompletionSupport {
                                     ? Optional.ofNullable(acknowledgement) : Optional.empty()))
                         .onFailure(failure -> !(failure instanceof org.pipelineframework.command.CommandInProgressException))
                         .recoverWithItem(failure -> new DispatchResult(classify(failure), Optional.of(failure), Optional.empty()))
-                        .chain(result -> coordinator.settleCommandDispatch(claim.orElseThrow(), result.settlement(),
-                                result.acknowledgement())
+                        .chain(result -> (context.transitionScope().isPresent()
+                            ? coordinator.settleCommandDispatch(claim.orElseThrow(), result.settlement(), result.acknowledgement(), context)
+                            : coordinator.settleCommandDispatch(claim.orElseThrow(), result.settlement(), result.acknowledgement()))
                             .chain(settled -> {
                                 if (settled.record().status() == AwaitInteractionStatus.WAITING) {
                                     return Uni.createFrom().<O>failure(result.failure().orElseThrow());
@@ -132,6 +146,13 @@ public class CommandDeferredCompletionSupport {
     @SuppressWarnings("unchecked")
     private <O> Uni<O> finish(CommandCompletionSettlementResult result, AwaitExecutionContext context) {
         AwaitInteractionRecord record = result.record();
+        if (context.transitionScope().isPresent()) {
+            if (record.status().terminal() && record.status() != AwaitInteractionStatus.COMPLETED) {
+                return Uni.createFrom().failure(new AwaitInteractionTerminalException("Command completion " + record.status()));
+            }
+            return result.completedByDispatch() ? Uni.createFrom().item(() -> (O) coordinator.resumePayload(record))
+                : suspended(record, context);
+        }
         if (record.status().terminal() && record.status() != AwaitInteractionStatus.COMPLETED) {
             return coordinator.recordCompletion(record, System.currentTimeMillis())
                 .chain(() -> coordinator.releaseAdmission(record))

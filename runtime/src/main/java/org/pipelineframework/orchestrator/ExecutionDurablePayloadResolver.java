@@ -6,6 +6,7 @@ import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -26,6 +27,7 @@ public class ExecutionDurablePayloadResolver {
 
     @Inject PipelineReleaseRegistry releaseRegistry;
     @Inject JsonDurablePayloadCodec codec;
+    @Inject PipelineOrchestratorConfig orchestratorConfig;
 
     private final DurablePayloadPlanRegistry plans = new DurablePayloadPlanRegistry();
     private static final int RELEASE_CACHE_MAXIMUM_SIZE = 256;
@@ -35,6 +37,9 @@ public class ExecutionDurablePayloadResolver {
     private static final Duration RELEASE_LOOKUP_TIMEOUT = Duration.ofSeconds(10);
 
     public String encode(ExecutionRecord<?, ?> execution, Slot slot, Object value) {
+        if (serializedMode()) {
+            return encodeEnvelope(execution, slot, value);
+        }
         CompiledDurablePayloadPlan plan = resolve(execution, slot, value instanceof List<?>);
         return encode(execution, slot, value, plan);
     }
@@ -46,6 +51,9 @@ public class ExecutionDurablePayloadResolver {
 
     /** Encodes an explicitly declared boundary type through the execution's pinned release. */
     public String encode(ExecutionRecord<?, ?> execution, String canonicalTypeId, Object value) {
+        if (serializedMode()) {
+            return encodeEnvelope(execution, Slot.CONTINUATION_INPUT, canonicalTypeId, value);
+        }
         CompiledDurablePayloadPlan plan = resolve(
             pinnedRelease(execution), execution, canonicalTypeId, value instanceof List<?>);
         return encode(execution, Slot.CONTINUATION_INPUT, value, plan);
@@ -68,6 +76,10 @@ public class ExecutionDurablePayloadResolver {
         try {
             TypedDurablePayload payload = TypedDurablePayload.fromSerializedBytes(stored.getBytes(StandardCharsets.UTF_8))
                 .orElseThrow(() -> new IllegalArgumentException("not a typed durable payload"));
+            if (serializedMode()) {
+                validateEnvelope(execution, slot, payload);
+                return payload;
+            }
             CompiledDurablePayloadPlan plan = resolveStoredPayload(execution, slot, payload);
             return codec.decode(payload, plan);
         } catch (Exception error) {
@@ -75,8 +87,173 @@ public class ExecutionDurablePayloadResolver {
         }
     }
 
+    /** Restores the result-item container expected by the execution read model. */
+    Object decodeResultItems(ExecutionRecord<?, ?> execution, String stored) {
+        Object decoded = decode(execution, Slot.RESULT, stored);
+        if (!(decoded instanceof TypedDurablePayload payload) || !serializedMode()) {
+            return decoded;
+        }
+        var expression = StoredExpression.parse(payload.canonicalTypeId());
+        if (!expression.collection()) {
+            if (execution.resultShape() != ExecutionResultShape.SINGLE) {
+                throw new IllegalStateException("A multi result requires a canonical collection");
+            }
+            return List.of(payload);
+        }
+        try {
+            var json = PipelineJson.mapper();
+            var items = json.readTree(payload.payload());
+            if (execution.resultShape() == ExecutionResultShape.SINGLE && items.size() > 1) {
+                throw new IllegalStateException("A single result cannot contain multiple canonical items");
+            }
+            var contract = pinnedRelease(execution).contract();
+            var result = new java.util.ArrayList<TypedDurablePayload>(items.size());
+            for (var item : items) {
+                result.add(canonicalEnvelope(contract, expression.elementTypeId(), false, json.writeValueAsBytes(item)));
+            }
+            return List.copyOf(result);
+        } catch (java.io.IOException failure) {
+            throw new IllegalStateException("Cannot read canonical result items", failure);
+        }
+    }
+
+    private boolean serializedMode() {
+        return orchestratorConfig != null && orchestratorConfig.controlPlane() != null
+            && orchestratorConfig.controlPlane().payloadMaterialization()
+                == PipelineOrchestratorConfig.ControlPlaneConfig.PayloadMaterialization.SERIALIZED;
+    }
+
+    private String encodeEnvelope(ExecutionRecord<?, ?> execution, Slot slot, Object value) {
+        String boundary = slot == Slot.CONTINUATION_INPUT && value instanceof TypedDurablePayload payload
+            ? StoredExpression.parse(payload.canonicalTypeId()).elementTypeId()
+            : canonicalTypeId(pinnedRelease(execution).contract(), execution, slot);
+        return encodeEnvelope(execution, slot, boundary, value);
+    }
+
+    private String encodeEnvelope(ExecutionRecord<?, ?> execution, Slot slot, String boundary, Object value) {
+        TypedDurablePayload payload;
+        if (value instanceof TypedDurablePayload envelope) {
+            payload = envelope;
+        } else if (value instanceof List<?> values && (!values.isEmpty() || slot != Slot.INPUT
+            || execution.inputPayload() instanceof ExecutionInputSnapshot snapshot && snapshot.shape() == ExecutionInputShape.MULTI)
+            && (values.isEmpty() || values.stream().allMatch(item -> item instanceof TypedDurablePayload))) {
+            String expected = serializedDefinition(pinnedRelease(execution).contract().canonicalTypes(), boundary)
+                .map(CanonicalPayloadBindingLookup.ResolvedCanonicalDefinition::canonicalTypeId).orElse(boundary);
+            var bytes = new java.io.ByteArrayOutputStream();
+            bytes.write('[');
+            for (int index = 0; index < values.size(); index++) {
+                var item = (TypedDurablePayload) values.get(index);
+                validateEnvelope(execution, slot, item);
+                if (!expected.equals(item.canonicalTypeId())) throw new IllegalArgumentException("Canonical items differ from the retained boundary");
+                if (index > 0) bytes.write(',');
+                bytes.writeBytes(item.payload());
+            }
+            bytes.write(']');
+            payload = canonicalEnvelope(pinnedRelease(execution).contract(), boundary, true, bytes.toByteArray());
+        } else if (slot == Slot.INPUT) {
+            try {
+                boolean multi = execution.inputPayload() instanceof ExecutionInputSnapshot snapshot
+                    && snapshot.shape() == ExecutionInputShape.MULTI;
+                payload = canonicalEnvelope(pinnedRelease(execution).contract(), boundary, multi,
+                    PipelineJson.mapper().writeValueAsBytes(value));
+            } catch (java.io.IOException failure) {
+                throw new IllegalArgumentException("Execution input is not canonical JSON", failure);
+            }
+        } else {
+            throw new IllegalArgumentException("Serialized continuation and result values require canonical durable envelopes");
+        }
+        validateEnvelope(execution, slot, payload);
+        String expected = serializedDefinition(pinnedRelease(execution).contract().canonicalTypes(), boundary)
+                .map(CanonicalPayloadBindingLookup.ResolvedCanonicalDefinition::canonicalTypeId).orElse(boundary);
+        if (!expected.equals(StoredExpression.parse(payload.canonicalTypeId()).elementTypeId())) {
+            throw new IllegalArgumentException("Durable payload differs from the pinned write boundary");
+        }
+        try {
+            return PipelineJson.mapper().writeValueAsString(payload);
+        } catch (Exception error) {
+            throw failure(execution, slot, payload.canonicalTypeId(), "encode", error);
+        }
+    }
+
+    /** Validates pinned canonical identity without resolving the application's Java class. */
+    private void validateEnvelope(ExecutionRecord<?, ?> execution, Slot slot, TypedDurablePayload payload) {
+        PipelineReleaseRecord release = pinnedRelease(execution);
+        StoredExpression stored = StoredExpression.parse(payload.canonicalTypeId());
+        validatePermitted(release.contract(), slot, stored.elementTypeId(), true);
+        TypedDurablePayload expected = canonicalEnvelope(release.contract(), stored.elementTypeId(),
+            stored.collection(), payload.payload());
+        if (!expected.canonicalTypeId().equals(payload.canonicalTypeId())
+            || !expected.typeExpressionFingerprint().equals(payload.typeExpressionFingerprint())
+            || !expected.catalogFingerprint().equals(payload.catalogFingerprint())
+            || !expected.encoding().equals(payload.encoding())
+            || payload.encodingVersion() != expected.encodingVersion()) {
+            throw new IllegalArgumentException("Durable payload identity differs from pinned release");
+        }
+        // Validate canonical schema using compiler-owned definitions without Java materialization.
+        try (var parser = PipelineJson.mapper().createParser(payload.payload())) {
+            parser.enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
+            com.fasterxml.jackson.databind.JsonNode body = PipelineJson.mapper().readTree(parser);
+            if (body == null || parser.nextToken() != null
+                || (stored.collection() && !body.isArray())) {
+                throw new IllegalArgumentException("Invalid canonical JSON payload framing");
+            }
+            if (release.contract().schemaVersion() >= 2) {
+                var catalogue = org.pipelineframework.type.CanonicalTypeCatalogue.fromCanonicalTypes(
+                    release.contract().canonicalTypes());
+                if (stored.collection()) {
+                    for (var item : body) catalogue.validateAndCanonicalize(stored.elementTypeId(), item.toString());
+                } else {
+                    catalogue.validateAndCanonicalize(stored.elementTypeId(), body.toString());
+                }
+            }
+        } catch (java.io.IOException error) {
+            throw new IllegalArgumentException("Invalid canonical JSON payload framing", error);
+        }
+    }
+
+    /** Constructs canonical framing from metadata; deliberately never resolves a Java type. */
+    static TypedDurablePayload canonicalEnvelope(PipelineContractDescriptor contract, String typeId,
+        boolean collection, byte[] bytes) {
+        var definition = serializedDefinition(contract.canonicalTypes(), typeId);
+        String canonical = definition.map(CanonicalPayloadBindingLookup.ResolvedCanonicalDefinition::canonicalTypeId)
+            .orElse(typeId);
+        String expression;
+        String catalog;
+        if (definition.isPresent()) {
+            expression = required(definition.orElseThrow().definition(), "definitionFingerprint", canonical);
+            catalog = contract.canonicalCatalogFingerprint();
+            if (catalog.isBlank()) throw new IllegalStateException("Pinned canonical catalog is unavailable");
+        } else if (contract.schemaVersion() == 1 && canonical.contains(".")) {
+            expression = fingerprint(canonical);
+            catalog = contract.contractHash();
+        } else {
+            throw new IllegalStateException("Pinned release has no canonical binding for " + canonical);
+        }
+        if (collection) expression = fingerprint("List<" + expression + ">");
+        return new TypedDurablePayload(collection ? "List<" + canonical + ">" : canonical,
+            expression, catalog, JsonDurablePayloadCodec.ENCODING, JsonDurablePayloadCodec.ENCODING_VERSION, bytes);
+    }
+
     /** Decode-only compatibility path; legacy class hints cannot select a Java target. */
     public Object decodeLegacy(ExecutionRecord<?, ?> execution, Slot slot, String stored) {
+        if (serializedMode()) {
+            try {
+                Object decoded = PipelineJson.mapper().readerFor(Object.class)
+                    .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                    .readValue(stored);
+                Object body = decoded instanceof Map<?, ?> map && map.containsKey("_tpf_payload")
+                    ? map.get("_tpf_payload") : decoded;
+                PipelineContractDescriptor contract = pinnedRelease(execution).contract();
+                TypedDurablePayload payload = canonicalEnvelope(contract,
+                    canonicalTypeId(contract, execution, slot),
+                    execution.resultShape() == ExecutionResultShape.MATERIALIZED_MULTI && slot == Slot.RESULT,
+                    PipelineJson.mapper().writeValueAsBytes(body));
+                validateEnvelope(execution, slot, payload);
+                return payload;
+            } catch (Exception error) {
+                throw failure(execution, slot, "<resolved-from-release>", "legacy decode", error);
+            }
+        }
         CompiledDurablePayloadPlan plan = resolve(execution, slot, execution.resultShape() == ExecutionResultShape.MATERIALIZED_MULTI && slot == Slot.RESULT);
         try {
             Object decoded = PipelineJson.mapper().readValue(stored, Object.class);
@@ -173,16 +350,30 @@ public class ExecutionDurablePayloadResolver {
     private PipelineReleaseRecord pinnedRelease(ExecutionRecord<?, ?> execution) {
         DurablePayloadReleaseCoordinate coordinate = new DurablePayloadReleaseCoordinate(
             execution.pipelineId(), execution.contractVersion(), execution.releaseVersion());
-        return releases.getOrLoad(new ReleaseCacheKey(execution.tenantId(), coordinate), ignored ->
-            releaseRegistry.get(execution.tenantId(), execution.pipelineId(), execution.releaseVersion())
+        return releases.getOrLoad(new ReleaseCacheKey(execution.tenantId(), coordinate), ignored -> {
+            PipelineReleaseRecord release = releaseRegistry.get(
+                    execution.tenantId(), execution.pipelineId(), execution.releaseVersion())
                 .await().atMost(RELEASE_LOOKUP_TIMEOUT)
-                .orElseThrow(() -> new IllegalStateException("pinned release is unavailable")));
+                .orElseThrow(() -> new IllegalStateException("pinned release is unavailable"));
+            if (!execution.tenantId().equals(release.tenantId())
+                || !execution.pipelineId().equals(release.pipelineId())
+                || !execution.contractVersion().equals(release.contractVersion())
+                || !execution.releaseVersion().equals(release.releaseVersion())) {
+                throw new IllegalStateException("Resolved release differs from execution's pinned identity");
+            }
+            return release;
+        });
     }
 
     private static void validatePermitted(
         PipelineContractDescriptor contract,
         Slot slot,
         String canonicalTypeId) {
+        validatePermitted(contract, slot, canonicalTypeId, false);
+    }
+
+    private static void validatePermitted(PipelineContractDescriptor contract, Slot slot,
+        String canonicalTypeId, boolean includePhysicalAwaitBoundaries) {
         List<PipelineBundleStepDescriptor> steps = contract.steps();
         Map<String, Map<String, Object>> definitions = contract.canonicalTypes();
         if (steps.isEmpty()) {
@@ -206,10 +397,37 @@ public class ExecutionDurablePayloadResolver {
                 .map(typeId -> canonicalIdentity(definitions, typeId))
                 .collect(Collectors.toUnmodifiableSet());
         };
+        if (includePhysicalAwaitBoundaries && !contract.rootBoundary().isEmpty()) {
+            var roots = new java.util.HashSet<>(permitted);
+            roots.add((String) contract.rootBoundary().get("inputCanonicalTypeId"));
+            roots.add((String) contract.rootBoundary().get("outputCanonicalTypeId"));
+            permitted = Set.copyOf(roots);
+        }
+        if (includePhysicalAwaitBoundaries && slot == Slot.CONTINUATION_INPUT) {
+            var expanded = new java.util.HashSet<>(permitted);
+            for (var step : steps) {
+                expanded.add(canonicalIdentity(definitions, step.inputTypeId()));
+                Object descriptor = step.deferredCompletion().get("runtimeDescriptor");
+                if (descriptor instanceof Map<?,?> metadata && metadata.get("stepId") instanceof String stepId) {
+                    var pinned = org.pipelineframework.awaitable.PinnedAwaitDescriptor.resolve(contract, stepId);
+                    expanded.add(pinned.canonicalInputTypeId()); expanded.add(pinned.canonicalOutputTypeId());
+                }
+            }
+            permitted = Set.copyOf(expanded);
+        }
         if (!permitted.contains(canonicalTypeId)) {
             throw new IllegalStateException("Typed execution durable payload canonical type '" + canonicalTypeId
                 + "' is not permitted for " + slot + "; permitted=" + permitted.stream().sorted().toList());
         }
+    }
+
+    private static Optional<CanonicalPayloadBindingLookup.ResolvedCanonicalDefinition> serializedDefinition(
+        Map<String, Map<String,Object>> definitions, String requested) {
+        if (definitions.containsKey(requested)) return Optional.of(
+            new CanonicalPayloadBindingLookup.ResolvedCanonicalDefinition(requested, definitions.get(requested)));
+        var matches = definitions.entrySet().stream().filter(entry -> requested.equals(entry.getValue().get("runtimeClass"))).toList();
+        if (matches.size() > 1) throw new IllegalStateException("Ambiguous historical canonical boundary " + requested);
+        return matches.stream().findFirst().map(entry -> new CanonicalPayloadBindingLookup.ResolvedCanonicalDefinition(entry.getKey(), entry.getValue()));
     }
 
     private static String canonicalIdentity(Map<String, Map<String, Object>> definitions, String typeId) {
@@ -238,6 +456,9 @@ public class ExecutionDurablePayloadResolver {
     }
 
     private static String canonicalTypeId(PipelineContractDescriptor contract, ExecutionRecord<?, ?> execution, Slot slot) {
+        if (slot != Slot.CONTINUATION_INPUT && !contract.rootBoundary().isEmpty()) {
+            return (String) contract.rootBoundary().get(slot == Slot.INPUT ? "inputCanonicalTypeId" : "outputCanonicalTypeId");
+        }
         if (contract.composition().present() && slot != Slot.CONTINUATION_INPUT) {
             var root = contract.composition().definition(contract.composition().rootDefinitionId());
             return slot == Slot.INPUT ? root.inputContractId() : root.outputContractId();

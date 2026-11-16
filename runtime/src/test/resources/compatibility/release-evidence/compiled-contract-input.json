@@ -1,0 +1,219 @@
+{
+  "schemaVersion": 2,
+  "pipelineId": "org.pipelineframework.examples.shared.expense",
+  "contractVersion": "sha256:35d350ecc2cc227a9a0c1a18061d4559c22fba3021462cfbecb03b7c04361e21",
+  "contractHash": "35d350ecc2cc227a9a0c1a18061d4559c22fba3021462cfbecb03b7c04361e21",
+  "platform": "COMPUTE",
+  "transport": "LOCAL",
+  "module": "shared-coordinator-application-a1",
+  "pluginHost": false,
+  "steps": [
+    {
+      "index": 0,
+      "authoredName": "Prepare",
+      "kind": "internal",
+      "cardinality": "ONE_TO_ONE",
+      "inputTypeId": "org.pipelineframework.examples.shared.expense.Request",
+      "outputTypeId": "org.pipelineframework.examples.shared.expense.Approved",
+      "runtimeClass": "org.pipelineframework.examples.shared.expense.pipeline.ProcessPrepareDeferredCompletionStep",
+      "clientClass": "org.pipelineframework.examples.shared.expense.pipeline.ProcessPrepareDeferredCompletionStep",
+      "deferredCompletion": {
+        "completionPayloadTypeId": "org.pipelineframework.examples.shared.expense.ApprovalReply",
+        "completionProjector": "org.pipelineframework.examples.shared.expense.ExpenseCompletionProjector",
+        "correlationStrategy": "interactionId",
+        "finalOutputTypeId": "org.pipelineframework.examples.shared.expense.Approved",
+        "fingerprint": "cd492ab4d276a627ff1badae47dcfbc4d2a51d22a66c2198f876658147640ad3",
+        "idempotencyKeyFields": [],
+        "operationOutputTypeId": "org.pipelineframework.examples.shared.expense.Pending",
+        "runtimeDescriptor": {
+          "acknowledgementAwareCommandCompletion": false,
+          "canonicalInputTypeId": "Pending",
+          "canonicalOutputTypeId": "Approved",
+          "completionPayloadTypeId": "ApprovalReply",
+          "completionProjectorId": "org.pipelineframework.examples.shared.expense.ExpenseCompletionProjector",
+          "inputTypeId": "org.pipelineframework.examples.shared.expense.Pending",
+          "outputTypeId": "org.pipelineframework.examples.shared.expense.Approved",
+          "requestAwareCompletion": true,
+          "schemaVersion": 1,
+          "stepId": "ProcessPrepareService",
+          "transportConfig": {},
+          "transportInputTypeId": "org.pipelineframework.examples.shared.expense.Pending",
+          "transportOutputTypeId": "org.pipelineframework.examples.shared.expense.ApprovalReply"
+        },
+        "timeout": "PT5M",
+        "transportConfigFingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "transportType": "interaction-api"
+      }
+    },
+    {
+      "index": 1,
+      "authoredName": "Finish",
+      "kind": "internal",
+      "cardinality": "ONE_TO_ONE",
+      "inputTypeId": "org.pipelineframework.examples.shared.expense.Approved",
+      "outputTypeId": "org.pipelineframework.examples.shared.expense.Receipt",
+      "runtimeClass": "org.pipelineframework.examples.shared.expense.FinishService"
+    }
+  ],
+  "canonicalTypes": {
+    "ApprovalReply": {
+      "definition": {
+        "fields": [
+          {
+            "name": "approved",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {
+              "id": "bool",
+              "kind": "scalar"
+            }
+          }
+        ],
+        "id": "ApprovalReply",
+        "kind": "record"
+      },
+      "definitionFingerprint": "29ce1de89552d3c7502a0163d8be149bb036e02700185ef067c90327416b188b",
+      "runtimeClass": "org.pipelineframework.examples.shared.expense.ApprovalReply"
+    },
+    "Approved": {
+      "definition": {
+        "fields": [
+          {
+            "name": "approved",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {
+              "id": "bool",
+              "kind": "scalar"
+            }
+          },
+          {
+            "name": "requestId",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {
+              "id": "string",
+              "kind": "scalar"
+            }
+          }
+        ],
+        "id": "Approved",
+        "kind": "record"
+      },
+      "definitionFingerprint": "e0bab3a11238acdb9b59cf3bb8c50a413eb2e56df46c4d453d87a60bf196d32f",
+      "runtimeClass": "org.pipelineframework.examples.shared.expense.Approved"
+    },
+    "Pending": {
+      "definition": {
+        "fields": [
+          {
+            "name": "amount",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {
+              "id": "int64",
+              "kind": "scalar"
+            }
+          },
+          {
+            "name": "requestId",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {
+              "id": "string",
+              "kind": "scalar"
+            }
+          },
+          {
+            "name": "revision",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {
+              "id": "string",
+              "kind": "scalar"
+            }
+          }
+        ],
+        "id": "Pending",
+        "kind": "record"
+      },
+      "definitionFingerprint": "ab8b7c82e74e4e405ce9fb336e0e58809b11a077542c2e29e1f0a44c6cda527d",
+      "runtimeClass": "org.pipelineframework.examples.shared.expense.Pending"
+    },
+    "Receipt": {
+      "definition": {
+        "fields": [
+          {
+            "name": "outcome",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {
+              "id": "string",
+              "kind": "scalar"
+            }
+          },
+          {
+            "name": "requestId",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {
+              "id": "string",
+              "kind": "scalar"
+            }
+          },
+          {
+            "name": "revision",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {
+              "id": "string",
+              "kind": "scalar"
+            }
+          }
+        ],
+        "id": "Receipt",
+        "kind": "record"
+      },
+      "definitionFingerprint": "9fc2b10e368768652845bf2fb3d902ff00ad772c0966b9bcf68aeeade21b9790",
+      "runtimeClass": "org.pipelineframework.examples.shared.expense.Receipt"
+    },
+    "Request": {
+      "definition": {
+        "fields": [
+          {
+            "name": "amount",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {
+              "id": "int64",
+              "kind": "scalar"
+            }
+          },
+          {
+            "name": "requestId",
+            "nullability": "NON_NULL",
+            "presence": "REQUIRED",
+            "type": {
+              "id": "string",
+              "kind": "scalar"
+            }
+          }
+        ],
+        "id": "Request",
+        "kind": "record"
+      },
+      "definitionFingerprint": "a0b876a8fb2c199d8186a2b1cffa27dcb6ba7a8311a11d307abcc1fecbf79175",
+      "runtimeClass": "org.pipelineframework.examples.shared.expense.Request"
+    }
+  },
+  "canonicalCatalogFingerprint": "8145da115fdafa9b0f16d3583ceeb355dcb1e551fc0ca55d7f9951b836aab3d5",
+  "capabilities": {
+    "localTransitionExecution": true,
+    "transitionWorkerProtocols": [
+      "local",
+      "rest",
+      "grpc",
+      "sqs"
+    ]
+  }
+}

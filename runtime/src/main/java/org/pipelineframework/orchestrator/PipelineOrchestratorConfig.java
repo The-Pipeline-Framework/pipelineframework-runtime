@@ -503,6 +503,14 @@ public interface PipelineOrchestratorConfig {
      */
     interface ControlPlaneConfig {
 
+        /** How coordinator persistence exposes canonical payloads; typed local behavior is the default. */
+        enum PayloadMaterialization { TYPED, SERIALIZED }
+
+        /** Serialized mode retains validated canonical envelopes without application Java classes. */
+        @WithName("payload-materialization")
+        @WithDefault("TYPED")
+        PayloadMaterialization payloadMaterialization();
+
         /**
          * Enables the internal hosted control-plane REST surface.
          *
@@ -707,6 +715,9 @@ public interface PipelineOrchestratorConfig {
      */
     interface WorkerConfig {
 
+        /** Optional remote authority for Await lifecycle operations of a typed worker. */
+        WorkerAwaitAuthorityConfig awaitAuthority();
+
         /** Legacy fixed target selection or explicitly bound whole-bundle REST targets. */
         @WithDefault("legacy")
         String targetingMode();
@@ -803,7 +814,18 @@ public interface PipelineOrchestratorConfig {
         WorkerLifecycleConfig lifecycle();
     }
 
+    interface WorkerAwaitAuthorityConfig {
+        /** Trusted Coordinator origin configured by the deployment owner. */
+        Optional<String> baseUrl();
+        /** Worker identity retained by the selected Release entry binding. */
+        Optional<String> workerId();
+        /** Declared immutable Release entry identity. */
+        Optional<String> entryId();
+    }
+
     interface RegisteredRestTargetConfig {
+        /** Declared immutable Release entry used for retained dispatch selection. */
+        Optional<String> entryId();
         /** Bound tenant identifier. */
         String tenantId();
         /** Bound pipeline identifier. */

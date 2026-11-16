@@ -42,6 +42,36 @@ public class CommandDeferredCompletionSupportTest {
         PipelineExecutionContextHolder.clear();
     }
 
+    @Test
+    void synchronousWorkerRequiresConfiguredAuthorityAndScopedTransition() {
+        when(config.mode()).thenReturn(OrchestratorMode.SYNC);
+        var coordinator = spy(coordinator());
+        coordinator.remoteLifecycle = mock(RemoteAwaitWorkerLifecycle.class);
+        when(coordinator.remoteLifecycle.enabled()).thenReturn(true);
+        var descriptor = new AwaitCompletionDescriptor("StartJob", String.class.getName(), String.class.getName(),
+            Duration.ofMinutes(1), "interactionId", "interaction-api", Map.of(), List.of());
+        var support = support(coordinator);
+        PipelineExecutionContextHolder.set(new PipelineExecutionContext("tenant", "execution", 0));
+        AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant", "execution", 0));
+        assertThrows(IllegalStateException.class, () -> support.execute(descriptor, "input",
+            ignored -> URI.create("https://app.test/"), ignored -> { throw new AssertionError("No dispatch"); }).await().indefinitely());
+        var scope = new AwaitTransitionScope("tenant", "execution", "pipeline", "contract", "release", 1, "transition");
+        AwaitExecutionContextHolder.set(new AwaitExecutionContext("tenant", "execution", 0,
+            AwaitContinuationMode.DURABLE_HANDOFF, TerminalOutputOwnership.TRANSITION_WORKER, Map.of(),
+            Optional.empty(), Optional.empty(), Optional.empty(), Optional.of(scope)));
+        var admitted = new IllegalStateException("Authority registration reached");
+        doReturn(io.smallrye.mutiny.Uni.createFrom().failure(admitted)).when(coordinator)
+            .registerCommandCompletionWithAuthority(any(), any(), any());
+        assertSame(admitted, assertThrows(IllegalStateException.class, () -> support.execute(descriptor, "input",
+            ignored -> URI.create("https://app.test/"), ignored -> { throw new AssertionError("No dispatch"); }).await().indefinitely()));
+        verify(coordinator).registerCommandCompletionWithAuthority(any(), any(), any());
+        clearInvocations(coordinator);
+        when(coordinator.remoteLifecycle.enabled()).thenReturn(false);
+        assertThrows(IllegalStateException.class, () -> support.execute(descriptor, "input",
+            ignored -> URI.create("https://app.test/"), ignored -> { throw new AssertionError("No dispatch"); }).await().indefinitely());
+        verify(coordinator, never()).registerCommandCompletionWithAuthority(any(), any(), any());
+    }
+
     @ParameterizedTest
     @org.junit.jupiter.params.provider.CsvSource({"false,true", "true,true", "false,false", "true,false"})
     void callbackAndDurableEffectJoinInEitherOrderWithoutRedispatch(boolean ambiguous, boolean callbackFirst) throws Exception {

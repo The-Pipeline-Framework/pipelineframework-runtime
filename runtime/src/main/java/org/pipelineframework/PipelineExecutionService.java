@@ -107,6 +107,9 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
   protected PipelineRunner pipelineRunner;
 
   @Inject
+  org.pipelineframework.objectpublish.ObjectPublishCompletionService terminalObjectPublish;
+
+  @Inject
   PipelineStepOrderer stepOrderer;
 
   /** Health check service to verify dependent services. */
@@ -142,6 +145,9 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
 
   @Inject
   PipelineOrchestratorConfig orchestratorConfig;
+
+  @Inject
+  org.pipelineframework.awaitable.RemoteAwaitWorkerLifecycle remoteAwaitLifecycle;
 
   @Inject
   PipelineTransitionWorkerSelector transitionWorkerSelector;
@@ -510,8 +516,16 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
       return Uni.createFrom().item(TransitionResultEnvelope.failed(new IllegalArgumentException(identityMismatch.get())));
     }
     TransitionWorkerCommand decodedCommand;
+    TransitionPayloadCodec transitionCodec;
     try {
-      decodedCommand = command.toCommand(payloadCodec());
+      TransitionPayloadCodec framing = payloadCodec();
+      var encodedInput = new org.pipelineframework.orchestrator.SerializedTransitionPayload(
+          command.payloadTypeId(), command.payloadEncoding(), command.payload());
+      boolean canonical = remoteAwaitLifecycle != null && remoteAwaitLifecycle.enabled()
+          || org.pipelineframework.orchestrator.CompiledCanonicalTransitionPayloadCodec.containsCanonicalPayload(framing, encodedInput);
+      transitionCodec = canonical ? new org.pipelineframework.orchestrator.CompiledTransitionBoundaryCodec(
+          framing, releaseIdentityResolver().compiledContract().orElseThrow(), command) : framing;
+      decodedCommand = command.toCommand(transitionCodec);
     } catch (Throwable failure) {
       return Uni.createFrom().item(TransitionResultEnvelope.failed(failure));
     }
@@ -541,21 +555,32 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
         })
         .onItem().transformToUni(items -> {
           boolean published = terminalOutputPublished.get();
-          TransitionResultEnvelope completed = terminalInputPassthrough.get()
-              ? TransitionResultEnvelope.completedTerminalInputPassthrough()
-              : policy.encodeOutputs()
-                  ? TransitionResultEnvelope.completed(payloadCodec(), published ? List.of() : items, published)
-                  : TransitionResultEnvelope.completedInProcess(items, published);
-          if (command.pageContext().isEmpty()) {
-            return Uni.createFrom().item(completed);
+          Uni<TransitionResultEnvelope> result;
+          if (terminalInputPassthrough.get()
+              && transitionCodec instanceof org.pipelineframework.orchestrator.CompiledTransitionBoundaryCodec) {
+            var terminalItems = canonicalTerminalItems(decodedCommand);
+            result = TerminalPublicationBoundary.publishTypedWorkerOutput(terminalObjectPublish, command, terminalItems)
+                .map(publishedByWorker -> TransitionResultEnvelope.completed(transitionCodec, terminalItems, publishedByWorker));
+          } else {
+            TransitionResultEnvelope completed = terminalInputPassthrough.get()
+                ? TransitionResultEnvelope.completedTerminalInputPassthrough()
+                : policy.encodeOutputs()
+                    ? TransitionResultEnvelope.completed(transitionCodec, published ? List.of() : items, published)
+                    : TransitionResultEnvelope.completedInProcess(items, published);
+            result = Uni.createFrom().item(completed);
           }
-          return validatedPageCompletion(decodedCommand, command, pageCompletion)
-              .onItem().transform(completed::withPageCompletion);
+          if (command.pageContext().isEmpty()) return result;
+          return result.chain(completed -> validatedPageCompletion(decodedCommand, command, pageCompletion)
+              .onItem().transform(completed::withPageCompletion));
         })
         .onFailure(AwaitThrowableSupport::containsAwaitSuspension).recoverWithUni(failure -> {
           AwaitSuspendedException suspended = AwaitThrowableSupport.extractAwaitSuspension(failure);
-          return awaitCoordinator.suspensionSnapshot(suspended)
-              .onItem().transformToUni(snapshot -> command.pageContext().isEmpty()
+          Uni<org.pipelineframework.orchestrator.TransitionAwaitSuspension> suspension = remoteAwaitLifecycle != null && remoteAwaitLifecycle.enabled()
+              ? remoteAwaitLifecycle.suspension(suspended, new org.pipelineframework.awaitable.AwaitTransitionScope(
+                  command.tenantId(), command.executionId(), command.pipelineId(), command.contractVersion(),
+                  command.releaseVersion(), command.executionVersion(), command.transitionKey()))
+              : awaitCoordinator.suspensionSnapshot(suspended);
+          return suspension.onItem().transformToUni(snapshot -> command.pageContext().isEmpty()
                   ? Uni.createFrom().item(TransitionResultEnvelope.waiting(snapshot))
                   : validatedPageCompletion(decodedCommand, command, pageCompletion)
                       .onItem().transform(completion -> TransitionResultEnvelope.waiting(
@@ -701,7 +726,14 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
               terminalOutputOwnership,
               java.util.Map.of(),
               command.pageContext(),
-              command.awaitOccurrenceCause(), rehydratedInput.invocationPath()));
+              command.awaitOccurrenceCause(), rehydratedInput.invocationPath(),
+              java.util.Optional.ofNullable(orchestratorConfig)
+                  .map(PipelineOrchestratorConfig::worker)
+                  .map(PipelineOrchestratorConfig.WorkerConfig::awaitAuthority)
+                  .flatMap(PipelineOrchestratorConfig.WorkerAwaitAuthorityConfig::baseUrl)
+                  .map(ignored -> new org.pipelineframework.awaitable.AwaitTransitionScope(
+                      envelope.tenantId(), envelope.executionId(), envelope.pipelineId(), envelope.contractVersion(),
+                      envelope.releaseVersion(), envelope.executionVersion(), envelope.transitionKey()))));
           PipelineExecutionContextHolder.set(executionContext);
           rehydratedInput.pipelineContext().ifPresentOrElse(
               PipelineContextHolder::set,
@@ -842,6 +874,22 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
     TerminalOutputOwnership terminalOutputOwnership() {
       return terminalOutputOwnership;
     }
+  }
+
+  private static List<?> canonicalTerminalItems(TransitionWorkerCommand command) {
+    Object value = command.inputPayload() instanceof org.pipelineframework.orchestrator.ExecutionInputSnapshot snapshot
+        ? snapshot.payload() : command.inputPayload();
+    return command.resultShape() == org.pipelineframework.orchestrator.ExecutionResultShape.MATERIALIZED_MULTI
+        && value instanceof List<?> items ? items : List.of(value);
+  }
+
+  public boolean supportsCanonicalTransitions() {
+    return releaseIdentityResolver().compiledContract()
+        .map(org.pipelineframework.orchestrator.CompiledTransitionBoundaryCodec::supports).orElse(false);
+  }
+
+  public boolean supportsRemoteAwaitAuthority() {
+    return remoteAwaitLifecycle != null && remoteAwaitLifecycle.supported() && supportsCanonicalTransitions();
   }
 
   private TransitionPayloadCodec payloadCodec() {

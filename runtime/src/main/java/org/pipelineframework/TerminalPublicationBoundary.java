@@ -1,11 +1,14 @@
 package org.pipelineframework;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.function.Supplier;
 
 import io.smallrye.mutiny.Uni;
 import org.pipelineframework.checkpoint.CheckpointPublicationService;
 import org.pipelineframework.objectpublish.ObjectPublishCompletionService;
+import org.pipelineframework.orchestrator.PagedExecutionState;
+import org.pipelineframework.orchestrator.TransitionCommandEnvelope;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 
@@ -36,6 +39,22 @@ class TerminalPublicationBoundary {
     return publishCheckpoint(completed, plan, nowEpochMs)
         .chain(() -> publishObjectOutput(plan, nowEpochMs))
         .chain(() -> composeExhaustedPagedOutput(completed));
+  }
+
+  /** Publishes application values while they are still typed in the worker. */
+  static Uni<Boolean> publishTypedWorkerOutput(ObjectPublishCompletionService publication,
+      TransitionCommandEnvelope command, List<?> items) {
+    return Uni.createFrom().deferred(() -> {
+      if (publication == null || !publication.enabled()) {
+        return Uni.createFrom().item(false);
+      }
+      return command.pageContext()
+          .map(page -> publication.publishIfConfigured(() -> items, command.executionId(),
+              new PagedExecutionState(page.pageIndex(), page.sourceIdentity(),
+                  page.startCheckpoint(), page.maxRecords(), page.suspendedCompletion())))
+          .orElseGet(() -> publication.publishIfConfigured(items))
+          .replaceWith(true);
+    });
   }
 
   boolean pagedOutputEnabled() {

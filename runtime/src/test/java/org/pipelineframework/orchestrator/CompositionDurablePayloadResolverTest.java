@@ -142,6 +142,10 @@ class CompositionDurablePayloadResolverTest {
             new PipelineCompositionDescriptor("$root", List.of(root, prepare, canary)));
         var release = mock(PipelineReleaseRecord.class);
         when(release.contract()).thenReturn(contract);
+        when(release.tenantId()).thenReturn("tenant");
+        when(release.pipelineId()).thenReturn("composed");
+        when(release.contractVersion()).thenReturn("3");
+        when(release.releaseVersion()).thenReturn("release");
         var registry = mock(PipelineReleaseRegistry.class);
         when(registry.get("tenant", "composed", "release")).thenReturn(Uni.createFrom().item(Optional.of(release)));
         var resolver = new ExecutionDurablePayloadResolver();

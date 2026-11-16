@@ -4,7 +4,8 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.function.IntSupplier;
+import java.util.function.Function;
+import java.util.OptionalInt;
 import java.util.function.Supplier;
 
 import io.smallrye.mutiny.Uni;
@@ -16,13 +17,13 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionOperation;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
 import org.pipelineframework.orchestrator.ControlPlaneTransitionAdmission;
+import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
 import org.pipelineframework.orchestrator.ExecutionRecord;
 import org.pipelineframework.orchestrator.ExecutionResultShape;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
 import org.pipelineframework.orchestrator.PipelineTransitionWorker;
-import org.pipelineframework.orchestrator.TransitionCommandEnvelope;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.TransitionResultEnvelope;
 import org.pipelineframework.orchestrator.TransitionWorkerExecutor;
@@ -44,7 +45,7 @@ class QueueAsyncSegmentPipeline {
   private final Supplier<TransitionPayloadCodec> payloadCodec;
   private final Supplier<SegmentBoundaryLedger> segmentBoundaryLedger;
   private final Supplier<Duration> saturatedDelay;
-  private final IntSupplier pipelineStepCount;
+  private final Function<ExecutionRecord<?, ?>, OptionalInt> pipelineStepCount;
   private final SegmentCommitEffects segmentCommitEffects;
 
   QueueAsyncSegmentPipeline(
@@ -57,7 +58,7 @@ class QueueAsyncSegmentPipeline {
       Supplier<TransitionPayloadCodec> payloadCodec,
       Supplier<SegmentBoundaryLedger> segmentBoundaryLedger,
       Supplier<Duration> saturatedDelay,
-      IntSupplier pipelineStepCount,
+      Function<ExecutionRecord<?, ?>, OptionalInt> pipelineStepCount,
       SegmentCommitEffects segmentCommitEffects,
       String queueWorkerId) {
     this.executionLease = new QueueAsyncExecutionLease(executionStateStore, orchestratorConfig, queueWorkerId);
@@ -139,25 +140,62 @@ class QueueAsyncSegmentPipeline {
   private Uni<TransitionResultEnvelope> executeTransition(
       ClaimedSegment segment,
       PipelineTransitionWorker worker) {
-    if (isCoordinatorTerminalMaterialization(segment)) {
-      // Keep terminal inputs at the coordinator instead of re-encoding them through a no-op worker.
-      Uni<TransitionResultEnvelope> completed = segment.resumesFromAwait()
-          ? awaitCoordinator.loadResumePayload(segment.record().tenantId(), segment.record().awaitUnitId())
-              .onItem().transform(payload ->
-              TransitionResultEnvelope.completedInProcess(terminalOutputItems(segment, payload)))
-          : Uni.createFrom().item(TransitionResultEnvelope.completedTerminalInputPassthrough());
-      return completed.onItem().transform(result -> segment.record().pagingState()
-          .map(page -> result.withPageCompletion(page.suspendedCompletion().orElseThrow(() ->
-              new IllegalStateException("a terminal paged segment requires retained page completion"))))
-          .orElse(result));
+    boolean atRootEnd = isCoordinatorTerminalMaterialization(segment);
+    if (atRootEnd && !segment.resumesFromAwait()) {
+      return Uni.createFrom().item(withRetainedPageCompletion(
+          segment, TransitionResultEnvelope.completedTerminalInputPassthrough()));
     }
-    return transitionCommand(segment)
-        .onItem().transformToUni(command -> transitionWorkerExecutor.execute(worker, command));
+    return inputPayload(segment).chain(payload -> {
+      // The root cursor can be at the end while an invoked definition still has work.
+      if (atRootEnd && !(payload instanceof ExecutionInputSnapshot snapshot
+          && snapshot.invocationPath().filter(path -> !path.frames().isEmpty()).isPresent())) {
+        Object output = payload instanceof ExecutionInputSnapshot snapshot ? snapshot.payload() : payload;
+        return Uni.createFrom().item(withRetainedPageCompletion(segment,
+            TransitionResultEnvelope.completedInProcess(terminalOutputItems(segment, output))));
+      }
+      return transitionWorkerExecutor.execute(worker, segment.transitionCommand(payload, payloadCodec.get()))
+          .chain(result -> normalizeTerminalAwaitResult(segment, result));
+    });
   }
+
+  private TransitionResultEnvelope withRetainedPageCompletion(
+      ClaimedSegment segment, TransitionResultEnvelope result) {
+    return segment.record().pagingState()
+        .map(page -> result.withPageCompletion(page.suspendedCompletion().orElseThrow(() ->
+            new IllegalStateException("a terminal paged segment requires retained page completion"))))
+        .orElse(result);
+  }
+
+  private Uni<TransitionResultEnvelope> normalizeTerminalAwaitResult(
+      ClaimedSegment segment, TransitionResultEnvelope result) {
+    if (result != null && result.outcome() == org.pipelineframework.orchestrator.TransitionWorkerOutcome.WAITING_EXTERNAL
+        && awaitCoordinator.requiresAuthoritativeSuspension()) {
+      return awaitCoordinator.authoritativeSuspension(result.awaitSuspension()).map(TransitionResultEnvelope::waiting);
+    }
+    if (result == null || !result.terminalInputPassthrough() || !segment.resumesFromAwait()) {
+      return Uni.createFrom().item(result);
+    }
+    if (awaitCoordinator.requiresAuthoritativeSuspension()) {
+      return Uni.createFrom().failure(new IllegalStateException(
+          "Serialized Await requires the worker to return a canonical terminal result"));
+    }
+    // The worker establishes the terminal cursor using its generated execution order.
+    // The authoritative completed Await value, not the execution's original input, is the result.
+    return awaitCoordinator.loadResumePayload(segment.record().tenantId(), segment.record().awaitUnitId())
+        .map(payload -> {
+          TransitionResultEnvelope completed = TransitionResultEnvelope.completedInProcess(
+              terminalOutputItems(segment, payload));
+          return result.pageCompletion().map(completed::withPageCompletion).orElse(completed);
+        });
+  }
+
   private boolean isCoordinatorTerminalMaterialization(ClaimedSegment segment) {
-    return (segment.record().resultShape() == ExecutionResultShape.MATERIALIZED_MULTI
-        || segment.resumesFromAwait())
-        && segment.record().currentStepIndex() == pipelineStepCount.getAsInt();
+    if (segment.record().resultShape() != ExecutionResultShape.MATERIALIZED_MULTI
+        && !segment.resumesFromAwait()) {
+      return false;
+    }
+    OptionalInt localCount = pipelineStepCount.apply(segment.record());
+    return localCount.isPresent() && segment.record().currentStepIndex() == localCount.getAsInt();
   }
   private static List<?> terminalOutputItems(ClaimedSegment segment, Object payload) {
     if (segment.record().resultShape() == ExecutionResultShape.SINGLE) {
@@ -169,11 +207,6 @@ class QueueAsyncSegmentPipeline {
     }
     return List.of(payload);
   }
-  private Uni<TransitionCommandEnvelope> transitionCommand(ClaimedSegment segment) {
-    return inputPayload(segment)
-        .onItem().transform(payload -> segment.transitionCommand(payload, payloadCodec.get()));
-  }
-
   private Uni<Object> inputPayload(ClaimedSegment segment) {
     if (!segment.resumesFromAwait()) {
       return Uni.createFrom().item(segment.record().inputPayload());

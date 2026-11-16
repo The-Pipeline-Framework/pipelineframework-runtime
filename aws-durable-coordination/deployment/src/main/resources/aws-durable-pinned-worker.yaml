@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Immutable typed REST worker attached to a shared TPF coordination installation
+Parameters:
+  CodeBucket: {Type: String}
+  CodeKey: {Type: String}
+  CodeObjectVersion: {Type: String}
+  CodeSha256: {Type: String}
+  ConfigurationDigest: {Type: String, AllowedPattern: '[a-f0-9]{64}'}
+  CoordinatorInvokerRoleArn: {Type: String}
+  CoordinatorLifecycleAliasArn: {Type: String}
+  CoordinatorLifecycleOrigin: {Type: String}
+  PipelineId: {Type: String}
+  ReleaseVersion: {Type: String}
+  ArtifactId: {Type: String}
+  ArtifactDigest: {Type: String}
+  WorkerId: {Type: String}
+  EntryId: {Type: String}
+  WorkerSecretArn: {Type: String}
+  WorkerSecretVersion: {Type: String}
+Resources:
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-worker'
+      RetentionInDays: 30
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker-attachment
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref WorkerSecretArn
+              - Effect: Allow
+                Action: logs:CreateLogStream
+                Resource: !GetAtt WorkerLogs.Arn
+              - Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: !GetAtt WorkerLogs.Arn
+              - Effect: Allow
+                Action: lambda:InvokeFunctionUrl
+                Resource: !Ref CoordinatorLifecycleAliasArn
+                Condition:
+                  StringEquals: {lambda:FunctionUrlAuthType: AWS_IAM}
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Ref CoordinatorLifecycleAliasArn
+                Condition:
+                  Bool: {lambda:InvokedViaFunctionUrl: 'true'}
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-worker'
+      Runtime: java21
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      Role: !GetAtt WorkerRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+        S3ObjectVersion: !Ref CodeObjectVersion
+      Environment:
+        Variables:
+          PIPELINE_ORCHESTRATOR_MODE: SYNC
+          PIPELINE_ORCHESTRATOR_PIPELINE_ID: !Ref PipelineId
+          PIPELINE_ORCHESTRATOR_RELEASE_VERSION: !Ref ReleaseVersion
+          PIPELINE_ORCHESTRATOR_STATE_PROVIDER: memory
+          PIPELINE_ORCHESTRATOR_RELEASES_REGISTRY_PROVIDER: memory
+          PIPELINE_ORCHESTRATOR_RELEASES_STORAGE_PROVIDER: local
+          PIPELINE_ORCHESTRATOR_WORKER_ARTIFACT_ID: !Ref ArtifactId
+          PIPELINE_ORCHESTRATOR_WORKER_ARTIFACT_DIGEST: !Ref ArtifactDigest
+          PIPELINE_ORCHESTRATOR_PROCESS_LOOPS_DISABLED: 'true'
+          PIPELINE_ORCHESTRATOR_WORKER_REST_SERVER_ENABLED: 'true'
+          PIPELINE_ORCHESTRATOR_WORKER_REST_SHARED_SECRET_REF: config:tpf.aws.durable.worker-signing-key
+          PIPELINE_ORCHESTRATOR_WORKER_AWAIT_AUTHORITY_BASE_URL: !Ref CoordinatorLifecycleOrigin
+          PIPELINE_ORCHESTRATOR_WORKER_AWAIT_AUTHORITY_WORKER_ID: !Ref WorkerId
+          PIPELINE_ORCHESTRATOR_WORKER_AWAIT_AUTHORITY_ENTRY_ID: !Ref EntryId
+          TPF_AWS_DURABLE_REST_SIGNING_REGION: !Ref AWS::Region
+          TPF_AWS_DURABLE_PINNED_REST_WORKER: 'true'
+          TPF_AWS_DURABLE_WORKER_SECRET_ARN: !Ref WorkerSecretArn
+          TPF_AWS_DURABLE_WORKER_SECRET_VERSION: !Ref WorkerSecretVersion
+  WorkerVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref WorkerFunction
+      CodeSha256: !Ref CodeSha256
+      Description: !Ref ConfigurationDigest
+  WorkerAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: release
+      FunctionName: !Ref WorkerFunction
+      FunctionVersion: !GetAtt WorkerVersion.Version
+  WorkerUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: AWS_IAM
+      TargetFunctionArn: !Ref WorkerFunction
+      Qualifier: release
+    DependsOn: WorkerAlias
+  CoordinatorUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WorkerAlias
+      Action: lambda:InvokeFunctionUrl
+      FunctionUrlAuthType: AWS_IAM
+      Principal: !Ref CoordinatorInvokerRoleArn
+  CoordinatorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WorkerAlias
+      Action: lambda:InvokeFunction
+      InvokedViaFunctionUrl: true
+      Principal: !Ref CoordinatorInvokerRoleArn
+Outputs:
+  WorkerVersionArn:
+    Value: !Ref WorkerVersion
+  WorkerAliasArn:
+    Value: !Ref WorkerAlias
+  WorkerOrigin:
+    Value: !GetAtt WorkerUrl.FunctionUrl
+  WorkerRoleArn:
+    Value: !GetAtt WorkerRole.Arn

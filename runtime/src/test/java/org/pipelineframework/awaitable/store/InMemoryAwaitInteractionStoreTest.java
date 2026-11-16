@@ -23,6 +23,50 @@ import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 
 class InMemoryAwaitInteractionStoreTest {
     @Test
+    void fencedCompletionRejectsStaleProjectionAndKeepsMatchingDuplicates() {
+        var store = new InMemoryAwaitInteractionStore();
+        var original = store.createOrGet(createCommand("fenced", 10_000L, 70_000L)).await().indefinitely().record();
+        var command = new AwaitCompletionCommand("tenant", original.interactionId(), null,
+            "completion", "projected", "alice", 15_000L);
+        var advanced = store.markDispatching("tenant", original.interactionId(), original.version(), 11_000L)
+            .await().indefinitely().orElseThrow();
+        assertTrue(store.complete(original, command).await().indefinitely().isEmpty());
+        var accepted = store.complete(advanced, command).await().indefinitely().orElseThrow();
+        assertFalse(accepted.duplicate());
+        assertEquals("projected", accepted.record().responsePayload());
+        assertTrue(store.getCompletionAdmission("tenant", original.interactionId()).await().indefinitely().isPresent());
+        assertTrue(store.complete(advanced, command).await().indefinitely().isEmpty());
+        assertTrue(store.complete(accepted.record(), command).await().indefinitely().orElseThrow().duplicate());
+    }
+
+    @Test
+    void fencedCompletionRetainsDeadlineAuthority() {
+        var store = new InMemoryAwaitInteractionStore();
+        var original = store.createOrGet(createCommand("fenced-deadline", 10_000L, 70_000L)).await().indefinitely().record();
+        assertThrows(org.pipelineframework.awaitable.AwaitInteractionTerminalException.class,
+            () -> store.complete(original, new AwaitCompletionCommand("tenant", original.interactionId(), null,
+                "completion", "projected", "alice", 70_000L)).await().indefinitely());
+        assertTrue(store.getCompletionAdmission("tenant", original.interactionId()).await().indefinitely().isEmpty());
+        assertTrue(store.complete(original, new AwaitCompletionCommand("tenant", original.interactionId(), null,
+            "completion", "projected", "alice", 70_000L)).await().indefinitely().isEmpty());
+    }
+
+    @Test
+    void fencedCompletionRejectsForeignOwnerAndCommandScope() {
+        var store = new InMemoryAwaitInteractionStore();
+        var original = store.createOrGet(createCommand("fenced-owner", 10_000L, 70_000L)).await().indefinitely().record();
+        var command = new AwaitCompletionCommand("tenant", original.interactionId(), null,
+            "completion", "projected", "alice", 15_000L);
+        var foreign = copyIdentity(original, original.interactionId(), "foreign-unit", original.itemIndex(),
+            original.idempotencyKey(), original.correlationId());
+        assertTrue(store.complete(foreign, command).await().indefinitely().isEmpty());
+        assertThrows(IllegalArgumentException.class, () -> store.complete(original,
+            new AwaitCompletionCommand("foreign", original.interactionId(), null,
+                "completion", "projected", "alice", 15_000L)).await().indefinitely());
+        assertFalse(store.complete(original, command).await().indefinitely().orElseThrow().duplicate());
+    }
+
+    @Test
     void legacyConfiguredKeyStillDeduplicatesActiveInteractionAcrossExecutions() {
         var store = new InMemoryAwaitInteractionStore();
         var first = store.createOrGet(createCommand("review:business-key", 10_000L, 70_000L)).await().indefinitely().record();

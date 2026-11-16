@@ -197,6 +197,10 @@ class ExecutionDurablePayloadResolverTest {
     void leavesSchemaV1ExecutionsOnTheirLegacyPayloadFormat() {
         PipelineReleaseRegistry registry = mock(PipelineReleaseRegistry.class);
         PipelineReleaseRecord release = mock(PipelineReleaseRecord.class);
+        when(release.tenantId()).thenReturn("tenant");
+        when(release.pipelineId()).thenReturn("payments");
+        when(release.contractVersion()).thenReturn("3");
+        when(release.releaseVersion()).thenReturn("release");
         when(release.contract()).thenReturn(new PipelineContractDescriptor(
             1, "payments", "2", "contract", null, null, null, false, null,
             List.of(new PipelineBundleStepDescriptor(0, "input", "object", "ONE_TO_ONE",
@@ -208,6 +212,164 @@ class ExecutionDurablePayloadResolverTest {
         resolver.codec = new JsonDurablePayloadCodec();
 
         assertFalse(resolver.supportsTypedPayloads(execution(0)));
+    }
+
+    @Test
+    void serializedModePreservesCanonicalBytesAndTypedReaderCompatibility() {
+        ExecutionDurablePayloadResolver typed = resolver();
+        var execution = execution(0);
+        String original = typed.encode(execution, ExecutionDurablePayloadResolver.Slot.RESULT,
+            new PaymentOutput("one", "approved"));
+        ExecutionDurablePayloadResolver serialized = serializedResolver();
+        TypedDurablePayload envelope = assertInstanceOf(TypedDurablePayload.class,
+            serialized.decode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, original));
+        String stored = serialized.encode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, envelope);
+        assertEquals(original, stored);
+        assertEquals(new PaymentOutput("one", "approved"),
+            typed.decode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, stored));
+    }
+
+    @Test
+    void serializedResultItemsPreserveCardinalityAndScalarCanonicalIdentity() throws Exception {
+        var single = execution(0, ExecutionResultShape.SINGLE);
+        var multi = execution(0, ExecutionResultShape.MATERIALIZED_MULTI);
+        var typed = resolver();
+        var serialized = serializedResolver();
+        var first = new PaymentOutput("one", "approved");
+        var second = new PaymentOutput("two", "approved");
+        var slot = ExecutionDurablePayloadResolver.Slot.RESULT;
+        String scalar = typed.encode(single, slot, first);
+        String oneItem = typed.encode(single, slot, List.of(first));
+        String twoItems = typed.encode(multi, slot, List.of(first, second));
+        String empty = typed.encode(single, slot, List.of());
+        assertEquals(List.of(), serialized.decodeResultItems(single, empty));
+        var one = assertInstanceOf(List.class, serialized.decodeResultItems(single, oneItem));
+        assertEquals(1, one.size());
+        assertEquals(scalar, org.pipelineframework.config.pipeline.PipelineJson.mapper().writeValueAsString(one.getFirst()));
+        var many = assertInstanceOf(List.class, serialized.decodeResultItems(multi, twoItems));
+        assertEquals(2, many.size());
+        assertEquals(typed.encode(multi, slot, second),
+            org.pipelineframework.config.pipeline.PipelineJson.mapper().writeValueAsString(many.get(1)));
+        assertThrows(IllegalStateException.class, () -> serialized.decodeResultItems(single, twoItems));
+        assertThrows(IllegalStateException.class, () -> serialized.decodeResultItems(multi, scalar));
+        assertEquals(List.of(first), typed.decodeResultItems(single, oneItem));
+    }
+
+    @Test
+    void serializedReadDoesNotResolveUnavailableApplicationBinding() throws Exception {
+        var fixture = resolverFixture();
+        var execution = execution(0);
+        String stored = fixture.resolver().encode(execution, ExecutionDurablePayloadResolver.Slot.RESULT,
+            new PaymentOutput("one", "approved"));
+        var release = fixture.registry().get("tenant", "payments", "release").await().indefinitely().orElseThrow();
+        var mapper = org.pipelineframework.config.pipeline.PipelineJson.mapper();
+        var unavailable = mapper.readValue(mapper.writeValueAsString(release.contract())
+            .replace(PaymentOutput.class.getName(), "unavailable.application.Output"), PipelineContractDescriptor.class);
+        when(release.contract()).thenReturn(unavailable);
+        ExecutionDurablePayloadResolver serialized = serializedResolver();
+        serialized.releaseRegistry = fixture.registry();
+        assertInstanceOf(TypedDurablePayload.class,
+            serialized.decode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, stored));
+        ExecutionDurablePayloadResolver freshTyped = resolver();
+        freshTyped.releaseRegistry = fixture.registry();
+        assertThrows(IllegalStateException.class,
+            () -> freshTyped.decode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, stored));
+    }
+
+    @Test
+    void serializedModeRejectsCorruptionAndWrongWriteBoundary() throws Exception {
+        var execution = execution(0);
+        ExecutionDurablePayloadResolver resolver = serializedResolver();
+        for (TypedDurablePayload payload : List.of(
+            new TypedDurablePayload("PaymentOutput", "wrong", "catalog",
+                JsonDurablePayloadCodec.ENCODING, 1, "{}".getBytes()),
+            new TypedDurablePayload("PaymentOutput", "output-fingerprint", "catalog",
+                JsonDurablePayloadCodec.ENCODING, 1, "invalid".getBytes()),
+            new TypedDurablePayload("PaymentOutput", "output-fingerprint", "catalog",
+                JsonDurablePayloadCodec.ENCODING, 1, "{} {}".getBytes()),
+            new TypedDurablePayload("PaymentOutput", "output-fingerprint", "catalog",
+                JsonDurablePayloadCodec.ENCODING, 1, "[]".getBytes()),
+            new TypedDurablePayload("PaymentOutput", "output-fingerprint", "catalog",
+                JsonDurablePayloadCodec.ENCODING, 1, "{}".getBytes()))) {
+            String stored = org.pipelineframework.config.pipeline.PipelineJson.mapper().writeValueAsString(payload);
+            assertThrows(IllegalStateException.class,
+                () -> resolver.decode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, stored));
+        }
+        TypedDurablePayload input = new TypedDurablePayload("PaymentRecord", "record-fingerprint", "catalog",
+            JsonDurablePayloadCodec.ENCODING, 1, "{}".getBytes());
+        assertThrows(IllegalArgumentException.class,
+            () -> resolver.encode(execution, ExecutionDurablePayloadResolver.Slot.RESULT, input));
+    }
+
+    @Test
+    void serializedInitialJsonUsesPinnedSchemaWithoutApplicationObjects() {
+        var serialized = serializedResolver();
+        var execution = execution(0);
+        String stored = serialized.encode(execution, ExecutionDurablePayloadResolver.Slot.INPUT,
+            Map.of("path", "/input.csv"));
+        assertEquals(new CsvPaymentsInputFile("/input.csv"),
+            resolver().decode(execution, ExecutionDurablePayloadResolver.Slot.INPUT, stored));
+        assertThrows(IllegalArgumentException.class, () -> serialized.encode(execution,
+            ExecutionDurablePayloadResolver.Slot.INPUT, Map.of("wrong", "field")));
+        assertThrows(IllegalArgumentException.class, () -> serialized.encode(execution,
+            ExecutionDurablePayloadResolver.Slot.INPUT, List.of(Map.of("path", "/input.csv"))));
+    }
+
+    @Test
+    void serializedMultiInputRetainsEmptyAndPopulatedStreamFraming() {
+        var serialized = serializedResolver();
+        var execution = execution(0);
+        when(execution.inputPayload()).thenReturn(new ExecutionInputSnapshot(ExecutionInputShape.MULTI, List.of()));
+        for (var values : List.of(List.of(), List.of(Map.of("path", "/input.csv")))) {
+            String stored = serialized.encode(execution, ExecutionDurablePayloadResolver.Slot.INPUT, values);
+            var envelope = assertInstanceOf(TypedDurablePayload.class,
+                serialized.decode(execution, ExecutionDurablePayloadResolver.Slot.INPUT, stored));
+            assertEquals("List<CsvPaymentsInputFile>", envelope.canonicalTypeId());
+            assertEquals(values.size(), assertInstanceOf(List.class,
+                resolver().decode(execution, ExecutionDurablePayloadResolver.Slot.INPUT, stored)).size());
+        }
+    }
+
+    @Test
+    void serializedContinuationUsesItsCanonicalIdentityAtPhysicalCursor() {
+        var execution = execution(99);
+        var typed = resolver();
+        var serialized = serializedResolver();
+        String source = typed.encode(execution, "PaymentStatus", new PaymentStatus("one", "approved"));
+        var envelope = assertInstanceOf(TypedDurablePayload.class,
+            serialized.decode(execution, ExecutionDurablePayloadResolver.Slot.CONTINUATION_INPUT, source));
+        assertEquals(source, serialized.encode(execution,
+            ExecutionDurablePayloadResolver.Slot.CONTINUATION_INPUT, envelope));
+        String combined = serialized.encode(execution, "PaymentStatus", List.of(envelope, envelope));
+        assertEquals(List.of(new PaymentStatus("one", "approved"), new PaymentStatus("one", "approved")),
+            typed.decode(execution, ExecutionDurablePayloadResolver.Slot.CONTINUATION_INPUT, combined));
+    }
+
+    @Test
+    void resolvedReleaseMustMatchEveryPinnedIdentityField() {
+        for (String field : List.of("tenant", "pipeline", "contract", "release")) {
+            ResolverFixture fixture = resolverFixture();
+            PipelineReleaseRecord release = fixture.registry().get("tenant", "payments", "release")
+                .await().indefinitely().orElseThrow();
+            switch (field) {
+                case "tenant" -> when(release.tenantId()).thenReturn("other");
+                case "pipeline" -> when(release.pipelineId()).thenReturn("other");
+                case "contract" -> when(release.contractVersion()).thenReturn("other");
+                case "release" -> when(release.releaseVersion()).thenReturn("other");
+            }
+            assertThrows(IllegalStateException.class,
+                () -> fixture.resolver().supportsTypedPayloads(execution(0)));
+        }
+    }
+
+    private static ExecutionDurablePayloadResolver serializedResolver() {
+        ExecutionDurablePayloadResolver resolver = resolver();
+        resolver.orchestratorConfig = mock(PipelineOrchestratorConfig.class);
+        var controlPlane = mock(PipelineOrchestratorConfig.ControlPlaneConfig.class);
+        when(resolver.orchestratorConfig.controlPlane()).thenReturn(controlPlane);
+        when(controlPlane.payloadMaterialization()).thenReturn(
+            PipelineOrchestratorConfig.ControlPlaneConfig.PayloadMaterialization.SERIALIZED);
+        return resolver;
     }
 
     private static ExecutionDurablePayloadResolver resolver() {
@@ -231,6 +393,10 @@ class ExecutionDurablePayloadResolverTest {
                 "PaymentOutput", binding(PaymentOutput.class, "output-fingerprint"),
                 "Unrelated", binding(Unrelated.class, "unrelated-fingerprint")), "catalog");
         PipelineReleaseRecord release = mock(PipelineReleaseRecord.class);
+        when(release.tenantId()).thenReturn("tenant");
+        when(release.pipelineId()).thenReturn("payments");
+        when(release.contractVersion()).thenReturn("3");
+        when(release.releaseVersion()).thenReturn("release");
         when(release.contract()).thenReturn(contract);
         when(registry.get("tenant", "payments", "release")).thenReturn(Uni.createFrom().item(Optional.of(release)));
         ExecutionDurablePayloadResolver resolver = new ExecutionDurablePayloadResolver();
@@ -258,7 +424,11 @@ class ExecutionDurablePayloadResolverTest {
     }
 
     private static Map<String, Object> binding(Class<?> type, String fingerprint) {
-        return Map.of("runtimeClass", type.getName(), "definitionFingerprint", fingerprint);
+        return Map.of("runtimeClass", type.getName(), "definitionFingerprint", fingerprint,
+            "definition", Map.of("kind", "record", "id", type.getSimpleName(), "fields",
+                java.util.Arrays.stream(type.getRecordComponents()).map(component -> Map.of(
+                    "name", component.getName(), "presence", "REQUIRED", "nullability", "NON_NULL",
+                    "type", Map.of("kind", "scalar", "id", "string"))).toList()));
     }
 
     private record CsvPaymentsInputFile(String path) { }

@@ -30,6 +30,7 @@ import org.pipelineframework.orchestrator.AwaitItemContinuationCommand;
 import org.pipelineframework.orchestrator.AwaitItemContinuationDisposition;
 import org.pipelineframework.orchestrator.AwaitItemContinuationResult;
 import org.pipelineframework.orchestrator.ExecutionCreateCommand;
+import org.pipelineframework.orchestrator.ExecutionDispatchPin;
 import org.pipelineframework.orchestrator.ExecutionInputShape;
 import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
 import org.pipelineframework.orchestrator.ExecutionRecord;
@@ -132,20 +133,21 @@ class ItemizedAwaitContinuationFlowTest {
     verify(workDispatcher, never()).enqueueNow(any());
   }
 
-  @Test
-  void childOutputsReleaseParentOnceWithOrderedOutput() {
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+  void childOutputsReleaseParentOnceWithOrderedOutput(boolean pinned) {
     InMemoryExecutionStateStore store = new InMemoryExecutionStateStore();
     when(workDispatcher.enqueueNow(any())).thenReturn(Uni.createFrom().voidItem());
     ItemContinuationClaims claims = new ItemContinuationClaims();
     ItemizedAwaitContinuationFlow flow = flow(store, workDispatcher, awaitCoordinator, claims);
     long now = 1234L;
+    Optional<ExecutionDispatchPin> pin = pinned
+        ? Optional.of(new ExecutionDispatchPin("entry-original", "operation-original")) : Optional.empty();
     CreateExecutionResult parent = store.createOrGetExecution(new ExecutionCreateCommand(
-            "tenant-1",
-            "parent-key",
+            "tenant-1", "parent-key", "pipeline", "contract", "release",
             new ExecutionInputSnapshot(ExecutionInputShape.UNI, "input"),
-            ExecutionResultShape.MATERIALIZED_MULTI,
-            now,
-            9_999_999_999L))
+            ExecutionResultShape.MATERIALIZED_MULTI, Optional.empty(), 0, Optional.empty(),
+            now, 9_999_999_999L, pin))
         .await().indefinitely();
     String unitId = awaitUnitId(parent.record());
     store.markWaitingExternal(
@@ -196,6 +198,13 @@ class ItemizedAwaitContinuationFlowTest {
     ExecutionInputSnapshot snapshot = assertInstanceOf(ExecutionInputSnapshot.class, resumed.inputPayload());
     assertEquals(List.of("out-0", "out-1"), snapshot.payload());
     assertFalse(claims.hasPendingClaims(resumed, unit));
+    assertEquals(pin, resumed.dispatchPin());
+    for (int item = 0; item < 2; item++) {
+      var child = store.getExecutionByKey("tenant-1", ItemContinuationKey.from(parent.record(), unit, item).childExecutionKey())
+          .await().indefinitely().orElseThrow();
+      assertEquals(pin, child.dispatchPin());
+      assertEquals(ExecutionStatus.SUCCEEDED, child.status());
+    }
     verify(workDispatcher).enqueueNow(new ExecutionWorkItem("tenant-1", parent.record().executionId()));
     ControlPlaneProjection projection = journal.projection("tenant-1", parent.record().executionId())
         .await().indefinitely();

@@ -49,6 +49,17 @@ public class AwaitDurablePayloadResolver {
     private static final Duration RELEASE_LOOKUP_TIMEOUT = Duration.ofSeconds(10);
 
     public String encode(AwaitInteractionRecord interaction, Slot slot, Object value) {
+        if (serializedMode()) {
+            if (!(value instanceof TypedDurablePayload payload)) {
+                throw new IllegalArgumentException("Serialized Await coordination requires a canonical envelope");
+            }
+            validateSerialized(interaction, slot, payload);
+            try {
+                return PipelineJson.mapper().writeValueAsString(payload);
+            } catch (Exception error) {
+                throw failure(interaction, slot, payload.canonicalTypeId(), "encode", error);
+            }
+        }
         CompiledDurablePayloadPlan plan = resolve(interaction, slot);
         try {
             return PipelineJson.mapper().writeValueAsString(codec.encode(value, plan));
@@ -95,10 +106,85 @@ public class AwaitDurablePayloadResolver {
     /** Restores a typed envelope that crossed a transition command as JSON object metadata. */
     public Object decodeEnvelope(AwaitInteractionRecord interaction, Slot slot, TypedDurablePayload payload) {
         try {
+            if (serializedMode()) {
+                validateSerialized(interaction, slot, payload);
+                return payload;
+            }
             CompiledDurablePayloadPlan plan = resolve(interaction, slot);
             return codec.decode(payload, plan);
         } catch (Exception e) {
             throw failure(interaction, slot, slot.name().toLowerCase(), "decode", e);
+        }
+    }
+
+    boolean serializedMode() {
+        return orchestratorConfig != null && orchestratorConfig.controlPlane() != null
+            && orchestratorConfig.controlPlane().payloadMaterialization()
+                == PipelineOrchestratorConfig.ControlPlaneConfig.PayloadMaterialization.SERIALIZED;
+    }
+
+    DurablePayloadReleaseCoordinate coordinateFor(AwaitInteractionRecord interaction) {
+        return owningExecution(interaction).coordinate();
+    }
+
+    public PinnedAwaitDescriptor pinnedDescriptor(AwaitInteractionRecord interaction) {
+        PipelineReleaseRecord release = pinnedRelease(interaction.tenantId(), owningExecution(interaction));
+        PinnedAwaitDescriptor descriptor = PinnedAwaitDescriptor.resolve(release.contract(), interaction.stepId());
+        if (!descriptor.outputTypeId().equals(interaction.outputType())
+            || !descriptor.transportOutputTypeId().equals(interaction.transportOutputType())
+            || !descriptor.completionProjectorId().equals(java.util.Optional.ofNullable(
+                interaction.transportMetadata().get("tpf.await.completion.projector")).map(Object::toString))
+            || !descriptor.callbackContract().equals(java.util.Optional.ofNullable(
+                interaction.transportMetadata().get("callbackSelection")))) {
+            throw new IllegalStateException("Await interaction differs from its pinned descriptor");
+        }
+        return descriptor;
+    }
+
+    private TypedDurablePayload serializedEnvelope(AwaitInteractionRecord interaction, Slot slot, byte[] bytes) {
+        PipelineReleaseRecord release = pinnedRelease(interaction.tenantId(), owningExecution(interaction));
+        PinnedAwaitDescriptor descriptor = pinnedDescriptor(interaction);
+        String canonicalTypeId = switch (slot) {
+            case REQUEST -> descriptor.canonicalInputTypeId();
+            case RESPONSE -> descriptor.canonicalOutputTypeId();
+            case COMMAND_ACKNOWLEDGEMENT -> descriptor.canonicalCommandAcknowledgementTypeId()
+                .orElseThrow(() -> new IllegalStateException("Pinned Await has no Command acknowledgement"));
+            case STAGED_COMPLETION -> descriptor.completionPayloadTypeId();
+        };
+        var definition = release.contract().canonicalTypes().get(canonicalTypeId);
+        if (definition == null) {
+            String requestedType = canonicalTypeId;
+            var matches = release.contract().canonicalTypes().entrySet().stream()
+                .filter(entry -> requestedType.equals(entry.getValue().get("runtimeClass"))).toList();
+            if (matches.size() != 1) throw new IllegalStateException("Pinned Await canonical binding is unavailable or ambiguous");
+            canonicalTypeId = matches.getFirst().getKey();
+            definition = matches.getFirst().getValue();
+        }
+        return new TypedDurablePayload(canonicalTypeId,
+            requiredString(definition, "definitionFingerprint", canonicalTypeId),
+            release.contract().canonicalCatalogFingerprint(), JsonDurablePayloadCodec.ENCODING,
+            JsonDurablePayloadCodec.ENCODING_VERSION, bytes);
+    }
+
+    private void validateSerialized(AwaitInteractionRecord interaction, Slot slot, TypedDurablePayload payload) {
+        TypedDurablePayload expected = serializedEnvelope(interaction, slot, payload.payload());
+        if (!expected.canonicalTypeId().equals(payload.canonicalTypeId())
+            || !expected.typeExpressionFingerprint().equals(payload.typeExpressionFingerprint())
+            || !expected.catalogFingerprint().equals(payload.catalogFingerprint())
+            || !expected.encoding().equals(payload.encoding()) || expected.encodingVersion() != payload.encodingVersion()) {
+            throw new IllegalArgumentException("Await canonical envelope differs from pinned slot");
+        }
+        try (var parser = PipelineJson.mapper().createParser(payload.payload())) {
+            parser.enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
+            com.fasterxml.jackson.databind.JsonNode body = PipelineJson.mapper().readTree(parser);
+            if (body == null || parser.nextToken() != null) {
+                throw new IllegalArgumentException("Invalid Await canonical JSON framing");
+            }
+            var release = pinnedRelease(interaction.tenantId(), owningExecution(interaction));
+            org.pipelineframework.type.CanonicalTypeCatalogue.fromCanonicalTypes(release.contract().canonicalTypes())
+                .validateAndCanonicalize(payload.canonicalTypeId(), body.toString());
+        } catch (java.io.IOException error) {
+            throw new IllegalArgumentException("Invalid Await canonical JSON framing", error);
         }
     }
 
@@ -107,6 +193,19 @@ public class AwaitDurablePayloadResolver {
      * deliberately ignored: the pinned release and expected slot choose the only permissible target.
      */
     public Object decodeLegacy(AwaitInteractionRecord interaction, Slot slot, String stored) {
+        if (serializedMode()) {
+            try {
+                Object decoded = PipelineJson.mapper().readerFor(Object.class)
+                    .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readValue(stored);
+                Object body = decoded instanceof Map<?, ?> map && map.containsKey("_tpf_payload")
+                    ? map.get("_tpf_payload") : decoded;
+                TypedDurablePayload payload = serializedEnvelope(interaction, slot, PipelineJson.mapper().writeValueAsBytes(body));
+                validateSerialized(interaction, slot, payload);
+                return payload;
+            } catch (Exception error) {
+                throw failure(interaction, slot, slot.name(), "legacy decode", error);
+            }
+        }
         CompiledDurablePayloadPlan plan = resolve(interaction, slot);
         try {
             Object decoded = PipelineJson.mapper().readValue(stored, Object.class);
@@ -203,10 +302,20 @@ public class AwaitDurablePayloadResolver {
 
     private PipelineReleaseRecord pinnedRelease(String tenantId, PinnedExecution execution) {
         DurablePayloadReleaseCoordinate coordinate = execution.coordinate();
-        return releases.getOrLoad(new ReleaseCacheKey(tenantId, coordinate), ignored ->
-            releaseRegistry.get(tenantId, execution.pipelineId(), execution.releaseVersion())
+        return releases.getOrLoad(new ReleaseCacheKey(tenantId, coordinate), ignored -> validateRelease(
+            tenantId, execution, releaseRegistry.get(tenantId, execution.pipelineId(), execution.releaseVersion())
                 .await().atMost(RELEASE_LOOKUP_TIMEOUT)
-                .orElseThrow(() -> new IllegalStateException("pinned release is unavailable")));
+                .orElseThrow(() -> new IllegalStateException("pinned release is unavailable"))));
+    }
+
+    private static PipelineReleaseRecord validateRelease(String tenantId, PinnedExecution execution,
+        PipelineReleaseRecord release) {
+        if (!tenantId.equals(release.tenantId()) || !execution.pipelineId().equals(release.pipelineId())
+            || !execution.contractVersion().equals(release.contractVersion())
+            || !execution.releaseVersion().equals(release.releaseVersion())) {
+            throw new IllegalStateException("Await resolved Release differs from owning execution pin");
+        }
+        return release;
     }
 
     private Uni<PipelineReleaseRecord> preloadRelease(
@@ -220,7 +329,7 @@ public class AwaitDurablePayloadResolver {
             .onItem().transform(optional -> optional
                 .orElseThrow(() -> new OwningExecutionUnavailableException()))
             .onItem().invoke(release -> releases.getOrLoad(
-                new ReleaseCacheKey(tenantId, coordinate), ignored -> release));
+                new ReleaseCacheKey(tenantId, coordinate), ignored -> validateRelease(tenantId, execution, release)));
     }
 
     private PinnedExecution owningExecution(AwaitInteractionRecord interaction) {

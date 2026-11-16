@@ -52,6 +52,10 @@ class AwaitDurablePayloadResolverTest {
                 "Decision", binding(Decision.class, "decision-fingerprint")),
             "catalog-fingerprint");
         PipelineReleaseRecord release = mock(PipelineReleaseRecord.class);
+        when(release.tenantId()).thenReturn("tenant");
+        when(release.pipelineId()).thenReturn("payments");
+        when(release.contractVersion()).thenReturn("3");
+        when(release.releaseVersion()).thenReturn("release-7");
         when(release.contract()).thenReturn(contract);
         when(releases.get("tenant", "payments", "release-7")).thenReturn(Uni.createFrom().item(Optional.of(release)));
 
@@ -106,6 +110,10 @@ class AwaitDurablePayloadResolverTest {
         when(execution.releaseVersion()).thenReturn("1");
         when(executionStore.getExecution(any(), any())).thenReturn(Uni.createFrom().item(Optional.of(execution)));
         PipelineReleaseRecord release = mock(PipelineReleaseRecord.class);
+        when(release.tenantId()).thenReturn("tenant");
+        when(release.pipelineId()).thenReturn("consumer-validation");
+        when(release.contractVersion()).thenReturn("1");
+        when(release.releaseVersion()).thenReturn("1");
         when(release.contract()).thenReturn(new PipelineContractDescriptor(
             1, "consumer-validation", "1", "contract", null, null, null, false, null,
             java.util.List.of(), PipelineBundleCapabilities.defaults()));
@@ -158,6 +166,10 @@ class AwaitDurablePayloadResolverTest {
         when(execution.releaseVersion()).thenReturn("release-7");
         when(executionStore.getExecution("tenant", "execution")).thenReturn(Uni.createFrom().item(Optional.of(execution)));
         PipelineReleaseRecord release = mock(PipelineReleaseRecord.class);
+        when(release.tenantId()).thenReturn("tenant");
+        when(release.pipelineId()).thenReturn("payments");
+        when(release.contractVersion()).thenReturn("3");
+        when(release.releaseVersion()).thenReturn("release-7");
         when(release.contract()).thenReturn(new PipelineContractDescriptor(
             2, "payments", "3", "contract", null, null, null, false, null,
             java.util.List.of(), PipelineBundleCapabilities.defaults(), Map.of(), "catalog"));
@@ -185,11 +197,15 @@ class AwaitDurablePayloadResolverTest {
         PipelineContractDescriptor contract = new PipelineContractDescriptor(
             2, "payments", "3", "contract-hash", null, null, null, false, null,
             java.util.List.of(new PipelineBundleStepDescriptor(2, "decision", "internal", "ONE_TO_ONE",
-                "Request", "Decision", null, null, Map.of("transportType", "kafka"))),
+                "Request", "Decision", null, null, Map.of("transportType", "kafka", "runtimeDescriptor", pinnedDescriptorMetadata()))),
             PipelineBundleCapabilities.defaults(),
             Map.of("Decision", binding(Decision.class, "decision-fingerprint"), "Request", binding(Request.class, "request-fingerprint")),
             "catalog-fingerprint");
         PipelineReleaseRecord release = mock(PipelineReleaseRecord.class);
+        when(release.tenantId()).thenReturn("tenant");
+        when(release.pipelineId()).thenReturn("payments");
+        when(release.contractVersion()).thenReturn("3");
+        when(release.releaseVersion()).thenReturn("release-7");
         when(release.contract()).thenReturn(contract);
         when(releases.get(any(), any(), any())).thenReturn(Uni.createFrom().item(Optional.of(release)));
         AwaitDurablePayloadResolver resolver = new AwaitDurablePayloadResolver();
@@ -201,8 +217,42 @@ class AwaitDurablePayloadResolverTest {
         return resolver;
     }
 
+    @Test
+    void serializedAwaitSlotsRoundTripWithoutLocalDescriptorOrProjection() {
+        AwaitDurablePayloadResolver resolver = resolverForPinnedRelease();
+        String typed = resolver.encode(interaction(), AwaitDurablePayloadResolver.Slot.RESPONSE, new Decision("approved"));
+        var config = mock(org.pipelineframework.orchestrator.PipelineOrchestratorConfig.class);
+        var controlPlane = mock(org.pipelineframework.orchestrator.PipelineOrchestratorConfig.ControlPlaneConfig.class);
+        when(config.controlPlane()).thenReturn(controlPlane);
+        when(controlPlane.payloadMaterialization()).thenReturn(
+            org.pipelineframework.orchestrator.PipelineOrchestratorConfig.ControlPlaneConfig.PayloadMaterialization.SERIALIZED);
+        resolver.orchestratorConfig = config;
+        resolver.descriptors = null;
+        var envelope = assertInstanceOf(org.pipelineframework.orchestrator.TypedDurablePayload.class,
+            resolver.decode(interaction(), AwaitDurablePayloadResolver.Slot.RESPONSE, typed));
+        assertEquals(typed, resolver.encode(interaction(), AwaitDurablePayloadResolver.Slot.RESPONSE, envelope));
+        assertThrows(IllegalArgumentException.class,
+            () -> resolver.encode(interaction(), AwaitDurablePayloadResolver.Slot.REQUEST, envelope));
+        assertThrows(IllegalStateException.class, () -> resolver.decodeLegacy(interaction(),
+            AwaitDurablePayloadResolver.Slot.RESPONSE, "{} {}"));
+        assertThrows(IllegalStateException.class, () -> resolver.decode(interaction(),
+            AwaitDurablePayloadResolver.Slot.RESPONSE, typed.replace("decision-fingerprint", "wrong")));
+    }
+
+    private static Map<String, Object> pinnedDescriptorMetadata() {
+        return Map.of("schemaVersion", 1, "stepId", "await",
+            "inputTypeId", Request.class.getName(), "outputTypeId", Decision.class.getName(),
+            "transportInputTypeId", Request.class.getName(), "transportOutputTypeId", Decision.class.getName(),
+            "canonicalInputTypeId", "Request", "canonicalOutputTypeId", "Decision",
+            "completionPayloadTypeId", "Decision", "requestAwareCompletion", false);
+    }
+
     private static Map<String, Object> binding(Class<?> type, String fingerprint) {
-        return Map.of("runtimeClass", type.getName(), "definitionFingerprint", fingerprint);
+        return Map.of("runtimeClass", type.getName(), "definitionFingerprint", fingerprint,
+            "definition", Map.of("kind", "record", "id", type.getSimpleName(), "fields",
+                java.util.Arrays.stream(type.getRecordComponents()).map(component -> Map.of(
+                    "name", component.getName(), "presence", "REQUIRED", "nullability", "NON_NULL",
+                    "type", Map.of("kind", "scalar", "id", "string"))).toList()));
     }
 
     private static AwaitInteractionRecord interaction() {

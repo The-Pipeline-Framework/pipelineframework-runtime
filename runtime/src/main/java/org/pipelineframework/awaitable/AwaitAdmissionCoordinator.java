@@ -89,15 +89,19 @@ public class AwaitAdmissionCoordinator {
         }
         Optional<String> endpoint = descriptor.callback().map(callback -> callback.binding().value())
             .or(() -> adapter(descriptor.transportType()).admissionEndpoint(descriptor));
-        if (endpoint.isEmpty()) {
-            return Uni.createFrom().item(Optional.empty());
-        }
+        return acquire(releaseIdentityResolver.pipelineId(orchestratorConfig), descriptor.stepId(), endpoint,
+            tenantId, unitId, itemIndex, executionId, expiresAtEpochMs);
+    }
+
+    /** Acquires the existing reservation under the execution's immutable pipeline identity. */
+    public Uni<Optional<AdmissionLease>> acquire(String pipelineId, String stepId, Optional<String> endpoint,
+        String tenantId, String unitId, Integer itemIndex, String executionId, long expiresAtEpochMs) {
+        if (!enabled() || endpoint.isEmpty()) return Uni.createFrom().item(Optional.empty());
         if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
             return Uni.createFrom().failure(new IllegalStateException(
                 "pipeline.await-admission.enabled requires pipeline.orchestrator.mode=QUEUE_ASYNC"));
         }
-        AwaitAdmissionScope scope = new AwaitAdmissionScope(
-            releaseIdentityResolver.pipelineId(orchestratorConfig), descriptor.stepId(), endpoint.orElseThrow());
+        AwaitAdmissionScope scope = new AwaitAdmissionScope(pipelineId, stepId, endpoint.orElseThrow());
         AwaitAdmissionOwner owner = new AwaitAdmissionOwner(AwaitAdmissionScope.lengthPrefixedKey(
             tenantId,
             unitId,

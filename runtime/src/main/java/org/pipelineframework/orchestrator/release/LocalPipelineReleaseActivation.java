@@ -35,7 +35,7 @@ public class LocalPipelineReleaseActivation {
     PipelineOrchestratorConfig orchestratorConfig;
 
     void activate(@Observes StartupEvent ignored) {
-        if (!usesInMemoryRegistry()) {
+        if (!usesInMemoryRegistry() || coordinatorWithoutLocalApplication()) {
             return;
         }
         activateForCurrentRelease("default", releaseIdentity.pipelineId(orchestratorConfig),
@@ -60,7 +60,7 @@ public class LocalPipelineReleaseActivation {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(contractVersion, "contractVersion");
         Objects.requireNonNull(releaseVersion, "releaseVersion");
-        if (!usesInMemoryRegistry() || !isCurrentRelease(pipelineId, contractVersion, releaseVersion)) {
+        if (!usesInMemoryRegistry() || coordinatorWithoutLocalApplication() || !isCurrentRelease(pipelineId, contractVersion, releaseVersion)) {
             return Uni.createFrom().voidItem();
         }
         PipelineContractDescriptor contract = releaseIdentity.contract();
@@ -95,6 +95,15 @@ public class LocalPipelineReleaseActivation {
                 .map(ignored -> Uni.createFrom().voidItem())
                 .orElseGet(() -> Uni.createFrom().failure(new IllegalStateException(
                     "Local in-memory release activation did not retain " + pipelineId + "@" + releaseVersion))));
+    }
+
+    private boolean coordinatorWithoutLocalApplication() {
+        if (orchestratorConfig == null || orchestratorConfig.controlPlane() == null) {
+            return false; // Preserve directly assembled local runtimes.
+        }
+        var controlPlane = orchestratorConfig.controlPlane();
+        return controlPlane.enabled() && controlPlane.requireRemoteWorker()
+            && releaseIdentity.compiledContract().isEmpty();
     }
 
     private boolean isCurrentRelease(String pipelineId, String contractVersion, String releaseVersion) {
