@@ -247,3 +247,80 @@ the numbered HTTP Lambda ARN.
 A Query-capable Release binds the existing append-only Dynamo Query capture
 store through its exact `QueryCaptureTable`. The table uses `capture_key` (S)
 and `revision` (N). Semantic functions select Dynamo for Await admission.
+
+## Independent REST worker attachment (experimental)
+
+The attachment uses a publicly reachable HTTPS Lambda Function URL protected by
+AWS IAM/SigV4 and the existing TPF request signatures and execution-scope checks.
+The Coordinator calls the worker's registered REST routes. The worker calls the
+Coordinator's dedicated Await lifecycle endpoint. Provision that endpoint on its
+own versioned alias and keep administrative routes outside its application
+assembly. Scope its invocation policy to the worker role and use separate
+credentials for different worker attachments.
+
+Publish one attachment per immutable Release and configuration. Retain the
+numbered version, alias, URL, credential generation, and permissions for as long
+as an execution references them. The worker and Coordinator execution roles have
+no alias-management permissions. Keep alias changes under the deployment
+authority and give ordinary publishers create and read access without update
+access. Apply `aws-durable-pinned-worker-stack-policy.json` when creating the
+attachment stack. Restrict stack-policy changes and direct Lambda alias, URL
+and permission mutations to a separate deployment administrator. Publish a
+new attachment for configuration or credential changes. Stack termination
+protection stays in place until the retained execution references are drained.
+
+Verify the alias target, absence of weighted routing, IAM URL mode, exact
+HTTPS origin, numbered version, code digest and Lambda configuration digest
+before registering the binding. Use the same verification when establishing or
+refreshing trusted routing state. The Coordinator caches successful observations
+per immutable binding for up to 60 seconds. A failed verification denies the
+route. The immutable entry binding records the expected AWS configuration digest.
+
+The template declares eight resources: function, numbered version, alias, URL,
+worker role, log group and two alias-scoped invocation permissions. Code storage,
+worker credential and the Coordinator lifecycle endpoint are external inputs.
+This is a static attachment count. Shared resource and retained-generation
+inventories require the integrated packaging proof.
+
+The shared reference template is `aws-durable-shared-rest.yaml`. Use the raw
+driver and ingress distribution, the shared event-handler ZIP and the dedicated
+HTTP Await lifecycle ZIP. Supply the semantic tables, their stream identifiers,
+the Release artifact bucket and immutable signing secret coordinates as platform
+inputs. The template owns the callback binding table and coordination queues.
+
+Store the registered target properties as a versioned object in the Release
+bucket under `tpf/rest-targets/`. Pass its exact key and version to the shared
+template. Retain this object version for as long as the published shared
+functions reference it.
+For each `shared-secret-ref` use
+`config:tpf.aws.durable.rest-credential.<full-secret-arn>@<version-id>`.
+The trusted shared host resolves those exact generations using the explicit
+worker secret allowlist. Keep all retained worker target properties and IAM
+references when adding a new worker. Update the platform publication identity
+whenever its versioned configuration changes. Keep each previously published
+routing object's `key|version` in `RetainedWorkerTargetGrants` while retained
+functions can cold-start with that configuration. Supply the corresponding
+zero-based indices in `RetainedWorkerTargetGrantSlots` (for example, `0,1`).
+Add the outgoing grant before switching the current key and version so there
+is no gap during the stack update. Remove the grant after its functions drain.
+Each grant authorizes one exact routing key and version.
+
+| Static inventory | Resource count |
+| --- | ---: |
+| Shared platform | 58 |
+| Platform and expense A1 | 66 |
+| Platform, expense A1 and parcel B | 74 |
+| Platform, expense A1 and A2, and parcel B | 82 |
+
+These totals exclude the supplied tables, code and Release buckets, secret
+generations and previously retained platform versions. The shared template
+adds one IAM policy per retained routing-object grant. Live resource and IAM acceptance belong to the
+deployment proof.
+
+
+For HTTP packages, use the Quarkus Lambda HTTP bridge and the generated
+`QuarkusStreamHandler` entry point. Exclude custom Lambda handler classes from
+the AWS Durable host dependency at Quarkus augmentation time. The expense,
+parcel and shared lifecycle package configurations in the Examples repository
+show the exact resource exclusions. The raw driver and shared SQS event
+assemblies retain their existing handlers.

@@ -27,6 +27,7 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
     @Inject PipelineWorkerRegistry workers;
     @Inject RestPipelineTransitionWorker rest;
     @Inject PipelineContractDescriptorLoader contractLoader;
+    @Inject jakarta.enterprise.inject.Instance<RestWorkerBindingVerifier> bindingVerifier;
 
     public static boolean enabled(PipelineOrchestratorConfig config) {
         return Optional.ofNullable(config).map(PipelineOrchestratorConfig::worker)
@@ -47,7 +48,6 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
             || !RestTransitionWorkerProtocol.CAPABILITIES_PATH.equals(config.workerRest().capabilitiesPath())) {
             throw new IllegalArgumentException("Registered REST targeting requires native worker routes");
         }
-        if (config.worker().targets().isEmpty()) throw new IllegalArgumentException("Registered REST targets are required");
         Set<List<String>> keys = new HashSet<>();
         for (var target : config.worker().targets().values()) {
             List<String> key = List.of(text(target.tenantId()), text(target.pipelineId()), text(target.workerId()));
@@ -69,12 +69,17 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
     }
 
     private URI endpoint(String value) {
+        return normalizeOrigin(value, config.worker().allowLoopbackHttp());
+    }
+
+    /** Validates and canonicalizes a registered worker origin. */
+    public static URI normalizeOrigin(String value, boolean allowLoopbackHttp) {
         URI uri;
         try { uri = URI.create(value).normalize(); }
         catch (IllegalArgumentException failure) { throw new IllegalArgumentException("Invalid registered worker endpoint"); }
         boolean loopback = Set.of("127.0.0.1", "[::1]", "::1").contains(Optional.ofNullable(uri.getHost()).orElse(""));
         boolean secure = "https".equalsIgnoreCase(uri.getScheme());
-        boolean local = "http".equalsIgnoreCase(uri.getScheme()) && loopback && config.worker().allowLoopbackHttp();
+        boolean local = "http".equalsIgnoreCase(uri.getScheme()) && loopback && allowLoopbackHttp;
         if ((!secure && !local) || uri.getHost() == null || uri.getUserInfo() != null
             || uri.getQuery() != null || uri.getFragment() != null
             || (!uri.getPath().isEmpty() && !"/".equals(uri.getPath()))) {
@@ -267,7 +272,9 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
                     throw new IllegalStateException("Configured worker differs from retained dispatch binding");
                 }
                 return binding;
-            });
+            }).chain(binding -> bindingVerifier == null || bindingVerifier.isUnsatisfied()
+                ? Uni.createFrom().item(binding)
+                : bindingVerifier.get().verify(binding).replaceWith(binding));
     }
 
     /** Guard coordination paths before any local terminal materialization shortcut. */
@@ -311,9 +318,10 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
         Set<String> capabilities = new HashSet<>(release.contract().capabilities().transitionWorkerProtocols());
         if (release.contract().capabilities().localTransitionExecution()) capabilities.add("local");
         List<PipelineReleaseArtifactDescriptor> candidates = release.descriptor().artifacts().stream()
-            .filter(artifact -> "application-archive".equals(artifact.kind()) && !steps.isEmpty()
+            .filter(artifact -> ("application-archive".equals(artifact.kind())
+                    || serializedCoordination() && "lambda-zip".equals(artifact.kind())) && !steps.isEmpty()
                 && artifact.stepIds().containsAll(steps) && artifact.capabilities().containsAll(capabilities)).toList();
-        if (candidates.size() != 1) throw new IllegalArgumentException("Registered REST targeting requires one whole-bundle application archive; distributed placement is unsupported");
+        if (candidates.size() != 1) throw new IllegalArgumentException("Registered REST targeting requires one whole-bundle runnable archive; distributed placement is unsupported");
         return candidates.getFirst();
     }
 

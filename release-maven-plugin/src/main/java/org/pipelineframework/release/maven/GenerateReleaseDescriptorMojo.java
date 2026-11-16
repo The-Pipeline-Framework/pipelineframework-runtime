@@ -8,6 +8,7 @@ import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugins.annotations.LifecyclePhase;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
+import org.pipelineframework.aws.durable.model.AwsDurableHostedProfile;
 import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
 import org.pipelineframework.release.producer.DefaultPipelineReleaseProducer;
 import org.pipelineframework.release.producer.ReleaseArtifactInput;
@@ -79,9 +80,13 @@ public final class GenerateReleaseDescriptorMojo extends AbstractMojo {
             var descriptor = producer.produce(new ReleaseProductionRequest(
                 contract, releaseVersion, carrierId, metadataDirectory, inputs, allowLocalUris,
                 deployment == null ? null : deployment.toDescriptor()));
+            if (descriptor.deployment() != null
+                && AwsDurableHostedProfile.REST_WORKER_PROFILE_ID.equals(descriptor.deployment().profile())) {
+                AwsDurableHostedProfile.requireRestWorkerRelease(descriptor, contract);
+            }
             producer.write(outputFile.toPath(), descriptor);
             getLog().info("Produced Pipeline Release Descriptor " + outputFile.toPath().toAbsolutePath().normalize());
-        } catch (IllegalArgumentException | IllegalStateException e) {
+        } catch (IllegalArgumentException | IllegalStateException | UnsupportedOperationException e) {
             throw new MojoExecutionException(e.getMessage(), e);
         }
     }

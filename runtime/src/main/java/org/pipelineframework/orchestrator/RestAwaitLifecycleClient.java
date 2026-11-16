@@ -23,6 +23,7 @@ public class RestAwaitLifecycleClient {
     @Inject PipelineOrchestratorConfig config;
     @Inject ControlPlaneSecretResolver secrets;
     @Inject org.eclipse.microprofile.context.ThreadContext requestContext;
+    @Inject jakarta.enterprise.inject.Instance<WorkerRestRequestSigner> requestSigner;
     private volatile HttpClient http;
 
     public Uni<AwaitWorkerRegistrationResult> register(URI coordinator, String credentialRef, String workerId,
@@ -118,12 +119,13 @@ public class RestAwaitLifecycleClient {
             String timestamp = Instant.now().toString();
             String nonce = UUID.randomUUID().toString();
             String signature = TransitionWorkerSignature.sign(secret, RestAwaitLifecycleProtocol.METHOD, path, timestamp, nonce, body);
-            HttpRequest httpRequest = HttpRequest.newBuilder(origin.resolve(path)).timeout(config.workerRest().requestTimeout())
+            HttpRequest httpRequest = WorkerRestRequestSigner.finish(requestSigner,
+                HttpRequest.newBuilder(origin.resolve(path)).timeout(config.workerRest().requestTimeout())
                 .header("Content-Type", "application/json")
                 .header(TransitionWorkerSignature.TIMESTAMP_HEADER, timestamp)
                 .header(TransitionWorkerSignature.NONCE_HEADER, nonce)
                 .header(TransitionWorkerSignature.SIGNATURE_HEADER, signature)
-                .POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body)), body);
             long start = System.nanoTime();
             var signal = org.pipelineframework.runtime.RuntimeAdapterBootstrap.captureRequestExecutor(
                 requestContext == null ? Runnable::run : requestContext.currentContextExecutor());

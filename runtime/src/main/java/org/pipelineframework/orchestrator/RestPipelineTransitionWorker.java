@@ -65,6 +65,9 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
     });
     private final ScheduledThreadPoolExecutor deadlineWarningExecutor = newDeadlineWarningExecutor();
 
+    @Inject
+    jakarta.enterprise.inject.Instance<WorkerRestRequestSigner> requestSigner;
+
     private volatile HttpClient httpClient;
 
     public RestPipelineTransitionWorker() {
@@ -227,13 +230,14 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
             String signature = TransitionWorkerSignature.sign(secret,
                 RestTransitionWorkerProtocol.AWAIT_VALUE_OPERATION_METHOD,
                 RestTransitionWorkerProtocol.AWAIT_VALUE_OPERATION_PATH, timestamp, nonce, body);
-            return HttpRequest.newBuilder(workerUri(endpoint, RestTransitionWorkerProtocol.AWAIT_VALUE_OPERATION_PATH))
+            return WorkerRestRequestSigner.finish(requestSigner,
+                HttpRequest.newBuilder(workerUri(endpoint, RestTransitionWorkerProtocol.AWAIT_VALUE_OPERATION_PATH))
                 .timeout(orchestratorConfig.workerRest().requestTimeout())
                 .header("Content-Type", "application/json").header("Accept", "application/json")
                 .header(TransitionWorkerSignature.TIMESTAMP_HEADER, timestamp)
                 .header(TransitionWorkerSignature.NONCE_HEADER, nonce)
                 .header(TransitionWorkerSignature.SIGNATURE_HEADER, signature)
-                .POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body)), body);
         } catch (IOException failure) {
             throw new IllegalArgumentException("Unable to encode Await value operation", failure);
         }
@@ -375,15 +379,14 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
                 timestamp,
                 nonce,
                 body);
-            return HttpRequest.newBuilder(uri)
+            return WorkerRestRequestSigner.finish(requestSigner, HttpRequest.newBuilder(uri)
                 .timeout(orchestratorConfig.workerRest().requestTimeout())
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
                 .header(TransitionWorkerSignature.TIMESTAMP_HEADER, timestamp)
                 .header(TransitionWorkerSignature.NONCE_HEADER, nonce)
                 .header(TransitionWorkerSignature.SIGNATURE_HEADER, signature)
-                .POST(HttpRequest.BodyPublishers.ofByteArray(body))
-                .build();
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body)), body);
         } catch (IOException e) {
             throw new IllegalStateException("Failed encoding REST transition worker command", e);
         }
@@ -401,14 +404,13 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
             timestamp,
             nonce,
             body);
-        return HttpRequest.newBuilder(uri)
+        return WorkerRestRequestSigner.finish(requestSigner, HttpRequest.newBuilder(uri)
             .timeout(orchestratorConfig.workerRest().requestTimeout())
             .header("Accept", "application/json")
             .header(TransitionWorkerSignature.TIMESTAMP_HEADER, timestamp)
             .header(TransitionWorkerSignature.NONCE_HEADER, nonce)
             .header(TransitionWorkerSignature.SIGNATURE_HEADER, signature)
-            .GET()
-            .build();
+            .GET(), body);
     }
 
     private PipelineWorkerCapability decodeCapabilitiesResponse(HttpResponse<String> response) {

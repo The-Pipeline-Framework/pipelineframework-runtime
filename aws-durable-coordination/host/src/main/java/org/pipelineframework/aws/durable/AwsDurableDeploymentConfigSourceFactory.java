@@ -17,6 +17,8 @@ import io.smallrye.config.ConfigSourceFactory;
 import io.smallrye.config.ConfigValue;
 import org.eclipse.microprofile.config.spi.ConfigSource;
 import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueRequest;
 import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueResponse;
 import software.amazon.awssdk.services.ssm.SsmClient;
@@ -72,8 +74,12 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
             @Override public java.util.Iterator<String> iterateNames() { return originalContext.iterateNames(); }
         };
         boolean http = value(context, PREFIX + "http.enabled").filter("true"::equals).isPresent();
+        if (value(context, PREFIX + "pinned-rest-worker").isPresent()) {
+            requireEqual(context, PREFIX + "pinned-rest-worker", "true");
+            return pinnedWorkerSettings(context, settings);
+        }
         if (value(context, PREFIX + "deployment-validation").isEmpty()) {
-            if (http || !settings.isEmpty() || List.of(PREFIX + "configuration", PREFIX + "transition-worker-placement", PREFIX + "http.coordinator-function-family",
+            if (http || !settings.isEmpty() || List.of(PREFIX + "configuration", PREFIX + "shared-rest-coordination", PREFIX + "transition-worker-placement", PREFIX + "http.coordinator-function-family",
                 PREFIX + "command-effect-table", PREFIX + "query-capture-table", PREFIX + "signing-source", PREFIX + "resume-token-parameter-arn", PREFIX + "worker-parameter-arn",
                 PREFIX + "resume-token-parameter-version", PREFIX + "worker-parameter-version",
                 PREFIX + "resume-token-secret-arn", PREFIX + "worker-secret-arn",
@@ -112,12 +118,17 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
                 throw new IllegalArgumentException("Invalid semantic table configuration: " + table);
             }
         }
+        for (String property : List.of("pipeline.orchestrator.releases.storage.s3.bucket",
+            "pipeline.orchestrator.queue-url", "pipeline.orchestrator.dlq-url", PREFIX + "binding-table")) {
+            required(context, property);
+        }
+        if (value(context, PREFIX + "shared-rest-coordination").isPresent()) {
+            return sharedRestSettings(context, settings);
+        }
         for (String property : List.of("pipeline.orchestrator.pipeline-id", "pipeline.orchestrator.release-version",
-            "pipeline.orchestrator.releases.storage.s3.bucket", "pipeline.orchestrator.queue-url",
-            "pipeline.orchestrator.dlq-url", "pipeline.orchestrator.worker.sqs.pipeline-id",
+            "pipeline.orchestrator.worker.sqs.pipeline-id",
             "pipeline.orchestrator.worker.sqs.contract-version", "pipeline.orchestrator.worker.sqs.release-version",
-            "pipeline.orchestrator.worker.sqs.artifact-id", "pipeline.orchestrator.worker.sqs.artifact-digest",
-            PREFIX + "binding-table")) {
+            "pipeline.orchestrator.worker.sqs.artifact-id", "pipeline.orchestrator.worker.sqs.artifact-digest")) {
             required(context, property);
         }
         validateTransitionPlacement(context, originalContext);
@@ -194,6 +205,98 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         resolved.putAll(querySettings);
         resolved.put("pipeline.orchestrator.resume-token-secret", resume);
         resolved.put("pipeline.orchestrator.worker.sqs.shared-secret", worker);
+        return List.of(new PinnedSecrets(resolved));
+    }
+
+    private Iterable<ConfigSource> sharedRestSettings(ConfigSourceContext context, Map<String, String> settings) {
+        requireEqual(context, PREFIX + "shared-rest-coordination", "true");
+        requireEqual(context, "pipeline.orchestrator.control-plane.enabled", "true");
+        requireEqual(context, "pipeline.orchestrator.control-plane.require-remote-worker", "true");
+        requireEqual(context, "pipeline.orchestrator.control-plane.payload-materialization", "SERIALIZED");
+        requireEqual(context, "pipeline.orchestrator.worker.targeting-mode", "registered-rest");
+        required(context, PREFIX + "rest-signing-region");
+        rejectConfigured(context, "release-isolation-mode", "entry-id", "continuation-entry-id",
+            "worker-secret-arn", "worker-secret-version", "worker-parameter-arn", "worker-parameter-version",
+            "resume-token-parameter-arn", "resume-token-parameter-version");
+        var resolved = new java.util.HashMap<>(settings);
+        var targetProperties = new java.util.Properties();
+        try {
+            targetProperties.load(new java.io.StringReader(readTargetProperties(context)));
+        } catch (java.io.IOException invalid) {
+            throw new IllegalArgumentException("Invalid shared REST target properties", invalid);
+        }
+        for (String key : targetProperties.stringPropertyNames()) {
+            if (!key.startsWith("pipeline.orchestrator.worker.targets.")) {
+                throw new IllegalArgumentException("Shared REST configuration accepts only registered worker targets");
+            }
+            String targetValue = targetProperties.getProperty(key);
+            if (key.endsWith(".shared-secret-ref")) {
+                if (!targetValue.startsWith("config:" + PREFIX + "rest-credential.")) {
+                    throw new IllegalArgumentException("Shared REST workers require an immutable credential reference");
+                }
+                String reference = targetValue.substring("config:".length());
+                if (!resolved.containsKey(reference)) {
+                    resolved.put(reference, resolve(restWorkerSecretRequest(reference)));
+                }
+            }
+            resolved.put(key, targetValue);
+        }
+        resolved.put("pipeline.orchestrator.resume-token-secret", resolve(request(context, "resume-token")));
+        return List.of(new PinnedSecrets(resolved));
+    }
+
+    static GetSecretValueRequest restWorkerSecretRequest(String reference) {
+        int start = (PREFIX + "rest-credential.").length();
+        int separator = reference.lastIndexOf('@');
+        if (separator <= start) {
+            throw new IllegalArgumentException("Shared REST credential requires an ARN and version");
+        }
+        return secretRequest(reference.substring(start, separator), reference.substring(separator + 1), "REST worker");
+    }
+
+    private String readTargetProperties(ConfigSourceContext context) throws java.io.IOException {
+        var key = value(context, PREFIX + "rest-target-key");
+        var version = value(context, PREFIX + "rest-target-version");
+        if (key.isEmpty() && version.isEmpty()) return "";
+        String objectKey = key.filter(name -> name.matches("tpf/rest-targets/[A-Za-z0-9._-]+[.]properties"))
+            .orElseThrow(() -> new IllegalArgumentException("Invalid shared REST routing object key"));
+        String versionId = version.filter(id -> !id.equals("null"))
+            .orElseThrow(() -> new IllegalArgumentException("An immutable REST routing object version is required"));
+        String bucket = required(context, "pipeline.orchestrator.releases.storage.s3.bucket");
+        try (var client = S3Client.builder().overrideConfiguration(config -> config
+            .apiCallTimeout(Duration.ofSeconds(15)).apiCallAttemptTimeout(Duration.ofSeconds(5))).build();
+            var response = client.getObject(GetObjectRequest.builder().bucket(bucket).key(objectKey).versionId(versionId).build())) {
+            if (!versionId.equals(response.response().versionId())) {
+                throw new IllegalStateException("Shared REST routing object version differs from the publication");
+            }
+            byte[] bytes = response.readNBytes(262145);
+            if (bytes.length > 262144) throw new IllegalArgumentException("Shared REST routing properties exceed 256 KiB");
+            return new String(bytes, StandardCharsets.UTF_8);
+        }
+    }
+
+    private Iterable<ConfigSource> pinnedWorkerSettings(ConfigSourceContext context, Map<String, String> settings) {
+        requireEqual(context, "pipeline.orchestrator.mode", "SYNC");
+        requireEqual(context, "pipeline.orchestrator.process-loops-disabled", "true");
+        requireEqual(context, "pipeline.orchestrator.state-provider", "memory");
+        requireEqual(context, "pipeline.orchestrator.releases.registry.provider", "memory");
+        requireEqual(context, "pipeline.orchestrator.releases.storage.provider", "local");
+        rejectConfigured(context, "resume-token-secret-arn", "resume-token-secret-version",
+            "resume-token-parameter-arn", "resume-token-parameter-version", "worker-parameter-arn",
+            "worker-parameter-version", "binding-table", "entry-id");
+        for (String property : List.of("pipeline.orchestrator.resume-token-secret",
+            "pipeline.orchestrator.worker.sqs.shared-secret", "pipeline.orchestrator.worker.sqs.shared-secret-ref",
+            "pipeline.orchestrator.releases.storage.s3.bucket")) {
+            if (value(context, property).isPresent()) {
+                throw new IllegalArgumentException("Pinned worker must not also configure " + property);
+            }
+        }
+        requireEqual(context, "pipeline.orchestrator.worker.rest.server-enabled", "true");
+        required(context, PREFIX + "rest-signing-region");
+        required(context, "pipeline.orchestrator.worker.artifact-id");
+        required(context, "pipeline.orchestrator.worker.artifact-digest");
+        var resolved = new java.util.HashMap<>(settings);
+        resolved.put(PREFIX + "worker-signing-key", resolve(request(context, "worker")));
         return List.of(new PinnedSecrets(resolved));
     }
 
@@ -274,6 +377,10 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
     private GetSecretValueRequest request(ConfigSourceContext context, String purpose) {
         String arn = required(context, PREFIX + purpose + "-secret-arn");
         String version = required(context, PREFIX + purpose + "-secret-version");
+        return secretRequest(arn, version, purpose);
+    }
+
+    private static GetSecretValueRequest secretRequest(String arn, String version, String purpose) {
         if (!arn.matches("arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}")
             || !version.matches("[A-Za-z0-9-]{32,64}")) {
             throw new IllegalArgumentException("A full Secrets Manager ARN and immutable version are required for " + purpose);
