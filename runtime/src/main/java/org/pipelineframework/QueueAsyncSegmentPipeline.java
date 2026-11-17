@@ -159,8 +159,8 @@ class QueueAsyncSegmentPipeline {
     }
     var rest = pairedRestWorker.get()
         .orElseThrow(() -> new IllegalStateException("The paired REST worker is unavailable"));
-    return transitionCommand(segment).chain(command -> {
-      var attempt = binding.pin(command, input);
+    return inputPayload(segment).chain(payload -> {
+      var attempt = binding.pin(segment.transitionCommand(payload, payloadCodec.get()), input);
       return rest.pairedCapabilities(binding)
           .chain(() -> rest.executeTransition(attempt, segment.record().leaseOwner(), pairedStore));
     }).chain(result -> result
