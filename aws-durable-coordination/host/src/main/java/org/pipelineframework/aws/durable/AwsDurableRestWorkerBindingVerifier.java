@@ -9,6 +9,7 @@ import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.pipelineframework.aws.durable.model.LambdaVersionConfigurationEvidence;
 import org.pipelineframework.orchestrator.RegisteredRestWorkerTargets;
 import org.pipelineframework.orchestrator.RestWorkerBindingVerifier;
 import org.pipelineframework.orchestrator.release.PipelineReleaseEntryBinding;
@@ -70,7 +71,7 @@ public class AwsDurableRestWorkerBindingVerifier implements RestWorkerBindingVer
         int separator = arn.lastIndexOf(':');
         String function = arn.substring(0, separator);
         String version = arn.substring(separator + 1);
-        String expectedConfigurationSha256 = binding.configurationDigest().orElseThrow(() ->
+        String expectedConfiguration = binding.configurationDigest().orElseThrow(() ->
             new IllegalStateException("REST worker configuration digest is missing"));
         var alias = lambda.getAlias(request -> request.functionName(function).name("release"));
         var url = lambda.getFunctionUrlConfig(request -> request.functionName(function).qualifier("release"));
@@ -82,7 +83,7 @@ public class AwsDurableRestWorkerBindingVerifier implements RestWorkerBindingVer
             || url.functionUrl() == null || !RegisteredRestWorkerTargets.normalizeOrigin(url.functionUrl(), false)
                 .equals(RegisteredRestWorkerTargets.normalizeOrigin(dispatch.endpoint(), false))
             || !version.equals(observed.version()) || !binding.codeDigest().equals(observed.codeSha256())
-            || !expectedConfigurationSha256.equals(observed.configSha256())) {
+            || !LambdaVersionConfigurationEvidence.matches(expectedConfiguration, observed.configSha256(), observed.revisionId())) {
             throw new IllegalStateException("REST worker alias, URL or numbered version differs from trusted publication");
         }
     }

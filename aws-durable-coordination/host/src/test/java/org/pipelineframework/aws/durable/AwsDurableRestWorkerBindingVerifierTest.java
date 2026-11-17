@@ -5,6 +5,7 @@ import java.util.Optional;
 import java.util.function.Consumer;
 
 import org.junit.jupiter.api.Test;
+import org.pipelineframework.aws.durable.model.LambdaVersionConfigurationEvidence;
 import org.pipelineframework.orchestrator.release.PipelineReleaseDispatchBinding;
 import org.pipelineframework.orchestrator.release.PipelineReleaseEntryBinding;
 import org.pipelineframework.orchestrator.release.PipelineReleaseRegistry;
@@ -51,6 +52,21 @@ class AwsDurableRestWorkerBindingVerifierTest {
     }
 
     @Test
+    void verifiesThePinnedNumberedRevisionWhenTheProviderOmitsItsConfigurationHash() {
+        var alias = GetAliasResponse.builder().functionVersion("3").build();
+        var binding = new PipelineReleaseEntryBinding(
+            BINDING.tenantId(), BINDING.pipelineId(), BINDING.contractVersion(), BINDING.releaseVersion(),
+            BINDING.entryId(), BINDING.artifactId(), BINDING.artifactDigest(), BINDING.provider(),
+            BINDING.resourceId(), BINDING.codeDigest(), BINDING.deploymentOperationId(), BINDING.dispatchBinding(),
+            Optional.of(LambdaVersionConfigurationEvidence.capture(null, "observed")));
+        AwsDurableRestWorkerBindingVerifier.verifyPublication(lambda(alias, null, "observed"), "us-east-1", binding);
+        assertThrows(IllegalStateException.class, () ->
+            AwsDurableRestWorkerBindingVerifier.verifyPublication(lambda(alias, null, "changed"), "us-east-1", binding));
+        assertThrows(IllegalStateException.class, () ->
+            AwsDurableRestWorkerBindingVerifier.verifyPublication(lambda(alias, null, null), "us-east-1", binding));
+    }
+
+    @Test
     void refusesToPublishAnUnverifiedBinding() {
         var verifier = new AwsDurableRestWorkerBindingVerifier();
         verifier.region = Optional.of("us-east-1");
@@ -66,6 +82,10 @@ class AwsDurableRestWorkerBindingVerifierTest {
     }
 
     private static LambdaClient lambda(GetAliasResponse alias, String configDigest) {
+        return lambda(alias, configDigest, null);
+    }
+
+    private static LambdaClient lambda(GetAliasResponse alias, String configDigest, String revisionId) {
         var client = mock(LambdaClient.class);
         when(client.getAlias(org.mockito.ArgumentMatchers.<Consumer<GetAliasRequest.Builder>>any()))
             .thenAnswer(invocation -> {
@@ -95,7 +115,7 @@ class AwsDurableRestWorkerBindingVerifierTest {
                 assertEquals(FUNCTION, request.functionName());
                 assertEquals("3", request.qualifier());
                 return GetFunctionConfigurationResponse.builder()
-                    .version("3").codeSha256("code-digest").configSha256(configDigest).build();
+                    .version("3").codeSha256("code-digest").configSha256(configDigest).revisionId(revisionId).build();
             });
         return client;
     }

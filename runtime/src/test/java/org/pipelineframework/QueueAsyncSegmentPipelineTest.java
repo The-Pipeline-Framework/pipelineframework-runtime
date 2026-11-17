@@ -312,6 +312,20 @@ class QueueAsyncSegmentPipelineTest {
   }
 
   @Test
+  void redeliveredWorkWithoutAClaimCompletesWithoutDispatchCommitOrDeadLetter() {
+    var item = new ExecutionWorkItem("tenant-1", "exec-already-terminal");
+    when(executionStateStore.claimLease(eq(item.tenantId()), eq(item.executionId()), any(), anyLong(), eq(1000L)))
+        .thenReturn(Uni.createFrom().item(Optional.empty()));
+
+    pipeline().process(item, command -> Uni.createFrom().failure(new AssertionError("stale Work reached the worker")),
+        AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER).await().indefinitely();
+
+    verify(executionStateStore).claimLease(eq(item.tenantId()), eq(item.executionId()), any(), anyLong(), eq(1000L));
+    org.mockito.Mockito.verifyNoMoreInteractions(executionStateStore);
+    org.mockito.Mockito.verifyNoInteractions(deadLetterPublisher, executionFailureHandler, workDispatcher);
+  }
+
+  @Test
   void segmentPipelineClaimsRunsPublishesAndCommitsSuccessInOrder() {
     ExecutionRecord<Object, Object> claimed = record("exec-success", ExecutionResultShape.MATERIALIZED_MULTI);
     ExecutionRecord<Object, Object> succeeded = withStatus(claimed, ExecutionStatus.SUCCEEDED, 1L);
