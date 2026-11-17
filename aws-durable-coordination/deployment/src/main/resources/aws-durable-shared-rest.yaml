@@ -245,7 +245,13 @@ Resources:
               - !If
                 - RefreshableTargets
                 - Effect: Allow
-                  Action: [lambda:GetAlias, lambda:GetFunctionUrlConfig]
+                  Action: lambda:GetAlias
+                  Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${WorkerFunctionNamePrefix}*-worker'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - RefreshableTargets
+                - Effect: Allow
+                  Action: lambda:GetFunctionUrlConfig
                   Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${WorkerFunctionNamePrefix}*:release'
                 - !Ref 'AWS::NoValue'
               - !If

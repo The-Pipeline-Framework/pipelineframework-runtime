@@ -34,6 +34,25 @@ class AwsDurableSharedRestDeploymentTest {
         assertFalse(attachment.path("WorkerRole").toString().contains("lambda:UpdateAlias"));
     }
 
+    @Test
+    void refreshableWorkerReadsUseSeparateAwsAuthorizationScopes() throws Exception {
+        var role = template("aws-durable-shared-rest.yaml").path("Resources").path("CoordinationRole");
+        var statements = role.path("Properties").path("Policies").findValues("Statement");
+        var refreshableStatements = statements.stream().flatMap(JsonNode::valueStream)
+            .filter(JsonNode::isArray)
+            .filter(branch -> "RefreshableTargets".equals(branch.path(0).asText()))
+            .map(branch -> branch.path(1)).toList();
+
+        assertEquals(
+            java.util.List.of("arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${WorkerFunctionNamePrefix}*-worker"),
+            refreshableStatements.stream().filter(statement -> "lambda:GetAlias".equals(statement.path("Action").asText()))
+                .map(statement -> statement.path("Resource").asText()).toList());
+        assertEquals(
+            java.util.List.of("arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${WorkerFunctionNamePrefix}*:release"),
+            refreshableStatements.stream().filter(statement -> "lambda:GetFunctionUrlConfig".equals(statement.path("Action").asText()))
+                .map(statement -> statement.path("Resource").asText()).toList());
+    }
+
     private static JsonNode template(String name) throws Exception {
         try (var input = AwsDurableSharedRestDeploymentTest.class.getResourceAsStream("/" + name)) {
             assertNotNull(input);
