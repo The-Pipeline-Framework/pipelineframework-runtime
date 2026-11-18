@@ -40,6 +40,16 @@ class AwsDurableExecutionAdmissionTest {
         controlPlane, bindings, decoder, JSON, Duration.ofSeconds(5), Duration.ofDays(1));
 
     @Test
+    void paddedTenantUsesTheSameCanonicalIdentityForLookupAndVerification() throws Exception {
+        var admitted = admission("tenant-1", "pipeline-1", "contract-1", "release-1", Optional.empty());
+        when(controlPlane.getExecutionAdmissionByClientKey("tenant-1", "client-key", "pipeline-1", "release-1"))
+            .thenReturn(Uni.createFrom().item(Optional.of(admitted)));
+        var request = AwsDurableActionRequest.executionAdmission(" tenant-1 ", "client-key", "pipeline-1", "contract-1", "release-1");
+        assertThat(JSON.readValue(actions.invoke(request).resultJson().orElseThrow(), ExecutionClientAdmission.class)).isEqualTo(admitted);
+        verifyOnlyAdmissionReads(1);
+    }
+
+    @Test
     void absentAdmissionRemainsPendingUntilTheAuthoritativeReadObservesIt() throws Exception {
         var admitted = admission("tenant-1", "pipeline-1", "contract-1", "release-1", Optional.of("retained-fingerprint"));
         when(controlPlane.getExecutionAdmissionByClientKey("tenant-1", "client-key", "pipeline-1", "release-1"))

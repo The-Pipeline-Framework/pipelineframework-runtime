@@ -381,10 +381,16 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
 
     @Override
     public Uni<Optional<ExecutionRecord<Object, Object>>> getExecutionByKey(String tenantId, String executionKey) {
-        return blocking(() -> findExistingByScopedExecutionKey(
-            tenantId,
-            scopedExecutionKey(tenantId, executionKey),
-            System.currentTimeMillis()));
+        return blocking(() -> {
+            var response = dynamoClient().getItem(GetItemRequest.builder()
+                .tableName(executionKeyTable())
+                .key(Map.of(TENANT_EXECUTION_KEY, avS(scopedExecutionKey(tenantId, executionKey))))
+                .consistentRead(true).build());
+            var item = response == null || response.item() == null ? Map.<String, AttributeValue>of() : response.item();
+            String executionId = readString(item, EXECUTION_ID);
+            return executionId == null || executionId.isBlank() ? Optional.empty()
+                : readRetainedExecution(tenantId, executionId, System.currentTimeMillis());
+        });
     }
 
     @Override
@@ -760,6 +766,14 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             }
             throw ignored;
         }
+    }
+
+    /** Observations do not clean up expired rows or a concurrently replaced admission key. */
+    private Optional<ExecutionRecord<Object, Object>> readRetainedExecution(String tenantId, String executionId, long nowEpochMs) {
+        var item = readExecutionItem(tenantId, executionId);
+        if (item.isEmpty()) return Optional.empty();
+        var record = toRecord(item);
+        return isExpired(record, nowEpochMs) ? Optional.empty() : Optional.of(record);
     }
 
     private Optional<ExecutionRecord<Object, Object>> getExecutionBlocking(String tenantId, String executionId, long nowEpochMs) {

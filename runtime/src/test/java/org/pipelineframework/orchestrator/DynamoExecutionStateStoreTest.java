@@ -47,6 +47,53 @@ import static org.mockito.Mockito.*;
 
 class DynamoExecutionStateStoreTest {
     @Test
+    void expiredKeyReadCannotDeleteAReplacementAdmission() {
+        var client = mock(DynamoDbClient.class);
+        var store = new DynamoExecutionStateStore(client, mockConfig("tpf_execution", "tpf_execution_key"));
+        var current = new java.util.concurrent.atomic.AtomicReference<>("expired");
+        when(client.getItem(any(GetItemRequest.class))).thenAnswer(call -> {
+            GetItemRequest request = call.getArgument(0);
+            assertTrue(request.consistentRead());
+            if (request.tableName().equals("tpf_execution_key"))
+                return GetItemResponse.builder().item(executionKeyItem(request.key(), current.get())).build();
+            String id = request.key().get("execution_id").s();
+            if (id.equals("expired")) current.set("replacement"); // A concurrent submit replaces the observed key.
+            return GetItemResponse.builder().item(executionItem("tenant", id, "client-key",
+                    id.equals("expired") ? 1 : System.currentTimeMillis() / 1000 + 3600)).build();
+        });
+        when(client.deleteItem(any(software.amazon.awssdk.services.dynamodb.model.DeleteItemRequest.class)))
+                .thenAnswer(call -> {
+                    software.amazon.awssdk.services.dynamodb.model.DeleteItemRequest request = call.getArgument(0);
+                    if (request.tableName().equals("tpf_execution_key")) current.set("deleted");
+                    return software.amazon.awssdk.services.dynamodb.model.DeleteItemResponse.builder().build();
+                });
+
+        assertTrue(store.getExecutionByKey("tenant", "client-key").await().indefinitely().isEmpty());
+        assertEquals("replacement", current.get(), "An observation must preserve the concurrent replacement key");
+        assertEquals("replacement", store.getExecutionByKey("tenant", "client-key").await().indefinitely()
+                .orElseThrow().executionId());
+        verify(client, never()).deleteItem(any(software.amazon.awssdk.services.dynamodb.model.DeleteItemRequest.class));
+        verify(client, never()).transactWriteItems(any(TransactWriteItemsRequest.class));
+    }
+
+    @Test
+    void orphanKeyReadRemainsAbsentWithoutCleanupWrites() {
+        var client = mock(DynamoDbClient.class);
+        var store = new DynamoExecutionStateStore(client, mockConfig("tpf_execution", "tpf_execution_key"));
+        when(client.getItem(any(GetItemRequest.class))).thenAnswer(call -> {
+            GetItemRequest request = call.getArgument(0);
+            if (request.tableName().equals("tpf_execution_key"))
+                return GetItemResponse.builder().item(executionKeyItem(request.key(), "missing")).build();
+            return GetItemResponse.builder().item(request.key().get("execution_id").s().equals("missing")
+                    ? Map.of() : executionItem("tenant", "expired", "client-key", 1)).build();
+        });
+
+        assertTrue(store.getExecutionByKey("tenant", "client-key").await().indefinitely().isEmpty());
+        verify(client, never()).deleteItem(any(software.amazon.awssdk.services.dynamodb.model.DeleteItemRequest.class));
+        verify(client, never()).transactWriteItems(any(TransactWriteItemsRequest.class));
+    }
+
+    @Test
     void executionCreationPersistsDispatchPinAndFreshReaderRejectsPartialPin() {
         var client = mock(DynamoDbClient.class);
         var config = mockConfig("tpf_execution", "tpf_execution_key");

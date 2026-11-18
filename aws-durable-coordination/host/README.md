@@ -54,44 +54,18 @@ and allowing work to outlive the Lambda invocation. Native execution belongs to
 the SQS handler, which awaits processing before acknowledging the message. The
 ordinary runtime's local-development default is unchanged.
 
-## Hosted execution evidence
+## Execution observation contracts
 
-After starting the Durable ingress, a client can observe semantic admission with
-`READ_EXECUTION_ADMISSION`. `AwsDurableActionRequest.executionAdmission` requires
-the tenant, client idempotency key, pipeline ID, contract version and Release
-version. The action calls the existing control-plane admission read and returns
-the canonical `ExecutionClientAdmission` in `resultJson`, preserving its checkpoint,
-submission timestamp and optional initial-input fingerprint. It rejects any
-observed tenant, pipeline, contract or Release mismatch before returning evidence.
-JSON null means admission is not yet observed; it establishes neither failure nor
-completion. The lookup submits no work and creates no provider registrations.
-Clients must start work through the Durable ingress so driver registration and
-recovery run; the driver's `SUBMIT` action is not an ingress replacement.
+The private Action gateway exposes `READ_EXECUTION_ADMISSION`,
+`READ_CURRENT_EXECUTION_LOCATOR`, `READ_EXECUTION_LOCATOR` and `TYPED_RESULT`.
+They reuse the existing semantic admission, immutable provider-generation evidence
+and canonical payload contracts. Clients retain the original tenant and Release
+pins; JSON null is pending evidence rather than permission to submit again.
 
-`READ_CURRENT_EXECUTION_LOCATOR` accepts that admission's exact semantic checkpoint
-through `AwsDurableActionRequest.currentExecutionLocator`; callers need no provider
-generation. After the existing semantic read authorization, it discovers the latest
-durable generation claim and returns its current `AwsDurableRecoveryLocator`, or
-JSON null when no claim/locator is available or a successor wins during the read.
-It never falls back to an older locator. The request's existing `generation` field
-is unused by this operation. Existing generation-specific reads and typed-result
-fencing keep their behavior.
-
-Claim keys contain unpadded decimal numbers, so lexical query order cannot establish
-the latest generation. Discovery uses the existing contiguous, immutable schema-v2
-claims: at most 126 exact, strongly consistent `GetItem` claim probes over the positive
-long domain, followed by the existing locator and current-generation checks. Every
-observed claim must match the exact execution pin and schema. This read is for
-admission recovery or refreshing stale client context; it is not required for each
-transition. It adds no rows, indexes or IAM grants.
-
-The private Lambda action gateway reads the exact tenant, execution, Release
-and driver generation. `READ_EXECUTION_LOCATOR` returns the retained
-`AwsDurableRecoveryLocator`, or JSON null when that generation has no current
-locator. An execution can have a locator without registering an Await callback.
-`TYPED_RESULT` requires one successful terminal item and a current locator.
-It returns a `SerializedTransitionPayload` through the existing transition
-codec. The existing raw `RESULT` action still serves native driver replay.
+See the canonical [AWS Durable deployment and observation contract](https://pipelineframework.org/deploy/orchestrator-runtime/aws-durable)
+for request identities, typed results, fencing and bounded generation discovery.
+[Transport and platform settings](https://pipelineframework.org/develop/configuration/transport-and-platform)
+explain the registered worker boundary and generated application adapters.
 
 ## Standalone transition Lambda
 

@@ -115,11 +115,12 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         String pipeline = required(request.pipelineId(), "pipelineId");
         String contract = required(request.contractVersion(), "contractVersion");
         String release = required(request.releaseVersion(), "releaseVersion");
-        var admission = controlPlane.getExecutionAdmissionByClientKey(request.tenantId(), key, pipeline, release)
+        String tenant = request.tenantId().trim();
+        var admission = controlPlane.getExecutionAdmissionByClientKey(tenant, key, pipeline, release)
             .await().atMost(actionTimeout);
         admission.ifPresent(observed -> {
             var checkpoint = observed.checkpoint();
-            if (!request.tenantId().equals(checkpoint.tenantId()) || !pipeline.equals(checkpoint.pipelineId())
+            if (!tenant.equals(checkpoint.tenantId()) || !pipeline.equals(checkpoint.pipelineId())
                 || !contract.equals(checkpoint.contractVersion()) || !release.equals(checkpoint.releaseVersion())) {
                 throw new IllegalStateException("Execution admission differs from the requested tenant and Release pin");
             }
