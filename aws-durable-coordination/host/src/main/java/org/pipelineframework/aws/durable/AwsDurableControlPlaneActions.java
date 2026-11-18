@@ -83,6 +83,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
                 .getExecutionResultPayload(request.tenantId(), required(request.executionId(), "executionId"))
                 .await().atMost(actionTimeout)));
             case READ_RUNTIME_IDENTITY -> runtimeIdentity(request);
+            case READ_EXECUTION_ADMISSION -> executionAdmission(request);
             case CHECK_REGISTERED_WORKER -> throw new IllegalArgumentException("Worker readiness requires the IAM action handler");
             case REDRIVE -> AwsDurableActionResponse.status(controlPlane.redriveExecution(
                     request.tenantId(),
@@ -105,6 +106,24 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             case READ_EXECUTION_LOCATOR -> executionLocator(request);
             case TYPED_RESULT -> typedResult(request);
         };
+    }
+
+    /** Reads retained admission without creating work or provider correlation. Absence remains unknown. */
+    private AwsDurableActionResponse executionAdmission(AwsDurableActionRequest request) {
+        String key = required(request.idempotencyKey(), "idempotencyKey");
+        String pipeline = required(request.pipelineId(), "pipelineId");
+        String contract = required(request.contractVersion(), "contractVersion");
+        String release = required(request.releaseVersion(), "releaseVersion");
+        var admission = controlPlane.getExecutionAdmissionByClientKey(request.tenantId(), key, pipeline, release)
+            .await().atMost(actionTimeout);
+        admission.ifPresent(observed -> {
+            var checkpoint = observed.checkpoint();
+            if (!request.tenantId().equals(checkpoint.tenantId()) || !pipeline.equals(checkpoint.pipelineId())
+                || !contract.equals(checkpoint.contractVersion()) || !release.equals(checkpoint.releaseVersion())) {
+                throw new IllegalStateException("Execution admission differs from the requested tenant and Release pin");
+            }
+        });
+        return AwsDurableActionResponse.result(json(admission.orElse(null)));
     }
 
     /** Only report readiness when the observed runtime matches the requested Release pin. */

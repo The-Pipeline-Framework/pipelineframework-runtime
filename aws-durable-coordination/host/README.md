@@ -56,6 +56,18 @@ ordinary runtime's local-development default is unchanged.
 
 ## Hosted execution evidence
 
+After starting the Durable ingress, a client can observe semantic admission with
+`READ_EXECUTION_ADMISSION`. `AwsDurableActionRequest.executionAdmission` requires
+the tenant, client idempotency key, pipeline ID, contract version and Release
+version. The action calls the existing control-plane admission read and returns
+the canonical `ExecutionClientAdmission` in `resultJson`, preserving its checkpoint,
+submission timestamp and optional initial-input fingerprint. It rejects any
+observed tenant, pipeline, contract or Release mismatch before returning evidence.
+JSON null means admission is not yet observed; it establishes neither failure nor
+completion. The lookup submits no work and creates no provider registrations.
+Clients must start work through the Durable ingress so driver registration and
+recovery run; the driver's `SUBMIT` action is not an ingress replacement.
+
 The private Lambda action gateway reads the exact tenant, execution, Release
 and driver generation. `READ_EXECUTION_LOCATOR` returns the retained
 `AwsDurableRecoveryLocator`, or JSON null when that generation has no current

@@ -132,6 +132,18 @@ public record AwsDurableActionRequest(
             input.generation());
     }
 
+    /** Observes admission for a client key within its exact original Release without submitting work. */
+    public static AwsDurableActionRequest executionAdmission(
+        String tenantId, String idempotencyKey, String pipelineId, String contractVersion, String releaseVersion) {
+        return new AwsDurableActionRequest(AwsDurableOperation.READ_EXECUTION_ADMISSION, tenantId,
+            Optional.empty(), Optional.of(AwsDurableValidation.required(idempotencyKey, "idempotencyKey")),
+            Optional.of(AwsDurableValidation.required(pipelineId, "pipelineId")),
+            Optional.of(AwsDurableValidation.required(contractVersion, "contractVersion")),
+            Optional.of(AwsDurableValidation.required(releaseVersion, "releaseVersion")),
+            Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+            Optional.empty(), Optional.empty(), 1);
+    }
+
     public static AwsDurableActionRequest status(AwsDurableDriverCheckpoint checkpoint) {
         return forExecution(AwsDurableOperation.STATUS, checkpoint);
     }
