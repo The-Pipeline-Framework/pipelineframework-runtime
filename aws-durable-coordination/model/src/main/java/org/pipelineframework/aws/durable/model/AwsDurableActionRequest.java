@@ -148,6 +148,12 @@ public record AwsDurableActionRequest(
         return forExecution(AwsDurableOperation.STATUS, checkpoint);
     }
 
+    /** Reads the current locator using only semantic identity; the request generation is unused. */
+    public static AwsDurableActionRequest currentExecutionLocator(AwsDurableExecutionCheckpoint checkpoint) {
+        return forExecution(AwsDurableOperation.READ_CURRENT_EXECUTION_LOCATOR,
+            new AwsDurableDriverCheckpoint(checkpoint, 1));
+    }
+
     /** Carries the existing canonical item-continuation command unchanged as JSON. */
     public static AwsDurableActionRequest itemContinuation(AwsDurableExecutionCheckpoint checkpoint, String commandJson) {
         return new AwsDurableActionRequest(AwsDurableOperation.PROCESS_AWAIT_CONTINUATION, checkpoint.tenantId(),

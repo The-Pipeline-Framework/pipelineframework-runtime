@@ -104,6 +104,7 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             case REGISTER_CALLBACK -> register(request);
             case BIND_CALLBACK -> bind(request);
             case READ_EXECUTION_LOCATOR -> executionLocator(request);
+            case READ_CURRENT_EXECUTION_LOCATOR -> currentExecutionLocator(request);
             case TYPED_RESULT -> typedResult(request);
         };
     }
@@ -401,6 +402,13 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
         return AwsDurableActionResponse.result(json(bindings.findCurrentRecovery(pin).orElse(null)));
     }
 
+    /** Discovers provider generation only after authorizing the exact semantic execution. */
+    private AwsDurableActionResponse currentExecutionLocator(AwsDurableActionRequest request) {
+        var pin = driverCheckpoint(request).execution();
+        readPinnedExecution(pin);
+        return AwsDurableActionResponse.result(json(bindings.findCurrentRecovery(pin).orElse(null)));
+    }
+
     /** Checks the driver generation around the result read, after authorizing the execution pin. */
     private AwsDurableActionResponse typedResult(AwsDurableActionRequest request) {
         var pin = driverCheckpoint(request);
@@ -420,6 +428,10 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
 
     /** Applies the existing status-read admission and verifies all coordinates before returning evidence. */
     private ExecutionSemanticCheckpoint readPinnedExecution(AwsDurableDriverCheckpoint pin) {
+        return readPinnedExecution(pin.execution());
+    }
+
+    private ExecutionSemanticCheckpoint readPinnedExecution(AwsDurableExecutionCheckpoint pin) {
         var semantic = controlPlane.getExecutionSemanticCheckpoint(pin.tenantId(), pin.executionId())
             .await().atMost(actionTimeout);
         if (!pin.tenantId().equals(semantic.tenantId()) || !pin.executionId().equals(semantic.executionId())

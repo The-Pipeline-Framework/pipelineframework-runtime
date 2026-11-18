@@ -91,6 +91,34 @@ class AwsDurableGenerationFencingIT {
     }
 
     @Test
+    void currentRecoveryCrossesDecimalGenerationBoundaryWithoutFallingBackToAnOldLocator() {
+        var repository = new AwsDurableCallbackBindingRepository(dynamo, TABLE);
+        String executionId = UUID.randomUUID().toString();
+        var first = registration(executionId, 1);
+        var firstLocator = new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(
+            first.checkpoint(), first.providerExecutionName(), first.providerExecutionArn());
+        repository.registerRecovery(firstLocator);
+        var pin = first.checkpoint().execution();
+        assertThat(repository.findCurrentRecovery(pin)).contains(firstLocator);
+        for (long generation = 2; generation <= 9; generation++) {
+            repository.claimGeneration(registration(executionId, generation).checkpoint());
+        }
+        var ninth = registration(executionId, 9);
+        var ninthLocator = new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(
+            ninth.checkpoint(), ninth.providerExecutionName(), ninth.providerExecutionArn());
+        repository.registerRecovery(ninthLocator);
+        assertThat(repository.findCurrentRecovery(pin)).contains(ninthLocator);
+        var tenth = registration(executionId, 10);
+        repository.claimGeneration(tenth.checkpoint());
+        assertThat(repository.findCurrentRecovery(pin)).isEmpty();
+        assertThat(repository.findCurrentRecovery(ninth.checkpoint())).isEmpty();
+        var tenthLocator = new org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator(
+            tenth.checkpoint(), tenth.providerExecutionName(), tenth.providerExecutionArn());
+        repository.registerRecovery(tenthLocator);
+        assertThat(repository.findCurrentRecovery(pin)).contains(tenthLocator);
+    }
+
+    @Test
     void admissionWithoutExecutionLocatorRecoversWithActualGenerationTransactionConditions() {
         var repository = new AwsDurableCallbackBindingRepository(dynamo, TABLE);
         String executionId = UUID.randomUUID().toString();
