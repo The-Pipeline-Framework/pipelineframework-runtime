@@ -115,4 +115,85 @@ class CompiledCanonicalTransitionPayloadCodecTest {
     }
 
     public record Value(String text) { }
+
+    @Test
+    void compiledDiscriminatorsBelongToTheDeclaredUnionIncludingNestedValues() {
+        var definitions = Map.of(
+            "Choice", unionDefinition("Choice", Choice.class, "executeLocal"),
+            "Alternative", unionDefinition("Alternative", Alternative.class, "runAgain"),
+            "ExecuteLocal", recordDefinition("ExecuteLocal", ExecuteLocal.class, "text", "string", "scalar"),
+            "Result", recordDefinition("Result", Result.class, "choice", "Choice", "named"));
+        var contract = contract(definitions);
+        var choice = new ExecuteLocal("payload");
+        for (String type : List.of("Choice", "Alternative")) {
+            var codec = new CompiledCanonicalTransitionPayloadCodec(framing, contract, type, type);
+            var encoded = codec.encode(choice);
+            assertEquals(choice, codec.decode(encoded));
+            var body = new String(((TypedDurablePayload) framing.decode(encoded)).payload(), StandardCharsets.UTF_8);
+            assertTrue(body.contains(type.equals("Choice") ? "executeLocal" : "runAgain"), body);
+            var typed = (TypedDurablePayload) framing.decode(encoded);
+            var tampered = new TypedDurablePayload(typed.canonicalTypeId(), typed.typeExpressionFingerprint(),
+                typed.catalogFingerprint(), typed.encoding(), typed.encodingVersion(),
+                body.replace(type.equals("Choice") ? "executeLocal" : "runAgain", "forged").getBytes(StandardCharsets.UTF_8));
+            assertThrows(IllegalArgumentException.class, () -> codec.decode(framing.encode(tampered)));
+        }
+        var nested = new CompiledCanonicalTransitionPayloadCodec(framing, contract, "Result", "Result");
+        assertEquals(new Result(choice), nested.decode(nested.encode(new Result(choice))));
+    }
+
+    @Test
+    void releaseScopedDurablePlansRetainCompiledDiscriminators() {
+        var binding = new CanonicalPayloadBinding("Choice", "choice", "catalog", Choice.class);
+        var definitions = Map.of(
+            "Choice", unionDefinition("Choice", Choice.class, "executeLocal"),
+            "ExecuteLocal", recordDefinition("ExecuteLocal", ExecuteLocal.class, "text", "string", "scalar"));
+        var registry = new DurablePayloadPlanRegistry();
+        var release = new DurablePayloadReleaseCoordinate("pipeline", "contract", "release");
+        registry.activate(release, Map.of("choice", binding), definitions);
+        var plan = registry.plan(release, "choice");
+        var codec = new JsonDurablePayloadCodec();
+        var value = new ExecuteLocal("durable");
+        var payload = codec.encode(value, plan);
+        assertTrue(new String(payload.payload(), StandardCharsets.UTF_8).contains("\"discriminator\":\"executeLocal\""));
+        assertEquals(value, codec.decode(payload, plan));
+    }
+
+    @Test
+    void concreteCanonicalRecordsIgnoreInheritedJacksonTypeMetadata() {
+        var contract = contract(Map.of(
+            "Report", recordDefinition("Report", Report.class, "text", "string", "scalar"),
+            "ConcreteResult", recordDefinition("ConcreteResult", ConcreteResult.class, "report", "Report", "named")));
+        var codec = new CompiledCanonicalTransitionPayloadCodec(framing, contract, "Report", "Report");
+        var value = new Report("finished");
+        var encoded = codec.encode(value);
+        assertEquals(value, codec.decode(encoded));
+        assertEquals("{\"text\":\"finished\"}",
+            new String(((TypedDurablePayload) framing.decode(encoded)).payload(), StandardCharsets.UTF_8));
+        var nested = new CompiledCanonicalTransitionPayloadCodec(framing, contract, "ConcreteResult", "ConcreteResult");
+        assertEquals(new ConcreteResult(value), nested.decode(nested.encode(new ConcreteResult(value))));
+    }
+
+    private static Map<String, Object> unionDefinition(String id, Class<?> type, String discriminator) {
+        return Map.of("runtimeClass", type.getName(), "definitionFingerprint", id,
+            "definition", Map.of("kind", "union", "id", id, "variants", List.of(
+                Map.of("discriminator", discriminator, "payload", Map.of("kind", "named", "id", "ExecuteLocal")))));
+    }
+
+    private static Map<String, Object> recordDefinition(String id, Class<?> type, String field, String fieldType, String kind) {
+        return Map.of("runtimeClass", type.getName(), "definitionFingerprint", id,
+            "definition", Map.of("kind", "record", "id", id, "fields", List.of(
+                Map.of("name", field, "presence", "REQUIRED", "nullability", "NON_NULL",
+                    "type", Map.of("kind", kind, "id", fieldType)))));
+    }
+
+    public sealed interface Choice permits ExecuteLocal {}
+    public sealed interface Alternative permits ExecuteLocal {}
+    public record ExecuteLocal(String text) implements Choice, Alternative {}
+    public record Result(Choice choice) {}
+
+    @com.fasterxml.jackson.annotation.JsonTypeInfo(use = com.fasterxml.jackson.annotation.JsonTypeInfo.Id.NAME, property = "completionKind")
+    @com.fasterxml.jackson.annotation.JsonSubTypes(@com.fasterxml.jackson.annotation.JsonSubTypes.Type(value = Report.class, name = "report"))
+    public sealed interface Completion permits Report {}
+    public record Report(String text) implements Completion {}
+    public record ConcreteResult(Report report) {}
 }

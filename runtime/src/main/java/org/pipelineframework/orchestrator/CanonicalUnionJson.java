@@ -38,6 +38,10 @@ final class CanonicalUnionJson {
     }
 
     static ObjectMapper mapper() {
+        return mapper(Map.of());
+    }
+
+    static ObjectMapper mapper(Map<String, Map<String, Object>> definitions) {
         ObjectMapper mapper = PipelineJson.mapper().copy();
         mapper.enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
         mapper.registerModule(new com.fasterxml.jackson.databind.module.SimpleModule("durable-canonical-unions") {
@@ -50,10 +54,14 @@ final class CanonicalUnionJson {
                     MapperConfig<?> config, AnnotatedClass annotated, JavaType baseType
                 ) {
                     // Presence has its own published serializer and is not a canonical union case envelope.
-                    return baseType.getRawClass().isSealed()
-                        && !baseType.getRawClass().isEnum()
-                        && baseType.getRawClass() != org.pipelineframework.type.CanonicalFieldValue.class
-                        ? new UnionResolver() : null;
+                    if (baseType.getRawClass() == org.pipelineframework.type.CanonicalFieldValue.class) {
+                        return super.findTypeResolver(config, annotated, baseType);
+                    }
+                    if (baseType.getRawClass().isSealed() && !baseType.getRawClass().isEnum()) {
+                        return new UnionResolver(definitions);
+                    }
+                    // Canonical concrete values must not inherit application Jackson type envelopes.
+                    return StdTypeResolverBuilder.noTypeInfoBuilder();
                 }
                 });
             }
@@ -61,8 +69,9 @@ final class CanonicalUnionJson {
         return mapper;
     }
 
-    private record Union(JavaType type, Map<String, Class<?>> cases, Optional<MethodHandle> discriminator) {
-        static Union of(JavaType type) {
+    private record Union(JavaType type, Map<String, Class<?>> cases, Optional<MethodHandle> discriminator,
+                         Map<Class<?>, String> compiledDiscriminators) {
+        static Union of(JavaType type, Map<String, Map<String, Object>> definitions) {
             // Jackson's dynamic case serializer erases a generic union's parameters. Fail before writing lossy JSON.
             // Generic records and containers whose values are non-generic unions remain supported.
             if (type.hasGenericTypes() || type.getRawClass().getTypeParameters().length > 0) {
@@ -90,10 +99,42 @@ final class CanonicalUnionJson {
             } catch (IllegalAccessException e) {
                 throw new IllegalArgumentException("Cannot access canonical union discriminator: " + type, e);
             }
-            return new Union(type, Map.copyOf(cases), discriminator);
+            return new Union(type, Map.copyOf(cases), discriminator, compiledDiscriminators(type, cases, definitions));
+        }
+
+        private static Map<Class<?>, String> compiledDiscriminators(
+            JavaType type, Map<String, Class<?>> cases, Map<String, Map<String, Object>> definitions
+        ) {
+            Map<Class<?>, String> labels = new java.util.HashMap<>();
+            for (var definition : definitions.values()) {
+                if (!type.getRawClass().getName().equals(definition.get("runtimeClass"))
+                    || !(definition.get("definition") instanceof Map<?, ?> schema)
+                    || !"union".equals(schema.get("kind"))
+                    || !(schema.get("variants") instanceof java.util.List<?> variants)) continue;
+                for (Object raw : variants) {
+                    if (!(raw instanceof Map<?, ?> variant)
+                        || !(variant.get("discriminator") instanceof String label)
+                        || !(variant.get("payload") instanceof Map<?, ?> payload)
+                        || !(payload.get("id") instanceof String payloadId)) {
+                        throw new IllegalArgumentException("Incomplete compiled union variant for " + type);
+                    }
+                    var target = definitions.get(payloadId);
+                    if (target == null) throw new IllegalArgumentException("Missing compiled union payload " + payloadId);
+                    for (Class<?> candidate : cases.values()) {
+                        if (!candidate.getName().equals(target.get("runtimeClass"))) continue;
+                        String previous = labels.putIfAbsent(candidate, label);
+                        if (previous != null && !previous.equals(label)) {
+                            throw new IllegalArgumentException("Ambiguous compiled discriminator for " + candidate.getName());
+                        }
+                    }
+                }
+            }
+            return Map.copyOf(labels);
         }
 
         String discriminator(Object value) throws IOException {
+            String compiled = compiledDiscriminators.get(value.getClass());
+            if (compiled != null) return compiled;
             try {
                 String result = discriminator.isPresent()
                     ? (String) discriminator.orElseThrow().invoke(value) : value.getClass().getSimpleName();
@@ -110,18 +151,23 @@ final class CanonicalUnionJson {
     }
 
     private static final class UnionResolver extends StdTypeResolverBuilder {
+        private final Map<String, Map<String, Object>> definitions;
+
+        private UnionResolver(Map<String, Map<String, Object>> definitions) {
+            this.definitions = definitions;
+        }
         @Override
         public TypeSerializer buildTypeSerializer(
             SerializationConfig config, JavaType baseType, Collection<NamedType> subtypes
         ) {
-            return new UnionSerializer(Union.of(baseType));
+            return new UnionSerializer(Union.of(baseType, definitions));
         }
 
         @Override
         public TypeDeserializer buildTypeDeserializer(
             DeserializationConfig config, JavaType baseType, Collection<NamedType> subtypes
         ) {
-            return new UnionDeserializer(Union.of(baseType));
+            return new UnionDeserializer(Union.of(baseType, definitions));
         }
     }
 

@@ -22,7 +22,14 @@ public record CompiledDurablePayloadPlan(
     }
 
     public static CompiledDurablePayloadPlan compile(CanonicalPayloadBinding binding) {
-        ObjectMapper mapper = CanonicalUnionJson.mapper();
+        return compile(binding, Map.of());
+    }
+
+    /** Compiles Java representation against the selected release's canonical definitions. */
+    public static CompiledDurablePayloadPlan compile(
+        CanonicalPayloadBinding binding, Map<String, Map<String, Object>> definitions
+    ) {
+        ObjectMapper mapper = CanonicalUnionJson.mapper(definitions);
         Map<String, UnionCasePlan> unionCases = unionCases(binding.runtimeClass(), mapper);
         return new CompiledDurablePayloadPlan(
             binding,

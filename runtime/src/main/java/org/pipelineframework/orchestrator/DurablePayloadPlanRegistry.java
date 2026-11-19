@@ -9,6 +9,12 @@ public final class DurablePayloadPlanRegistry {
     private final ConcurrentHashMap<DurablePayloadReleaseCoordinate, Map<String, CompiledDurablePayloadPlan>> plans = new ConcurrentHashMap<>();
 
     public void activate(DurablePayloadReleaseCoordinate release, Map<String, CanonicalPayloadBinding> bindings) {
+        activate(release, bindings, Map.of());
+    }
+
+    /** Activates plans with the canonical variant bindings from the pinned release. */
+    public void activate(DurablePayloadReleaseCoordinate release, Map<String, CanonicalPayloadBinding> bindings,
+                         Map<String, Map<String, Object>> definitions) {
         plans.compute(release, (ignored, existing) -> {
             Map<String, CompiledDurablePayloadPlan> merged = new java.util.HashMap<>(
                 existing == null ? Map.of() : existing);
@@ -19,7 +25,7 @@ public final class DurablePayloadPlanRegistry {
                         + " and type expression " + expression);
                 }
                 if (prior == null) {
-                    merged.put(expression, CompiledDurablePayloadPlan.compile(binding));
+                    merged.put(expression, CompiledDurablePayloadPlan.compile(binding, definitions));
                 }
             });
             return Map.copyOf(merged);
