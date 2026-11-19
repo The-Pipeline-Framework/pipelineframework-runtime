@@ -54,15 +54,18 @@ and allowing work to outlive the Lambda invocation. Native execution belongs to
 the SQS handler, which awaits processing before acknowledging the message. The
 ordinary runtime's local-development default is unchanged.
 
-## Hosted execution evidence
+## Execution observation contracts
 
-The private Lambda action gateway reads the exact tenant, execution, Release
-and driver generation. `READ_EXECUTION_LOCATOR` returns the retained
-`AwsDurableRecoveryLocator`, or JSON null when that generation has no current
-locator. An execution can have a locator without registering an Await callback.
-`TYPED_RESULT` requires one successful terminal item and a current locator.
-It returns a `SerializedTransitionPayload` through the existing transition
-codec. The existing raw `RESULT` action still serves native driver replay.
+The private Action gateway exposes `READ_EXECUTION_ADMISSION`,
+`READ_CURRENT_EXECUTION_LOCATOR`, `READ_EXECUTION_LOCATOR` and `TYPED_RESULT`.
+They reuse the existing semantic admission, immutable provider-generation evidence
+and canonical payload contracts. Clients retain the original tenant and Release
+pins; JSON null is pending evidence rather than permission to submit again.
+
+See the canonical [AWS Durable deployment and observation contract](https://pipelineframework.org/deploy/orchestrator-runtime/aws-durable)
+for request identities, typed results, fencing and bounded generation discovery.
+[Transport and platform settings](https://pipelineframework.org/develop/configuration/transport-and-platform)
+explain the registered worker boundary and generated application adapters.
 
 ## Standalone transition Lambda
 

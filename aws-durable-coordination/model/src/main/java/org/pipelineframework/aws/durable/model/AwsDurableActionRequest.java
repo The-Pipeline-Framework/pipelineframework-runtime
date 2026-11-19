@@ -132,8 +132,26 @@ public record AwsDurableActionRequest(
             input.generation());
     }
 
+    /** Observes admission for a client key within its exact original Release without submitting work. */
+    public static AwsDurableActionRequest executionAdmission(
+        String tenantId, String idempotencyKey, String pipelineId, String contractVersion, String releaseVersion) {
+        return new AwsDurableActionRequest(AwsDurableOperation.READ_EXECUTION_ADMISSION, tenantId,
+            Optional.empty(), Optional.of(AwsDurableValidation.required(idempotencyKey, "idempotencyKey")),
+            Optional.of(AwsDurableValidation.required(pipelineId, "pipelineId")),
+            Optional.of(AwsDurableValidation.required(contractVersion, "contractVersion")),
+            Optional.of(AwsDurableValidation.required(releaseVersion, "releaseVersion")),
+            Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+            Optional.empty(), Optional.empty(), 1);
+    }
+
     public static AwsDurableActionRequest status(AwsDurableDriverCheckpoint checkpoint) {
         return forExecution(AwsDurableOperation.STATUS, checkpoint);
+    }
+
+    /** Reads the current locator using only semantic identity; the request generation is unused. */
+    public static AwsDurableActionRequest currentExecutionLocator(AwsDurableExecutionCheckpoint checkpoint) {
+        return forExecution(AwsDurableOperation.READ_CURRENT_EXECUTION_LOCATOR,
+            new AwsDurableDriverCheckpoint(checkpoint, 1));
     }
 
     /** Carries the existing canonical item-continuation command unchanged as JSON. */

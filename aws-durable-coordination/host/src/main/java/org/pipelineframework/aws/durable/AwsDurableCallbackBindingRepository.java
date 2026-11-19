@@ -284,6 +284,55 @@ public final class AwsDurableCallbackBindingRepository {
         }
     }
 
+    /**
+     * Observes the latest durable claim without assuming a provider generation or using an index.
+     * Contiguous immutable schema-v2 claims permit at most 126 exact, strongly consistent claim
+     * probes across the positive long domain. The existing recovery read then fences the candidate.
+     */
+    public Optional<org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator> findCurrentRecovery(
+        AwsDurableExecutionCheckpoint expected) {
+        Objects.requireNonNull(expected, "expected");
+        long generation = latestClaimedGeneration(expected);
+        return generation == 0 ? Optional.empty()
+            : findCurrentRecovery(new AwsDurableDriverCheckpoint(expected, generation));
+    }
+
+    private long latestClaimedGeneration(AwsDurableExecutionCheckpoint expected) {
+        if (!hasMatchingClaim(expected, 1)) return 0;
+        long latest = 1;
+        long upper = 2;
+        while (hasMatchingClaim(expected, upper)) {
+            latest = upper;
+            if (latest == Long.MAX_VALUE) return latest;
+            upper = latest > Long.MAX_VALUE / 2 ? Long.MAX_VALUE : latest * 2;
+        }
+        long lower = latest + 1;
+        long high = upper - 1;
+        while (lower <= high) {
+            long middle = lower + (high - lower) / 2;
+            if (hasMatchingClaim(expected, middle)) {
+                latest = middle;
+                lower = middle + 1;
+            } else {
+                high = middle - 1;
+            }
+        }
+        return latest;
+    }
+
+    private boolean hasMatchingClaim(AwsDurableExecutionCheckpoint expected, long generation) {
+        String partition = expected.tenantId() + "#" + expected.executionId();
+        var item = read(partition, claimKey(generation));
+        if (item.isEmpty()) return false;
+        if (!item.equals(Map.of(PK, string(partition), SK, string(claimKey(generation)),
+            RECORD_TYPE, string("GENERATION_CLAIM"), "schema_version", number(2),
+            "pipeline_id", string(expected.pipelineId()), "contract_version", string(expected.contractVersion()),
+            "release_version", string(expected.releaseVersion())))) {
+            throw new IllegalStateException("Generation claim differs from the requested execution pin or schema");
+        }
+        return true;
+    }
+
     /** Looks up the original locator without needing a callback or relying on the ARN index. */
     public Optional<org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator> findCurrentRecovery(
         AwsDurableDriverCheckpoint expected) {
@@ -292,7 +341,9 @@ public final class AwsDurableCallbackBindingRepository {
         if (item.isEmpty()) {
             return Optional.empty();
         }
-        if (!"RECOVERY".equals(text(item, RECORD_TYPE))) {
+        if (!partition.equals(text(item, PK))
+            || !org.pipelineframework.aws.durable.model.AwsDurableRecoveryLocator.sortKey(expected.generation())
+                .equals(text(item, SK)) || !"RECOVERY".equals(text(item, RECORD_TYPE))) {
             throw new IllegalStateException("Unexpected recovery locator record type");
         }
         var locator = recoveryFromItem(item);
