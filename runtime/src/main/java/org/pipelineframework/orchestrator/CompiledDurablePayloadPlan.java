@@ -29,7 +29,7 @@ public record CompiledDurablePayloadPlan(
     public static CompiledDurablePayloadPlan compile(
         CanonicalPayloadBinding binding, Map<String, Map<String, Object>> definitions
     ) {
-        ObjectMapper mapper = CanonicalUnionJson.mapper(definitions);
+        ObjectMapper mapper = CanonicalUnionJson.mapper(definitions, Optional.of(binding.canonicalTypeId()));
         Map<String, UnionCasePlan> unionCases = unionCases(binding.runtimeClass(), mapper);
         return new CompiledDurablePayloadPlan(
             binding,

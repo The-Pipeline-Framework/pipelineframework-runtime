@@ -156,6 +156,34 @@ class CompiledCanonicalTransitionPayloadCodecTest {
         var payload = codec.encode(value, plan);
         assertTrue(new String(payload.payload(), StandardCharsets.UTF_8).contains("\"discriminator\":\"executeLocal\""));
         assertEquals(value, codec.decode(payload, plan));
+        var historical = codec.encode(value, binding);
+        assertTrue(new String(historical.payload(), StandardCharsets.UTF_8).contains("\"discriminator\":\"ExecuteLocal\""));
+        assertEquals(value, codec.decode(historical, plan));
+        var forged = new TypedDurablePayload(historical.canonicalTypeId(), historical.typeExpressionFingerprint(),
+            historical.catalogFingerprint(), historical.encoding(), historical.encodingVersion(),
+            new String(historical.payload(), StandardCharsets.UTF_8).replace("\"discriminator\":\"ExecuteLocal\"", "\"discriminator\":\"forged\"")
+                .getBytes(StandardCharsets.UTF_8));
+        assertThrows(IllegalArgumentException.class, () -> codec.decode(forged, plan));
+    }
+
+    @Test
+    void aliasesSharingAJavaUnionUseOnlyTheSelectedCanonicalGraph() {
+        var contract = contract(Map.of(
+            "Choice", unionDefinition("Choice", Choice.class, "executeLocal"),
+            "ChoiceAlias", unionDefinition("ChoiceAlias", Choice.class, "anotherName"),
+            "ExecuteLocal", recordDefinition("ExecuteLocal", ExecuteLocal.class, "text", "string", "scalar"),
+            "Result", recordDefinition("Result", Result.class, "choice", "Choice", "named")));
+        var value = new ExecuteLocal("selected");
+        for (String type : List.of("Choice", "ChoiceAlias")) {
+            var codec = new CompiledCanonicalTransitionPayloadCodec(framing, contract, type, type);
+            var encoded = codec.encode(value);
+            assertEquals(value, codec.decode(encoded));
+            var body = new String(((TypedDurablePayload) framing.decode(encoded)).payload(), StandardCharsets.UTF_8);
+            assertTrue(body.contains(type.equals("Choice") ? "executeLocal" : "anotherName"));
+            assertEquals(List.of(value), codec.decode(codec.encode(List.of(value))));
+        }
+        var nested = new CompiledCanonicalTransitionPayloadCodec(framing, contract, "Result", "Result");
+        assertEquals(new Result(value), nested.decode(nested.encode(new Result(value))));
     }
 
     @Test

@@ -42,6 +42,11 @@ final class CanonicalUnionJson {
     }
 
     static ObjectMapper mapper(Map<String, Map<String, Object>> definitions) {
+        return mapper(definitions, Optional.empty());
+    }
+
+    static ObjectMapper mapper(Map<String, Map<String, Object>> definitions, Optional<String> canonicalIdentity) {
+        Map<String, Map<String, Object>> selectedDefinitions = reachableDefinitions(definitions, canonicalIdentity);
         ObjectMapper mapper = PipelineJson.mapper().copy();
         mapper.enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
         mapper.registerModule(new com.fasterxml.jackson.databind.module.SimpleModule("durable-canonical-unions") {
@@ -58,7 +63,7 @@ final class CanonicalUnionJson {
                         return super.findTypeResolver(config, annotated, baseType);
                     }
                     if (baseType.getRawClass().isSealed() && !baseType.getRawClass().isEnum()) {
-                        return new UnionResolver(definitions);
+                        return new UnionResolver(selectedDefinitions);
                     }
                     // Canonical concrete values must not inherit application Jackson type envelopes.
                     return StdTypeResolverBuilder.noTypeInfoBuilder();
@@ -67,6 +72,34 @@ final class CanonicalUnionJson {
             }
         });
         return mapper;
+    }
+
+    private static Map<String, Map<String, Object>> reachableDefinitions(
+        Map<String, Map<String, Object>> definitions, Optional<String> canonicalIdentity
+    ) {
+        if (canonicalIdentity.isEmpty() || definitions.isEmpty()) return definitions;
+        String root = canonicalIdentity.orElseThrow();
+        while (root.startsWith("List<") && root.endsWith(">")) root = root.substring(5, root.length() - 1);
+        Map<String, Map<String, Object>> selected = new java.util.HashMap<>();
+        collectDefinition(root, definitions, selected);
+        return Map.copyOf(selected);
+    }
+
+    private static void collectDefinition(String id, Map<String, Map<String, Object>> definitions,
+                                          Map<String, Map<String, Object>> selected) {
+        var definition = definitions.get(id);
+        if (definition == null || selected.putIfAbsent(id, definition) != null) return;
+        collectReferences(definition.get("definition"), definitions, selected);
+    }
+
+    private static void collectReferences(Object value, Map<String, Map<String, Object>> definitions,
+                                          Map<String, Map<String, Object>> selected) {
+        if (value instanceof Map<?, ?> map) {
+            if (map.get("id") instanceof String id) collectDefinition(id, definitions, selected);
+            map.values().forEach(item -> collectReferences(item, definitions, selected));
+        } else if (value instanceof Collection<?> items) {
+            items.forEach(item -> collectReferences(item, definitions, selected));
+        }
     }
 
     private record Union(JavaType type, Map<String, Class<?>> cases, Optional<MethodHandle> discriminator,
@@ -135,6 +168,10 @@ final class CanonicalUnionJson {
         String discriminator(Object value) throws IOException {
             String compiled = compiledDiscriminators.get(value.getClass());
             if (compiled != null) return compiled;
+            return legacyDiscriminator(value);
+        }
+
+        String legacyDiscriminator(Object value) throws IOException {
             try {
                 String result = discriminator.isPresent()
                     ? (String) discriminator.orElseThrow().invoke(value) : value.getClass().getSimpleName();
@@ -258,7 +295,8 @@ final class CanonicalUnionJson {
                 value = context.readValue(valueParser, caseType);
             }
             if (value == null || value.getClass() != candidate
-                || !discriminator.textValue().equals(union.discriminator(value))) {
+                || !(discriminator.textValue().equals(union.discriminator(value))
+                    || discriminator.textValue().equals(union.legacyDiscriminator(value)))) {
                 throw JsonMappingException.from(parser, "Canonical union discriminator mismatch for " + union.type());
             }
             return value;
