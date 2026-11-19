@@ -9,6 +9,18 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class AwsDurableSharedRestDeploymentTest {
     @Test
+    void completionBindingsExposeTheExistingNativeQueue() throws Exception {
+        var shared = template("aws-durable-shared-rest.yaml");
+        var queue = shared.required("Resources").required("AwaitCompletionQueue");
+        assertEquals("AWS::SQS::Queue", queue.required("Type").asText());
+        var outputs = shared.required("Outputs");
+        assertEquals("AwaitCompletionQueue", outputs.required("AwaitCompletionQueueUrl").required("Value").asText());
+        assertEquals("AwaitCompletionQueue.Arn", outputs.required("AwaitCompletionQueueArn").required("Value").asText());
+        assertEquals("AwaitCompletionQueue.Arn", shared.required("Resources").required("AwaitCompletionFunctionAwaitCompletion")
+                .required("Properties").required("EventSourceArn").asText());
+    }
+
+    @Test
     void sharedAndAttachmentOwnershipProduceIndependentInventories() throws Exception {
         JsonNode shared = template("aws-durable-shared-rest.yaml");
         JsonNode worker = template("aws-durable-pinned-worker.yaml");

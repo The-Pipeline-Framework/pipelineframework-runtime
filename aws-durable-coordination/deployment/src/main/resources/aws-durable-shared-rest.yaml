@@ -1063,6 +1063,8 @@ Resources:
       TargetFunctionArn: !Ref LifecycleFunction
       Qualifier: lifecycle
 Outputs:
+  AwaitCompletionQueueUrl: {Value: !Ref AwaitCompletionQueue}
+  AwaitCompletionQueueArn: {Value: !GetAtt AwaitCompletionQueue.Arn}
   LifecycleAliasArn: {Value: !Ref LifecycleAlias}
   LifecycleOrigin: {Value: !GetAtt LifecycleUrl.FunctionUrl}
   CoordinatorInvokerRoleArn: {Value: !GetAtt CoordinationRole.Arn}
