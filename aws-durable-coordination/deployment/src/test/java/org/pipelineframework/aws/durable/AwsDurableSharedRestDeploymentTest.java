@@ -3,8 +3,14 @@ package org.pipelineframework.aws.durable;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.nodes.MappingNode;
+import org.yaml.snakeyaml.nodes.Node;
+import org.yaml.snakeyaml.nodes.ScalarNode;
 import static org.junit.jupiter.api.Assertions.*;
 
 class AwsDurableSharedRestDeploymentTest {
@@ -13,11 +19,26 @@ class AwsDurableSharedRestDeploymentTest {
         var shared = template("aws-durable-shared-rest.yaml");
         var queue = shared.required("Resources").required("AwaitCompletionQueue");
         assertEquals("AWS::SQS::Queue", queue.required("Type").asText());
-        var outputs = shared.required("Outputs");
-        assertEquals("AwaitCompletionQueue", outputs.required("AwaitCompletionQueueUrl").required("Value").asText());
-        assertEquals("AwaitCompletionQueue.Arn", outputs.required("AwaitCompletionQueueArn").required("Value").asText());
-        assertEquals("AwaitCompletionQueue.Arn", shared.required("Resources").required("AwaitCompletionFunctionAwaitCompletion")
-                .required("Properties").required("EventSourceArn").asText());
+        try (var input = getClass().getResourceAsStream("/aws-durable-shared-rest.yaml")) {
+            assertNotNull(input);
+            var nodes = new Yaml().compose(new InputStreamReader(input, StandardCharsets.UTF_8));
+            assertIntrinsic(nodes, "!Ref", "AwaitCompletionQueue", "Outputs", "AwaitCompletionQueueUrl", "Value");
+            assertIntrinsic(nodes, "!GetAtt", "AwaitCompletionQueue.Arn", "Outputs", "AwaitCompletionQueueArn", "Value");
+            assertIntrinsic(nodes, "!GetAtt", "AwaitCompletionQueue.Arn", "Resources", "AwaitCompletionFunctionAwaitCompletion",
+                    "Properties", "EventSourceArn");
+        }
+    }
+
+    private static void assertIntrinsic(Node node, String tag, String target, String... path) {
+        for (String key : path) {
+            var mapping = assertInstanceOf(MappingNode.class, node);
+            node = mapping.getValue().stream()
+                    .filter(pair -> pair.getKeyNode() instanceof ScalarNode scalar
+                            && key.equals(scalar.getValue()))
+                    .findFirst().orElseThrow().getValueNode();
+        }
+        assertEquals(tag, node.getTag().getValue(), String.join(".", path));
+        assertEquals(target, assertInstanceOf(ScalarNode.class, node).getValue());
     }
 
     @Test
