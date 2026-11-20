@@ -70,6 +70,9 @@ public class AwaitDurablePayloadResolver {
 
     /** Reads canonical request bytes while preserving the original retained Release binding. */
     public TypedDurablePayload canonicalRequestPayload(AwaitInteractionRecord interaction) {
+        // A public read requires retained type authority, including for legacy materialised stores.
+        // Do not infer it from the application currently loaded in this process.
+        pinnedDescriptor(interaction);
         if (serializedMode()) {
             TypedDurablePayload payload = TypedDurablePayload.fromDurableValue(interaction.requestPayload())
                 .orElseThrow(() -> new IllegalStateException("Canonical Await request envelope is unavailable"));
@@ -242,7 +245,11 @@ public class AwaitDurablePayloadResolver {
         PipelineReleaseRecord release = pinnedRelease(interaction.tenantId(), execution);
         AwaitCompletionDescriptor descriptor = descriptors.descriptorByStepIdNow(interaction.stepId());
         String requestedTypeId = switch (slot) {
-            case REQUEST -> descriptor.inputType();
+            // Older materialised stores predate retained Await metadata. Preserve their existing
+            // persistence path; canonicalRequestPayload above fails closed for those Releases.
+            case REQUEST -> release.contract().steps().stream()
+                .anyMatch(step -> step.deferredCompletion().containsKey("runtimeDescriptor"))
+                    ? pinnedDescriptor(interaction).inputTypeId() : descriptor.inputType();
             case RESPONSE -> interaction.outputType();
             case COMMAND_ACKNOWLEDGEMENT -> {
                 if (!descriptor.acknowledgementAwareCommandCompletion()) {
