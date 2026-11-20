@@ -288,6 +288,14 @@ HTTP Await lifecycle ZIP. Supply the semantic tables, their stream identifiers,
 the Release artifact bucket and immutable signing secret coordinates as platform
 inputs. The template owns the callback binding table and coordination queues.
 
+The `AwaitCompletionQueueUrl` and `AwaitCompletionQueueArn` outputs identify the
+existing native Await completion queue. A trusted completion adapter can consume
+these bindings without deriving resource names or installing another queue.
+Queue access requires its own scoped IAM policy; these outputs grant no access.
+Send the existing completion envelope with the original native-issued resume
+token. An SQS acknowledgement confirms transport delivery, not semantic
+acceptance of that completion.
+
 Store the registered target properties as a versioned object in the Release
 bucket under `tpf/rest-targets/`. Pass its exact key and version to the shared
 template. Retain this object version for as long as the published shared
