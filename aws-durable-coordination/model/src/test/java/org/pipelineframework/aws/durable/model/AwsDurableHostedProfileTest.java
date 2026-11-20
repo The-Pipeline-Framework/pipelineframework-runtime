@@ -9,6 +9,29 @@ import org.pipelineframework.orchestrator.release.*;
 import static org.assertj.core.api.Assertions.*;
 
 class AwsDurableHostedProfileTest {
+    @Test void completeHostStillRejectsMissingExecutionCanaryBeforeDereferencingIt() {
+        var contract = contract("com.customer.Input", "ONE_TO_ONE");
+        var original = release(contract, AwsDurableHostedProfile.TYPED_JSON_ENCODING);
+        var missing = new PipelineReleaseDescriptor(2, original.pipelineId(), original.contractVersion(), original.releaseVersion(),
+            original.compiledTruthArtifactId(), original.artifacts(), new PipelineReleaseDeployment(original.deployment().profile(),
+                original.deployment().entries(), original.deployment().bindings(), null));
+        assertThatThrownBy(() -> AwsDurableHostedProfile.requireSupported(missing, contract))
+            .isInstanceOf(UnsupportedOperationException.class).hasMessageContaining("Native execution check is required");
+    }
+
+    @Test void standaloneRegisteredRestWorkerProfileNeedsNoRootExecutionCanary() {
+        var base = contract("com.customer.Input", "ONE_TO_ONE");
+        var contract = new PipelineContractDescriptor(base.schemaVersion(), base.pipelineId(), base.contractVersion(), base.contractHash(),
+            base.platform(), base.transport(), base.module(), false, base.runtimeLayout(), base.steps(), base.capabilities(),
+            Map.of("Input", Map.of("runtimeClass", "com.customer.Input")), "catalog");
+        var entry = new PipelineReleaseDeployment.Entry("worker", "zip", contract.module(), ".",
+            AwsDurableHostedProfile.HTTP_ENTRY.entryClass(), AwsDurableHostedProfile.REST_WORKER_TRIGGER, List.of());
+        var release = new PipelineReleaseDescriptor(2, contract.pipelineId(), contract.contractVersion(), "A1", "zip",
+            List.of(artifact("zip", List.of("Transform"))), new PipelineReleaseDeployment(
+                AwsDurableHostedProfile.REST_WORKER_PROFILE_ID, List.of(entry), List.of(), null));
+        assertThatCode(() -> AwsDurableHostedProfile.requireRestWorkerRelease(release, contract)).doesNotThrowAnyException();
+    }
+
     @Test void colocatedTransitionHasNoRemoteEntryWhileLegacyStillRequiresIt() {
         var contract = contract("com.customer.Input", "ONE_TO_ONE");
         var original = release(contract, AwsDurableHostedProfile.TYPED_JSON_ENCODING);

@@ -297,6 +297,44 @@ class ExecutionReadModel {
     return getAwaitSemanticCheckpoint(tenantId, tenant -> awaitCoordinator.getInteraction(tenant, interactionId));
   }
 
+  Uni<Optional<org.pipelineframework.orchestrator.AwaitInteractionView>> getAwaitInteractionView(
+      ExecutionSemanticCheckpoint pin, String interactionId) {
+    return getScopedAwaitInteraction(pin, interactionId).map(found -> found.map(record ->
+        new org.pipelineframework.orchestrator.AwaitInteractionView(new AwaitSemanticCheckpoint(record.tenantId(),
+            record.executionId(), record.interactionId(), record.correlationId(), record.unitId(), record.stepId(),
+            record.status(), pin.pipelineId(), pin.contractVersion(), pin.releaseVersion()),
+            awaitCoordinator.canonicalRequestPayload(record), awaitCoordinator.canonicalCompletionPayloadTypeId(record), record.deadlineEpochMs(),
+            record.transportType(), record.commandCallback())));
+  }
+
+  Uni<Optional<AwaitInteractionRecord>> getScopedAwaitInteraction(ExecutionSemanticCheckpoint pin, String interactionId) {
+    Objects.requireNonNull(pin, "pin");
+    if (interactionId == null || interactionId.isBlank()) {
+      return Uni.createFrom().failure(new IllegalArgumentException("interactionId is required"));
+    }
+    return Uni.createFrom().deferred(() -> {
+      var denied = awaitReadAdmission(pin.tenantId(), ControlPlaneAdmissionOperation.READ_AWAIT_SEMANTIC_CHECKPOINT,
+          Optional.of(pin.executionId()), pin.tenantId());
+      if (denied.isPresent()) return Uni.createFrom().failure(denied.orElseThrow());
+      return getExecutionSemanticCheckpoint(pin.tenantId(), pin.executionId()).chain(parent -> {
+        if (!pin.tenantId().equals(parent.tenantId()) || !pin.executionId().equals(parent.executionId())
+            || !pin.pipelineId().equals(parent.pipelineId()) || !pin.contractVersion().equals(parent.contractVersion())
+            || !pin.releaseVersion().equals(parent.releaseVersion())) {
+          return Uni.createFrom().failure(new IllegalStateException("Await parent differs from the requested execution and Release"));
+        }
+        return awaitCoordinator.getInteraction(pin.tenantId(), interactionId).map(found -> {
+          found.ifPresent(record -> {
+            if (!pin.tenantId().equals(record.tenantId()) || !pin.executionId().equals(record.executionId())
+                || !interactionId.equals(record.interactionId())) {
+              throw new IllegalStateException("Await interaction differs from the requested execution");
+            }
+          });
+          return found;
+        });
+      });
+    });
+  }
+
   Uni<Optional<AwaitSemanticCheckpoint>> getAwaitSemanticCheckpointByCorrelation(
       String tenantId, String correlationId) {
     return getAwaitSemanticCheckpoint(tenantId, tenant -> awaitCoordinator.getInteractionByCorrelation(tenant, correlationId));

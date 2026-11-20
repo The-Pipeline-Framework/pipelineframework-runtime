@@ -67,6 +67,36 @@ for request identities, typed results, fencing and bounded generation discovery.
 [Transport and platform settings](https://pipelineframework.org/develop/configuration/transport-and-platform)
 explain the registered worker boundary and generated application adapters.
 
+## Exact human interaction boundary
+
+`READ_AWAIT_INTERACTION` carries the exact execution/Release checkpoint and Await
+identity using `AwsDurableActionRequest.readAwaitInteraction`. Native read admission
+checks the retained parent and interaction through point reads. Its `resultJson`
+contains `AwaitInteractionView` or JSON null. The view contains the semantic
+checkpoint, original canonical request envelope, canonical `completionPayloadTypeId`,
+deadline, transport type and Command callback flag. The completion type is the
+input expected by the pinned Await completion projector, which may differ from
+the request type and final Await output type. No token, transport metadata,
+assignee/group policy or application Java class is exported. Missing canonical
+bindings fail closed; retained Release A1 remains authoritative after A2 exists.
+
+The trusted IAM Action host accepts `COMPLETE_HUMAN_AWAIT` with the same exact
+identity and an `AwsDurableHumanCompletionRequest` in `inputJson`: a stable
+idempotency key, canonical typed response and an audit actor supplied by the
+authorized caller. Native completion checks the original Release and requires
+an `interaction-api`, non-Command interaction on every admission/commit retry.
+It uses ordinary native completion, idempotency and continuation machinery.
+The safe native receipt reports status and duplicate disposition; a duplicate
+does not mean the supplied decision replaced the original completion.
+
+Both operations require an Action host version containing these enum values.
+Older Action decoders reject the unknown operation before any legacy completion
+can run. There is no fallback to a nullable-token SQS envelope. The existing SQS
+envelope, external signed-token route, and legacy native completion semantics
+are unchanged. A normal Action receipt is native admission evidence; provider
+transport acknowledgement alone is not. Terminal execution results remain the
+authoritative business outcome.
+
 ## Standalone transition Lambda
 
 Select `aws-durable-transition-worker` with `QUARKUS_LAMBDA_HANDLER` and opt in

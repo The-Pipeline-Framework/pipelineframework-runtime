@@ -45,7 +45,8 @@ class AwaitDurablePayloadResolverTest {
         PipelineContractDescriptor contract = new PipelineContractDescriptor(
             2, "payments", "3", "contract-hash", null, null, null, false, null,
             java.util.List.of(new PipelineBundleStepDescriptor(2, "branch-after-await", "internal", "ONE_TO_ONE",
-                Decision.class.getName(), Decision.class.getName(), null, null, null)),
+                Decision.class.getName(), Decision.class.getName(), null, null,
+                Map.of("transportType", "kafka", "runtimeDescriptor", pinnedDescriptorMetadata()))),
             PipelineBundleCapabilities.defaults(),
             Map.of(
                 "Request", binding(Request.class, "request-fingerprint"),
@@ -186,6 +187,14 @@ class AwaitDurablePayloadResolverTest {
     }
 
     private static AwaitDurablePayloadResolver resolverForPinnedRelease() {
+        return resolverForPinnedRelease(2);
+    }
+
+    private static AwaitDurablePayloadResolver resolverForPinnedRelease(int schemaVersion) {
+        return resolverForPinnedRelease(schemaVersion, true);
+    }
+
+    private static AwaitDurablePayloadResolver resolverForPinnedRelease(int schemaVersion, boolean retainedMetadata) {
         ExecutionStateStore executionStore = mock(ExecutionStateStore.class);
         PipelineReleaseRegistry releases = mock(PipelineReleaseRegistry.class);
         @SuppressWarnings("unchecked")
@@ -195,11 +204,12 @@ class AwaitDurablePayloadResolverTest {
         when(execution.releaseVersion()).thenReturn("release-7");
         when(executionStore.getExecution(any(), any())).thenReturn(Uni.createFrom().item(Optional.of(execution)));
         PipelineContractDescriptor contract = new PipelineContractDescriptor(
-            2, "payments", "3", "contract-hash", null, null, null, false, null,
+            schemaVersion, "payments", "3", "contract-hash", null, null, null, false, null,
             java.util.List.of(new PipelineBundleStepDescriptor(2, "decision", "internal", "ONE_TO_ONE",
-                "Request", "Decision", null, null, Map.of("transportType", "kafka", "runtimeDescriptor", pinnedDescriptorMetadata()))),
+                "Request", "Decision", null, null, retainedMetadata
+                    ? Map.of("transportType", "kafka", "runtimeDescriptor", pinnedDescriptorMetadata()) : Map.of())),
             PipelineBundleCapabilities.defaults(),
-            Map.of("Decision", binding(Decision.class, "decision-fingerprint"), "Request", binding(Request.class, "request-fingerprint")),
+            schemaVersion == 1 ? Map.of() : Map.of("Decision", binding(Decision.class, "decision-fingerprint"), "Request", binding(Request.class, "request-fingerprint")),
             "catalog-fingerprint");
         PipelineReleaseRecord release = mock(PipelineReleaseRecord.class);
         when(release.tenantId()).thenReturn("tenant");
@@ -215,6 +225,34 @@ class AwaitDurablePayloadResolverTest {
         when(resolver.descriptors.descriptorByStepIdNow("await")).thenReturn(descriptor());
         resolver.codec = new JsonDurablePayloadCodec();
         return resolver;
+    }
+
+    @Test
+    void legacyPersistenceRemainsUsableButPublicRequestReadRequiresRetainedTypeAuthority() {
+        var resolver = resolverForPinnedRelease(1, false);
+        var interaction = interaction().withPayloadSnapshots(new Request("legacy"), null);
+        var stored = resolver.encode(interaction, AwaitDurablePayloadResolver.Slot.REQUEST, interaction.requestPayload());
+        assertEquals(new Request("legacy"), resolver.decode(interaction, AwaitDurablePayloadResolver.Slot.REQUEST, stored));
+        assertThrows(IllegalStateException.class, () -> resolver.canonicalRequestPayload(interaction));
+    }
+
+    @Test
+    void materializedRequestUsesRetainedBindingWithEitherUnchangedOrNewerLoadedInputType() {
+        for (int schemaVersion : new int[] {1, 2}) {
+            for (Class<?> loadedType : java.util.List.of(Request.class, NewRequest.class)) {
+                var resolver = resolverForPinnedRelease(schemaVersion);
+                var loaded = new AwaitCompletionDescriptor("await", loadedType.getName(), Decision.class.getName(),
+                    "ONE_TO_ONE", Duration.ofSeconds(30), "correlation", "kafka", Map.of(), java.util.List.of());
+                when(resolver.descriptors.descriptorByStepIdNow("await")).thenReturn(loaded);
+
+                var canonical = resolver.canonicalRequestPayload(interaction()
+                    .withPayloadSnapshots(new Request("retained-request"), null));
+
+                assertEquals(schemaVersion == 1 ? Request.class.getName() : "Request", canonical.canonicalTypeId());
+                assertEquals(new Request("retained-request"), resolver.decodeEnvelope(interaction(),
+                    AwaitDurablePayloadResolver.Slot.REQUEST, canonical));
+            }
+        }
     }
 
     @Test
@@ -267,5 +305,6 @@ class AwaitDurablePayloadResolverTest {
     }
 
     private record Request(String id) { }
+    private record NewRequest(String id, String extra) { }
     private record Decision(String status) { }
 }

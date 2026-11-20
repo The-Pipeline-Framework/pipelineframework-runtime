@@ -25,13 +25,37 @@ public final class AwsDurableActionGatewayHandler
 
     @Inject RegisteredRestWorkerTargets registeredTargets;
     @Inject ObjectMapper mapper;
+    @Inject org.pipelineframework.PipelineExecutionService executionService;
 
     @Override
     public AwsDurableActionResponse handleRequest(AwsDurableActionRequest request, Context context) {
         if (request.operation() == AwsDurableOperation.CHECK_REGISTERED_WORKER) {
             return checkRegisteredWorker(request);
         }
+        if (request.operation() == AwsDurableOperation.COMPLETE_HUMAN_AWAIT) return completeHumanAwait(request);
         return services.actions().invoke(request);
+    }
+
+    private AwsDurableActionResponse completeHumanAwait(AwsDurableActionRequest request) {
+        var identity = AwsDurableControlPlaneActions.scopedInteraction(request);
+        var pin = AwsDurableControlPlaneActions.semanticPin(request);
+        AwsDurableHumanCompletionRequest input;
+        try {
+            input = org.pipelineframework.config.pipeline.PipelineJson.mapper().readValue(
+                request.inputJson().orElseThrow(() -> new IllegalArgumentException("inputJson is required")),
+                AwsDurableHumanCompletionRequest.class);
+        } catch (java.io.IOException malformed) {
+            throw new IllegalArgumentException("Invalid canonical human completion request", malformed);
+        }
+        var command = new org.pipelineframework.awaitable.AwaitCompletionCommand(pin.tenantId(), identity.interactionId(),
+            identity.correlationId(), null, input.idempotencyKey(), input.responsePayload(), input.actor(), System.currentTimeMillis());
+        var accepted = executionService.completeHumanAwaitInteraction(pin, command).await().atMost(java.time.Duration.ofSeconds(30));
+        try {
+            return AwsDurableActionResponse.result(mapper.writeValueAsString(
+                org.pipelineframework.awaitable.dto.AwaitDtoMapper.toCompletionResponse(accepted)));
+        } catch (JsonProcessingException failure) {
+            throw new IllegalStateException("Cannot serialize human completion receipt", failure);
+        }
     }
 
     private AwsDurableActionResponse checkRegisteredWorker(AwsDurableActionRequest request) {

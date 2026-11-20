@@ -202,6 +202,18 @@ public class LocalPipelineControlPlane implements PipelineControlPlane {
     }
 
     @Override
+    public Uni<AwaitCompletionResult> completeHumanAwait(org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin,
+        AwaitCompletionCommand command, AwaitItemContinuationHandler itemContinuationHandler) {
+        return queueAsyncCoordinator.completeHumanAwait(pin, command, itemContinuationHandler);
+    }
+
+    @Override
+    public Uni<Optional<org.pipelineframework.orchestrator.AwaitInteractionView>> getAwaitInteractionView(
+        org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin, String interactionId) {
+        return queueAsyncCoordinator.getAwaitInteractionView(pin, interactionId);
+    }
+
+    @Override
     public Uni<AwaitCompletionResult> completeAwait(
         AwaitCompletionCommand command,
         AwaitItemContinuationHandler itemContinuationHandler) {

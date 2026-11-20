@@ -429,12 +429,23 @@ public class AwaitCoordinator {
     }
 
     public Uni<AwaitCompletionResult> complete(AwaitCompletionCommand command) {
+        return complete(command, null);
+    }
+
+    /** Explicit human boundary; legacy callback admission remains unchanged. */
+    public Uni<AwaitCompletionResult> completeHuman(AwaitCompletionCommand command,
+        org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin) {
+        return complete(command, Objects.requireNonNull(pin, "pin"));
+    }
+
+    private Uni<AwaitCompletionResult> complete(AwaitCompletionCommand command,
+        org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint humanPin) {
         AwaitCompletionCommand normalized = normalizeCompletionCommand(command);
         if (durablePayloadResolver != null && durablePayloadResolver.serializedMode()) {
-            return completeSerialized(normalized, 8).invoke(this::recordCompletionObservation);
+            return completeSerialized(normalized, 8, humanPin).invoke(this::recordCompletionObservation);
         }
         return resolveForCompletion(normalized)
-            .onItem().transformToUni(record -> validateCompletionAdmission(record, normalized)
+            .onItem().transformToUni(record -> validateCompletionAdmission(record, normalized, humanPin)
                 .onItem().transformToUni(safeCommand -> record.acknowledgementAwareCommandCallback()
                     ? completeAcknowledgedCommand(record, safeCommand, 8)
                     : Uni.createFrom().item(completionContract(record, safeCommand))
@@ -449,13 +460,18 @@ public class AwaitCoordinator {
     }
 
     private Uni<AwaitCompletionResult> completeSerialized(AwaitCompletionCommand command, int remainingRaces) {
+        return completeSerialized(command, remainingRaces, null);
+    }
+
+    private Uni<AwaitCompletionResult> completeSerialized(AwaitCompletionCommand command, int remainingRaces,
+        org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint humanPin) {
         if (!(interactionStore() instanceof org.pipelineframework.awaitable.spi.FencedAwaitInteractionStore fenced)) {
             return Uni.createFrom().failure(new IllegalStateException("Serialized Await requires fenced completion"));
         }
         if (remainingRaces <= 0) {
             return Uni.createFrom().failure(new IllegalStateException("Await completion exceeded concurrent update limit"));
         }
-        return resolveForCompletion(command).chain(record -> validateCompletionAdmission(record, command).chain(admitted -> {
+        return resolveForCompletion(command).chain(record -> validateCompletionAdmission(record, command, humanPin).chain(admitted -> {
             if (record.acknowledgementAwareCommandCallback()) {
                 return completeAcknowledgedSerialized(record, admitted, remainingRaces);
             }
@@ -470,7 +486,7 @@ public class AwaitCoordinator {
             }
             return projected.chain(value -> fenced.complete(record, value))
                 .chain(committed -> committed.map(Uni.createFrom()::item)
-                    .orElseGet(() -> completeSerialized(command, remainingRaces - 1)));
+                    .orElseGet(() -> completeSerialized(command, remainingRaces - 1, humanPin)));
         }));
     }
 
@@ -992,6 +1008,29 @@ public class AwaitCoordinator {
         AwaitInteractionRecord record,
         AwaitCompletionCommand command
     ) {
+        return validateCompletionAdmission(record, command, null);
+    }
+
+    private Uni<AwaitCompletionCommand> validateCompletionAdmission(AwaitInteractionRecord record,
+        AwaitCompletionCommand command, org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint humanPin) {
+        if (humanPin != null) {
+            if (command.resumeToken() != null || command.interactionId() == null
+                || !humanPin.tenantId().equals(command.tenantId()) || !humanPin.tenantId().equals(record.tenantId())
+                || !humanPin.executionId().equals(record.executionId()) || !command.interactionId().equals(record.interactionId())
+                || (command.correlationId() != null && !command.correlationId().equals(record.correlationId()))
+                || !"interaction-api".equals(record.transportType()) || record.commandCallback()) {
+                return Uni.createFrom().failure(new AwaitResumeTokenRejectedException(
+                    "Human completion requires an exact non-Command interaction-api interaction"));
+            }
+            if (durablePayloadResolver == null) {
+                return Uni.createFrom().failure(new IllegalStateException("Human completion requires retained Release authority"));
+            }
+            var coordinate = durablePayloadResolver.coordinateFor(record);
+            if (!humanPin.pipelineId().equals(coordinate.pipelineId()) || !humanPin.contractVersion().equals(coordinate.contractVersion())
+                || !humanPin.releaseVersion().equals(coordinate.releaseVersion())) {
+                return Uni.createFrom().failure(new AwaitResumeTokenRejectedException("Human completion differs from original Release"));
+            }
+        }
         if (record.status().terminal() && record.status() != AwaitInteractionStatus.COMPLETED) {
             return Uni.createFrom().failure(
                 new AwaitInteractionTerminalException("Await interaction is terminal: " + record.status()));
@@ -1269,6 +1308,21 @@ public class AwaitCoordinator {
         return TypedDurablePayload.fromSerializedBytes(
             durablePayloadResolver.encode(interaction, slot, payload).getBytes(StandardCharsets.UTF_8))
             .orElseThrow(() -> new IllegalStateException("Await typed snapshot encoding failed for " + interaction.interactionId()));
+    }
+
+    /** Exports only the original canonical request envelope, without materializing application classes. */
+    public TypedDurablePayload canonicalRequestPayload(AwaitInteractionRecord interaction) {
+        if (durablePayloadResolver == null || !durablePayloadResolver.supportsTypedPayloads(interaction)) {
+            throw new IllegalStateException("Canonical Await request binding is unavailable");
+        }
+        return durablePayloadResolver.canonicalRequestPayload(interaction);
+    }
+
+    public String canonicalCompletionPayloadTypeId(AwaitInteractionRecord interaction) {
+        if (durablePayloadResolver == null || !durablePayloadResolver.supportsTypedPayloads(interaction)) {
+            throw new IllegalStateException("Canonical Await completion binding is unavailable");
+        }
+        return durablePayloadResolver.pinnedDescriptor(interaction).completionPayloadTypeId();
     }
 
     public boolean requiresAuthoritativeSuspension() {

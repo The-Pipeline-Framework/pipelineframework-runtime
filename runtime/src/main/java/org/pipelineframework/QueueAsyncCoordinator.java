@@ -381,6 +381,19 @@ class QueueAsyncCoordinator {
     return completeAwait(command, NOOP_ITEM_CONTINUATION_HANDLER);
   }
 
+  Uni<Optional<org.pipelineframework.orchestrator.AwaitInteractionView>> getAwaitInteractionView(
+      org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin, String interactionId) {
+    return Uni.createFrom().deferred(() -> executionReadModel().getAwaitInteractionView(pin, interactionId));
+  }
+
+  Uni<AwaitCompletionResult> completeHumanAwait(org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin,
+      AwaitCompletionCommand command, AwaitItemContinuationHandler itemContinuationHandler) {
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) return Uni.createFrom().failure(queueModeDisabledException());
+      return awaitBoundaryAdmission().completeHuman(pin, command, itemContinuationHandler, executionReadModel());
+    });
+  }
+
   Uni<AwaitCompletionResult> completeAwait(
       AwaitCompletionCommand command,
       AwaitItemContinuationHandler itemContinuationHandler) {

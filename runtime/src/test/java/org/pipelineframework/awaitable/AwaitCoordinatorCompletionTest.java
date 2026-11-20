@@ -1285,6 +1285,25 @@ class AwaitCoordinatorCompletionTest {
         return coordinator(store, null);
     }
 
+    @Test
+    void explicitHumanCompletionUsesOrdinaryNativeCompletionAndLeavesLegacyTokenAdmissionUntouched() {
+        var store = new InMemoryAwaitInteractionStore();
+        var coordinator = coordinator(store);
+        var created = coordinator.createOrGet(descriptor("FraudCheck"), "tenant-1", "exec-1", 0, "cause",
+            Map.of("paymentRecordId", "one"), null, null).await().indefinitely().record();
+        var resolver = mock(AwaitDurablePayloadResolver.class);
+        org.mockito.Mockito.when(resolver.coordinateFor(org.mockito.ArgumentMatchers.any())).thenReturn(
+            new org.pipelineframework.orchestrator.DurablePayloadReleaseCoordinate("pipeline", "contract", "A1"));
+        coordinator.durablePayloadResolver = resolver;
+        var pin = new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint("tenant-1", "exec-1", "pipeline", "contract", "A1",
+            org.pipelineframework.orchestrator.ExecutionStatus.WAITING_EXTERNAL);
+        var command = new AwaitCompletionCommand("tenant-1", created.interactionId(), null, "decision",
+            Map.of("approved", true), "reviewer", System.currentTimeMillis());
+        var result = coordinator.completeHuman(command, pin).await().indefinitely();
+        assertFalse(result.duplicate()); assertEquals(Map.of("approved", true), result.record().responsePayload());
+        assertTrue(coordinator.completeHuman(command, pin).await().indefinitely().duplicate());
+    }
+
     private static AwaitCoordinator coordinator(InMemoryAwaitInteractionStore store, PipelineOrchestratorConfig config) {
         AwaitCoordinator coordinator = new AwaitCoordinator();
         coordinator.interactionStores = new SimpleInstance<>(List.<AwaitInteractionStore>of(store));
