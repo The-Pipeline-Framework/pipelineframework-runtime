@@ -390,15 +390,7 @@ class QueueAsyncCoordinator {
       AwaitCompletionCommand command, AwaitItemContinuationHandler itemContinuationHandler) {
     return Uni.createFrom().deferred(() -> {
       if (!ensureQueueModeReady()) return Uni.createFrom().failure(queueModeDisabledException());
-      if (command == null || !pin.tenantId().equals(command.tenantId()) || command.interactionId() == null
-          || command.resumeToken() != null) {
-        return Uni.createFrom().failure(new IllegalArgumentException("Human completion requires an exact interaction without a token"));
-      }
-      return executionReadModel().getScopedAwaitInteraction(pin, command.interactionId()).chain(found -> {
-        if (found.isEmpty()) return Uni.createFrom().failure(new org.pipelineframework.awaitable.AwaitInteractionNotFoundException(
-            "Human Await interaction is unavailable"));
-        return awaitBoundaryAdmission().completeHuman(pin, command, itemContinuationHandler);
-      });
+      return awaitBoundaryAdmission().completeHuman(pin, command, itemContinuationHandler, executionReadModel());
     });
   }
 

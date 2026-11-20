@@ -64,8 +64,19 @@ class AwaitBoundaryAdmission {
   }
 
   Uni<AwaitCompletionResult> completeHuman(org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin,
-      AwaitCompletionCommand command, AwaitItemContinuationHandler itemContinuationHandler) {
-    return complete(java.util.Objects.requireNonNull(pin, "pin"), command, itemContinuationHandler);
+      AwaitCompletionCommand command, AwaitItemContinuationHandler itemContinuationHandler, ExecutionReadModel reads) {
+    return Uni.createFrom().deferred(() -> {
+      java.util.Objects.requireNonNull(pin, "pin");
+      if (command == null || !pin.tenantId().equals(command.tenantId()) || command.interactionId() == null
+          || command.resumeToken() != null) {
+        return Uni.createFrom().failure(new IllegalArgumentException("Human completion requires an exact interaction without a token"));
+      }
+      return reads.getScopedAwaitInteraction(pin, command.interactionId()).chain(found -> {
+        if (found.isEmpty()) return Uni.createFrom().failure(new org.pipelineframework.awaitable.AwaitInteractionNotFoundException(
+            "Human Await interaction is unavailable"));
+        return complete(pin, command, itemContinuationHandler);
+      });
+    });
   }
 
   private Uni<AwaitCompletionResult> complete(org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint humanPin,
