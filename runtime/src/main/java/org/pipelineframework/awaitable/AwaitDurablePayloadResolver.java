@@ -68,6 +68,18 @@ public class AwaitDurablePayloadResolver {
         }
     }
 
+    /** Reads canonical request bytes while preserving the original retained Release binding. */
+    public TypedDurablePayload canonicalRequestPayload(AwaitInteractionRecord interaction) {
+        if (serializedMode()) {
+            TypedDurablePayload payload = TypedDurablePayload.fromDurableValue(interaction.requestPayload())
+                .orElseThrow(() -> new IllegalStateException("Canonical Await request envelope is unavailable"));
+            validateSerialized(interaction, Slot.REQUEST, payload);
+            return payload;
+        }
+        return TypedDurablePayload.fromSerializedBytes(encode(interaction, Slot.REQUEST, interaction.requestPayload())
+            .getBytes(StandardCharsets.UTF_8)).orElseThrow(() -> new IllegalStateException("Canonical Await request encoding failed"));
+    }
+
     /** Returns whether the interaction's pinned release has the v3 canonical binding catalog. */
     public boolean supportsTypedPayloads(AwaitInteractionRecord interaction) {
         return findOwningExecution(interaction)

@@ -124,6 +124,17 @@ public interface PipelineControlPlane {
 
     Uni<AwaitCompletionResult> completeAwait(AwaitCompletionCommand command);
 
+    /** Explicit trusted human completion, scoped to an original execution and Release. */
+    default Uni<AwaitCompletionResult> completeHumanAwait(ExecutionSemanticCheckpoint pin, AwaitCompletionCommand command,
+        AwaitItemContinuationHandler itemContinuationHandler) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Human Await completion is unsupported"));
+    }
+
+    /** Reads one exact interaction's canonical request and immutable completion classification. */
+    default Uni<Optional<AwaitInteractionView>> getAwaitInteractionView(ExecutionSemanticCheckpoint pin, String interactionId) {
+        return Uni.createFrom().failure(new UnsupportedOperationException("Scoped Await interaction reads are unsupported"));
+    }
+
     Uni<AwaitCompletionResult> completeAwait(
         AwaitCompletionCommand command,
         AwaitItemContinuationHandler itemContinuationHandler);

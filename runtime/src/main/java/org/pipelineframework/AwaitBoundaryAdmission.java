@@ -60,6 +60,16 @@ class AwaitBoundaryAdmission {
   Uni<AwaitCompletionResult> complete(
       AwaitCompletionCommand command,
       AwaitItemContinuationHandler itemContinuationHandler) {
+    return complete(null, command, itemContinuationHandler);
+  }
+
+  Uni<AwaitCompletionResult> completeHuman(org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin,
+      AwaitCompletionCommand command, AwaitItemContinuationHandler itemContinuationHandler) {
+    return complete(java.util.Objects.requireNonNull(pin, "pin"), command, itemContinuationHandler);
+  }
+
+  private Uni<AwaitCompletionResult> complete(org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint humanPin,
+      AwaitCompletionCommand command, AwaitItemContinuationHandler itemContinuationHandler) {
     return Uni.createFrom().deferred(() -> {
       if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
         return Uni.createFrom().failure(new IllegalStateException(
@@ -70,7 +80,7 @@ class AwaitBoundaryAdmission {
       if (admissionFailure.isPresent()) {
         return Uni.createFrom().failure(admissionFailure.get());
       }
-      return awaitCoordinator.complete(normalized)
+      return (humanPin == null ? awaitCoordinator.complete(normalized) : awaitCoordinator.completeHuman(normalized, humanPin))
           .onFailure(failure -> !AwaitCompletionAdmissionFailures.isDeterministic(failure))
           .transform(failure -> new IllegalStateException(
               "Failed completing await interaction tenant=" + normalized.tenantId()

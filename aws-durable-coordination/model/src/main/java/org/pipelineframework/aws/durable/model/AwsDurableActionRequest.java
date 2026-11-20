@@ -154,6 +154,29 @@ public record AwsDurableActionRequest(
             new AwsDurableDriverCheckpoint(checkpoint, 1));
     }
 
+    public static AwsDurableActionRequest readAwaitInteraction(AwsDurableExecutionCheckpoint checkpoint,
+        AwsDurableAwaitIdentity identity) {
+        return forAwaitInteraction(AwsDurableOperation.READ_AWAIT_INTERACTION, checkpoint, identity, Optional.empty());
+    }
+
+    /** The JSON command is admitted only through the explicit human completion operation. */
+    public static AwsDurableActionRequest completeHumanAwait(AwsDurableExecutionCheckpoint checkpoint,
+        AwsDurableAwaitIdentity identity, String commandJson) {
+        return forAwaitInteraction(AwsDurableOperation.COMPLETE_HUMAN_AWAIT, checkpoint, identity,
+            Optional.of(AwsDurableValidation.required(commandJson, "commandJson")));
+    }
+
+    private static AwsDurableActionRequest forAwaitInteraction(AwsDurableOperation operation,
+        AwsDurableExecutionCheckpoint checkpoint, AwsDurableAwaitIdentity identity, Optional<String> input) {
+        if (!checkpoint.tenantId().equals(identity.tenantId()) || !checkpoint.executionId().equals(identity.executionId())) {
+            throw new IllegalArgumentException("Await identity differs from execution pin");
+        }
+        var base = forExecution(operation, new AwsDurableDriverCheckpoint(checkpoint, identity.generation()));
+        return new AwsDurableActionRequest(operation, base.tenantId(), base.executionId(), Optional.empty(),
+            base.pipelineId(), base.contractVersion(), base.releaseVersion(), input, Optional.of(identity),
+            Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), base.generation());
+    }
+
     /** Carries the existing canonical item-continuation command unchanged as JSON. */
     public static AwsDurableActionRequest itemContinuation(AwsDurableExecutionCheckpoint checkpoint, String commandJson) {
         return new AwsDurableActionRequest(AwsDurableOperation.PROCESS_AWAIT_CONTINUATION, checkpoint.tenantId(),
