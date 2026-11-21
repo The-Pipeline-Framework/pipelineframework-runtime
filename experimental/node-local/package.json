@@ -1,0 +1,25 @@
+{
+  "name": "@tpf/experimental-node-local",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./index.d.mts",
+      "import": "./index.mjs"
+    }
+  },
+  "files": [
+    "index.d.mts",
+    "index.mjs",
+    "projection.mjs",
+    "records.mjs"
+  ],
+  "scripts": {
+    "test": "node --test"
+  }
+}
