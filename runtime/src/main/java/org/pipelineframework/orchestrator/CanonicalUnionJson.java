@@ -38,6 +38,15 @@ final class CanonicalUnionJson {
     }
 
     static ObjectMapper mapper() {
+        return mapper(Map.of());
+    }
+
+    static ObjectMapper mapper(Map<String, Map<String, Object>> definitions) {
+        return mapper(definitions, Optional.empty());
+    }
+
+    static ObjectMapper mapper(Map<String, Map<String, Object>> definitions, Optional<String> canonicalIdentity) {
+        Map<String, Map<String, Object>> selectedDefinitions = reachableDefinitions(definitions, canonicalIdentity);
         ObjectMapper mapper = PipelineJson.mapper().copy();
         mapper.enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
         mapper.registerModule(new com.fasterxml.jackson.databind.module.SimpleModule("durable-canonical-unions") {
@@ -50,10 +59,14 @@ final class CanonicalUnionJson {
                     MapperConfig<?> config, AnnotatedClass annotated, JavaType baseType
                 ) {
                     // Presence has its own published serializer and is not a canonical union case envelope.
-                    return baseType.getRawClass().isSealed()
-                        && !baseType.getRawClass().isEnum()
-                        && baseType.getRawClass() != org.pipelineframework.type.CanonicalFieldValue.class
-                        ? new UnionResolver() : null;
+                    if (baseType.getRawClass() == org.pipelineframework.type.CanonicalFieldValue.class) {
+                        return super.findTypeResolver(config, annotated, baseType);
+                    }
+                    if (baseType.getRawClass().isSealed() && !baseType.getRawClass().isEnum()) {
+                        return new UnionResolver(selectedDefinitions);
+                    }
+                    // Canonical concrete values must not inherit application Jackson type envelopes.
+                    return StdTypeResolverBuilder.noTypeInfoBuilder();
                 }
                 });
             }
@@ -61,8 +74,37 @@ final class CanonicalUnionJson {
         return mapper;
     }
 
-    private record Union(JavaType type, Map<String, Class<?>> cases, Optional<MethodHandle> discriminator) {
-        static Union of(JavaType type) {
+    private static Map<String, Map<String, Object>> reachableDefinitions(
+        Map<String, Map<String, Object>> definitions, Optional<String> canonicalIdentity
+    ) {
+        if (canonicalIdentity.isEmpty() || definitions.isEmpty()) return definitions;
+        String root = canonicalIdentity.orElseThrow();
+        while (root.startsWith("List<") && root.endsWith(">")) root = root.substring(5, root.length() - 1);
+        Map<String, Map<String, Object>> selected = new java.util.HashMap<>();
+        collectDefinition(root, definitions, selected);
+        return Map.copyOf(selected);
+    }
+
+    private static void collectDefinition(String id, Map<String, Map<String, Object>> definitions,
+                                          Map<String, Map<String, Object>> selected) {
+        var definition = definitions.get(id);
+        if (definition == null || selected.putIfAbsent(id, definition) != null) return;
+        collectReferences(definition.get("definition"), definitions, selected);
+    }
+
+    private static void collectReferences(Object value, Map<String, Map<String, Object>> definitions,
+                                          Map<String, Map<String, Object>> selected) {
+        if (value instanceof Map<?, ?> map) {
+            if (map.get("id") instanceof String id) collectDefinition(id, definitions, selected);
+            map.values().forEach(item -> collectReferences(item, definitions, selected));
+        } else if (value instanceof Collection<?> items) {
+            items.forEach(item -> collectReferences(item, definitions, selected));
+        }
+    }
+
+    private record Union(JavaType type, Map<String, Class<?>> cases, Optional<MethodHandle> discriminator,
+                         Map<Class<?>, String> compiledDiscriminators) {
+        static Union of(JavaType type, Map<String, Map<String, Object>> definitions) {
             // Jackson's dynamic case serializer erases a generic union's parameters. Fail before writing lossy JSON.
             // Generic records and containers whose values are non-generic unions remain supported.
             if (type.hasGenericTypes() || type.getRawClass().getTypeParameters().length > 0) {
@@ -90,10 +132,46 @@ final class CanonicalUnionJson {
             } catch (IllegalAccessException e) {
                 throw new IllegalArgumentException("Cannot access canonical union discriminator: " + type, e);
             }
-            return new Union(type, Map.copyOf(cases), discriminator);
+            return new Union(type, Map.copyOf(cases), discriminator, compiledDiscriminators(type, cases, definitions));
+        }
+
+        private static Map<Class<?>, String> compiledDiscriminators(
+            JavaType type, Map<String, Class<?>> cases, Map<String, Map<String, Object>> definitions
+        ) {
+            Map<Class<?>, String> labels = new java.util.HashMap<>();
+            for (var definition : definitions.values()) {
+                if (!type.getRawClass().getName().equals(definition.get("runtimeClass"))
+                    || !(definition.get("definition") instanceof Map<?, ?> schema)
+                    || !"union".equals(schema.get("kind"))
+                    || !(schema.get("variants") instanceof java.util.List<?> variants)) continue;
+                for (Object raw : variants) {
+                    if (!(raw instanceof Map<?, ?> variant)
+                        || !(variant.get("discriminator") instanceof String label)
+                        || !(variant.get("payload") instanceof Map<?, ?> payload)
+                        || !(payload.get("id") instanceof String payloadId)) {
+                        throw new IllegalArgumentException("Incomplete compiled union variant for " + type);
+                    }
+                    var target = definitions.get(payloadId);
+                    if (target == null) throw new IllegalArgumentException("Missing compiled union payload " + payloadId);
+                    for (Class<?> candidate : cases.values()) {
+                        if (!candidate.getName().equals(target.get("runtimeClass"))) continue;
+                        String previous = labels.putIfAbsent(candidate, label);
+                        if (previous != null && !previous.equals(label)) {
+                            throw new IllegalArgumentException("Ambiguous compiled discriminator for " + candidate.getName());
+                        }
+                    }
+                }
+            }
+            return Map.copyOf(labels);
         }
 
         String discriminator(Object value) throws IOException {
+            String compiled = compiledDiscriminators.get(value.getClass());
+            if (compiled != null) return compiled;
+            return legacyDiscriminator(value);
+        }
+
+        String legacyDiscriminator(Object value) throws IOException {
             try {
                 String result = discriminator.isPresent()
                     ? (String) discriminator.orElseThrow().invoke(value) : value.getClass().getSimpleName();
@@ -110,18 +188,23 @@ final class CanonicalUnionJson {
     }
 
     private static final class UnionResolver extends StdTypeResolverBuilder {
+        private final Map<String, Map<String, Object>> definitions;
+
+        private UnionResolver(Map<String, Map<String, Object>> definitions) {
+            this.definitions = definitions;
+        }
         @Override
         public TypeSerializer buildTypeSerializer(
             SerializationConfig config, JavaType baseType, Collection<NamedType> subtypes
         ) {
-            return new UnionSerializer(Union.of(baseType));
+            return new UnionSerializer(Union.of(baseType, definitions));
         }
 
         @Override
         public TypeDeserializer buildTypeDeserializer(
             DeserializationConfig config, JavaType baseType, Collection<NamedType> subtypes
         ) {
-            return new UnionDeserializer(Union.of(baseType));
+            return new UnionDeserializer(Union.of(baseType, definitions));
         }
     }
 
@@ -212,7 +295,8 @@ final class CanonicalUnionJson {
                 value = context.readValue(valueParser, caseType);
             }
             if (value == null || value.getClass() != candidate
-                || !discriminator.textValue().equals(union.discriminator(value))) {
+                || !(discriminator.textValue().equals(union.discriminator(value))
+                    || discriminator.textValue().equals(union.legacyDiscriminator(value)))) {
                 throw JsonMappingException.from(parser, "Canonical union discriminator mismatch for " + union.type());
             }
             return value;

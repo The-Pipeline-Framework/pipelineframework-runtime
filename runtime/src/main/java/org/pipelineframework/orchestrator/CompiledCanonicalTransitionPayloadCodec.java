@@ -154,7 +154,8 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
             var scalar = new CanonicalPayloadBinding(identity, fingerprint, catalog, type);
             var collection = new CanonicalPayloadBinding("List<" + identity + ">", fingerprint("List<" + fingerprint + ">"),
                 catalog, List.class, TypeFactory.defaultInstance().constructCollectionType(List.class, type));
-            return new Boundary(CompiledDurablePayloadPlan.compile(scalar), CompiledDurablePayloadPlan.compile(collection));
+            return new Boundary(CompiledDurablePayloadPlan.compile(scalar, contract.canonicalTypes()),
+                CompiledDurablePayloadPlan.compile(collection, contract.canonicalTypes()));
         } catch (ClassNotFoundException error) {
             throw new IllegalArgumentException("Compiled canonical boundary class is unavailable: " + identity, error);
         }
