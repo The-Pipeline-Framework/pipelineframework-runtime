@@ -46,6 +46,23 @@ integrity error. The projection digest checks the bytes passed to the loader.
 Source/build provenance and final Release identity belong to their respective
 generation and Release workflows.
 
+## Load against verified Compiled Truth
+
+Ordinary LOCAL use can omit `expectedProjectionJson`. For Release-bound use,
+the deployment host verifies the runnable, its dependencies and the Release's
+Compiled Truth before loading the generated application. The host supplies the
+exact projection from that verified carrier. Decode its bytes as UTF-8 with
+`new TextDecoder('utf-8', {fatal: true, ignoreBOM: true})` and pass the resulting
+string to `createNodeLocalRuntime({expectedProjectionJson})`. Preserve whitespace
+and use the Compiled Truth carrier as the source of the expected projection.
+
+The runtime captures the text at construction and compares it with the generated
+binding during load, before inspecting the handler registry. A different projection
+raises `TRUSTED_PROJECTION_MISMATCH` even when its embedded digest matches.
+Matching bindings still undergo all ordinary LOCAL admission checks. Release
+verification and deployment isolation are host responsibilities. Same-process
+handlers run with the process's privileges.
+
 ## Execution
 
 - Each handler receives a frozen input record and a frozen context snapshot with
