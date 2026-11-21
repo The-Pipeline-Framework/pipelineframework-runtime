@@ -76,6 +76,29 @@ thread. Multiple invocations can overlap on that loop. Synchronous handlers
 run on the event-loop thread. There is no threaded scheduling, external I/O
 or durable execution in this profile.
 
+## Experimental worker payload binding
+
+The package exports `PolyglotInt32PayloadBinding`. Construct it with the four distinct
+logical type IDs from a verified compiler projection. `encode(type_id, value)`
+creates a serialized payload carrier. `decode(expected_type_id, envelope)` checks
+the exact logical type and inner encoding and returns the signed int32. The
+caller can then construct the generated model for that boundary.
+
+```python
+from tpf_experimental_python_local import PolyglotInt32PayloadBinding
+
+binding = PolyglotInt32PayloadBinding("InputValue", "FirstValue", "SecondValue", "OutputValue")
+envelope = binding.encode("InputValue", 7)
+value = binding.decode("InputValue", envelope)
+```
+
+`tpf-polyglot-int32-json/1` encodes only the application value as a JSON object
+with a single required integer field, `value`. The REST worker command and result
+use `application/tpf-transition-envelope+json` as their outer encoding. A future
+worker host must select the inner encoding and expected type from its trusted,
+verified Release binding and pin them to the dispatch. This helper is available
+for future host integration and conformance tests.
+
 ## Verify or remove
 
 From this directory, build a local wheel, install it in a fresh environment
