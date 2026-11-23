@@ -14,6 +14,7 @@ import json
 from os import PathLike
 import re
 import socket
+from socketserver import TCPServer
 import ssl
 import threading
 import time
@@ -180,6 +181,13 @@ class _WorkerServer(ThreadingHTTPServer):
         self._tls = tls
         self._connections = threading.BoundedSemaphore(self.request_queue_size)
         super().__init__(address, handler)
+
+    def server_bind(self) -> None:
+        # Skip HTTPServer.server_bind()'s blocking socket.getfqdn() reverse-DNS lookup on loopback addresses.
+        TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
     def process_request(self, request: _ServerRequest, client_address: tuple[str, int]) -> None:
         if not self._connections.acquire(blocking=False):

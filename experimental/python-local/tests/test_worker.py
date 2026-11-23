@@ -259,3 +259,12 @@ class WorkerTests(unittest.TestCase):
         rejected = self.listen(**self.options(handlers={"second": lambda input, context: {"kind": "EMPTY"},
                                                         "third": never}))
         self.assertEqual((500, None), self.send(rejected, "POST", EXECUTE_PATH, command()))
+
+    def test_server_bind_skips_blocking_reverse_dns_lookup(self):
+        with patch("socket.getfqdn", side_effect=AssertionError("server_bind must not call socket.getfqdn")):
+            server = self.listen(**self.options())
+            self.assertEqual("127.0.0.1", server.server_name)
+            self.assertGreater(server.server_port, 0)
+            status, body = self.send(server, "GET", CAPABILITIES_PATH)
+            self.assertEqual(200, status)
+            self.assertEqual("local", body["pipelineId"])
