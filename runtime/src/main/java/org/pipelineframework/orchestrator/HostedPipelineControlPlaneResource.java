@@ -454,7 +454,8 @@ public class HostedPipelineControlPlaneResource {
     }
 
     Optional<NativeWorkerReleaseBinding> pairedBinding(PipelineReleaseRecord release) {
-        return NativeWorkerReleaseBinding.configured(nativeWorkerBinding).filter(binding -> binding.matchesScope(release));
+        return NativeWorkerReleaseBinding.configured(orchestratorConfig, nativeWorkerBinding)
+            .filter(binding -> binding.matchesScope(release));
     }
 
     private int clampPendingLimit(Integer limit) {

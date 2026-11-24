@@ -256,6 +256,11 @@ class PairedTransitionSettlementIT {
       var request = hostedRequest(target, ExecutionInputShape.UNI, input);
       assertEquals(401, route.admit(tenant, pipeline, "Bearer wrong", request).await().atMost(TIMEOUT).getStatus());
       assertEquals(404, route.admit("foreign-tenant", pipeline, token, request).await().atMost(TIMEOUT).getStatus());
+      // Disabling the experimental killswitch immediately suppresses paired binding resolution even when the CDI bean exists.
+      when(coordinator.orchestratorConfig.experimentalNativeWorkerEnabled()).thenReturn(false);
+      assertTrue(NativeWorkerReleaseBinding.configured(coordinator.orchestratorConfig, binding).isEmpty());
+      when(coordinator.orchestratorConfig.experimentalNativeWorkerEnabled()).thenReturn(true);
+      assertTrue(NativeWorkerReleaseBinding.configured(coordinator.orchestratorConfig, binding).isPresent());
       assertEquals(409, route.admit(tenant, pipeline, token, new HostedExecutionAdmissionResource.Request("hosted-native",
           "wrong-contract", target.releaseVersion(), ExecutionInputShape.UNI, input, false)).await().atMost(TIMEOUT).getStatus());
       assertEquals(404, route.admit(tenant, pipeline, token, new HostedExecutionAdmissionResource.Request("hosted-native",
@@ -691,6 +696,7 @@ class PairedTransitionSettlementIT {
     when(control.enabled()).thenReturn(true);
     when(control.adminToken()).thenReturn(Optional.of("hosted-test"));
     when(config.idempotencyPolicy()).thenReturn(OrchestratorIdempotencyPolicy.SERVER_KEY_ONLY);
+    when(config.experimentalNativeWorkerEnabled()).thenReturn(true);
     when(config.executionTtlDays()).thenReturn(1);
     when(config.leaseMs()).thenReturn(LEASE_MS);
     when(dispatcher.enqueueNow(any())).thenReturn(Uni.createFrom().voidItem());

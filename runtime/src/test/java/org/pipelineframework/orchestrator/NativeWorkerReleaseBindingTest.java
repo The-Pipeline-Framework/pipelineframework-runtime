@@ -6,9 +6,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.smallrye.config.SmallRyeConfigBuilder;
+import jakarta.enterprise.inject.Instance;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -18,6 +22,7 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -212,6 +217,40 @@ public class NativeWorkerReleaseBindingTest {
 
         assertEquals("\u00a0", retained.executionId());
         assertEquals("\u2003", retained.traceId());
+    }
+
+    @Test
+    void experimentalNativeWorkerKillswitchDefaultsToDisabledAndSuppressesPresentBinding() throws IOException {
+        var fixture = fixture(Language.NODE);
+        var prepared = prepare(fixture.target(), fixture, "killswitch");
+        @SuppressWarnings("unchecked")
+        Instance<NativeWorkerReleaseBinding> present = mock(Instance.class);
+        when(present.isUnsatisfied()).thenReturn(false);
+        when(present.isAmbiguous()).thenReturn(false);
+        when(present.get()).thenReturn(prepared);
+
+        PipelineOrchestratorConfig defaultConfig = new SmallRyeConfigBuilder()
+            .withMapping(PipelineOrchestratorConfig.class)
+            .build()
+            .getConfigMapping(PipelineOrchestratorConfig.class);
+        assertFalse(defaultConfig.experimentalNativeWorkerEnabled());
+        assertEquals(Optional.empty(), NativeWorkerReleaseBinding.configured(null, present));
+        assertEquals(Optional.empty(), NativeWorkerReleaseBinding.configured(defaultConfig, present));
+
+        PipelineOrchestratorConfig enabledConfig = new SmallRyeConfigBuilder()
+            .withMapping(PipelineOrchestratorConfig.class)
+            .withDefaultValues(Map.of("pipeline.orchestrator.experimental.native-worker.enabled", "true"))
+            .build()
+            .getConfigMapping(PipelineOrchestratorConfig.class);
+        assertTrue(enabledConfig.experimentalNativeWorkerEnabled());
+        assertSame(prepared, NativeWorkerReleaseBinding.configured(enabledConfig, present).orElseThrow());
+
+        @SuppressWarnings("unchecked")
+        Instance<NativeWorkerReleaseBinding> ambiguous = mock(Instance.class);
+        when(ambiguous.isUnsatisfied()).thenReturn(false);
+        when(ambiguous.isAmbiguous()).thenReturn(true);
+        assertEquals(Optional.empty(), NativeWorkerReleaseBinding.configured(defaultConfig, ambiguous));
+        assertThrows(IllegalStateException.class, () -> NativeWorkerReleaseBinding.configured(enabledConfig, ambiguous));
     }
 
     @Test

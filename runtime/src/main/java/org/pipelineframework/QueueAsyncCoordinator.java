@@ -939,7 +939,7 @@ class QueueAsyncCoordinator {
         awaitCoordinator,
         transitionWorkerExecutor,
         admissionPolicy(),
-            () -> NativeWorkerReleaseBinding.configured(nativeWorkerBinding),
+            () -> NativeWorkerReleaseBinding.configured(orchestratorConfig, nativeWorkerBinding),
             () -> Optional.ofNullable(pairedRestWorker),
             this::payloadCodec,
             this::segmentBoundaryLedger,

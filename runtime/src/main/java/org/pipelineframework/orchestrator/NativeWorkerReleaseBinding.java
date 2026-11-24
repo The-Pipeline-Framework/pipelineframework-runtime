@@ -214,8 +214,12 @@ public final class NativeWorkerReleaseBinding {
         return projectionBytes.clone();
     }
 
-    /** An optional prepared binding supplied by the coordinator deployment. */
-    public static Optional<NativeWorkerReleaseBinding> configured(Instance<NativeWorkerReleaseBinding> bindings) {
+    /** An optional prepared binding supplied by the coordinator deployment, gated by the experimental killswitch. */
+    public static Optional<NativeWorkerReleaseBinding> configured(
+            PipelineOrchestratorConfig config, Instance<NativeWorkerReleaseBinding> bindings) {
+        if (config == null || !config.experimentalNativeWorkerEnabled()) {
+            return Optional.empty();
+        }
         if (bindings == null || bindings.isUnsatisfied()) {
             return Optional.empty();
         }
