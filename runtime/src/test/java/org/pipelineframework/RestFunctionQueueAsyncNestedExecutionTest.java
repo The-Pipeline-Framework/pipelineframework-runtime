@@ -223,19 +223,28 @@ class RestFunctionQueueAsyncNestedExecutionTest {
             TransitionWireResult firstResult = PipelineJson.mapper().readValue(firstResp.body(), TransitionWireResult.class);
             assertEquals(TransitionWorkerOutcome.WAITING_EXTERNAL, firstResult.outcome(), firstResp.body());
             assertNotNull(firstResult.awaitSuspension());
+            assertEquals("exec-rf-1", firstResult.awaitSuspension().executionId());
+            assertEquals(1, firstResult.awaitSuspension().interactions().size(),
+                "Expected retained nested Await interaction in decoded HTTP suspension");
+            var decodedPath = firstResult.awaitSuspension().interactions().getFirst().invocationPath();
+            assertTrue(decodedPath.isPresent(),
+                "Decoded HTTP Await suspension must retain the nested invocation path across JSON serialization");
+            assertEquals(1, decodedPath.orElseThrow().frames().size());
+            assertEquals("review-flow", decodedPath.orElseThrow().frames().getFirst().definitionId());
+            assertEquals("Run Review", decodedPath.orElseThrow().frames().getFirst().callsiteId());
             assertEquals(1, commandInvocations.get(), "Ordinary Command should execute once before nested Await suspension");
             var recorded = commandStore.find("tenant-1", "cmd-1").await().atMost(TIMEOUT).orElseThrow();
             assertEquals(CommandEffectStatus.SUCCEEDED, recorded.status());
             assertNotNull(capturedAwaitContext.get());
-            assertTrue(capturedAwaitContext.get().invocationPath().isPresent(),
-                "Nested Await suspension must retain its invocation path");
+            assertEquals(capturedAwaitContext.get().invocationPath(), decodedPath,
+                "Wire-decoded invocation path must match the captured nested Await path");
 
-            // 3. Resumed admitted transition: restores nested invocation path with projected completion value 5,
-            // completes nested review-flow (+10 -> 15), triggers bounded self-call (command executes cmd-15 -> 16,
-            // nested 16->17->27, self-call base case >= 20 -> 27, finalize +100 -> 127, unwind +100 -> 227)
-            // WITHOUT replaying the initial command effect for input 1!
+            // 3. Resumed admitted transition: restores nested invocation path from the wire-decoded HTTP suspension
+            // with projected completion value 5, completes nested review-flow (+10 -> 15), triggers bounded self-call
+            // (command executes cmd-15 -> 16, nested 16->17->27, self-call base case >= 20 -> 27, finalize +100 -> 127,
+            // unwind +100 -> 227) WITHOUT replaying the initial command effect for input 1!
             var resumeSnapshot = new ExecutionInputSnapshot(
-                ExecutionInputShape.UNI, 5, Optional.empty(), capturedAwaitContext.get().invocationPath());
+                ExecutionInputShape.UNI, 5, Optional.empty(), decodedPath);
             var resumeCommand = new TransitionWorkerCommand(
                 "tenant-1", "exec-rf-1", 2, 0, ExecutionResultShape.SINGLE, 1L, "exec-rf-1:resume:1",
                 resumeSnapshot);
