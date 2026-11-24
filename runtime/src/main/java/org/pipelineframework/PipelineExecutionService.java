@@ -150,6 +150,9 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
   org.pipelineframework.awaitable.RemoteAwaitWorkerLifecycle remoteAwaitLifecycle;
 
   @Inject
+  org.pipelineframework.command.CommandStepSupport commandStepSupport;
+
+  @Inject
   PipelineTransitionWorkerSelector transitionWorkerSelector;
 
   @Inject
@@ -517,6 +520,7 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
     }
     TransitionWorkerCommand decodedCommand;
     TransitionPayloadCodec transitionCodec;
+    java.util.Optional<org.pipelineframework.command.CommandWorkerExecutionScope> workerCommandScope;
     try {
       TransitionPayloadCodec framing = payloadCodec();
       var encodedInput = new org.pipelineframework.orchestrator.SerializedTransitionPayload(
@@ -526,6 +530,7 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
       transitionCodec = canonical ? new org.pipelineframework.orchestrator.CompiledTransitionBoundaryCodec(
           framing, releaseIdentityResolver().compiledContract().orElseThrow(), command) : framing;
       decodedCommand = command.toCommand(transitionCodec);
+      workerCommandScope = resolveWorkerCommandScope(command, policy);
     } catch (Throwable failure) {
       return Uni.createFrom().item(TransitionResultEnvelope.failed(failure));
     }
@@ -545,7 +550,8 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
             terminalInputPassthrough,
             pageCompletion,
             policy.continuationMode(),
-            policy.terminalOutputOwnership())
+            policy.terminalOutputOwnership(),
+            workerCommandScope)
         // Object Publish has already durably consumed each terminal item. Retaining those items
         // in the worker result would turn an otherwise live stream into whole-source collection.
         .collect().in(ArrayList<Object>::new, (items, item) -> {
@@ -698,14 +704,15 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
       AtomicBoolean terminalInputPassthrough,
       AtomicReference<java.util.concurrent.CompletionStage<PagedSourceCompletion>> pageCompletion,
       AwaitContinuationMode continuationMode,
-      TerminalOutputOwnership terminalOutputOwnership) {
+      TerminalOutputOwnership terminalOutputOwnership,
+      java.util.Optional<org.pipelineframework.command.CommandWorkerExecutionScope> workerCommandScope) {
     return Multi.createFrom().deferred(() -> {
       Uni<Object> sourcePayload = Uni.createFrom().item(command.inputPayload());
       return sourcePayload.onItem().transformToMulti(payload -> {
         ExecutionInputPolicy.RehydratedExecutionInput rehydratedInput =
             executionInputPolicy.rehydrateExecutionInput(payload);
         Object reactiveInput = rehydratedInput.reactiveInput();
-        return CommandReexecutionBoundary.invokeTransitionWorker(command, () -> {
+        return CommandReexecutionBoundary.invokeTransitionWorker(command, workerCommandScope, () -> {
           PipelineContext previousPipeline = PipelineContextHolder.get();
           AwaitExecutionContext previous = AwaitExecutionContextHolder.get();
           java.util.Optional<PipelineExecutionContext> previousExecution = PipelineExecutionContextHolder.get();
@@ -890,6 +897,50 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
 
   public boolean supportsRemoteAwaitAuthority() {
     return remoteAwaitLifecycle != null && remoteAwaitLifecycle.supported() && supportsCanonicalTransitions();
+  }
+
+  /** True only when a remote transition worker server is enabled with an explicit recoverable CommandEffectStore. */
+  public boolean supportsRemoteCommandAuthority() {
+    return activeWorkerTransport().isPresent()
+        && commandStepSupport != null
+        && commandStepSupport.supportsRemoteCommandAuthority();
+  }
+
+  private java.util.Optional<org.pipelineframework.command.CommandWorkerExecutionScope> resolveWorkerCommandScope(
+      TransitionCommandEnvelope command,
+      TransitionExecutionPolicy policy) {
+    if (policy == TransitionExecutionPolicy.IN_PROCESS) {
+      return java.util.Optional.empty();
+    }
+    return activeWorkerTransport().map(transport -> new org.pipelineframework.command.CommandWorkerExecutionScope(
+        command.tenantId(),
+        command.executionId(),
+        command.pipelineId(),
+        command.contractVersion(),
+        command.releaseVersion(),
+        command.executionVersion(),
+        command.transitionKey(),
+        command.currentStepIndex(),
+        command.stopBeforeStepIndex(),
+        transport,
+        releaseIdentityResolver().artifactId(orchestratorConfig),
+        releaseIdentityResolver().artifactDigest(orchestratorConfig)));
+  }
+
+  private java.util.Optional<String> activeWorkerTransport() {
+    if (orchestratorConfig == null || orchestratorConfig.worker() == null) {
+      return java.util.Optional.empty();
+    }
+    if (orchestratorConfig.workerRest() != null && orchestratorConfig.workerRest().serverEnabled()) {
+      return java.util.Optional.of("rest");
+    }
+    if (orchestratorConfig.workerSqs() != null && orchestratorConfig.workerSqs().serverEnabled()) {
+      return java.util.Optional.of("sqs");
+    }
+    if (orchestratorConfig.workerGrpc() != null && orchestratorConfig.workerGrpc().serverEnabled()) {
+      return java.util.Optional.of("grpc");
+    }
+    return java.util.Optional.empty();
   }
 
   private TransitionPayloadCodec payloadCodec() {

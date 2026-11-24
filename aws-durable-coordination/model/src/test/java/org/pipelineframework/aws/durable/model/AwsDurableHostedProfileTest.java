@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
+import org.pipelineframework.orchestrator.PipelineBundleCapabilities;
 import org.pipelineframework.orchestrator.PipelineBundleStepDescriptor;
 import org.pipelineframework.orchestrator.release.*;
 import static org.assertj.core.api.Assertions.*;
@@ -226,5 +227,44 @@ class AwsDurableHostedProfileTest {
         var check = new PipelineReleaseDeployment.Check(ingress.entryId(),Map.of("payloadTypeId",c.steps().getFirst().inputTypeId(),"payloadEncoding",encoding,"payload","{}"),
             Map.of("payloadTypeId","com.customer.Output","payloadEncoding",encoding,"payload","{}"),1000);
         return new PipelineReleaseDescriptor(2,c.pipelineId(),c.contractVersion(),"release","zip",List.of(artifact("zip", List.of("Transform"))),new PipelineReleaseDeployment(AwsDurableHostedProfile.PROFILE_ID,entries,List.of(),check));
+    }
+
+    @Test void restWorkerReleaseRequiresDurableEffectBindingWhenContractHasCommands() {
+        var canonicalTypes = Map.<String, Map<String, Object>>of(
+            "Input", Map.of("runtimeClass", "com.customer.Input", "definitionFingerprint", "fp-in"),
+            "Output", Map.of("runtimeClass", "com.customer.Output", "definitionFingerprint", "fp-out"));
+        var commandContract = new PipelineContractDescriptor(3, "pipe", "contract", "hash", "FUNCTION", "REST", "app", false,
+            "PIPELINE_RUNTIME", List.of(new PipelineBundleStepDescriptor(0, "Submit", "command", "ONE_TO_ONE",
+                "com.customer.Input", "com.customer.Output", "com.customer.Submit", "com.customer.Submit", Map.of())),
+            PipelineBundleCapabilities.defaults(), canonicalTypes, "catalog");
+        var artifact = artifact("worker", List.of("Submit"));
+        var check = new PipelineReleaseDeployment.Check("worker", Map.of("payload", "{}"), Map.of("payload", "{}"), 1000);
+        var entryWithoutBinding = new PipelineReleaseDeployment.Entry("worker", "worker", "app", ".",
+            AwsDurableHostedProfile.HTTP_ENTRY.entryClass(), AwsDurableHostedProfile.REST_WORKER_TRIGGER, List.of());
+        var missingBinding = new PipelineReleaseDescriptor(2, "pipe", "contract", "rel-1", "worker", List.of(artifact),
+            new PipelineReleaseDeployment(AwsDurableHostedProfile.REST_WORKER_PROFILE_ID, List.of(entryWithoutBinding), List.of(), check));
+        assertThatThrownBy(() -> AwsDurableHostedProfile.requireRestWorkerRelease(missingBinding, commandContract))
+            .isInstanceOf(UnsupportedOperationException.class);
+
+        var effectBinding = new PipelineReleaseDeployment.Binding("command-effects", AwsDurableHostedProfile.COMMAND_EFFECT_CAPABILITY);
+        var unboundEntry = new PipelineReleaseDescriptor(2, "pipe", "contract", "rel-1", "worker", List.of(artifact),
+            new PipelineReleaseDeployment(AwsDurableHostedProfile.REST_WORKER_PROFILE_ID, List.of(entryWithoutBinding), List.of(effectBinding), check));
+        assertThatThrownBy(() -> AwsDurableHostedProfile.requireRestWorkerRelease(unboundEntry, commandContract))
+            .isInstanceOf(UnsupportedOperationException.class);
+
+        var boundEntry = new PipelineReleaseDeployment.Entry("worker", "worker", "app", ".",
+            AwsDurableHostedProfile.HTTP_ENTRY.entryClass(), AwsDurableHostedProfile.REST_WORKER_TRIGGER, List.of("command-effects"));
+        var valid = new PipelineReleaseDescriptor(2, "pipe", "contract", "rel-1", "worker", List.of(artifact),
+            new PipelineReleaseDeployment(AwsDurableHostedProfile.REST_WORKER_PROFILE_ID, List.of(boundEntry), List.of(effectBinding), check));
+        assertThatCode(() -> AwsDurableHostedProfile.requireRestWorkerRelease(valid, commandContract)).doesNotThrowAnyException();
+
+        var nonCommandContract = new PipelineContractDescriptor(3, "pipe", "contract", "hash", "FUNCTION", "REST", "app", false,
+            "PIPELINE_RUNTIME", List.of(new PipelineBundleStepDescriptor(0, "Submit", "internal", "ONE_TO_ONE",
+                "com.customer.Input", "com.customer.Output", "com.customer.Submit", "com.customer.Submit", Map.of())),
+            PipelineBundleCapabilities.defaults(), canonicalTypes, "catalog");
+        assertThatThrownBy(() -> AwsDurableHostedProfile.requireRestWorkerRelease(valid, nonCommandContract))
+            .isInstanceOf(UnsupportedOperationException.class);
+        assertThatCode(() -> AwsDurableHostedProfile.requireRestWorkerRelease(missingBinding, nonCommandContract))
+            .doesNotThrowAnyException();
     }
 }

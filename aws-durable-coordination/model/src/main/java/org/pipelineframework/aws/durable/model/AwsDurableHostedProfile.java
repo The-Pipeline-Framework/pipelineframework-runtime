@@ -297,6 +297,17 @@ public final class AwsDurableHostedProfile {
             && new HashSet<>(artifact.stepIds()).equals(contract.steps().stream()
                 .map(PipelineBundleStepDescriptor::authoredName).collect(java.util.stream.Collectors.toSet())),
             "The REST worker Lambda ZIP must own the entire compiled pipeline");
+        boolean hasCommands = contract.steps().stream().anyMatch(step -> "command".equals(step.kind()));
+        var effectBindings = deployment.bindings().stream()
+            .filter(binding -> COMMAND_EFFECT_CAPABILITY.equals(binding.capability()))
+            .map(org.pipelineframework.orchestrator.release.PipelineReleaseDeployment.Binding::bindingId)
+            .toList();
+        require(effectBindings.size() == (hasCommands ? 1 : 0),
+            "REST worker Commands require exactly one durable effect-store binding");
+        if (hasCommands) {
+            require(entry.bindingIds().contains(effectBindings.getFirst()),
+                "REST worker entry must declare the durable Command effect-store binding");
+        }
     }
 
     /** Resolves owner SAM code groups from immutable Release entries. */

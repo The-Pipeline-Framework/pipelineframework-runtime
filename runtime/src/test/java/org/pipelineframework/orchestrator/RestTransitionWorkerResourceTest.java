@@ -146,6 +146,25 @@ class RestTransitionWorkerResourceTest {
         assertEquals("sha256:bundle", capability.releaseVersion());
         assertEquals("restaurant-approval-monolith", capability.artifactId());
         assertEquals("sha256:artifact", capability.artifactDigest());
+        org.junit.jupiter.api.Assertions.assertFalse(capability.workerProtocols().contains(
+            org.pipelineframework.command.CommandStepSupport.COMMAND_AUTHORITY_CAPABILITY));
+    }
+
+    @Test
+    void advertisesCommandAuthorityCapabilityOnlyWhenRecoverableStoreIsSupported() throws Exception {
+        when(restConfig.serverEnabled()).thenReturn(true);
+        when(executionService.supportsRemoteCommandAuthority()).thenReturn(true);
+        SignedRequest request = signedCapability();
+
+        Response response = resource.capabilities(
+            request.timestamp(),
+            request.nonce(),
+            request.signature()).await().indefinitely();
+
+        assertEquals(200, response.getStatus());
+        PipelineWorkerCapability capability = (PipelineWorkerCapability) response.getEntity();
+        org.junit.jupiter.api.Assertions.assertTrue(capability.workerProtocols().contains(
+            org.pipelineframework.command.CommandStepSupport.COMMAND_AUTHORITY_CAPABILITY));
     }
 
     @Test

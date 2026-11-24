@@ -205,6 +205,10 @@ public class RestTransitionWorkerResource {
         if (executionService.supportsRemoteAwaitAuthority()) {
             protocols = java.util.stream.Stream.concat(protocols.stream(), java.util.stream.Stream.of("await-authority-v1")).distinct().toList();
         }
+        if (executionService.supportsRemoteCommandAuthority()) {
+            protocols = java.util.stream.Stream.concat(protocols.stream(),
+                java.util.stream.Stream.of(org.pipelineframework.command.CommandStepSupport.COMMAND_AUTHORITY_CAPABILITY)).distinct().toList();
+        }
         return new PipelineWorkerCapability(
             PipelineWorkerCapability.PROTOCOL_VERSION,
             "rest",
