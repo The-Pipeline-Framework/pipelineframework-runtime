@@ -1,5 +1,6 @@
 package org.pipelineframework.orchestrator;
 
+import org.pipelineframework.orchestrator.release.PipelineReleaseRecord;
 import org.pipelineframework.orchestrator.worker.PipelineWorkerCapability;
 import java.io.IOException;
 import java.net.URI;
@@ -7,21 +8,32 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Flow;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectReader;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -44,8 +56,13 @@ import org.pipelineframework.awaitable.CommandCompletionRejectedException;
 public class RestPipelineTransitionWorker implements PipelineTransitionWorker, TransportBoundaryInvocation {
 
     private static final ObjectMapper JSON = PipelineJson.mapper();
+    private static final ObjectReader PAIRED_CAPABILITIES = JSON.readerFor(PipelineWorkerCapability.class)
+        .with(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+        .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     private static final Logger LOG = Logger.getLogger(RestPipelineTransitionWorker.class);
     private static final AtomicInteger THREAD_SEQUENCE = new AtomicInteger();
+    private static final int MAX_PAIRED_REQUEST_BYTES = 16 * 1024;
+    private static final int MAX_PAIRED_RESPONSE_BYTES = 4096;
     private static final TransportBoundaryDescriptor BOUNDARY =
         new TransportBoundaryDescriptor("rest", "transition-worker.execute");
 
@@ -69,6 +86,7 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
     jakarta.enterprise.inject.Instance<WorkerRestRequestSigner> requestSigner;
 
     private volatile HttpClient httpClient;
+    private volatile HttpClient pairedHttpClient;
 
     public RestPipelineTransitionWorker() {
         this(null);
@@ -79,7 +97,13 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
     }
 
     RestPipelineTransitionWorker(HttpClient httpClient, PipelineInvocationRuntime invocationRuntime) {
+        this(httpClient, Optional.empty(), invocationRuntime);
+    }
+
+    RestPipelineTransitionWorker(HttpClient httpClient, Optional<HttpClient> pairedHttpClient,
+            PipelineInvocationRuntime invocationRuntime) {
         this.httpClient = httpClient;
+        pairedHttpClient.ifPresent(client -> this.pairedHttpClient = client);
         this.invocationRuntime = invocationRuntime;
     }
 
@@ -113,25 +137,110 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
         });
     }
 
+    /**
+     * Dispatches an explicitly paired native attempt only when the durable store reserves its current lease.
+     * An empty result means the attempt was not authorized to send.
+     */
+    public Uni<Optional<TransitionResultEnvelope>> executeTransition(NativeWorkerReleaseBinding.Attempt attempt,
+            String leaseOwner, PairedTransitionSettlementStore store) {
+        Objects.requireNonNull(attempt, "attempt");
+        Objects.requireNonNull(store, "store");
+        var runtime = invocationRuntime();
+        return Uni.createFrom().deferred(() -> {
+            Executor signalContext = subscriberSignalContext();
+            return runtime.invokeTransportUni(this, () -> Uni.createFrom().deferred(() -> {
+                var target = attempt.target();
+                if (!RestTransitionWorkerProtocol.EXECUTE_PATH.equals(orchestratorConfig.workerRest().path())) {
+                    throw new IllegalStateException("Paired native dispatch requires the fixed worker route");
+                }
+                var decoder = new PairedTransitionResultDecoder(attempt);
+                decoder.validateCommand();
+                String secret = targetSecret(target.sharedSecretRef());
+                PairedDispatchIntent intent = PairedDispatchIntent.from(attempt, leaseOwner);
+                return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(
+                        () -> request(attempt.command(), target.endpoint(), secret, true), blockingExecutor))
+                    .emitOn(signalContext)
+                    .chain(request -> store.beginPairedDispatch(intent)
+                        .emitOn(signalContext)
+                        .chain(permit -> permit.isPresent()
+                            ? executePairedRequest(request, target.endpoint(), decoder, intent, store, signalContext,
+                                permit.orElseThrow())
+                            : Uni.createFrom().item(Optional.empty())));
+            }));
+        });
+    }
+
+    private Uni<Optional<TransitionResultEnvelope>> executePairedRequest(HttpRequest request, URI endpoint,
+            PairedTransitionResultDecoder decoder, PairedDispatchIntent intent, PairedTransitionSettlementStore store,
+            Executor signalContext, long leaseExpiresEpochMs) {
+        HttpClient client = pairedHttpClient();
+        if (leaseExpiresEpochMs <= System.currentTimeMillis()) {
+            // The durable intent stays outstanding even if its authorization arrived too late to send.
+            return Uni.createFrom().item(Optional.empty());
+        }
+        long deadlineMillis = Math.max(1L, orchestratorConfig.workerRest().requestTimeout().toMillis());
+        long startedAtNanos = System.nanoTime();
+        String target = workerTarget(endpoint);
+        ScheduledFuture<?> warning = scheduleDeadlineWarning(intent.command(), target, deadlineMillis);
+        return Uni.createFrom().completionStage(() -> sendPaired(client, request, decoder, target, startedAtNanos, deadlineMillis))
+            .emitOn(signalContext)
+            .onItemOrFailure().invoke((ignored, failure) -> warning.cancel(false))
+            .onFailure().transform(failure -> classifyFailure(failure, target, startedAtNanos, deadlineMillis))
+            .onFailure(RemoteTransitionOutcomeUnknownException.class).call(failure ->
+                store.settlePairedUnknown(intent).replaceWithVoid())
+            .map(Optional::of);
+    }
+
     private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command, Executor signalContext) {
         return executeRequest(command, configuredEndpoint(), sharedSecret(), signalContext);
     }
 
     private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command, URI endpoint, String secret,
                                                        Executor signalContext) {
-        Duration deadline = orchestratorConfig.workerRest().requestTimeout();
-        long deadlineMillis = Math.max(1L, deadline.toMillis());
+        long deadlineMillis = Math.max(1L, orchestratorConfig.workerRest().requestTimeout().toMillis());
         long startedAtNanos = System.nanoTime();
         String target = workerTarget(endpoint);
         ScheduledFuture<?> warning = scheduleDeadlineWarning(command, target, deadlineMillis);
-        return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(() -> request(command, endpoint, secret), blockingExecutor)
-                .thenCompose(request -> httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString()))
-                .thenCompose(response -> CompletableFuture.supplyAsync(
-                    () -> decodeResponse(response, command),
-                    blockingExecutor)))
+        return Uni.createFrom().completionStage(() -> CompletableFuture
+                .supplyAsync(() -> request(command, endpoint, secret, false), blockingExecutor)
+                .thenCompose(request -> httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                    .thenApplyAsync(response -> decodeResponse(response, command), blockingExecutor)))
             .emitOn(signalContext)
             .onItemOrFailure().invoke((ignored, failure) -> warning.cancel(false))
             .onFailure().transform(failure -> classifyFailure(failure, target, startedAtNanos, deadlineMillis));
+    }
+
+    private CompletableFuture<TransitionResultEnvelope> sendPaired(HttpClient client, HttpRequest request,
+            PairedTransitionResultDecoder decoder,
+            String target, long startedAtNanos, long deadlineMillis) {
+        return CompletableFuture.completedFuture(request)
+            .thenCompose(sent -> sendBoundedPaired(client, sent, deadlineMillis))
+            .thenApplyAsync(response -> decodePairedResponse(request, response, decoder), blockingExecutor)
+            .exceptionally(failure -> {
+                long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+                throw new RemoteTransitionOutcomeUnknownException("rest", target, elapsedMillis,
+                    deadlineMillis, new TransitionWorkerFailureException("No validated paired worker result"));
+            });
+    }
+
+    private CompletableFuture<HttpResponse<String>> sendBoundedPaired(HttpClient client, HttpRequest request,
+            long deadlineMillis) {
+        CompletableFuture<HttpResponse<String>> response = client.sendAsync(request, ignored -> new BoundedPairedResponse());
+        return response.copy().orTimeout(deadlineMillis, TimeUnit.MILLISECONDS)
+            .whenComplete((received, failure) -> {
+                if (failure instanceof TimeoutException) {
+                    response.cancel(true);
+                }
+            });
+    }
+
+    private TransitionResultEnvelope decodePairedResponse(HttpRequest request, HttpResponse<String> response,
+            PairedTransitionResultDecoder decoder) {
+        if (!request.uri().equals(response.uri()) || response.previousResponse().isPresent()
+            || response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new TransitionWorkerFailureException("No successful response on the paired worker request channel");
+        }
+        return decoder.decode(response.body());
     }
 
     private ScheduledFuture<?> scheduleDeadlineWarning(
@@ -276,11 +385,43 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
         }
     }
 
+    /** Probe the configured native endpoint on the same direct HTTPS channel policy as paired execution. */
+    public Uni<PipelineWorkerCapability> pairedCapabilities(NativeWorkerReleaseBinding binding) {
+        return Uni.createFrom().deferred(() -> {
+            if (!RestTransitionWorkerProtocol.CAPABILITIES_PATH.equals(orchestratorConfig.workerRest().capabilitiesPath())
+                || !RestTransitionWorkerProtocol.EXECUTE_PATH.equals(orchestratorConfig.workerRest().path())) {
+                throw new IllegalStateException("Paired native execution requires the fixed worker routes");
+            }
+            var target = binding.target();
+            Executor signalContext = subscriberSignalContext();
+            return capabilitiesAt(target.endpoint(), targetSecret(target.sharedSecretRef()), signalContext,
+                    Optional.of(binding.projectionDigest()))
+                .invoke(capability -> {
+                    if (!binding.acceptsCapabilities(capability)) {
+                        throw new IllegalStateException("Paired worker capabilities do not match its prepared Release binding");
+                    }
+                });
+        });
+    }
+
     private Uni<PipelineWorkerCapability> capabilitiesAt(URI endpoint, String secret, Executor signalContext) {
+        return capabilitiesAt(endpoint, secret, signalContext, Optional.empty());
+    }
+
+    private Uni<PipelineWorkerCapability> capabilitiesAt(URI endpoint, String secret, Executor signalContext,
+            Optional<String> expectedProjectionDigest) {
         return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(() -> capabilitiesRequest(endpoint, secret), blockingExecutor)
-            .thenCompose(request -> httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString()))
+            .thenCompose(request -> expectedProjectionDigest.isPresent()
+                ? sendBoundedPaired(pairedHttpClient(), request, orchestratorConfig.workerRest().requestTimeout().toMillis())
+                    .thenApply(response -> {
+                    if (!request.uri().equals(response.uri()) || response.previousResponse().isPresent()) {
+                        throw new TransitionWorkerFailureException("Paired worker capabilities response changed channels");
+                    }
+                    return response;
+                })
+                : httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString()))
             .thenCompose(response -> CompletableFuture.supplyAsync(
-                () -> decodeCapabilitiesResponse(response),
+                () -> decodeCapabilitiesResponse(response, expectedProjectionDigest),
                 blockingExecutor)))
             .emitOn(signalContext)
             .onFailure().transform(this::unwrapFailure);
@@ -366,30 +507,52 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
         }
     }
 
-    private HttpRequest request(TransitionCommandEnvelope command, URI endpoint, String secret) {
+    static void requireHostedAdmissionFits(PipelineReleaseRecord release, SerializedTransitionPayload payload) {
+        // The two supported stores generate UUID execution IDs. Claims reuse that ID as trace ID
+        // and append the root step and attempt to the transition key. Reserve the widest counters.
+        String executionId = "00000000-0000-0000-0000-000000000000";
+        int attempt = Integer.MAX_VALUE;
+        requestBody(new TransitionCommandEnvelope(release.tenantId(), executionId, release.pipelineId(),
+            release.contractVersion(), release.releaseVersion(), 0, -1, attempt, ExecutionResultShape.SINGLE,
+            Long.MAX_VALUE, executionId + ":0:" + attempt, executionId, payload.payloadTypeId(),
+            payload.payloadEncoding(), payload.payload()), true);
+    }
+
+    private static byte[] requestBody(TransitionCommandEnvelope command, boolean paired) {
         try {
             byte[] body = JSON.writeValueAsBytes(command);
-            URI uri = workerUri(endpoint, orchestratorConfig.workerRest().path());
-            String timestamp = Instant.now().toString();
-            String nonce = UUID.randomUUID().toString();
-            String signature = TransitionWorkerSignature.sign(
-                secret,
-                RestTransitionWorkerProtocol.EXECUTE_METHOD,
-                orchestratorConfig.workerRest().path(),
-                timestamp,
-                nonce,
-                body);
-            return WorkerRestRequestSigner.finish(requestSigner, HttpRequest.newBuilder(uri)
-                .timeout(orchestratorConfig.workerRest().requestTimeout())
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header(TransitionWorkerSignature.TIMESTAMP_HEADER, timestamp)
-                .header(TransitionWorkerSignature.NONCE_HEADER, nonce)
-                .header(TransitionWorkerSignature.SIGNATURE_HEADER, signature)
-                .POST(HttpRequest.BodyPublishers.ofByteArray(body)), body);
+            if (paired && body.length > MAX_PAIRED_REQUEST_BYTES) {
+                throw new ExecutionAdmissionTooLargeException("Paired worker command exceeds the 16 KiB request limit");
+            }
+            return body;
         } catch (IOException e) {
             throw new IllegalStateException("Failed encoding REST transition worker command", e);
         }
+    }
+
+    private HttpRequest request(TransitionCommandEnvelope command, URI endpoint, String secret, boolean paired) {
+        byte[] body = requestBody(command, paired);
+        URI uri = workerUri(endpoint, orchestratorConfig.workerRest().path());
+        String timestamp = Instant.now().toString();
+        String nonce = UUID.randomUUID().toString();
+        String signature = TransitionWorkerSignature.sign(
+            secret,
+            RestTransitionWorkerProtocol.EXECUTE_METHOD,
+            orchestratorConfig.workerRest().path(),
+            timestamp,
+            nonce,
+            body);
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri)
+            .timeout(orchestratorConfig.workerRest().requestTimeout())
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(TransitionWorkerSignature.TIMESTAMP_HEADER, timestamp)
+            .header(TransitionWorkerSignature.NONCE_HEADER, nonce)
+            .header(TransitionWorkerSignature.SIGNATURE_HEADER, signature);
+        var publisher = HttpRequest.BodyPublishers.ofByteArray(body);
+        request = paired ? request.version(HttpClient.Version.HTTP_1_1).POST(new OneShotRequestBody(publisher))
+            : request.POST(publisher);
+        return WorkerRestRequestSigner.finish(requestSigner, request, body);
     }
 
     private HttpRequest capabilitiesRequest(URI endpoint, String secret) {
@@ -413,14 +576,21 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
             .GET(), body);
     }
 
-    private PipelineWorkerCapability decodeCapabilitiesResponse(HttpResponse<String> response) {
+    private PipelineWorkerCapability decodeCapabilitiesResponse(HttpResponse<String> response,
+            Optional<String> expectedProjectionDigest) {
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             throw new TransitionWorkerFailureException(
                 "REST transition worker capabilities returned HTTP " + response.statusCode()
                     + " with response body omitted");
         }
+        if (expectedProjectionDigest.isPresent()
+                && !response.headers().allValues(RestTransitionWorkerProtocol.PROJECTION_DIGEST_HEADER)
+                    .equals(List.of(expectedProjectionDigest.orElseThrow()))) {
+            throw new TransitionWorkerFailureException("Paired worker projection does not match its prepared Release binding");
+        }
         try {
-            PipelineWorkerCapability capability = JSON.readValue(response.body(), PipelineWorkerCapability.class);
+            PipelineWorkerCapability capability = expectedProjectionDigest.isPresent() ? PAIRED_CAPABILITIES.readValue(response.body())
+                : JSON.readValue(response.body(), PipelineWorkerCapability.class);
             if (capability == null) {
                 throw new TransitionWorkerFailureException(
                     "REST transition worker capabilities returned an empty response");
@@ -482,6 +652,91 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
         }
     }
 
+    private HttpClient pairedHttpClient() {
+        HttpClient client = pairedHttpClient;
+        if (client != null) {
+            return client;
+        }
+        synchronized (this) {
+            if (pairedHttpClient == null) {
+                pairedHttpClient = HttpClient.newBuilder()
+                    .connectTimeout(orchestratorConfig.workerRest().connectTimeout())
+                    .proxy(HttpClient.Builder.NO_PROXY)
+                    .followRedirects(HttpClient.Redirect.NEVER)
+                    .version(HttpClient.Version.HTTP_1_1)
+                    .build();
+            }
+            return pairedHttpClient;
+        }
+    }
+
+    private static final class OneShotRequestBody implements HttpRequest.BodyPublisher {
+        private final HttpRequest.BodyPublisher body;
+        private final AtomicBoolean subscribed = new AtomicBoolean();
+
+        private OneShotRequestBody(HttpRequest.BodyPublisher body) {
+            this.body = body;
+        }
+
+        @Override
+        public long contentLength() {
+            return body.contentLength();
+        }
+
+        @Override
+        public void subscribe(Flow.Subscriber<? super ByteBuffer> subscriber) {
+            if (subscribed.compareAndSet(false, true)) {
+                body.subscribe(subscriber);
+                return;
+            }
+            subscriber.onSubscribe(new Flow.Subscription() {
+                @Override public void request(long count) { }
+                @Override public void cancel() { }
+            });
+            subscriber.onError(new IOException("Paired transition request body cannot be sent again"));
+        }
+    }
+
+    private static final class BoundedPairedResponse implements HttpResponse.BodySubscriber<String> {
+        private final HttpResponse.BodySubscriber<String> body = HttpResponse.BodySubscribers.ofString(StandardCharsets.UTF_8);
+        private Flow.Subscription subscription;
+        private long bytes;
+
+        @Override
+        public CompletionStage<String> getBody() {
+            return body.getBody();
+        }
+
+        @Override
+        public void onSubscribe(Flow.Subscription subscription) {
+            this.subscription = subscription;
+            body.onSubscribe(subscription);
+        }
+
+        @Override
+        public void onNext(List<ByteBuffer> buffers) {
+            for (ByteBuffer buffer : buffers) {
+                bytes += buffer.remaining();
+            }
+            if (bytes > MAX_PAIRED_RESPONSE_BYTES) {
+                subscription.cancel();
+                body.onError(new IOException("Paired worker response exceeded its size limit"));
+                return;
+            }
+            body.onNext(buffers);
+        }
+
+        @Override
+        public void onError(Throwable error) {
+            body.onError(error);
+        }
+
+        @Override
+        public void onComplete() {
+            body.onComplete();
+        }
+    }
+
     private PipelineInvocationRuntime invocationRuntime() {
         if (invocationRuntime == null) {
             throw new IllegalStateException("PipelineInvocationRuntime was not injected into "
@@ -499,6 +754,9 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
 
     @PreDestroy
     void close() {
+        if (pairedHttpClient != null) {
+            pairedHttpClient.shutdownNow();
+        }
         deadlineWarningExecutor.shutdownNow();
         blockingExecutor.shutdownNow();
     }

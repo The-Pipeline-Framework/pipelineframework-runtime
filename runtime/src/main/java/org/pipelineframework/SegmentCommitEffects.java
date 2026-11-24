@@ -33,6 +33,7 @@ class SegmentCommitEffects {
   private final Supplier<SegmentBoundaryLedger> segmentBoundaryLedger;
   private final AwaitContinuations awaitContinuations;
   private final TerminalPublicationBoundary terminalPublicationBoundary;
+  private final PairedSegmentSettlement pairedSettlement;
   private final Consumer<AwaitReplayLifecycleEvent> lifecycleRecorder;
 
   SegmentCommitEffects(
@@ -56,15 +57,20 @@ class SegmentCommitEffects {
         terminalPublicationBoundary,
         "terminalPublicationBoundary must not be null");
     this.lifecycleRecorder = Objects.requireNonNull(lifecycleRecorder, "lifecycleRecorder must not be null");
+    this.pairedSettlement = new PairedSegmentSettlement(
+        executionStateStore, executionFailureHandler, deadLetterPublisher, terminalPublicationBoundary, segmentBoundaryLedger);
   }
 
   Uni<Void> commit(
       SegmentCommitPlan plan,
       AwaitItemContinuationHandler itemContinuationHandler) {
     return switch (plan) {
-      case CompletedSegment completed -> commitCompleted(completed);
+      case CompletedSegment completed -> completed.result().pairedResult()
+          .map(paired -> pairedSettlement.complete(completed, paired))
+          .orElseGet(() -> commitCompleted(completed));
       case SuspendedSegment suspended -> commitSuspended(suspended, itemContinuationHandler);
       case FailedSegment failed -> fail(failed.segment(), failed.failure());
+      case PairedFailedSegment failed -> pairedSettlement.fail(failed);
     };
   }
 
@@ -77,6 +83,7 @@ class SegmentCommitEffects {
         workDispatcher,
         deadLetterPublisher);
   }
+
   private Uni<Void> commitCompleted(CompletedSegment completed) {
     ClaimedSegment segment = completed.segment();
     long nowEpochMs = System.currentTimeMillis();
@@ -103,9 +110,9 @@ class SegmentCommitEffects {
                 succeeded,
                 completed.outputItems(),
                 nowEpochMs))
-            .orElseGet(() -> Uni.createFrom().failure(successCommitFailure(completed))))
-        .replaceWithVoid();
+            .orElseGet(() -> Uni.createFrom().failure(successCommitFailure(segment))));
   }
+
   private Uni<Void> advancePage(
       CompletedSegment completed,
       PagedTransitionCompletion completion,
@@ -130,8 +137,7 @@ class SegmentCommitEffects {
         .onItem().transformToUni(updated -> updated
             .map(queued -> workDispatcher.enqueueNow(new ExecutionWorkItem(
                 queued.tenantId(), queued.executionId())))
-            .orElseGet(() -> reconcilePageCommit(completed, successor)))
-        .replaceWithVoid();
+            .orElseGet(() -> reconcilePageCommit(completed, successor)));
   }
 
   private Uni<Void> reconcilePageCommit(
@@ -225,26 +231,19 @@ class SegmentCommitEffects {
   }
 
   private IllegalStateException waitingExternalFailure(SuspendedSegment suspended) {
+    ClaimedSegment segment = suspended.segment();
+    var suspension = suspended.suspension();
     return new IllegalStateException(
-        "Failed to persist WAITING_EXTERNAL state for execution "
-            + suspended.segment().record().executionId()
-            + " at step "
-            + suspended.suspension().stepIndex()
-            + " (expectedVersion="
-            + suspended.segment().record().version()
-            + ", awaitUnitId="
-            + suspended.suspension().unitId()
-            + ")");
+        "Failed to persist WAITING_EXTERNAL state for execution " + segment.record().executionId()
+            + " at step " + suspension.stepIndex()
+            + " (expectedVersion=" + segment.record().version()
+            + ", awaitUnitId=" + suspension.unitId() + ")");
   }
 
-  private IllegalStateException successCommitFailure(CompletedSegment completed) {
+  private IllegalStateException successCommitFailure(ClaimedSegment segment) {
     return new IllegalStateException(
-        "Failed to persist SUCCEEDED state for execution "
-            + completed.segment().record().executionId()
-            + " (expectedVersion="
-            + completed.segment().record().version()
-            + ", transitionKey="
-            + completed.segment().transitionKey()
-            + ")");
+        "Failed to persist SUCCEEDED state for execution " + segment.record().executionId()
+            + " (expectedVersion=" + segment.record().version()
+            + ", transitionKey=" + segment.transitionKey() + ")");
   }
 }

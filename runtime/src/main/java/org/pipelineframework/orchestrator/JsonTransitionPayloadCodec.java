@@ -283,7 +283,8 @@ public class JsonTransitionPayloadCodec implements TransitionPayloadCodec {
     }
 
     private Class<?> resolvePayloadClass(String payloadTypeId) throws ClassNotFoundException {
-        if (!isAllowedPayloadType(payloadTypeId)) {
+        if (NativeWorkerReleaseBinding.AdmittedInput.class.getName().equals(payloadTypeId)
+            || !isAllowedPayloadType(payloadTypeId)) {
             throw new IllegalArgumentException("Unsupported transition payload type: " + payloadTypeId);
         }
         ClassLoader contextLoader = Thread.currentThread().getContextClassLoader();

@@ -1,0 +1,119 @@
+name: Experimental Python LOCAL
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'experimental/python-local/**'
+      - '.github/workflows/experimental-python-local.yml'
+  pull_request:
+    paths:
+      - 'experimental/python-local/**'
+      - '.github/workflows/experimental-python-local.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.14.10', '3.14.10t']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build and test the installed wheel
+        env:
+          TPF_EXPECT_FREE_THREADED: ${{ matrix.python == '3.14.10t' && '1' || '0' }}
+          TPF_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python -m pip install setuptools==80.9.0 wheel==0.45.1
+          artifacts="$RUNNER_TEMP/python-local-runtime"
+          mkdir "$artifacts"
+          python -m pip wheel --no-deps --no-build-isolation --wheel-dir "$artifacts" ./experimental/python-local
+          printf '%s\n' "$TPF_SOURCE_SHA" > "$artifacts/source-sha.txt"
+          (cd "$artifacts" && sha256sum ./*.whl > SHA256SUMS)
+          consumer="$(mktemp -d)"
+          python -m venv "$consumer/venv"
+          "$consumer/venv/bin/python" -m pip install --no-index --no-deps "$artifacts"/*.whl
+          cp -R experimental/python-local/tests "$consumer/tests"
+          cd "$consumer"
+          "$consumer/venv/bin/python" -W error - <<'PY'
+          import os, sys, sysconfig, unittest
+          expected = os.environ['TPF_EXPECT_FREE_THREADED'] == '1'
+          assert sys.version_info[:3] == (3, 14, 10)
+          assert bool(sysconfig.get_config_var('Py_GIL_DISABLED')) == expected
+          assert sys._is_gil_enabled() != expected
+          suite = unittest.defaultTestLoader.discover('tests')
+          assert suite.countTestCases() > 0
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert sys._is_gil_enabled() != expected, 'A dependency changed GIL state'
+          sys.exit(not result.wasSuccessful())
+          PY
+      - name: Type-check the runtime package
+        if: matrix.python == '3.14.10'
+        run: |
+          python -m pip install mypy==2.4.1 mypy_extensions==1.1.0 pathspec==1.1.1 typing_extensions==4.15.0 librt==0.16.0 ast-serialize==0.13.1
+          python -m mypy --strict experimental/python-local/src
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.python == '3.14.10'
+        with:
+          name: python-local-runtime-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/python-local-runtime/
+          if-no-files-found: error
+          retention-days: 14
+
+  test-merge-package:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.14.10', '3.14.10t']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Test the synthetic merge separately; published test artefacts stay head-pinned.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build and test the merge result as an installed wheel
+        env:
+          TPF_EXPECT_FREE_THREADED: ${{ matrix.python == '3.14.10t' && '1' || '0' }}
+        run: |
+          python -m pip install setuptools==80.9.0 wheel==0.45.1
+          artifacts="$(mktemp -d)"
+          python -m pip wheel --no-deps --no-build-isolation --wheel-dir "$artifacts" ./experimental/python-local
+          consumer="$(mktemp -d)"
+          python -m venv "$consumer/venv"
+          "$consumer/venv/bin/python" -m pip install --no-index --no-deps "$artifacts"/*.whl
+          cp -R experimental/python-local/tests "$consumer/tests"
+          cd "$consumer"
+          "$consumer/venv/bin/python" -W error - <<'PY'
+          import os, sys, sysconfig, unittest
+          expected = os.environ['TPF_EXPECT_FREE_THREADED'] == '1'
+          assert sys.version_info[:3] == (3, 14, 10)
+          assert bool(sysconfig.get_config_var('Py_GIL_DISABLED')) == expected
+          assert sys._is_gil_enabled() != expected
+          suite = unittest.defaultTestLoader.discover('tests')
+          assert suite.countTestCases() > 0
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert sys._is_gil_enabled() != expected, 'A dependency changed GIL state'
+          sys.exit(not result.wasSuccessful())
+          PY
+      - name: Type-check the runtime package
+        if: matrix.python == '3.14.10'
+        run: |
+          python -m pip install mypy==2.4.1 mypy_extensions==1.1.0 pathspec==1.1.1 typing_extensions==4.15.0 librt==0.16.0 ast-serialize==0.13.1
+          python -m mypy --strict experimental/python-local/src
