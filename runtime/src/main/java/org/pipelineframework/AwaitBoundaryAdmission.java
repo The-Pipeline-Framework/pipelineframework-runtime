@@ -60,6 +60,27 @@ class AwaitBoundaryAdmission {
   Uni<AwaitCompletionResult> complete(
       AwaitCompletionCommand command,
       AwaitItemContinuationHandler itemContinuationHandler) {
+    return complete(null, command, itemContinuationHandler);
+  }
+
+  Uni<AwaitCompletionResult> completeHuman(org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin,
+      AwaitCompletionCommand command, AwaitItemContinuationHandler itemContinuationHandler, ExecutionReadModel reads) {
+    return Uni.createFrom().deferred(() -> {
+      java.util.Objects.requireNonNull(pin, "pin");
+      if (command == null || !pin.tenantId().equals(command.tenantId()) || command.interactionId() == null
+          || command.resumeToken() != null) {
+        return Uni.createFrom().failure(new IllegalArgumentException("Human completion requires an exact interaction without a token"));
+      }
+      return reads.getScopedAwaitInteraction(pin, command.interactionId()).chain(found -> {
+        if (found.isEmpty()) return Uni.createFrom().failure(new org.pipelineframework.awaitable.AwaitInteractionNotFoundException(
+            "Human Await interaction is unavailable"));
+        return complete(pin, command, itemContinuationHandler);
+      });
+    });
+  }
+
+  private Uni<AwaitCompletionResult> complete(org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint humanPin,
+      AwaitCompletionCommand command, AwaitItemContinuationHandler itemContinuationHandler) {
     return Uni.createFrom().deferred(() -> {
       if (orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
         return Uni.createFrom().failure(new IllegalStateException(
@@ -70,7 +91,7 @@ class AwaitBoundaryAdmission {
       if (admissionFailure.isPresent()) {
         return Uni.createFrom().failure(admissionFailure.get());
       }
-      return awaitCoordinator.complete(normalized)
+      return (humanPin == null ? awaitCoordinator.complete(normalized) : awaitCoordinator.completeHuman(normalized, humanPin))
           .onFailure(failure -> !AwaitCompletionAdmissionFailures.isDeterministic(failure))
           .transform(failure -> new IllegalStateException(
               "Failed completing await interaction tenant=" + normalized.tenantId()

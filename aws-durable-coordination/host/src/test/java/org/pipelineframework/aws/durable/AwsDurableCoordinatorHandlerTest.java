@@ -60,7 +60,7 @@ class AwsDurableCoordinatorHandlerTest {
         AtomicBoolean resumed = new AtomicBoolean();
         AtomicInteger resumeMarkerCalls = new AtomicInteger();
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
-            case READ_CURRENT_EXECUTION_LOCATOR, READ_EXECUTION_ADMISSION, READ_EXECUTION_LOCATOR, TYPED_RESULT -> throw new AssertionError("driver uses its existing result action");
+            case READ_AWAIT_INTERACTION, COMPLETE_HUMAN_AWAIT, READ_CURRENT_EXECUTION_LOCATOR, READ_EXECUTION_ADMISSION, READ_EXECUTION_LOCATOR, TYPED_RESULT -> throw new AssertionError("driver uses its existing result action");
             case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case REGISTER_CALLBACK -> {
@@ -216,7 +216,7 @@ class AwsDurableCoordinatorHandlerTest {
         AtomicBoolean resultRead = new AtomicBoolean();
         AtomicBoolean unexpectedAction = new AtomicBoolean();
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
-            case READ_CURRENT_EXECUTION_LOCATOR, READ_EXECUTION_ADMISSION, READ_EXECUTION_LOCATOR, TYPED_RESULT -> { unexpectedAction.set(true); throw new AssertionError("driver uses its existing result action"); }
+            case READ_AWAIT_INTERACTION, COMPLETE_HUMAN_AWAIT, READ_CURRENT_EXECUTION_LOCATOR, READ_EXECUTION_ADMISSION, READ_EXECUTION_LOCATOR, TYPED_RESULT -> { unexpectedAction.set(true); throw new AssertionError("driver uses its existing result action"); }
             case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case REGISTER_CALLBACK -> { unexpectedAction.set(true); throw new AssertionError("terminal state must not register a callback"); }
@@ -251,7 +251,7 @@ class AwsDurableCoordinatorHandlerTest {
         var registrations = new java.util.ArrayList<AwsDurableAwaitIdentity>();
         java.util.concurrent.atomic.AtomicInteger completedAwaits = new java.util.concurrent.atomic.AtomicInteger();
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
-            case READ_CURRENT_EXECUTION_LOCATOR, READ_EXECUTION_ADMISSION, READ_EXECUTION_LOCATOR, TYPED_RESULT -> throw new AssertionError("driver uses its existing result action");
+            case READ_AWAIT_INTERACTION, COMPLETE_HUMAN_AWAIT, READ_CURRENT_EXECUTION_LOCATOR, READ_EXECUTION_ADMISSION, READ_EXECUTION_LOCATOR, TYPED_RESULT -> throw new AssertionError("driver uses its existing result action");
             case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SUBMIT -> AwsDurableActionResponse.submitted(checkpoint, false);
             case REGISTER_CALLBACK -> {
@@ -302,7 +302,7 @@ class AwsDurableCoordinatorHandlerTest {
         AtomicBoolean submitted = new AtomicBoolean();
         AtomicBoolean callbackBound = new AtomicBoolean();
         AwsDurableActionInvoker actions = request -> switch (request.operation()) {
-            case READ_CURRENT_EXECUTION_LOCATOR, READ_EXECUTION_ADMISSION, READ_EXECUTION_LOCATOR, TYPED_RESULT -> throw new AssertionError("driver uses its existing result action");
+            case READ_AWAIT_INTERACTION, COMPLETE_HUMAN_AWAIT, READ_CURRENT_EXECUTION_LOCATOR, READ_EXECUTION_ADMISSION, READ_EXECUTION_LOCATOR, TYPED_RESULT -> throw new AssertionError("driver uses its existing result action");
             case REGISTER_EXECUTION -> AwsDurableActionResponse.bound(true);
             case SUBMIT -> {
                 submitted.set(true);
