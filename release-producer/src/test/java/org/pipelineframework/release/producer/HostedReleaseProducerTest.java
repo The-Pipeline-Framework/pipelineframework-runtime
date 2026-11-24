@@ -109,6 +109,97 @@ class HostedReleaseProducerTest {
         assertFalse(json.has("deployment"));
     }
 
+    @Test void restFunctionPlacementContractPassesProducerAndConsumerAndRejectsModuleMismatch() throws Exception {
+        Path root = Files.createDirectories(directory.resolve("rest-function-placement"));
+        var placement = new PipelinePlacementDescriptor(
+            PipelinePlacementDescriptor.CURRENT_SCHEMA_VERSION,
+            List.of(
+                new PipelinePlacementDescriptor.InvocationPlacement(
+                    "$root", "Run Review", "review-flow", false,
+                    PipelinePlacementDescriptor.LOCAL_IN_SEGMENT, "app", "application"),
+                new PipelinePlacementDescriptor.InvocationPlacement(
+                    "$root", "Continue Review", "$root", true,
+                    PipelinePlacementDescriptor.LOCAL_IN_SEGMENT, "app", "application")),
+            List.of(
+                new PipelinePlacementDescriptor.ExecutionSegment(
+                    "segment-root", PipelinePlacementDescriptor.ROOT_ENTRY, "",
+                    "app", "application", true, List.of("$root", "review-flow"), List.of("review-flow:Nested Wait")),
+                new PipelinePlacementDescriptor.ExecutionSegment(
+                    "segment-await-1", PipelinePlacementDescriptor.AWAIT_RESUME, "review-flow:Nested Wait",
+                    "app", "application", true, List.of("$root", "review-flow"), List.of("review-flow:Nested Wait"))));
+        var contract = new PipelineContractDescriptor(
+            PipelineContractDescriptor.CURRENT_SCHEMA_VERSION,
+            "rest-function-nested",
+            "contract-rf-nested",
+            "hash-rf-nested",
+            "FUNCTION",
+            "REST",
+            "app",
+            true,
+            "PIPELINE_RUNTIME",
+            List.of(new PipelineBundleStepDescriptor(0, "Run Review", "service", "ONE_TO_ONE", "WorkChoice", "LoopOutcome",
+                "rfproof.pipeline.PipelineInvocation_root_RunReview", "", Map.of())),
+            new PipelineBundleCapabilities(true, List.of("rest")),
+            Map.of(),
+            "",
+            org.pipelineframework.orchestrator.composition.PipelineCompositionDescriptor.empty(),
+            List.of(),
+            List.of(),
+            List.of(),
+            Map.of(),
+            placement);
+
+        Path metadata = Files.createDirectories(root.resolve("classes/META-INF/pipeline"));
+        Files.write(metadata.resolve("pipeline-contract.json"), PipelineJson.mapper().writeValueAsBytes(contract));
+        Files.writeString(metadata.resolve("order.json"), "{\"order\":[\"rfproof.pipeline.PipelineInvocation_root_RunReview\"]}");
+        Files.writeString(metadata.resolve("platform.json"), "{\"platform\":\"FUNCTION\",\"transport\":\"REST\",\"module\":\"app\"}");
+        var bytes = new ByteArrayOutputStream();
+        try (var jar = new JarOutputStream(bytes)) {
+            add(jar, PipelineContractDescriptor.RESOURCE_PATH, PipelineJson.mapper().writeValueAsBytes(contract));
+            add(jar, "META-INF/pipeline/order.json", "{\"order\":[\"rfproof.pipeline.PipelineInvocation_root_RunReview\"]}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            add(jar, "META-INF/pipeline/platform.json", "{\"platform\":\"FUNCTION\",\"transport\":\"REST\",\"module\":\"app\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            try (var in = getClass().getResourceAsStream("/" + getClass().getName().replace('.', '/') + ".class")) {
+                add(jar, getClass().getName().replace('.', '/') + ".class", in.readAllBytes());
+            }
+        }
+        Path zip = root.resolve("application.zip");
+        try (var out = new JarOutputStream(Files.newOutputStream(zip))) { add(out, "lib/application.jar", bytes.toByteArray()); }
+        var producer = new DefaultPipelineReleaseProducer();
+        var inputs = producer.materialize(List.of(
+            new ReleaseArtifactInput("application", "lambda-zip", zip, zip.toUri().toString(), List.of("Run Review"), List.of("local", "rest")),
+            new ReleaseArtifactInput("truth", "compiled-truth", metadata, root.resolve("truth.jar").toUri().toString(), List.of(), List.of())),
+            "truth", metadata, root).stream()
+            .map(a -> new ReleaseArtifactInput(a.artifactId(), a.kind(), a.file(), a.file().toUri().toString(), a.stepIds(), a.capabilities()))
+            .toList();
+        var payload = Map.of("payloadTypeId", "java.lang.String", "payloadEncoding", "json", "payload", "\"sample\"");
+        var validDeployment = new PipelineReleaseDeployment("aws-durable-java-zip-v1", List.of(
+            new PipelineReleaseDeployment.Entry("http", "application", "app", "lib/application.jar", getClass().getName(), "HTTP", List.of("route")),
+            new PipelineReleaseDeployment.Entry("work", "application", "app", "lib/application.jar", getClass().getName(), "SQS", List.of("queue"))),
+            List.of(new PipelineReleaseDeployment.Binding("route", "HTTP_ROUTE"), new PipelineReleaseDeployment.Binding("queue", "SQS_QUEUE")),
+            new PipelineReleaseDeployment.Check("http", payload, payload, 1000));
+
+        var produced = producer.produce(new ReleaseProductionRequest(contract, "1.0.0", "truth", metadata, inputs, true, validDeployment));
+        Path descriptor = root.resolve("pipeline-release.json");
+        producer.write(descriptor, produced);
+        var loaded = PipelineJson.mapper().readValue(Files.readAllBytes(descriptor), PipelineReleaseDescriptor.class);
+        var consumer = new PipelineReleaseClosureResolver(Map.of(PipelineReleaseArtifactUri.Scheme.FILE,
+            artifact -> Files.newInputStream(Path.of(java.net.URI.create(artifact.uri())))),
+            path -> PipelineJson.mapper().readValue(path.toFile(), PipelineContractDescriptor.class));
+        var resolved = consumer.resolve(loaded, root.resolve("resolved"));
+        assertEquals("FUNCTION", resolved.contract().platform());
+        assertEquals("REST", resolved.contract().transport());
+        assertTrue(resolved.contract().placement().present());
+        assertEquals(placement, resolved.contract().placement());
+
+        var mismatchedDeployment = new PipelineReleaseDeployment("aws-durable-java-zip-v1", List.of(
+            new PipelineReleaseDeployment.Entry("http", "application", "wrong-module", "lib/application.jar", getClass().getName(), "HTTP", List.of("route"))),
+            List.of(new PipelineReleaseDeployment.Binding("route", "HTTP_ROUTE")),
+            new PipelineReleaseDeployment.Check("http", payload, payload, 1000));
+        var failure = assertThrows(IllegalArgumentException.class, () ->
+            producer.produce(new ReleaseProductionRequest(contract, "1.0.0", "truth", metadata, inputs, true, mismatchedDeployment)));
+        assertTrue(failure.getMessage().contains("placement"), failure.getMessage());
+    }
+
     private ReleaseProductionRequest request(Path root, String name, String packagedName) throws Exception {
         return request(root, name, packagedName, Optional.of("[\"Transform\"]"));
     }
