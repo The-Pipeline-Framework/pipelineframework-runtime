@@ -60,4 +60,46 @@ new ZipFile(zipFile).withCloseable { zip ->
     assert foundHandler : 'Missing LambdaHttpHandler.class inside declared entry package'
     assert zip.getEntry('org/pipelineframework/aws/durable/AwsDurableCoordinatorHandler.class') == null
 }
+
+// Execute the real packaged worker classes from function.zip through an app-free shared Coordinator.
+def unpackDir = new File(basedir, 'app/target/unpacked-proof')
+if (unpackDir.exists()) unpackDir.deleteDir()
+unpackDir.mkdirs()
+new ZipFile(zipFile).withCloseable { zip ->
+    zip.entries().each { ze ->
+        def dest = new File(unpackDir, ze.name)
+        if (ze.isDirectory()) {
+            dest.mkdirs()
+        } else {
+            dest.parentFile.mkdirs()
+            dest.bytes = zip.getInputStream(ze).bytes
+        }
+    }
+}
+def proofClasses = new File(basedir, 'app/target/proof-classes')
+proofClasses.mkdirs()
+def cpEntries = [unpackDir.absolutePath]
+def libDir = new File(unpackDir, 'lib')
+if (libDir.isDirectory()) {
+    libDir.listFiles().findAll { it.name.endsWith('.jar') }.sort().each { cpEntries << it.absolutePath }
+}
+def sep = File.pathSeparator
+def compileCp = cpEntries.join(sep)
+def javaHome = System.getProperty('java.home')
+def javacBin = new File(javaHome, 'bin/javac').exists() ? new File(javaHome, 'bin/javac').absolutePath : 'javac'
+def javaBin = new File(javaHome, 'bin/java').exists() ? new File(javaHome, 'bin/java').absolutePath : 'java'
+
+def proofSrc = new File(basedir, 'app/proof/PackagedRestWorkerCommandProof.java')
+def compileProc = new ProcessBuilder(javacBin, '--release', '21', '-cp', compileCp, '-d', proofClasses.absolutePath, proofSrc.absolutePath)
+    .redirectErrorStream(true).start()
+def compileOut = compileProc.inputStream.text
+assert compileProc.waitFor() == 0 : "Failed compiling packaged proof:\n${compileOut}"
+
+def runCp = proofClasses.absolutePath + sep + compileCp
+def runProc = new ProcessBuilder(javaBin, '-cp', runCp, 'org.pipelineframework.PackagedRestWorkerCommandProof',
+    new File(basedir, 'app/target/pipeline-release.json').absolutePath)
+    .redirectErrorStream(true).start()
+def runOut = runProc.inputStream.text
+assert runProc.waitFor() == 0 : "Packaged proof failed:\n${runOut}"
+assert runOut.contains('PASS packaged REST/FUNCTION SYNC worker Command + Command/Await proof') : "Unexpected proof output:\n${runOut}"
 return true

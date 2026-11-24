@@ -132,7 +132,7 @@ public class CommandStepSupport {
             return Uni.createFrom().failure(failure);
         }
         return descriptor.onItem().transformToUni(
-            resolved -> execute(resolved, commandIdGenerator, input, authorization, false, Optional.empty()));
+            resolved -> executeWithScope(resolved, commandIdGenerator, input, authorization, false, Optional.empty()));
     }
 
     public <I, O> Uni<O> execute(
@@ -177,7 +177,7 @@ public class CommandStepSupport {
             return Uni.createFrom().failure(failure);
         }
         return descriptor.onItem().transformToUni(
-            resolved -> execute(resolved, commandIdGenerator, input, authorization, true, Optional.empty()));
+            resolved -> executeWithScope(resolved, commandIdGenerator, input, authorization, true, Optional.empty()));
     }
 
     /**
@@ -229,6 +229,23 @@ public class CommandStepSupport {
         }
     }
 
+    private <I, O> Uni<O> executeWithScope(
+        CommandDescriptor descriptor,
+        CommandIdGenerator<? super I> commandIdGenerator,
+        I input,
+        AuthorizedExecution authorization,
+        boolean deliberateRetry,
+        Optional<org.pipelineframework.connector.ConnectorCallbackContext> callbackContext
+    ) {
+        CommandReexecutionScope.Snapshot previous = CommandReexecutionScope.capture();
+        CommandReexecutionScope.restore(authorization.scopeSnapshot());
+        try {
+            return execute(descriptor, commandIdGenerator, input, authorization, deliberateRetry, callbackContext);
+        } finally {
+            CommandReexecutionScope.restore(previous);
+        }
+    }
+
     private <I, O> Uni<O> execute(
         CommandDescriptor descriptor,
         CommandIdGenerator<? super I> commandIdGenerator,
@@ -259,7 +276,7 @@ public class CommandStepSupport {
         CommandRequest<I> request = new CommandRequest<>(
             descriptor, commandId, commandId, CommandRequest.newAttemptId(), input, context, descriptor.config(), callbackContext);
         CommandEffectStore store = selectStore(authorization.requireRecoverableStore());
-        CommandReexecutionScope.Snapshot scopeSnapshot = CommandReexecutionScope.capture();
+        CommandReexecutionScope.Snapshot scopeSnapshot = authorization.scopeSnapshot();
         return store.find(context.tenantId(), request.commandId())
             .onItem().transformToUni(existing -> {
                 CommandReexecutionScope.Snapshot previous = CommandReexecutionScope.capture();
@@ -961,7 +978,11 @@ public class CommandStepSupport {
     private record ConfirmationBarrier(CommandEffectStatus status, String code) {
     }
 
-    private record AuthorizedExecution(PipelineExecutionContext context, boolean requireRecoverableStore) {
+    private record AuthorizedExecution(
+        PipelineExecutionContext context,
+        boolean requireRecoverableStore,
+        CommandReexecutionScope.Snapshot scopeSnapshot
+    ) {
     }
 
     /** True only when a single explicit recoverable CommandEffectStore is wired (never the default memory store). */
@@ -995,7 +1016,7 @@ public class CommandStepSupport {
         if (orchestratorConfig.mode() == OrchestratorMode.QUEUE_ASYNC) {
             PipelineExecutionContext context = PipelineExecutionContextHolder.get().orElseThrow(() ->
                 new IllegalStateException("Command step executed without queue-async execution context."));
-            return new AuthorizedExecution(context, false);
+            return new AuthorizedExecution(context, false, CommandReexecutionScope.capture());
         }
         if (orchestratorConfig.mode() == OrchestratorMode.SYNC) {
             CommandWorkerExecutionScope workerScope = CommandReexecutionScope.currentWorkerScope().orElseThrow(() ->
@@ -1007,7 +1028,7 @@ public class CommandStepSupport {
                 throw new IllegalStateException(
                     "Command execution context does not match the admitted transition-worker scope.");
             }
-            return new AuthorizedExecution(context, true);
+            return new AuthorizedExecution(context, true, CommandReexecutionScope.capture());
         }
         throw new IllegalStateException(
             "Command steps require pipeline.orchestrator.mode=QUEUE_ASYNC or an admitted leased transition-worker scope.");

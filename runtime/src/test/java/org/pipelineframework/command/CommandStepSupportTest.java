@@ -912,6 +912,42 @@ class CommandStepSupportTest {
     assertDurationCount("dlq", 1);
   }
 
+  @Test
+  void asyncDescriptorResolutionPreservesCommandReexecutionScope() {
+    PipelineExecutionContextHolder.set(new PipelineExecutionContext("tenant", "exec-1", 4));
+    connector.failure = new RuntimeException("transient-outage");
+    assertThrows(RuntimeException.class,
+        () -> support.<CommandInput, CommandOutput>execute(
+            descriptor, new StaticCommandIdGenerator(), new CommandInput("doc-async-retry"))
+            .await().atMost(Duration.ofSeconds(5)));
+    connector.failure = null;
+
+    var asyncExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
+    try {
+      CommandReexecutionScope.Snapshot previous = CommandReexecutionScope.capture();
+      CommandReexecutionScope.AdmissionHandle admission =
+          CommandReexecutionScope.installRetry("cmd-doc-async-retry", "exec-1:1");
+      try {
+        Uni<CommandDescriptor> coldDescriptor = Uni.createFrom().item(descriptor).emitOn(asyncExecutor);
+        CommandOutput output = support.<CommandInput, CommandOutput>execute(
+            coldDescriptor, new StaticCommandIdGenerator(), new CommandInput("doc-async-retry"))
+            .await().atMost(Duration.ofSeconds(5));
+        assertEquals("cmd-doc-async-retry", output.commandId);
+        admission.requireConsumed();
+        assertEquals(2, connector.calls.get());
+        CommandEffectRecord record = store.find("tenant", "cmd-doc-async-retry")
+            .await().atMost(Duration.ofSeconds(5)).orElseThrow();
+        assertEquals(CommandEffectStatus.SUCCEEDED, record.status());
+        assertEquals(2, record.attempts().size());
+        assertEquals(CommandAttemptPurpose.RETRY, record.currentAttempt().purpose());
+      } finally {
+        CommandReexecutionScope.restore(previous);
+      }
+    } finally {
+      asyncExecutor.close();
+    }
+  }
+
   private void assertTransitionCount(String status, long expected) {
     long actual = longSumPointValue(
         CommandEffectMetrics.TRANSITION_TOTAL,
