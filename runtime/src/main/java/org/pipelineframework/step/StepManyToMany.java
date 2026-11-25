@@ -82,7 +82,7 @@ public interface StepManyToMany<I, O> extends Configurable, ManyToMany<I, O>, It
             output = BackpressureBufferMetrics.buffer(output, this.getClass(), 128);
         }
 
-        return output.onItem().transform(item -> {
+        Multi<O> logged = output.onItem().transform(item -> {
             if (LOG.isDebugEnabled()) {
                 LOG.debugf(
                     "Step %s emitted item: %s",
@@ -90,14 +90,18 @@ public interface StepManyToMany<I, O> extends Configurable, ManyToMany<I, O>, It
                 );
             }
             return item;
-        })
-        .onFailure(this::shouldRetry)
-        .invoke(t -> PipelineRetryTelemetry.recordRetry(this.getClass(), t))
-        .onFailure(this::shouldRetry)
-        .retry()
-        .withBackOff(retryWait(), maxBackoff())
-        .withJitter(jitter() ? 0.5 : 0.0)
-        .atMost(retryLimit())
+        });
+        Multi<O> maybeRetried = retryLimit() > 0
+            ? logged
+                .onFailure(this::shouldRetry)
+                .invoke(t -> PipelineRetryTelemetry.recordRetry(this.getClass(), t))
+                .onFailure(this::shouldRetry)
+                .retry()
+                .withBackOff(retryWait(), maxBackoff())
+                .withJitter(jitter() ? 0.5 : 0.0)
+                .atMost(retryLimit())
+            : logged;
+        return maybeRetried
         .onFailure().recoverWithMulti(error -> {
             if (shouldPropagateWithoutRecovery(error)) {
                 return Multi.createFrom().failure(error);

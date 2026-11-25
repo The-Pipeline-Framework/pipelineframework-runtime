@@ -61,6 +61,27 @@ class TransitionFailureEnvelopeTest {
     assertEquals(Optional.of("archive:confirmation-7"), decoded.failedCommandId());
   }
 
+  @Test
+  void preservesStepIndexAndCommandIdAcrossNonRetryableFailureRoundTrip() {
+    Throwable failure = new TransitionWorkerFailureException(
+        "order rejected",
+        new NonRetryableException("order rejected"),
+        2,
+        Optional.of("cmd-finalize-order"));
+
+    TransitionFailureEnvelope envelope = TransitionFailureRuntimeAdapter.from(failure, 2);
+    RuntimeException decoded = TransitionFailureRuntimeAdapter.toException(envelope);
+
+    assertEquals(NonRetryableException.class.getName(), envelope.failureClass());
+    assertEquals(2, envelope.failedStepIndex());
+    assertEquals(Optional.of("cmd-finalize-order"), envelope.failedCommandId());
+    NonRetryableException nonRetryable = assertInstanceOf(NonRetryableException.class, decoded);
+    TransitionWorkerFailureException cause = assertInstanceOf(
+        TransitionWorkerFailureException.class, nonRetryable.getCause());
+    assertEquals(2, cause.failedStepIndex());
+    assertEquals(Optional.of("cmd-finalize-order"), cause.failedCommandId());
+  }
+
   private static final class CustomNonRetryableException extends NonRetryableException {
     private CustomNonRetryableException(String message) {
       super(message);

@@ -73,13 +73,19 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
             return new ExecutionInputSnapshot(snapshot.shape(), encoded, snapshot.pipelineContext(), snapshot.invocationPath());
         }
         if (value instanceof List<?> items) {
+            if (output.isClassFree()) {
+                return encodeClassFreeCollection(items, output);
+            }
             for (Object item : items) requireElement(item, output);
-            TypedDurablePayload payload = canonical.encode(items, output.collection());
+            TypedDurablePayload payload = canonical.encode(items, output.typedPlans().orElseThrow().collection());
             validateSchema(payload, output);
             return payload;
         }
+        if (output.isClassFree()) {
+            return validateAndNormalizeClassFree(value, output, false);
+        }
         requireElement(value, output);
-        TypedDurablePayload payload = canonical.encode(value, output.scalar());
+        TypedDurablePayload payload = canonical.encode(value, output.typedPlans().orElseThrow().scalar());
         validateSchema(payload, output);
         return payload;
     }
@@ -96,9 +102,13 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
         if (value instanceof List<?> items) return items.stream().map(this::decodeValue).toList();
         TypedDurablePayload payload = TypedDurablePayload.fromDurableValue(value)
             .orElseThrow(() -> new IllegalArgumentException("Canonical transition boundary requires a typed durable payload"));
-        boolean collection = payload.canonicalTypeId().equals(input.collection().binding().canonicalTypeId());
+        boolean collection = payload.canonicalTypeId().equals(input.collectionTypeId());
+        if (input.isClassFree()) {
+            return validateAndNormalizeClassFree(payload, input, collection);
+        }
         validateSchema(payload, input);
-        Object decoded = canonical.decode(payload, collection ? input.collection() : input.scalar());
+        var plans = input.typedPlans().orElseThrow();
+        Object decoded = canonical.decode(payload, collection ? plans.collection() : plans.scalar());
         if (collection) {
             if (!(decoded instanceof List<?> items)) throw new IllegalArgumentException("Canonical collection must decode to a List");
             for (Object item : items) requireElement(item, input);
@@ -108,26 +118,83 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
         return decoded;
     }
 
-    private void validateSchema(TypedDurablePayload payload, Boundary boundary) {
+    private TypedDurablePayload encodeClassFreeCollection(List<?> items, Boundary boundary) {
+        var array = org.pipelineframework.config.pipeline.PipelineJson.mapper().createArrayNode();
+        for (Object item : items) {
+            TypedDurablePayload normalized = validateAndNormalizeClassFree(item, boundary, false);
+            try {
+                array.add(org.pipelineframework.config.pipeline.PipelineJson.mapper().readTree(normalized.payload()));
+            } catch (java.io.IOException failure) {
+                throw new IllegalArgumentException("Invalid canonical JSON element", failure);
+            }
+        }
+        return new TypedDurablePayload(
+            boundary.collectionTypeId(),
+            boundary.collectionFingerprint(),
+            boundary.catalogFingerprint(),
+            JsonDurablePayloadCodec.ENCODING,
+            JsonDurablePayloadCodec.ENCODING_VERSION,
+            array.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private TypedDurablePayload validateAndNormalizeClassFree(Object value, Boundary boundary, boolean collection) {
+        TypedDurablePayload payload = TypedDurablePayload.fromDurableValue(value)
+            .orElseThrow(() -> new IllegalArgumentException(
+                "Class-free canonical boundary requires TypedDurablePayload for " + boundary.canonicalTypeId()));
+        boolean isCollection = collection || payload.canonicalTypeId().equals(boundary.collectionTypeId());
+        String expectedTypeId = isCollection ? boundary.collectionTypeId() : boundary.canonicalTypeId();
+        String expectedFingerprint = isCollection ? boundary.collectionFingerprint() : boundary.definitionFingerprint();
+        if (!expectedTypeId.equals(payload.canonicalTypeId())) {
+            throw new IllegalArgumentException("Canonical type mismatch: expected " + expectedTypeId
+                + " but found " + payload.canonicalTypeId());
+        }
+        if (!expectedFingerprint.equals(payload.typeExpressionFingerprint())) {
+            throw new IllegalArgumentException("Canonical definition fingerprint mismatch for " + expectedTypeId);
+        }
+        if (!boundary.catalogFingerprint().equals(payload.catalogFingerprint())) {
+            throw new IllegalArgumentException("Canonical catalog fingerprint mismatch for " + expectedTypeId);
+        }
+        if (!JsonDurablePayloadCodec.ENCODING.equals(payload.encoding())
+            || payload.encodingVersion() != JsonDurablePayloadCodec.ENCODING_VERSION) {
+            throw new IllegalArgumentException("Unsupported canonical durable payload encoding for " + expectedTypeId);
+        }
+        String canonicalJson = validateSchema(payload, boundary);
+        return new TypedDurablePayload(
+            expectedTypeId,
+            expectedFingerprint,
+            boundary.catalogFingerprint(),
+            JsonDurablePayloadCodec.ENCODING,
+            JsonDurablePayloadCodec.ENCODING_VERSION,
+            canonicalJson.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String validateSchema(TypedDurablePayload payload, Boundary boundary) {
         try {
             var body = org.pipelineframework.config.pipeline.PipelineJson.mapper().reader()
                 .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
                 .with(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
                 .readTree(payload.payload());
-            String identity = boundary.scalar().binding().canonicalTypeId();
-            if (payload.canonicalTypeId().equals(boundary.collection().binding().canonicalTypeId())) {
+            String identity = boundary.canonicalTypeId();
+            if (payload.canonicalTypeId().equals(boundary.collectionTypeId())) {
                 if (!body.isArray()) throw new IllegalArgumentException("Canonical collection requires a JSON array");
-                for (var item : (com.fasterxml.jackson.databind.JsonNode) body) catalogue.validateAndCanonicalize(identity, item.toString());
+                var normalized = org.pipelineframework.config.pipeline.PipelineJson.mapper().createArrayNode();
+                for (var item : (com.fasterxml.jackson.databind.JsonNode) body) {
+                    normalized.add(org.pipelineframework.config.pipeline.PipelineJson.mapper()
+                        .readTree(catalogue.validateAndCanonicalize(identity, item.toString())));
+                }
+                return normalized.toString();
             } else {
-                catalogue.validateAndCanonicalize(identity, body.toString());
+                return catalogue.validateAndCanonicalize(identity, body.toString());
             }
         } catch (java.io.IOException failure) { throw new IllegalArgumentException("Invalid canonical JSON", failure); }
     }
 
     private static void requireElement(Object value, Boundary boundary) {
-        if (value == null || !boundary.scalar().binding().runtimeClass().isInstance(value)) {
+        var plans = boundary.typedPlans().orElseThrow(() -> new IllegalStateException(
+            "Class-free canonical boundary has no Java runtimeClass: " + boundary.canonicalTypeId()));
+        if (value == null || !plans.scalar().binding().runtimeClass().isInstance(value)) {
             throw new IllegalArgumentException("Value does not match compiled canonical boundary "
-                + boundary.scalar().binding().canonicalTypeId());
+                + boundary.canonicalTypeId());
         }
     }
 
@@ -148,13 +215,23 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
         String fingerprint = required(definition, "definitionFingerprint");
         String catalog = contract.canonicalCatalogFingerprint();
         if (catalog == null || catalog.isBlank()) throw new IllegalArgumentException("Compiled canonical catalog fingerprint is required");
+        String collectionTypeId = "List<" + identity + ">";
+        String collectionFingerprint = fingerprint("List<" + fingerprint + ">");
+        Object rawRuntimeClass = definition.get("runtimeClass");
+        if (!(rawRuntimeClass instanceof String runtimeClassName) || runtimeClassName.isBlank()) {
+            return new Boundary(identity, fingerprint, collectionTypeId, collectionFingerprint, catalog,
+                java.util.Optional.empty());
+        }
         try {
-            Class<?> type = CanonicalPayloadRuntimeClassLoader.load(required(definition, "runtimeClass"),
+            Class<?> type = CanonicalPayloadRuntimeClassLoader.load(runtimeClassName,
                 org.pipelineframework.config.pipeline.PipelineResources.resolveClassLoader());
             var scalar = new CanonicalPayloadBinding(identity, fingerprint, catalog, type);
-            var collection = new CanonicalPayloadBinding("List<" + identity + ">", fingerprint("List<" + fingerprint + ">"),
+            var collection = new CanonicalPayloadBinding(collectionTypeId, collectionFingerprint,
                 catalog, List.class, TypeFactory.defaultInstance().constructCollectionType(List.class, type));
-            return new Boundary(CompiledDurablePayloadPlan.compile(scalar), CompiledDurablePayloadPlan.compile(collection));
+            return new Boundary(identity, fingerprint, collectionTypeId, collectionFingerprint, catalog,
+                java.util.Optional.of(new TypedPlans(
+                    CompiledDurablePayloadPlan.compile(scalar),
+                    CompiledDurablePayloadPlan.compile(collection))));
         } catch (ClassNotFoundException error) {
             throw new IllegalArgumentException("Compiled canonical boundary class is unavailable: " + identity, error);
         }
@@ -176,5 +253,18 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
         }
     }
 
-    private record Boundary(CompiledDurablePayloadPlan scalar, CompiledDurablePayloadPlan collection) { }
+    private record TypedPlans(CompiledDurablePayloadPlan scalar, CompiledDurablePayloadPlan collection) { }
+
+    private record Boundary(
+        String canonicalTypeId,
+        String definitionFingerprint,
+        String collectionTypeId,
+        String collectionFingerprint,
+        String catalogFingerprint,
+        java.util.Optional<TypedPlans> typedPlans
+    ) {
+        boolean isClassFree() {
+            return typedPlans.isEmpty();
+        }
+    }
 }
