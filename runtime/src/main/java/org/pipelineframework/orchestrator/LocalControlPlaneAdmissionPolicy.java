@@ -4,7 +4,9 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -33,8 +35,11 @@ public class LocalControlPlaneAdmissionPolicy implements ControlPlaneAdmissionPo
     private static final Logger LOG = Logger.getLogger(LocalControlPlaneAdmissionPolicy.class);
     static final String TRANSITION_QUOTA_PIPELINE = "__tpf_transition_quota__";
     static final String TRANSITION_QUOTA_STEP = "__tenant__";
+    private static final String NON_SHARED_STORE_PROVIDER = "in-memory";
     private static final long DISTRIBUTED_IO_TIMEOUT_MS = 5_000L;
-    private static final long DEFAULT_LEASE_MS = 120_000L;
+    private static final long DEFAULT_LEASE_MS = 180_000L;
+    private static final long MIN_LEASE_MS = 2_000L;
+    private static final long MAX_LEASE_SAFETY_MARGIN_MS = 10_000L;
 
     @Inject
     PipelineOrchestratorConfig orchestratorConfig;
@@ -47,14 +52,15 @@ public class LocalControlPlaneAdmissionPolicy implements ControlPlaneAdmissionPo
 
     private final AwaitAdmissionStore directStore;
     private final Clock clock;
+    private final long distributedIoTimeoutMs;
     private final ConcurrentHashMap<String, AtomicInteger> activeTransitionsByTenant = new ConcurrentHashMap<>();
 
     public LocalControlPlaneAdmissionPolicy() {
-        this(null, null, Clock.systemUTC());
+        this(null, null, Clock.systemUTC(), DISTRIBUTED_IO_TIMEOUT_MS);
     }
 
     public LocalControlPlaneAdmissionPolicy(PipelineOrchestratorConfig orchestratorConfig) {
-        this(orchestratorConfig, null, Clock.systemUTC());
+        this(orchestratorConfig, null, Clock.systemUTC(), DISTRIBUTED_IO_TIMEOUT_MS);
     }
 
     LocalControlPlaneAdmissionPolicy(
@@ -62,9 +68,19 @@ public class LocalControlPlaneAdmissionPolicy implements ControlPlaneAdmissionPo
         AwaitAdmissionStore directStore,
         Clock clock
     ) {
+        this(orchestratorConfig, directStore, clock, DISTRIBUTED_IO_TIMEOUT_MS);
+    }
+
+    LocalControlPlaneAdmissionPolicy(
+        PipelineOrchestratorConfig orchestratorConfig,
+        AwaitAdmissionStore directStore,
+        Clock clock,
+        long distributedIoTimeoutMs
+    ) {
         this.orchestratorConfig = orchestratorConfig;
         this.directStore = directStore;
         this.clock = clock == null ? Clock.systemUTC() : clock;
+        this.distributedIoTimeoutMs = Math.max(10L, distributedIoTimeoutMs);
     }
 
     @Override
@@ -137,13 +153,25 @@ public class LocalControlPlaneAdmissionPolicy implements ControlPlaneAdmissionPo
         AwaitAdmissionOwner owner = new AwaitAdmissionOwner(
             AwaitAdmissionScope.lengthPrefixedKey("transition", executionId, UUID.randomUUID().toString()));
         long now = clock.millis();
-        long expiresAt = now + transitionLeaseDurationMs();
+        long leaseDurationMs = transitionLeaseDurationMs();
+        long expiresAt = now + leaseDurationMs;
+        CompletableFuture<AwaitAdmissionAcquireResult> acquireFuture =
+            store.acquire(scope, owner, maxInFlight, expiresAt, now).toCompletableFuture();
+        AtomicBoolean abandoned = new AtomicBoolean(false);
+        AtomicBoolean orphanReleased = new AtomicBoolean(false);
+        acquireFuture.whenComplete((lateResult, lateFailure) -> {
+            if (abandoned.get() && lateFailure == null) {
+                releaseLateReservation(store, lateResult, orphanReleased, scopeTenant);
+            }
+        });
         final AwaitAdmissionAcquireResult acquired;
         try {
-            acquired = store.acquire(scope, owner, maxInFlight, expiresAt, now)
-                .toCompletableFuture()
-                .get(DISTRIBUTED_IO_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            acquired = acquireFuture.get(distributedIoTimeoutMs, TimeUnit.MILLISECONDS);
         } catch (Exception failure) {
+            abandoned.set(true);
+            if (acquireFuture.isDone() && !acquireFuture.isCompletedExceptionally()) {
+                releaseLateReservation(store, acquireFuture.getNow(null), orphanReleased, scopeTenant);
+            }
             if (failure instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
@@ -158,20 +186,50 @@ public class LocalControlPlaneAdmissionPolicy implements ControlPlaneAdmissionPo
                 "Tenant '" + scopeTenant + "' has reached max in-flight transitions " + maxInFlight));
         }
         AwaitAdmissionReservation reservation = acquired.reservation().get();
+        Duration maxActiveDuration = Duration.ofMillis(maxActiveDurationMs(leaseDurationMs));
         AtomicBoolean released = new AtomicBoolean(false);
-        return ControlPlaneTransitionAdmission.admitted(() -> {
-            if (released.compareAndSet(false, true)) {
-                try {
-                    store.release(reservation)
-                        .toCompletableFuture()
-                        .get(DISTRIBUTED_IO_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                } catch (Exception failure) {
-                    if (failure instanceof InterruptedException) {
-                        Thread.currentThread().interrupt();
+        return ControlPlaneTransitionAdmission.admitted(new ControlPlaneTransitionPermit() {
+            @Override
+            public void close() {
+                if (released.compareAndSet(false, true)) {
+                    try {
+                        store.release(reservation)
+                            .toCompletableFuture()
+                            .get(distributedIoTimeoutMs, TimeUnit.MILLISECONDS);
+                    } catch (Exception failure) {
+                        if (failure instanceof InterruptedException) {
+                            Thread.currentThread().interrupt();
+                        }
+                        LOG.warnf(failure, "Failed to release distributed transition quota slot=%d for tenant=%s; lease will expire",
+                            reservation.slot(), scopeTenant);
                     }
-                    LOG.warnf(failure, "Failed to release distributed transition quota slot=%d for tenant=%s; lease will expire",
-                        reservation.slot(), scopeTenant);
                 }
+            }
+
+            @Override
+            public Optional<Duration> maxActiveDuration() {
+                return Optional.of(maxActiveDuration);
+            }
+        });
+    }
+
+    private void releaseLateReservation(
+        AwaitAdmissionStore store,
+        AwaitAdmissionAcquireResult lateResult,
+        AtomicBoolean orphanReleased,
+        String scopeTenant
+    ) {
+        if (lateResult == null || !lateResult.acquired() || lateResult.reservation().isEmpty()) {
+            return;
+        }
+        if (!orphanReleased.compareAndSet(false, true)) {
+            return;
+        }
+        AwaitAdmissionReservation orphan = lateResult.reservation().get();
+        store.release(orphan).whenComplete((ignored, releaseFailure) -> {
+            if (releaseFailure != null) {
+                LOG.warnf(releaseFailure, "Failed to release late distributed transition quota slot=%d for tenant=%s; lease will expire",
+                    orphan.slot(), scopeTenant);
             }
         });
     }
@@ -184,16 +242,23 @@ public class LocalControlPlaneAdmissionPolicy implements ControlPlaneAdmissionPo
             return null;
         }
         String desired = configuredTransitionAdmissionStore();
+        if (NON_SHARED_STORE_PROVIDER.equals(desired)) {
+            LOG.warn("Distributed transition quota requires a shared AwaitAdmissionStore; rejecting non-shared 'in-memory' store");
+            return null;
+        }
         return admissionStores.stream()
             .filter(candidate -> desired.equals(candidate.providerName().toLowerCase(Locale.ROOT)))
+            .filter(candidate -> !NON_SHARED_STORE_PROVIDER.equals(candidate.providerName().toLowerCase(Locale.ROOT)))
             .findFirst()
             .orElse(null);
     }
 
     private String configuredTransitionAdmissionStore() {
         PipelineOrchestratorConfig.QuotaConfig quotas = orchestratorConfig == null ? null : orchestratorConfig.quotas();
-        if (quotas != null && quotas.transitionAdmissionStore() != null && !quotas.transitionAdmissionStore().isBlank()) {
-            return quotas.transitionAdmissionStore().trim().toLowerCase(Locale.ROOT);
+        if (quotas != null && quotas.transitionAdmissionStore() != null
+            && quotas.transitionAdmissionStore().isPresent()
+            && !quotas.transitionAdmissionStore().get().isBlank()) {
+            return quotas.transitionAdmissionStore().get().trim().toLowerCase(Locale.ROOT);
         }
         if (stepConfig != null && stepConfig.awaitAdmission() != null
             && stepConfig.awaitAdmission().store() != null && !stepConfig.awaitAdmission().store().isBlank()) {
@@ -213,7 +278,12 @@ public class LocalControlPlaneAdmissionPolicy implements ControlPlaneAdmissionPo
         if (configured == null || configured.isZero() || configured.isNegative()) {
             return DEFAULT_LEASE_MS;
         }
-        return Math.max(1_000L, configured.toMillis());
+        return Math.max(MIN_LEASE_MS, configured.toMillis());
+    }
+
+    private static long maxActiveDurationMs(long leaseDurationMs) {
+        long safetyMargin = Math.min(MAX_LEASE_SAFETY_MARGIN_MS, Math.max(500L, leaseDurationMs / 5L));
+        return Math.max(500L, leaseDurationMs - safetyMargin);
     }
 
     private void releasePermit(String tenantId) {

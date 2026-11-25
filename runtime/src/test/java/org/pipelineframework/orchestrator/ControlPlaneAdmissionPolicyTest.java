@@ -5,10 +5,17 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
+import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
+import org.pipelineframework.awaitable.admission.AwaitAdmissionAcquireResult;
+import org.pipelineframework.awaitable.admission.AwaitAdmissionOwner;
+import org.pipelineframework.awaitable.admission.AwaitAdmissionReservation;
+import org.pipelineframework.awaitable.admission.AwaitAdmissionScope;
 import org.pipelineframework.awaitable.admission.AwaitAdmissionStore;
 import org.pipelineframework.awaitable.admission.InMemoryAwaitAdmissionStore;
 
@@ -20,6 +27,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ControlPlaneAdmissionPolicyTest {
@@ -170,6 +178,52 @@ class ControlPlaneAdmissionPolicyTest {
         assertEquals(ControlPlaneAdmissionDecision.TENANT_TRANSITION_QUOTA_SATURATED, deniedFailure.decision().errorCode());
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void distributedQuotaRejectsNonSharedInMemoryProviderLookup() {
+        PipelineOrchestratorConfig config = distributedConfig(2, Duration.ofSeconds(30));
+        when(config.quotas().transitionAdmissionStore()).thenReturn(Optional.of("in-memory"));
+        Instance<AwaitAdmissionStore> stores = mock(Instance.class);
+        when(stores.stream()).thenAnswer(invocation -> Stream.of(new InMemoryAwaitAdmissionStore()));
+        LocalControlPlaneAdmissionPolicy policy = new LocalControlPlaneAdmissionPolicy(config);
+        policy.admissionStores = stores;
+
+        ControlPlaneTransitionAdmission denied = policy.admitTransition(transitionRequest("tenant-a", "exec-mem"));
+        assertFalse(denied.decision().allowed());
+        assertEquals(ControlPlaneAdmissionDecision.TENANT_TRANSITION_QUOTA_SATURATED, denied.decision().errorCode());
+    }
+
+    @Test
+    void distributedQuotaBoundsActiveDurationStrictlyBelowLeaseAndReleasesLateAcquireAfterTimeout() {
+        InMemoryAwaitAdmissionStore sharedStore = new InMemoryAwaitAdmissionStore();
+        PipelineOrchestratorConfig config = distributedConfig(1, Duration.ofSeconds(30));
+        LocalControlPlaneAdmissionPolicy policy = new LocalControlPlaneAdmissionPolicy(config, sharedStore, Clock.systemUTC());
+        ControlPlaneTransitionAdmission admitted = policy.admitTransition(transitionRequest("tenant-a", "exec-bound"));
+        assertTrue(admitted.decision().allowed());
+        assertTrue(admitted.permit().maxActiveDuration().isPresent());
+        assertTrue(admitted.permit().maxActiveDuration().get().compareTo(Duration.ofSeconds(30)) < 0);
+        admitted.permit().close();
+
+        CompletableFuture<AwaitAdmissionAcquireResult> delayedAcquire = new CompletableFuture<>();
+        AwaitAdmissionStore slowStore = mock(AwaitAdmissionStore.class);
+        when(slowStore.acquire(any(), any(), anyInt(), anyLong(), anyLong())).thenReturn(delayedAcquire);
+        when(slowStore.release(any())).thenReturn(CompletableFuture.completedFuture(true));
+
+        LocalControlPlaneAdmissionPolicy timeoutPolicy =
+            new LocalControlPlaneAdmissionPolicy(config, slowStore, Clock.systemUTC(), 25L);
+        ControlPlaneTransitionAdmission timedOut = timeoutPolicy.admitTransition(transitionRequest("tenant-a", "exec-timeout"));
+        assertFalse(timedOut.decision().allowed());
+
+        AwaitAdmissionReservation lateReservation = new AwaitAdmissionReservation(
+            new AwaitAdmissionScope(LocalControlPlaneAdmissionPolicy.TRANSITION_QUOTA_PIPELINE,
+                LocalControlPlaneAdmissionPolicy.TRANSITION_QUOTA_STEP, "tenant-a"),
+            new AwaitAdmissionOwner("late-owner"),
+            0,
+            System.currentTimeMillis() + 30_000L);
+        delayedAcquire.complete(AwaitAdmissionAcquireResult.acquired(lateReservation));
+        verify(slowStore).release(lateReservation);
+    }
+
     private static ControlPlaneAdmissionRequest request(String tenantId, boolean explicitTenant) {
         return new ControlPlaneAdmissionRequest(
             tenantId,
@@ -200,6 +254,7 @@ class ControlPlaneAdmissionPolicyTest {
         PipelineOrchestratorConfig cfg = config(List.of(), false, maxInFlight);
         when(cfg.quotas().distributedTransitionAdmission()).thenReturn(true);
         when(cfg.quotas().transitionLeaseDuration()).thenReturn(leaseDuration);
+        when(cfg.quotas().transitionAdmissionStore()).thenReturn(Optional.empty());
         return cfg;
     }
 

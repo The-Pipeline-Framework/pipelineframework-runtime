@@ -528,23 +528,23 @@ public interface PipelineOrchestratorConfig {
 
         /**
          * Lease duration for a distributed per-tenant transition permit so crashed instances
-         * automatically release slots without manual intervention.
+         * automatically release slots without manual intervention. Active transitions are bounded
+         * strictly within this lease duration.
          *
          * @return transition permit lease duration
          */
         @WithName("transition-lease-duration")
-        @WithDefault("PT2M")
+        @WithDefault("PT3M")
         Duration transitionLeaseDuration();
 
         /**
          * Optional explicit {@code AwaitAdmissionStore} provider name for distributed transition quotas.
-         * When blank, falls back to {@code pipeline.await.admission.store}.
+         * When omitted or blank, falls back to {@code pipeline.await.admission.store}.
          *
-         * @return admission store provider name or empty string
+         * @return optional admission store provider name
          */
         @WithName("transition-admission-store")
-        @WithDefault("")
-        String transitionAdmissionStore();
+        Optional<String> transitionAdmissionStore();
     }
 
     /**

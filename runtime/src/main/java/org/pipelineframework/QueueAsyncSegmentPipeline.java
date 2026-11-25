@@ -100,8 +100,16 @@ class QueueAsyncSegmentPipeline {
         transitionPermit.close();
         return handleDeniedAdmission(workItem, tenantAdmission);
       }
-      return executionLease.run(workItem,
-          (segment, claimedAt) -> runClaimed(segment, worker, itemContinuationHandler, claimedAt))
+      Uni<Void> execution = executionLease.run(workItem,
+          (segment, claimedAt) -> runClaimed(segment, worker, itemContinuationHandler, claimedAt));
+      Optional<Duration> maxActiveDuration = tenantAdmission.permit().maxActiveDuration();
+      if (maxActiveDuration.isPresent()) {
+        Duration limit = maxActiveDuration.get();
+        execution = execution.ifNoItem().after(limit).failWith(() -> new IllegalStateException(
+            "Transition exceeded distributed admission lease limit " + limit
+                + " for execution " + workItem.executionId()));
+      }
+      return execution
           .onTermination().invoke(() -> {
             transitionPermit.close();
             tenantAdmission.permit().close();
