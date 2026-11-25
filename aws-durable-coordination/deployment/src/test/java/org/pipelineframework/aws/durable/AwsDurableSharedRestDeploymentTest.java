@@ -86,6 +86,40 @@ class AwsDurableSharedRestDeploymentTest {
                 .map(statement -> statement.path("Resource").asText()).toList());
     }
 
+    @Test
+    void sharedRestTemplateBoundsSqsConcurrencyExposesDlqOutputsAndWiresTenantQuotas() throws Exception {
+        var shared = template("aws-durable-shared-rest.yaml");
+        var params = shared.required("Parameters");
+        assertEquals(10, params.required("WorkMaxConcurrency").required("Default").asInt());
+        assertEquals(2, params.required("WorkMaxConcurrency").required("MinValue").asInt());
+        assertEquals(5, params.required("AwaitCompletionMaxConcurrency").required("Default").asInt());
+        assertEquals(2, params.required("DueWorkMaxConcurrency").required("Default").asInt());
+        assertEquals(0, params.required("MaxInFlightTransitionsPerTenant").required("Default").asInt());
+        assertEquals("false", params.required("DistributedTransitionAdmission").required("Default").asText());
+
+        try (var input = getClass().getResourceAsStream("/aws-durable-shared-rest.yaml")) {
+            assertNotNull(input);
+            var nodes = new Yaml().compose(new InputStreamReader(input, StandardCharsets.UTF_8));
+            assertIntrinsic(nodes, "!Ref", "WorkMaxConcurrency",
+                "Resources", "WorkFunctionWork", "Properties", "ScalingConfig", "MaximumConcurrency");
+            assertIntrinsic(nodes, "!Ref", "AwaitCompletionMaxConcurrency",
+                "Resources", "AwaitCompletionFunctionAwaitCompletion", "Properties", "ScalingConfig", "MaximumConcurrency");
+            assertIntrinsic(nodes, "!Ref", "DueWorkMaxConcurrency",
+                "Resources", "DueWorkFunctionTick", "Properties", "ScalingConfig", "MaximumConcurrency");
+            assertIntrinsic(nodes, "!Ref", "MaxInFlightTransitionsPerTenant",
+                "Resources", "WorkFunction", "Properties", "Environment", "Variables",
+                "PIPELINE_ORCHESTRATOR_QUOTAS_MAX_IN_FLIGHT_TRANSITIONS_PER_TENANT");
+            assertIntrinsic(nodes, "!Ref", "DistributedTransitionAdmission",
+                "Resources", "WorkFunction", "Properties", "Environment", "Variables",
+                "PIPELINE_ORCHESTRATOR_QUOTAS_DISTRIBUTED_TRANSITION_ADMISSION");
+            assertIntrinsic(nodes, "!GetAtt", "WorkDlq.QueueName", "Outputs", "WorkDlqName", "Value");
+            assertIntrinsic(nodes, "!GetAtt", "AwaitCompletionDlq.QueueName", "Outputs", "AwaitCompletionDlqName", "Value");
+            assertIntrinsic(nodes, "!GetAtt", "DurableDlq.QueueName", "Outputs", "DurableDlqName", "Value");
+            assertIntrinsic(nodes, "!GetAtt", "RepairFailureDlq.QueueName", "Outputs", "RepairFailureDlqName", "Value");
+            assertIntrinsic(nodes, "!GetAtt", "StreamFailureDlq.QueueName", "Outputs", "StreamFailureDlqName", "Value");
+        }
+    }
+
     private static JsonNode template(String name) throws Exception {
         try (var input = AwsDurableSharedRestDeploymentTest.class.getResourceAsStream("/" + name)) {
             assertNotNull(input);
