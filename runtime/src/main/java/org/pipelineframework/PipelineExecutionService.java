@@ -709,6 +709,8 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
           PipelineContext previousPipeline = PipelineContextHolder.get();
           AwaitExecutionContext previous = AwaitExecutionContextHolder.get();
           java.util.Optional<PipelineExecutionContext> previousExecution = PipelineExecutionContextHolder.get();
+          java.util.Optional<org.pipelineframework.orchestrator.TransitionDispatchScope> previousDispatchScope =
+              org.pipelineframework.orchestrator.TransitionDispatchScopeHolder.get();
           PipelineExecutionContext executionContext = new PipelineExecutionContext(
               command.tenantId(),
               command.executionId(),
@@ -735,24 +737,31 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
                       envelope.tenantId(), envelope.executionId(), envelope.pipelineId(), envelope.contractVersion(),
                       envelope.releaseVersion(), envelope.executionVersion(), envelope.transitionKey()))));
           PipelineExecutionContextHolder.set(executionContext);
+          org.pipelineframework.orchestrator.TransitionDispatchScopeHolder.set(
+              new org.pipelineframework.orchestrator.TransitionDispatchScope(
+                  envelope.tenantId(),
+                  envelope.executionId(),
+                  envelope.executionVersion(),
+                  envelope.attempt(),
+                  envelope.transitionKey()));
           rehydratedInput.pipelineContext().ifPresentOrElse(
               PipelineContextHolder::set,
               PipelineContextHolder::clear);
           try {
             RuntimeException healthFailure = healthCheckFailure();
             if (healthFailure != null) {
-              restoreExecutionContexts(previousPipeline, previous, previousExecution);
+              restoreExecutionContexts(previousPipeline, previous, previousExecution, previousDispatchScope);
               return Multi.createFrom().failure(healthFailure);
             }
             RuntimeException inputFailure = validateInputShape(reactiveInput);
             if (inputFailure != null) {
-              restoreExecutionContexts(previousPipeline, previous, previousExecution);
+              restoreExecutionContexts(previousPipeline, previous, previousExecution, previousDispatchScope);
               return Multi.createFrom().failure(inputFailure);
             }
             List<Object> steps = loadStepsForExecution();
             if (command.pageContext().isPresent()) {
               if (steps.isEmpty()) {
-                restoreExecutionContexts(previousPipeline, previous, previousExecution);
+                restoreExecutionContexts(previousPipeline, previous, previousExecution, previousDispatchScope);
                 return Multi.createFrom().failure(new IllegalStateException(
                     "paged transitions require a source step"));
               }
@@ -763,14 +772,14 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
                     pageExecutionTelemetry == null ? PageExecutionTelemetry.disabled() : pageExecutionTelemetry,
                     command.attempt() > 0));
               } else if (command.pageContext().orElseThrow().suspendedCompletion().isEmpty()) {
-                restoreExecutionContexts(previousPipeline, previous, previousExecution);
+                restoreExecutionContexts(previousPipeline, previous, previousExecution, previousDispatchScope);
                 return Multi.createFrom().failure(new IllegalStateException(
                     "a resumed paged transition requires retained page completion"));
               }
             }
             int requestedStopBeforeStepIndex = command.stopBeforeStepIndex();
             if (requestedStopBeforeStepIndex > steps.size()) {
-              restoreExecutionContexts(previousPipeline, previous, previousExecution);
+              restoreExecutionContexts(previousPipeline, previous, previousExecution, previousDispatchScope);
               return Multi.createFrom().failure(new IllegalArgumentException(
                   "stopBeforeStepIndex " + requestedStopBeforeStepIndex
                       + " exceeds pipeline step count " + steps.size()));
@@ -785,14 +794,14 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
                 terminalInputPassthrough.set(true);
                 return Multi.createFrom().empty()
                     .onTermination().invoke((failure, cancelled) ->
-                        restoreExecutionContexts(previousPipeline, previous, previousExecution));
+                        restoreExecutionContexts(previousPipeline, previous, previousExecution, previousDispatchScope));
               }
               Multi<?> unchanged = reactiveInput instanceof Multi<?> multi
                   ? multi
                   : ((Uni<?>) reactiveInput).toMulti();
               return unchanged
                   .onTermination().invoke((failure, cancelled) ->
-                      restoreExecutionContexts(previousPipeline, previous, previousExecution));
+                      restoreExecutionContexts(previousPipeline, previous, previousExecution, previousDispatchScope));
             }
             PipelineRunner.ExecutionResult executionResult = executePipelineStreamingInternalFromStep(
                 reactiveInput,
@@ -807,15 +816,15 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
             } else if (result instanceof Uni<?> uni) {
               stream = uni.toMulti();
             } else {
-              restoreExecutionContexts(previousPipeline, previous, previousExecution);
+              restoreExecutionContexts(previousPipeline, previous, previousExecution, previousDispatchScope);
               return Multi.createFrom().failure(new IllegalStateException(
                   "Pipeline runner returned unsupported result"));
             }
             return stream
                 .onTermination().invoke((failure, cancelled) ->
-                    restoreExecutionContexts(previousPipeline, previous, previousExecution));
+                    restoreExecutionContexts(previousPipeline, previous, previousExecution, previousDispatchScope));
           } catch (Throwable failure) {
-            restoreExecutionContexts(previousPipeline, previous, previousExecution);
+            restoreExecutionContexts(previousPipeline, previous, previousExecution, previousDispatchScope);
             return Multi.createFrom().failure(failure);
           }
         });
@@ -1015,7 +1024,8 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
   private void restoreExecutionContexts(
       PipelineContext previousPipeline,
       AwaitExecutionContext previousAwait,
-      java.util.Optional<PipelineExecutionContext> previousExecution) {
+      java.util.Optional<PipelineExecutionContext> previousExecution,
+      java.util.Optional<org.pipelineframework.orchestrator.TransitionDispatchScope> previousDispatchScope) {
     if (previousPipeline == null) {
       PipelineContextHolder.clear();
     } else {
@@ -1025,6 +1035,9 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
     previousExecution.ifPresentOrElse(
         PipelineExecutionContextHolder::set,
         PipelineExecutionContextHolder::clear);
+    previousDispatchScope.ifPresentOrElse(
+        org.pipelineframework.orchestrator.TransitionDispatchScopeHolder::set,
+        org.pipelineframework.orchestrator.TransitionDispatchScopeHolder::clear);
   }
 
   private Uni<?> executePipelineUnaryInternal(Object input) {
