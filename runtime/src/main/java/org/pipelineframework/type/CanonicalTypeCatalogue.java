@@ -23,6 +23,7 @@ import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -40,7 +41,8 @@ import org.pipelineframework.orchestrator.release.PipelineContractDescriptorLoad
  */
 public final class CanonicalTypeCatalogue {
     private static final String DEFINITIONS_REFERENCE_PREFIX = "#/$defs/";
-    private static final ObjectMapper JSON = PipelineJson.mapper();
+    private static final ObjectMapper JSON = PipelineJson.mapper().copy()
+        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
     private static final Pattern EMAIL = Pattern.compile("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$");
     private final Map<String, TypeBinding> types;
 

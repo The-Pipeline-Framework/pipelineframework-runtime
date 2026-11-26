@@ -79,6 +79,35 @@ class CanonicalTypeCatalogueFieldSemanticsTest {
         assertEquals("{\"name\":\"Ada\"}", bound.validateAndCanonicalize("Customer", "{\"name\":\"Ada\"}"));
     }
 
+    @Test
+    void preservesArbitraryPrecisionDecimalsDuringValidationAndCanonicalization() {
+        var decimalCatalogue = CanonicalTypeCatalogue.fromCanonicalTypes(Map.of(
+            "BoundedAmount", Map.of("definition", Map.of(
+                "id", "BoundedAmount",
+                "kind", "wrapper",
+                "wraps", Map.of("kind", "scalar", "id", "decimal"),
+                "minimum", new java.math.BigDecimal("99999999999999999999.000000001"),
+                "maximum", new java.math.BigDecimal("99999999999999999999.500000000"))),
+            "Invoice", Map.of("definition", Map.of(
+                "id", "Invoice",
+                "kind", "record",
+                "fields", List.of(
+                    Map.of("name", "amount", "type", Map.of("kind", "named", "id", "BoundedAmount"),
+                        "presence", "REQUIRED", "nullability", "NON_NULL"),
+                    Map.of("name", "seq", "type", Map.of("kind", "scalar", "id", "int64"),
+                        "presence", "REQUIRED", "nullability", "NON_NULL"))))));
+
+        String canonical = decimalCatalogue.validateAndCanonicalize(
+            "Invoice",
+            "{\"seq\":9007199254740993,\"amount\":99999999999999999999.123456789}");
+        assertEquals("{\"amount\":99999999999999999999.123456789,\"seq\":9007199254740993}", canonical);
+
+        // Values differing only beyond IEEE-754 double precision must still be caught by bounds.
+        assertThrows(IllegalArgumentException.class, () -> decimalCatalogue.validateAndCanonicalize(
+            "Invoice",
+            "{\"seq\":1,\"amount\":99999999999999999999.500000001}"));
+    }
+
     private static Map<String, Object> field(String name, String presence, String nullability) {
         return Map.of("name", name, "type", Map.of("kind", "scalar", "id", "string"),
             "presence", presence, "nullability", nullability);
