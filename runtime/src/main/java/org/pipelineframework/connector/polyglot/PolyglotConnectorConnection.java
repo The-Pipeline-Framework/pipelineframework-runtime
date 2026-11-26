@@ -46,10 +46,12 @@ public record PolyglotConnectorConnection(
         URI uri = Objects.requireNonNull(raw, "hostUri must not be null").normalize();
         String scheme = uri.getScheme();
         String host = uri.getHost();
+        String path = uri.getRawPath();
         if (!uri.isAbsolute() || scheme == null || host == null
+            || (path != null && !path.isEmpty() && !"/".equals(path))
             || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null) {
             throw new IllegalArgumentException(
-                "Polyglot connector hostUri must be an absolute HTTP(S) origin without userInfo, query, or fragment");
+                "Polyglot connector hostUri must be an absolute root HTTP(S) origin without path, userInfo, query, or fragment");
         }
         String lowerScheme = scheme.toLowerCase(Locale.ROOT);
         if ("https".equals(lowerScheme)) {

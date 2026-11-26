@@ -1,10 +1,12 @@
 package org.pipelineframework.connector.polyglot;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -17,6 +19,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.fasterxml.jackson.core.JsonParser;
@@ -222,7 +225,7 @@ public final class PolyglotConnectorProvider
         idempotencyKey.ifPresent(key -> builder.header(IDEMPOTENCY_KEY_HEADER, key));
         ClassLoader callerLoader = Thread.currentThread().getContextClassLoader();
         CompletableFuture<HttpResponse<byte[]>> delivered = new CompletableFuture<>();
-        httpClient.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
+        httpClient.sendAsync(builder.build(), boundedByteArrayHandler(spec.maxResponseBytes()))
             .whenComplete((response, failure) -> {
                 Thread current = Thread.currentThread();
                 ClassLoader previous = current.getContextClassLoader();
@@ -238,6 +241,62 @@ public final class PolyglotConnectorProvider
                 }
             });
         return delivered;
+    }
+
+    private static HttpResponse.BodyHandler<byte[]> boundedByteArrayHandler(int maxBytes) {
+        return responseInfo -> new HttpResponse.BodySubscriber<>() {
+            private final CompletableFuture<byte[]> body = new CompletableFuture<>();
+            private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            private Flow.Subscription subscription;
+            private int totalBytes;
+            private boolean exceeded;
+
+            @Override
+            public void onSubscribe(Flow.Subscription sub) {
+                this.subscription = sub;
+                sub.request(Long.MAX_VALUE);
+            }
+
+            @Override
+            public void onNext(List<ByteBuffer> items) {
+                if (exceeded) {
+                    return;
+                }
+                for (ByteBuffer item : items) {
+                    int remaining = item.remaining();
+                    if (remaining > maxBytes - totalBytes) {
+                        exceeded = true;
+                        if (subscription != null) {
+                            subscription.cancel();
+                        }
+                        body.completeExceptionally(
+                            new IOException("Polyglot connector response exceeded " + maxBytes + " bytes"));
+                        return;
+                    }
+                    byte[] chunk = new byte[remaining];
+                    item.get(chunk);
+                    buffer.write(chunk, 0, remaining);
+                    totalBytes += remaining;
+                }
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                body.completeExceptionally(throwable);
+            }
+
+            @Override
+            public void onComplete() {
+                if (!exceeded) {
+                    body.complete(buffer.toByteArray());
+                }
+            }
+
+            @Override
+            public CompletionStage<byte[]> getBody() {
+                return body;
+            }
+        };
     }
 
     private JsonNode validateCanonical(String canonicalTypeId, JsonNode node) {

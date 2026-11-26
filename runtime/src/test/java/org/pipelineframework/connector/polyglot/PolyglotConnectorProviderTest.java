@@ -175,14 +175,19 @@ class PolyglotConnectorProviderTest {
     }
 
     @Test
-    void enforcesHttpsUnlessLoopbackIsExplicitlyAllowed() {
+    void enforcesHttpsAndRootOriginUnlessLoopbackIsExplicitlyAllowed() {
         assertThrows(IllegalArgumentException.class, () -> new PolyglotConnectorConnection(
             URI.create("http://127.0.0.1:8080"), SHARED_SECRET, Map.of(), false));
         assertThrows(IllegalArgumentException.class, () -> new PolyglotConnectorConnection(
             URI.create("http://remote.example.test"), SHARED_SECRET, Map.of(), true));
+        assertThrows(IllegalArgumentException.class, () -> new PolyglotConnectorConnection(
+            URI.create("https://connector.internal/base"), SHARED_SECRET, Map.of(), false));
         var httpsConn = new PolyglotConnectorConnection(
             URI.create("https://connector.internal:8443"), SHARED_SECRET, Map.of("k", "v"), false);
         assertEquals("https", httpsConn.hostUri().getScheme());
+        var rootSlashConn = new PolyglotConnectorConnection(
+            URI.create("https://connector.internal:8443/"), SHARED_SECRET, Map.of("k", "v"), false);
+        assertEquals("/", rootSlashConn.hostUri().getRawPath());
     }
 
     @Test
@@ -266,6 +271,19 @@ class PolyglotConnectorProviderTest {
         assertEquals(CommandEffectStatus.AMBIGUOUS, badErr.status());
     }
 
+    @Test
+    void cancelsOversizedResponseDuringStreamingReception() {
+        queryMode.set("OVERSIZED");
+        PipelineExecutionContextHolder.set(execCtx("exec-q-oversized", 1));
+        QueryStepDescriptor desc = queryDescriptor();
+        ObjectNode req = JSON.createObjectNode().put("sku", "SKU-BIG");
+        RuntimeException err = assertThrows(RuntimeException.class,
+            () -> queryStepSupport.queryOneToOne(desc, req, JsonNode.class).await().atMost(TIMEOUT));
+        assertTrue(err.getMessage().contains("polyglot-query-transport-error")
+            || (err.getCause() != null && err.getCause().getMessage().contains("polyglot-query-transport-error")),
+            "Expected bounded subscriber cancellation mapped to transport error: " + err);
+    }
+
     private void handleQuery(HttpExchange ex) throws IOException {
         byte[] raw = ex.getRequestBody().readAllBytes();
         if (!verifyHmac(ex, "/tpf/connector/query/custom.inventory.lookup", raw)) {
@@ -278,6 +296,12 @@ class PolyglotConnectorProviderTest {
             verifiedHostSecret.set(true);
         }
         queryCalls.incrementAndGet();
+        if ("OVERSIZED".equals(queryMode.get())) {
+            String huge = "{\"outcome\":\"FOUND\",\"payload\":{\"sku\":\"SKU-BIG\",\"availableUnits\":1,\"warehouse\":\""
+                + "x".repeat(5 * 1024 * 1024) + "\"}}";
+            respond(ex, 200, huge);
+            return;
+        }
         if ("BAD_SCHEMA".equals(queryMode.get())) {
             respond(ex, 200, "{\"outcome\":\"FOUND\",\"payload\":{\"sku\":\"SKU-42\",\"availableUnits\":\"bad\",\"warehouse\":\"eu\"}}");
             return;

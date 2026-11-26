@@ -82,7 +82,7 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
             return payload;
         }
         if (output.isClassFree()) {
-            return validateAndNormalizeClassFree(value, output, false);
+            return validateAndNormalizeClassFree(value, output, false, true);
         }
         requireElement(value, output);
         TypedDurablePayload payload = canonical.encode(value, output.typedPlans().orElseThrow().scalar());
@@ -104,7 +104,7 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
             .orElseThrow(() -> new IllegalArgumentException("Canonical transition boundary requires a typed durable payload"));
         boolean collection = payload.canonicalTypeId().equals(input.collectionTypeId());
         if (input.isClassFree()) {
-            return validateAndNormalizeClassFree(payload, input, collection);
+            return validateAndNormalizeClassFree(payload, input, collection, true);
         }
         validateSchema(payload, input);
         var plans = input.typedPlans().orElseThrow();
@@ -121,7 +121,7 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
     private TypedDurablePayload encodeClassFreeCollection(List<?> items, Boundary boundary) {
         var array = org.pipelineframework.config.pipeline.PipelineJson.mapper().createArrayNode();
         for (Object item : items) {
-            TypedDurablePayload normalized = validateAndNormalizeClassFree(item, boundary, false);
+            TypedDurablePayload normalized = validateAndNormalizeClassFree(item, boundary, false, false);
             try {
                 array.add(org.pipelineframework.config.pipeline.PipelineJson.mapper().readTree(normalized.payload()));
             } catch (java.io.IOException failure) {
@@ -137,11 +137,14 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
             array.toString().getBytes(StandardCharsets.UTF_8));
     }
 
-    private TypedDurablePayload validateAndNormalizeClassFree(Object value, Boundary boundary, boolean collection) {
+    private TypedDurablePayload validateAndNormalizeClassFree(
+        Object value, Boundary boundary, boolean collection, boolean allowCollectionEnvelope
+    ) {
         TypedDurablePayload payload = TypedDurablePayload.fromDurableValue(value)
             .orElseThrow(() -> new IllegalArgumentException(
                 "Class-free canonical boundary requires TypedDurablePayload for " + boundary.canonicalTypeId()));
-        boolean isCollection = collection || payload.canonicalTypeId().equals(boundary.collectionTypeId());
+        boolean isCollection = collection
+            || (allowCollectionEnvelope && payload.canonicalTypeId().equals(boundary.collectionTypeId()));
         String expectedTypeId = isCollection ? boundary.collectionTypeId() : boundary.canonicalTypeId();
         String expectedFingerprint = isCollection ? boundary.collectionFingerprint() : boundary.definitionFingerprint();
         if (!expectedTypeId.equals(payload.canonicalTypeId())) {
