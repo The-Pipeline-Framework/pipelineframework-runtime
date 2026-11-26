@@ -220,7 +220,24 @@ public final class PolyglotConnectorProvider
             .header(TransitionWorkerSignature.SIGNATURE_HEADER, signature)
             .POST(HttpRequest.BodyPublishers.ofByteArray(payload));
         idempotencyKey.ifPresent(key -> builder.header(IDEMPOTENCY_KEY_HEADER, key));
-        return httpClient.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+        ClassLoader callerLoader = Thread.currentThread().getContextClassLoader();
+        CompletableFuture<HttpResponse<byte[]>> delivered = new CompletableFuture<>();
+        httpClient.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
+            .whenComplete((response, failure) -> {
+                Thread current = Thread.currentThread();
+                ClassLoader previous = current.getContextClassLoader();
+                current.setContextClassLoader(callerLoader);
+                try {
+                    if (failure != null) {
+                        delivered.completeExceptionally(failure);
+                    } else {
+                        delivered.complete(response);
+                    }
+                } finally {
+                    current.setContextClassLoader(previous);
+                }
+            });
+        return delivered;
     }
 
     private JsonNode validateCanonical(String canonicalTypeId, JsonNode node) {
