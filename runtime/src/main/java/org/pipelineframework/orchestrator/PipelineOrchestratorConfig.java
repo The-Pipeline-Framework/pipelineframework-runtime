@@ -304,24 +304,6 @@ public interface PipelineOrchestratorConfig {
     boolean strictStartup();
 
     /**
-     * Experimental feature switches, disabled by default.
-     *
-     * @return experimental configuration
-     */
-    @WithName("experimental")
-    ExperimentalConfig experimental();
-
-    /**
-     * True only when the experimental native worker killswitch is explicitly enabled.
-     *
-     * @return true when {@code pipeline.orchestrator.experimental.native-worker.enabled=true}
-     */
-    default boolean experimentalNativeWorkerEnabled() {
-        ExperimentalConfig exp = experimental();
-        return exp != null && exp.nativeWorker() != null && exp.nativeWorker().enabled();
-    }
-
-    /**
      * DynamoDB provider settings.
      */
     interface DynamoConfig {
@@ -1229,36 +1211,5 @@ public interface PipelineOrchestratorConfig {
         default boolean isEnabled() {
             return requestQueueUrl().filter(value -> !value.isBlank()).isPresent();
         }
-    }
-
-    /**
-     * Experimental feature switches. Every switch defaults to disabled so experimental work
-     * cannot affect ordinary Java pipelines without explicit operator opt-in.
-     */
-    interface ExperimentalConfig {
-
-        /**
-         * Experimental native worker execution settings.
-         *
-         * @return native worker switch config
-         */
-        @WithName("native-worker")
-        NativeWorkerConfig nativeWorker();
-    }
-
-    /**
-     * Killswitch configuration for experimental native (Node/Python) worker execution.
-     */
-    interface NativeWorkerConfig {
-
-        /**
-         * Enables hosted native worker admission and paired native dispatch.
-         * Defaults to {@code false}.
-         *
-         * @return true only when explicitly enabled
-         */
-        @WithName("enabled")
-        @WithDefault("false")
-        boolean enabled();
     }
 }
