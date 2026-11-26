@@ -33,7 +33,6 @@ class SegmentCommitEffects {
   private final Supplier<SegmentBoundaryLedger> segmentBoundaryLedger;
   private final AwaitContinuations awaitContinuations;
   private final TerminalPublicationBoundary terminalPublicationBoundary;
-  private final PairedSegmentSettlement pairedSettlement;
   private final Consumer<AwaitReplayLifecycleEvent> lifecycleRecorder;
 
   SegmentCommitEffects(
@@ -57,20 +56,15 @@ class SegmentCommitEffects {
         terminalPublicationBoundary,
         "terminalPublicationBoundary must not be null");
     this.lifecycleRecorder = Objects.requireNonNull(lifecycleRecorder, "lifecycleRecorder must not be null");
-    this.pairedSettlement = new PairedSegmentSettlement(
-        executionStateStore, executionFailureHandler, deadLetterPublisher, terminalPublicationBoundary, segmentBoundaryLedger);
   }
 
   Uni<Void> commit(
       SegmentCommitPlan plan,
       AwaitItemContinuationHandler itemContinuationHandler) {
     return switch (plan) {
-      case CompletedSegment completed -> completed.result().pairedResult()
-          .map(paired -> pairedSettlement.complete(completed, paired))
-          .orElseGet(() -> commitCompleted(completed));
+      case CompletedSegment completed -> commitCompleted(completed);
       case SuspendedSegment suspended -> commitSuspended(suspended, itemContinuationHandler);
       case FailedSegment failed -> fail(failed.segment(), failed.failure());
-      case PairedFailedSegment failed -> pairedSettlement.fail(failed);
     };
   }
 

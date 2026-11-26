@@ -55,9 +55,6 @@ import org.pipelineframework.orchestrator.PipelineRuntimeIdentityObservation;
 import org.pipelineframework.orchestrator.PipelineTransitionWorker;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
-import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding;
-import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding.AdmittedInput;
-import org.pipelineframework.orchestrator.RestPipelineTransitionWorker;
 import org.pipelineframework.orchestrator.TransitionWorkerExecutor;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
@@ -129,12 +126,6 @@ class QueueAsyncCoordinator {
 
   @Inject
   org.pipelineframework.orchestrator.RegisteredRestWorkerTargets registeredTargets;
-
-  @Inject
-  Instance<NativeWorkerReleaseBinding> nativeWorkerBinding;
-
-  @Inject
-  RestPipelineTransitionWorker pairedRestWorker;
 
   @Inject
   PipelineReleaseIdentityResolver releaseIdentityResolver;
@@ -342,7 +333,7 @@ class QueueAsyncCoordinator {
       }
       if (org.pipelineframework.orchestrator.RegisteredRestWorkerTargets.enabled(orchestratorConfig)) {
         return executionStateStore.getExecution(workItem.tenantId(), workItem.executionId())
-            .chain(execution -> execution.filter(record -> AdmittedInput.fromSnapshot(record.inputPayload()).isEmpty())
+            .chain(execution -> execution
                 .map(registeredTargets::validateExecutionPin)
                 .orElseGet(() -> Uni.createFrom().voidItem()))
             .chain(() -> segmentPipeline().process(workItem, worker, itemContinuationHandler));
@@ -952,8 +943,6 @@ class QueueAsyncCoordinator {
         awaitCoordinator,
         transitionWorkerExecutor,
         admissionPolicy(),
-            () -> NativeWorkerReleaseBinding.configured(orchestratorConfig, nativeWorkerBinding),
-            () -> Optional.ofNullable(pairedRestWorker),
             this::payloadCodec,
             this::segmentBoundaryLedger,
             this::saturatedDelay,

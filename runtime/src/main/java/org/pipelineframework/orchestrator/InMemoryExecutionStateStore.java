@@ -11,9 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.OptionalLong;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 import jakarta.enterprise.context.ApplicationScoped;
 
 import io.smallrye.mutiny.Uni;
@@ -25,14 +23,12 @@ import org.pipelineframework.awaitable.AwaitUnitReleaseAcknowledgement;
  * In-memory execution state store intended for development and tests.
  */
 @ApplicationScoped
-public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeExecutionAdmissionStore,
-        PairedTransitionSettlementStore {
+public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeExecutionAdmissionStore {
 
     private final Object lock = new Object();
     private final Map<String, ExecutionRecord<Object, Object>> executionsByScopedId = new HashMap<>();
     private final Map<String, String> executionIdByScopedKey = new HashMap<>();
     private final Map<String, Object> initialInputByScopedId = new HashMap<>();
-    private final Map<String, PairedDispatchIntent> activePairedIntents = new HashMap<>();
     private final Map<String, NativeExecutionAdmission> admissions = new HashMap<>();
     private final Map<AwaitReleaseKey, AwaitUnitReleaseAcknowledgement> awaitReleaseAcknowledgements = new HashMap<>();
 
@@ -124,7 +120,6 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                         }
                         String scopedId = scopedExecutionId(command.tenantId(), existing.executionId());
                         executionsByScopedId.remove(scopedId);
-                        activePairedIntents.remove(scopedId);
                         initialInputByScopedId.remove(scopedId);
                     }
                     executionIdByScopedKey.remove(scopedKey);
@@ -255,9 +250,6 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     return Optional.empty();
                 }
                 boolean leaseExpired = current.leaseOwner() == null || current.leaseExpiresEpochMs() <= nowEpochMs;
-                if (recoverPairedLease(scopedId, current, nowEpochMs)) {
-                    return Optional.empty();
-                }
                 boolean due = current.nextDueEpochMs() <= nowEpochMs;
                 if (!leaseExpired || !due) {
                     return Optional.empty();
@@ -319,8 +311,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     || current.status() != ExecutionStatus.RUNNING
                     || current.version() != expectedVersion
                     || !Objects.equals(current.leaseOwner(), leaseOwner)
-                    || current.leaseExpiresEpochMs() <= nowEpochMs
-                    || (activePairedIntents.containsKey(scopedId) && current.leaseExpiresEpochMs() > nowEpochMs + leaseMs)) {
+                    || current.leaseExpiresEpochMs() <= nowEpochMs) {
                     return Optional.empty();
                 }
                 ExecutionRecord<Object, Object> renewed = new ExecutionRecord<>(
@@ -369,57 +360,11 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
         String transitionKey,
         Object resultPayload,
         long nowEpochMs) {
-        return markSucceeded(tenantId, executionId, expectedVersion, transitionKey, resultPayload,
-            nowEpochMs, Optional.empty());
-    }
-
-    @Override
-    public Uni<OptionalLong> beginPairedDispatch(PairedDispatchIntent intent) {
-        var command = intent.command();
-        return Uni.createFrom().item(() -> {
-            synchronized (lock) {
-                long now = System.currentTimeMillis();
-                String scopedId = scopedExecutionId(command.tenantId(), command.executionId());
-                var current = getActiveRecord(scopedId, now);
-                if (!intent.matchesLease(current, now) || activePairedIntents.containsKey(scopedId)
-                    || !command.pipelineId().equals(current.pipelineId())
-                    || !command.contractVersion().equals(current.contractVersion())
-                    || !command.releaseVersion().equals(current.releaseVersion())
-                    || command.attempt() != current.attempt() || command.currentStepIndex() != current.currentStepIndex()
-                    || command.resultShape() != current.resultShape() || current.pagingState().isPresent()
-                    || current.redriveIntent() != ExecutionRedriveIntent.REPLAY) {
-                    return OptionalLong.empty();
-                }
-                activePairedIntents.put(scopedId, intent);
-                long retentionExpiry = current.ttlEpochS() > 0
-                    ? TimeUnit.SECONDS.toMillis(current.ttlEpochS()) : Long.MAX_VALUE;
-                return OptionalLong.of(Math.min(current.leaseExpiresEpochMs(), retentionExpiry));
-            }
-        });
-    }
-
-    @Override
-    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedSuccess(PairedDispatchIntent intent,
-            SerializedTransitionPayload output) {
-        var command = intent.command();
-        return Uni.createFrom().deferred(() -> markSucceeded(command.tenantId(), command.executionId(),
-            command.executionVersion(), command.transitionKey(), List.of(output), System.currentTimeMillis(),
-            Optional.of(intent)));
-    }
-
-    private Uni<Optional<ExecutionRecord<Object, Object>>> markSucceeded(
-        String tenantId,
-        String executionId,
-        long expectedVersion,
-        String transitionKey,
-        Object resultPayload,
-        long nowEpochMs,
-        Optional<PairedDispatchIntent> pairedIntent) {
         return Uni.createFrom().item(() -> {
             synchronized (lock) {
                 String scopedId = scopedExecutionId(tenantId, executionId);
                 ExecutionRecord<Object, Object> current = getActiveRecord(scopedId, nowEpochMs);
-                if (!canSettle(scopedId, current, expectedVersion, pairedIntent, nowEpochMs)) {
+                if (current == null || current.version() != expectedVersion) {
                     return Optional.empty();
                 }
                 ExecutionRecord<Object, Object> updated = new ExecutionRecord<>(
@@ -452,7 +397,6 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
                     current.awaitOccurrenceCause(), current.dispatchPin());
                 executionsByScopedId.put(scopedId, updated);
-                activePairedIntents.remove(scopedId);
                 return Optional.of(updated);
             }
         });
@@ -476,7 +420,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
             synchronized (lock) {
                 String scopedId = scopedExecutionId(tenantId, executionId);
                 ExecutionRecord<Object, Object> current = getActiveRecord(scopedId, nowEpochMs);
-                if (current == null || activePairedIntents.containsKey(scopedId) || current.version() != expectedVersion
+                if (current == null || current.version() != expectedVersion
                     || current.status() != ExecutionStatus.RUNNING
                     || current.pagingState().isEmpty()
                     || nextPage.pageIndex() != current.pagingState().orElseThrow().pageIndex() + 1) {
@@ -526,7 +470,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
             synchronized (lock) {
                 String scopedId = scopedExecutionId(tenantId, executionId);
                 ExecutionRecord<Object, Object> current = getActiveRecord(scopedId, nowEpochMs);
-                if (current == null || activePairedIntents.containsKey(scopedId) || current.version() != expectedVersion) {
+                if (current == null || current.version() != expectedVersion) {
                     return Optional.empty();
                 }
                 if (!awaitOccurrenceMatches(current, awaitUnitId, awaitStepIndex)) {
@@ -768,7 +712,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
             synchronized (lock) {
                 String scopedId = scopedExecutionId(tenantId, executionId);
                 ExecutionRecord<Object, Object> current = getActiveRecord(scopedId, nowEpochMs);
-                if (current == null || activePairedIntents.containsKey(scopedId) || current.version() != expectedVersion) {
+                if (current == null || current.version() != expectedVersion) {
                     return Optional.empty();
                 }
                 ExecutionRecord<Object, Object> updated = new ExecutionRecord<>(
@@ -819,7 +763,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
             synchronized (lock) {
                 String scopedId = scopedExecutionId(tenantId, executionId);
                 ExecutionRecord<Object, Object> current = getActiveRecord(scopedId, nowEpochMs);
-                if (current == null || activePairedIntents.containsKey(scopedId) || current.version() != expectedVersion) {
+                if (current == null || current.version() != expectedVersion) {
                     return Optional.empty();
                 }
                 var updated = unknownRecord(current, transitionKey, errorCode, errorMessage, nowEpochMs);
@@ -827,41 +771,6 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                 return Optional.of(updated);
             }
         });
-    }
-
-    @Override
-    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedUnknown(PairedDispatchIntent intent) {
-        var command = intent.command();
-        return Uni.createFrom().item(() -> {
-            synchronized (lock) {
-                long now = System.currentTimeMillis();
-                String scopedId = scopedExecutionId(command.tenantId(), command.executionId());
-                var current = getActiveRecord(scopedId, now);
-                if (!canSettle(scopedId, current, command.executionVersion(), Optional.of(intent), now)) {
-                    return Optional.empty();
-                }
-                return Optional.of(markPairedUnknown(scopedId, current, intent, now));
-            }
-        });
-    }
-
-    private boolean recoverPairedLease(String scopedId, ExecutionRecord<Object, Object> current, long now) {
-        var active = activePairedIntents.get(scopedId);
-        if (active == null) {
-            return false;
-        }
-        if (current.status() == ExecutionStatus.RUNNING && current.leaseExpiresEpochMs() <= now) {
-            markPairedUnknown(scopedId, current, active, now);
-        }
-        return true;
-    }
-
-    private ExecutionRecord<Object, Object> markPairedUnknown(String scopedId, ExecutionRecord<Object, Object> current,
-            PairedDispatchIntent intent, long now) {
-        var updated = unknownRecord(current, intent.command().transitionKey(), PairedDispatchIntent.UNKNOWN_CODE,
-            PairedDispatchIntent.UNKNOWN_DIAGNOSTIC, now);
-        executionsByScopedId.put(scopedId, updated);
-        return updated;
     }
 
     private static ExecutionRecord<Object, Object> unknownRecord(ExecutionRecord<Object, Object> current,
@@ -915,7 +824,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
             synchronized (lock) {
                 String scopedId = scopedExecutionId(tenantId, executionId);
                 ExecutionRecord<Object, Object> current = getActiveRecord(scopedId, nowEpochMs);
-                if (current == null || activePairedIntents.containsKey(scopedId) || current.version() != expectedVersion) {
+                if (current == null || current.version() != expectedVersion) {
                     return Optional.empty();
                 }
                 ExecutionRecord<Object, Object> updated = new ExecutionRecord<>(
@@ -976,43 +885,6 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
         int failedStepIndex,
         Optional<String> failedCommandId,
         long nowEpochMs) {
-        return markTerminalFailure(tenantId, executionId, expectedVersion, finalStatus, transitionKey,
-            errorCode, errorMessage, failedStepIndex, failedCommandId, nowEpochMs, Optional.empty());
-    }
-
-    @Override
-    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedFailure(PairedDispatchIntent intent,
-            TransitionResultEnvelope.PortableFailure failure) {
-        return settlePairedFailure(intent, failure.code().name(), failure.code().diagnostic(), failure.stepIndex());
-    }
-
-    @Override
-    public Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedRejection(PairedDispatchIntent intent,
-            String errorCode, String diagnostic) {
-        return settlePairedFailure(intent, errorCode, diagnostic, -1);
-    }
-
-    private Uni<Optional<ExecutionRecord<Object, Object>>> settlePairedFailure(PairedDispatchIntent intent,
-            String errorCode, String diagnostic, int failedStepIndex) {
-        var command = intent.command();
-        return Uni.createFrom().deferred(() -> markTerminalFailure(command.tenantId(), command.executionId(),
-            command.executionVersion(), ExecutionStatus.FAILED, command.transitionKey(), errorCode,
-            diagnostic, failedStepIndex, Optional.empty(), System.currentTimeMillis(),
-            Optional.of(intent)));
-    }
-
-    private Uni<Optional<ExecutionRecord<Object, Object>>> markTerminalFailure(
-        String tenantId,
-        String executionId,
-        long expectedVersion,
-        ExecutionStatus finalStatus,
-        String transitionKey,
-        String errorCode,
-        String errorMessage,
-        int failedStepIndex,
-        Optional<String> failedCommandId,
-        long nowEpochMs,
-        Optional<PairedDispatchIntent> pairedIntent) {
         if (finalStatus != ExecutionStatus.FAILED && finalStatus != ExecutionStatus.DLQ) {
             return Uni.createFrom().item(Optional.empty());
         }
@@ -1020,7 +892,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
             synchronized (lock) {
                 String scopedId = scopedExecutionId(tenantId, executionId);
                 ExecutionRecord<Object, Object> current = getActiveRecord(scopedId, nowEpochMs);
-                if (!canSettle(scopedId, current, expectedVersion, pairedIntent, nowEpochMs)) {
+                if (current == null || current.version() != expectedVersion) {
                     return Optional.empty();
                 }
                 ExecutionRecord<Object, Object> updated = new ExecutionRecord<>(
@@ -1061,21 +933,9 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     retainAwaitRelease(current, updated, current.awaitUnitId(), AwaitReleaseDisposition.TERMINAL_FAILED, nowEpochMs);
                 }
                 executionsByScopedId.put(scopedId, updated);
-                activePairedIntents.remove(scopedId);
                 return Optional.of(updated);
             }
         });
-    }
-
-    private boolean canSettle(String scopedId, ExecutionRecord<?, ?> current, long expectedVersion,
-            Optional<PairedDispatchIntent> pairedIntent, long now) {
-        if (current == null || current.version() != expectedVersion) {
-            return false;
-        }
-        var active = Optional.ofNullable(activePairedIntents.get(scopedId));
-        return pairedIntent.map(intent -> intent.matchesLease(current, now)
-            && active.filter(retained -> intent.digest().equals(retained.digest())).isPresent())
-            .orElseGet(active::isEmpty);
     }
 
     @Override
@@ -1149,7 +1009,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
             synchronized (lock) {
                 String scopedId = scopedExecutionId(tenantId, executionId);
                 ExecutionRecord<Object, Object> current = getActiveRecord(scopedId, nowEpochMs);
-                if (current == null || activePairedIntents.containsKey(scopedId)
+                if (current == null
                     || current.version() != expectedVersion
                     || !redrivable(current.status(), allowFailed, resolvedIntent)) {
                     return Optional.empty();
@@ -1215,7 +1075,6 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     ExecutionRecord<Object, Object> record = entry.getValue();
                     if (isExpired(record, nowEpochMs)) {
                         iterator.remove();
-                        activePairedIntents.remove(entry.getKey());
                         initialInputByScopedId.remove(entry.getKey());
                         executionIdByScopedKey.remove(scopedExecutionKey(record.tenantId(), record.executionKey()));
                         continue;
@@ -1227,7 +1086,7 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                     }
                     boolean dueNow = record.nextDueEpochMs() <= nowEpochMs;
                     boolean leaseFree = record.leaseOwner() == null || record.leaseExpiresEpochMs() <= nowEpochMs;
-                    if (dueNow && leaseFree && !recoverPairedLease(entry.getKey(), record, nowEpochMs)) {
+                    if (dueNow && leaseFree) {
                         due.add(record);
                     }
                 }
@@ -1273,7 +1132,6 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
             return current;
         }
         executionsByScopedId.remove(scopedId);
-        activePairedIntents.remove(scopedId);
         initialInputByScopedId.remove(scopedId);
         executionIdByScopedKey.remove(scopedExecutionKey(current.tenantId(), current.executionKey()));
         return null;

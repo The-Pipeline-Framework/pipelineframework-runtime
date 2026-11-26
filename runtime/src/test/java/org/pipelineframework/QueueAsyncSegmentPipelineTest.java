@@ -37,7 +37,6 @@ import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
-import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding.AdmittedInput;
 import org.pipelineframework.orchestrator.PagedExecutionState;
 import org.pipelineframework.orchestrator.PagedTransitionCompletion;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
@@ -51,7 +50,6 @@ import org.pipelineframework.orchestrator.TransitionWorkerExecutionMode;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 import org.pipelineframework.orchestrator.controlplane.TerminalPublicationClaim;
-import org.pipelineframework.serialization.PolyglotInt32JsonCodec;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -680,36 +678,6 @@ class QueueAsyncSegmentPipelineTest {
   }
 
   @Test
-  void admittedNativeInputWithUnavailableBindingFailsWithoutDispatchingToJava() {
-    var input = new ExecutionInputSnapshot(ExecutionInputShape.UNI, new AdmittedInput(
-        new SerializedTransitionPayload("InputValue", PolyglotInt32JsonCodec.ENCODING, "{\"value\":3}"),
-        "sha256:" + "a".repeat(64)));
-    String executionId = "exec-admitted-native";
-    var claimed = withCurrentStep(record(executionId, ExecutionResultShape.SINGLE), 0, input);
-    when(executionStateStore.claimLease(eq("tenant-1"), eq(executionId), any(), anyLong(), eq(1000L)))
-        .thenReturn(Uni.createFrom().item(Optional.of(claimed)));
-    var javaWorker = mock(PipelineTransitionWorker.class);
-
-    pipeline().process(
-            new ExecutionWorkItem("tenant-1", executionId),
-            javaWorker,
-            AwaitContinuations.NOOP_ITEM_CONTINUATION_HANDLER)
-        .await().atMost(Duration.ofSeconds(5));
-
-    ArgumentCaptor<Throwable> failure = ArgumentCaptor.forClass(Throwable.class);
-    verify(executionFailureHandler).handleExecutionFailure(
-        same(claimed),
-        eq(executionId + ":0:0"),
-        failure.capture(),
-        same(executionStateStore),
-        same(workDispatcher),
-        same(deadLetterPublisher));
-    assertEquals("The admitted native worker binding is unavailable",
-        assertInstanceOf(IllegalStateException.class, failure.getValue()).getMessage());
-    verifyNoInteractions(javaWorker);
-  }
-
-  @Test
   void awaitSuspensionImportsMarksWaitingAndReleasesCompletedWork() {
     ExecutionRecord<Object, Object> claimed = record("exec-await", ExecutionResultShape.MATERIALIZED_MULTI);
     ExecutionRecord<Object, Object> waiting = withStatus(claimed, ExecutionStatus.WAITING_EXTERNAL, 1L);
@@ -898,8 +866,6 @@ class QueueAsyncSegmentPipelineTest {
         awaitCoordinator,
         executor,
         admissionPolicy,
-        Optional::empty,
-        Optional::empty,
         () -> payloadCodec,
         () -> segmentBoundaryLedger,
         () -> Duration.ofMillis(25),
