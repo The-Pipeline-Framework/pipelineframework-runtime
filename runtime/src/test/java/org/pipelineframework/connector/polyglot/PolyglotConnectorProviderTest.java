@@ -493,8 +493,6 @@ class PolyglotConnectorProviderTest {
             @Override public ReleasesConfig releases() { return null; }
             @Override public WorkerConfig worker() { return null; }
             @Override public boolean strictStartup() { return false; }
-            @Override public ExperimentalConfig experimental() { return () -> () -> false; }
-            @Override public boolean experimentalNativeWorkerEnabled() { return false; }
         };
     }
 }
