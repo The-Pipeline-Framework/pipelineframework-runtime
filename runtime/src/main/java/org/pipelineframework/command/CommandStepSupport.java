@@ -100,10 +100,21 @@ public class CommandStepSupport {
         Collection<CommandEffectStore> stores,
         PipelineOrchestratorConfig orchestratorConfig
     ) {
+        this(registry, bindingRegistry, ConnectorRuntimeContext.empty(), stores, orchestratorConfig);
+    }
+
+    public CommandStepSupport(
+        ConnectorRegistry registry,
+        ConnectorBindingRegistry bindingRegistry,
+        ConnectorRuntimeContext runtimeContext,
+        Collection<CommandEffectStore> stores,
+        PipelineOrchestratorConfig orchestratorConfig
+    ) {
         this.fixedConnectorRegistry = java.util.Objects.requireNonNull(registry, "connector registry must not be null");
         this.fixedConnectorBindingRegistry = java.util.Objects.requireNonNull(
             bindingRegistry, "connector binding registry must not be null");
-        this.fixedConnectorRuntimeContext = ConnectorRuntimeContext.empty();
+        this.fixedConnectorRuntimeContext = java.util.Objects.requireNonNull(
+            runtimeContext, "connector runtime context must not be null");
         this.fixedStores = stores == null ? List.of() : stores;
         this.orchestratorConfig = orchestratorConfig;
     }
