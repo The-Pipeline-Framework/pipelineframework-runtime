@@ -306,6 +306,13 @@ public class PipelineExecutionService implements PipelineTransitionWorker {
     return controlPlane.completeAwait(command, awaitItemContinuationHandler(selectedWorker));
   }
 
+  /** Completes only an exact, retained non-Command interaction-api interaction. */
+  public Uni<AwaitCompletionResult> completeHumanAwaitInteraction(
+      org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin, AwaitCompletionCommand command) {
+    PipelineTransitionWorker selectedWorker = transitionWorkerSelector.select(this);
+    return controlPlane.completeHumanAwait(pin, command, awaitItemContinuationHandler(selectedWorker));
+  }
+
   AwaitItemContinuationHandler awaitItemContinuationHandlerForControlPlane() {
     return awaitItemContinuationHandler(transitionWorkerSelector.select(this));
   }

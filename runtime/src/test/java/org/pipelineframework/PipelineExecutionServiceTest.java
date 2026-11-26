@@ -174,6 +174,25 @@ class PipelineExecutionServiceTest {
     }
 
     @Test
+    void humanCompletionCarriesTheSelectedWorkerContinuationHandlerToTheSemanticBoundary() {
+        var worker = mock(PipelineTransitionWorker.class);
+        when(transitionWorkerSelector.select(service)).thenReturn(worker);
+        var pin = new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint("tenant", "execution", "pipeline", "contract", "A1",
+            org.pipelineframework.orchestrator.ExecutionStatus.WAITING_EXTERNAL);
+        var command = new org.pipelineframework.awaitable.AwaitCompletionCommand("tenant", "interaction", null, "decision",
+            Map.of("approved", true), "reviewer", System.currentTimeMillis());
+        var stop = new IllegalStateException("semantic boundary reached");
+        when(controlPlane.completeHumanAwait(eq(pin), eq(command), any(AwaitItemContinuationHandler.class)))
+            .thenReturn(Uni.createFrom().failure(stop));
+        assertSame(stop, assertThrows(IllegalStateException.class,
+            () -> service.completeHumanAwaitInteraction(pin, command).await().indefinitely()));
+        var captured = org.mockito.ArgumentCaptor.forClass(AwaitItemContinuationHandler.class);
+        verify(controlPlane).completeHumanAwait(eq(pin), eq(command), captured.capture());
+        assertFalse(captured.getValue() == null);
+        verify(transitionWorkerSelector).select(service);
+    }
+
+    @Test
     void startupHealthStateInitiallyPending() {
         assertEquals(PipelineExecutionService.StartupHealthState.PENDING, service.getStartupHealthState());
     }

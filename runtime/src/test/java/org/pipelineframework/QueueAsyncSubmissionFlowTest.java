@@ -35,7 +35,6 @@ import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
 import org.pipelineframework.orchestrator.InMemoryExecutionStateStore;
 import org.pipelineframework.orchestrator.NativeExecutionAdmissionStore;
-import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding.AdmittedInput;
 import org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy;
 import org.pipelineframework.orchestrator.OrchestratorMode;
 import org.pipelineframework.orchestrator.PipelineBundleCapabilities;
@@ -242,58 +241,7 @@ class QueueAsyncSubmissionFlowTest {
     verify(workDispatcher).enqueueNow(new ExecutionWorkItem("tenant-1", "exec-1"));
   }
 
-  @ParameterizedTest
-  @CsvSource({
-      "false, ExecutionStateStore(fixture) does not support fenced paged progress",
-      "true, Hosted native execution does not support paging"
-  })
-  void pairedPagingRejectsBeforeStorageAndDispatch(boolean supportsPaging, String expectedMessage) {
-    when(executionStateStore.supportsPagedProgress()).thenReturn(supportsPaging);
-    if (!supportsPaging) {
-      when(executionStateStore.providerName()).thenReturn("fixture");
-    }
-    var nativeStore = mock(NativeExecutionAdmissionStore.class);
-    var evidence = mock(PipelineReleaseEvidence.class);
-    var payload = new SerializedTransitionPayload("InputValue", "tpf-polyglot-int32-json/1", "{\"value\":3}");
-    var input = new AdmittedInput(payload, "sha256:" + "1".repeat(64));
-    var intent = new ExecutionAdmissionIntent(1, "tenant-1", "pipeline-a", "idem-1", "contract-a", "release-a",
-        "UNI", payload.payloadTypeId(), payload.payloadEncoding(), payload.payload().getBytes(StandardCharsets.UTF_8), false);
-
-    var error = assertThrows(IllegalStateException.class,
-        () -> pagedFlow().admit(input, intent, evidence, nativeStore).await().indefinitely());
-
-    assertEquals(expectedMessage, error.getMessage());
-    verify(executionStateStore, never()).createOrGetExecution(any());
-    verifyNoInteractions(nativeStore, workDispatcher);
-  }
-
-  @Test
-  void pairedAdmissionPreservesExactClientKeysAcrossPipelines() {
-    var store = new InMemoryExecutionStateStore();
-    var pairedFlow = new QueueAsyncSubmissionFlow(
-        orchestratorConfig, inputPolicy, resultShapeResolver, store, workDispatcher,
-        admissionPolicy, () -> "pipeline-a", () -> "contract-a", () -> "release-a", () -> segmentBoundaryLedger);
-    when(workDispatcher.enqueueNow(any())).thenReturn(Uni.createFrom().voidItem());
-    var payload = new SerializedTransitionPayload("InputValue", "tpf-polyglot-int32-json/1", "{\"value\":3}");
-
-    var first = admitPaired(pairedFlow, store, "pipeline-a", "key", payload);
-    var spaced = admitPaired(pairedFlow, store, "pipeline-a", " key ", payload);
-    var otherPipeline = admitPaired(pairedFlow, store, "pipeline-b", "key", payload);
-
-    var ids = List.of(first.receipt().executionId(), spaced.receipt().executionId(),
-        otherPipeline.receipt().executionId());
-    assertEquals(3, Set.copyOf(ids).size());
-    assertEquals(spaced.receipt(), store.lookupAdmission("tenant-1", "pipeline-a", " key ")
-        .await().indefinitely().orElseThrow());
-    var replay = admitPaired(pairedFlow, store, "pipeline-a", "key", payload);
-    assertFalse(replay.newlyCreated());
-    assertEquals(first.receipt(), replay.receipt());
-    var changed = new SerializedTransitionPayload(payload.payloadTypeId(), payload.payloadEncoding(), "{\"value\":4}");
-    assertThrows(IllegalStateException.class, () -> admitPaired(pairedFlow, store, "pipeline-a", "key", changed));
-    verify(workDispatcher, times(3)).enqueueNow(any());
-  }
-
-  @Test
+    @Test
   void duplicateExecutionSkipsLedgerAndEnqueue() {
     when(executionStateStore.createOrGetExecution(any()))
         .thenReturn(Uni.createFrom().item(new CreateExecutionResult(record("exec-1", "key-1"), true)));
@@ -360,20 +308,6 @@ class QueueAsyncSubmissionFlowTest {
     verify(activation).apply(submission.capture());
     assertEquals("restaurant-demo", submission.getValue().tenantId());
     verify(executionStateStore).createOrGetExecution(any());
-  }
-
-  private ExecutionAdmissionResult admitPaired(QueueAsyncSubmissionFlow pairedFlow, InMemoryExecutionStateStore store,
-      String pipeline, String clientKey, SerializedTransitionPayload payload) {
-    var intent = new ExecutionAdmissionIntent(1, "tenant-1", pipeline, clientKey, "contract-a", "release-a", "UNI",
-        payload.payloadTypeId(), payload.payloadEncoding(), payload.payload().getBytes(StandardCharsets.UTF_8), false);
-    var descriptor = new PipelineReleaseDescriptor(1, pipeline, "contract-a", "release-a", "artifact", List.of());
-    var contract = new PipelineContractDescriptor(1, pipeline, "contract-a", "contract-a", "COMPUTE", "LOCAL",
-        "fixture", false, "monolith", List.of(), PipelineBundleCapabilities.defaults());
-    var evidence = ExecutionAdmissionReleaseEvidence.snapshot(new PipelineReleaseRecord(
-        "tenant-1", pipeline, "contract-a", "release-a", PipelineReleaseStatus.REGISTERED, descriptor,
-        "artifact", "sha256:artifact", "file:/artifact.jar", 1, "artifact", contract, 1, 1, 0));
-    return pairedFlow.admit(new AdmittedInput(payload, "sha256:" + "1".repeat(64)), intent, evidence, store)
-        .await().indefinitely();
   }
 
   private QueueAsyncSubmissionFlow pagedFlow() {

@@ -304,24 +304,6 @@ public interface PipelineOrchestratorConfig {
     boolean strictStartup();
 
     /**
-     * Experimental feature switches, disabled by default.
-     *
-     * @return experimental configuration
-     */
-    @WithName("experimental")
-    ExperimentalConfig experimental();
-
-    /**
-     * True only when the experimental native worker killswitch is explicitly enabled.
-     *
-     * @return true when {@code pipeline.orchestrator.experimental.native-worker.enabled=true}
-     */
-    default boolean experimentalNativeWorkerEnabled() {
-        ExperimentalConfig exp = experimental();
-        return exp != null && exp.nativeWorker() != null && exp.nativeWorker().enabled();
-    }
-
-    /**
      * DynamoDB provider settings.
      */
     interface DynamoConfig {
@@ -507,13 +489,44 @@ public interface PipelineOrchestratorConfig {
     interface QuotaConfig {
 
         /**
-         * Maximum active transitions per tenant in this runtime instance. Zero disables the limit.
+         * Maximum active transitions per tenant in this runtime instance, or across shared instances
+         * when {@link #distributedTransitionAdmission()} is enabled. Zero disables the limit.
          *
          * @return max in-flight transitions per tenant
          */
         @WithName("max-in-flight-transitions-per-tenant")
         @WithDefault("0")
         int maxInFlightTransitionsPerTenant();
+
+        /**
+         * Enables distributed per-tenant transition quota leases backed by the configured
+         * {@code AwaitAdmissionStore} so multiple worker instances enforce a shared per-tenant cap.
+         *
+         * @return true to enforce per-tenant transition limits through the shared admission store
+         */
+        @WithName("distributed-transition-admission")
+        @WithDefault("false")
+        boolean distributedTransitionAdmission();
+
+        /**
+         * Lease duration for a distributed per-tenant transition permit so crashed instances
+         * automatically release slots without manual intervention. Active transitions are bounded
+         * strictly within this lease duration.
+         *
+         * @return transition permit lease duration
+         */
+        @WithName("transition-lease-duration")
+        @WithDefault("PT3M")
+        Duration transitionLeaseDuration();
+
+        /**
+         * Optional explicit {@code AwaitAdmissionStore} provider name for distributed transition quotas.
+         * When omitted or blank, falls back to {@code pipeline.await.admission.store}.
+         *
+         * @return optional admission store provider name
+         */
+        @WithName("transition-admission-store")
+        Optional<String> transitionAdmissionStore();
     }
 
     /**
@@ -1198,36 +1211,5 @@ public interface PipelineOrchestratorConfig {
         default boolean isEnabled() {
             return requestQueueUrl().filter(value -> !value.isBlank()).isPresent();
         }
-    }
-
-    /**
-     * Experimental feature switches. Every switch defaults to disabled so experimental work
-     * cannot affect ordinary Java pipelines without explicit operator opt-in.
-     */
-    interface ExperimentalConfig {
-
-        /**
-         * Experimental native worker execution settings.
-         *
-         * @return native worker switch config
-         */
-        @WithName("native-worker")
-        NativeWorkerConfig nativeWorker();
-    }
-
-    /**
-     * Killswitch configuration for experimental native (Node/Python) worker execution.
-     */
-    interface NativeWorkerConfig {
-
-        /**
-         * Enables hosted native worker admission and paired native dispatch.
-         * Defaults to {@code false}.
-         *
-         * @return true only when explicitly enabled
-         */
-        @WithName("enabled")
-        @WithDefault("false")
-        boolean enabled();
     }
 }

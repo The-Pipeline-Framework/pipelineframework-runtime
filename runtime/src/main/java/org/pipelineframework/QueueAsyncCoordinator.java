@@ -55,9 +55,6 @@ import org.pipelineframework.orchestrator.PipelineRuntimeIdentityObservation;
 import org.pipelineframework.orchestrator.PipelineTransitionWorker;
 import org.pipelineframework.orchestrator.TransitionPayloadCodec;
 import org.pipelineframework.orchestrator.JsonTransitionPayloadCodec;
-import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding;
-import org.pipelineframework.orchestrator.NativeWorkerReleaseBinding.AdmittedInput;
-import org.pipelineframework.orchestrator.RestPipelineTransitionWorker;
 import org.pipelineframework.orchestrator.TransitionWorkerExecutor;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
@@ -129,12 +126,6 @@ class QueueAsyncCoordinator {
 
   @Inject
   org.pipelineframework.orchestrator.RegisteredRestWorkerTargets registeredTargets;
-
-  @Inject
-  Instance<NativeWorkerReleaseBinding> nativeWorkerBinding;
-
-  @Inject
-  RestPipelineTransitionWorker pairedRestWorker;
 
   @Inject
   PipelineReleaseIdentityResolver releaseIdentityResolver;
@@ -342,7 +333,7 @@ class QueueAsyncCoordinator {
       }
       if (org.pipelineframework.orchestrator.RegisteredRestWorkerTargets.enabled(orchestratorConfig)) {
         return executionStateStore.getExecution(workItem.tenantId(), workItem.executionId())
-            .chain(execution -> execution.filter(record -> AdmittedInput.fromSnapshot(record.inputPayload()).isEmpty())
+            .chain(execution -> execution
                 .map(registeredTargets::validateExecutionPin)
                 .orElseGet(() -> Uni.createFrom().voidItem()))
             .chain(() -> segmentPipeline().process(workItem, worker, itemContinuationHandler));
@@ -389,6 +380,19 @@ class QueueAsyncCoordinator {
 
   Uni<AwaitCompletionResult> completeAwait(AwaitCompletionCommand command) {
     return completeAwait(command, NOOP_ITEM_CONTINUATION_HANDLER);
+  }
+
+  Uni<Optional<org.pipelineframework.orchestrator.AwaitInteractionView>> getAwaitInteractionView(
+      org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin, String interactionId) {
+    return Uni.createFrom().deferred(() -> executionReadModel().getAwaitInteractionView(pin, interactionId));
+  }
+
+  Uni<AwaitCompletionResult> completeHumanAwait(org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin,
+      AwaitCompletionCommand command, AwaitItemContinuationHandler itemContinuationHandler) {
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) return Uni.createFrom().failure(queueModeDisabledException());
+      return awaitBoundaryAdmission().completeHuman(pin, command, itemContinuationHandler, executionReadModel());
+    });
   }
 
   Uni<AwaitCompletionResult> completeAwait(
@@ -939,8 +943,6 @@ class QueueAsyncCoordinator {
         awaitCoordinator,
         transitionWorkerExecutor,
         admissionPolicy(),
-            () -> NativeWorkerReleaseBinding.configured(orchestratorConfig, nativeWorkerBinding),
-            () -> Optional.ofNullable(pairedRestWorker),
             this::payloadCodec,
             this::segmentBoundaryLedger,
             this::saturatedDelay,

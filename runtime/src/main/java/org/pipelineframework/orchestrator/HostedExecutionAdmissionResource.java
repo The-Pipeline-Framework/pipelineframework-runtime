@@ -27,8 +27,6 @@ public class HostedExecutionAdmissionResource {
     HostedPipelineControlPlaneResource hosted;
     @Inject
     LocalPipelineControlPlane nativeControlPlane;
-    @Inject
-    RestPipelineTransitionWorker pairedRestWorker;
 
     public record Request(String clientKey, String contractVersion, String releaseVersion,
         ExecutionInputShape inputShape, SerializedTransitionPayload inputPayload, boolean outputStreaming) {
@@ -91,20 +89,6 @@ public class HostedExecutionAdmissionResource {
                         return Uni.createFrom().item(Response.status(409).build());
                     }
                     hosted.registrar().verify(release);
-                    var paired = hosted.pairedBinding(release);
-                    if (paired.isPresent()) {
-                        var binding = paired.orElseThrow();
-                        var input = binding.admitInput(release, request.inputShape(), request.inputPayload(),
-                            request.outputStreaming());
-                        RestPipelineTransitionWorker.requireHostedAdmissionFits(release, input.payload());
-                        var evidence = ExecutionAdmissionReleaseEvidence.snapshot(release);
-                        return pairedRestWorker.pairedCapabilities(binding).replaceWith(true)
-                            .onFailure().recoverWithItem(false)
-                            .flatMap(available -> available
-                                ? nativeControlPlane.admitExecution(input, intent, evidence)
-                                    .map(result -> Response.ok(result.receipt()).build())
-                                : Uni.createFrom().item(Response.status(503).build()));
-                    }
                     Object input;
                     try {
                         input = hosted.executionInput(new HostedExecutionSubmitRequest(pipeline, request.inputShape(),

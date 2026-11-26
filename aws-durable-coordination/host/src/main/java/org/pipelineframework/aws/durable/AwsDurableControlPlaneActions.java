@@ -96,6 +96,8 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             case PROCESS_AWAIT_CONTINUATION -> itemContinuation(request);
             case QUERY_PENDING_AWAIT -> pendingAwait(request);
             case READ_AWAIT_CHECKPOINT -> awaitCheckpoint(request);
+            case READ_AWAIT_INTERACTION -> interactionView(request);
+            case COMPLETE_HUMAN_AWAIT -> throw new IllegalArgumentException("Human completion requires the IAM action handler");
             case READ_EXECUTION_AWAITS -> executionAwaits(request);
             case READ_AWAIT_COMPLETION -> completionObservation(request);
             case QUERY_AWAIT_COMPLETIONS -> completionObservations(request);
@@ -327,6 +329,36 @@ public final class AwsDurableControlPlaneActions implements AwsDurableActionInvo
             checkpoint.tenantId(), checkpoint.executionId(), checkpoint.interactionId(),
             checkpoint.correlationId(), checkpoint.unitId(), checkpoint.stepId(), checkpoint.status().name(),
             checkpoint.pipelineId(), checkpoint.contractVersion(), checkpoint.releaseVersion()));
+    }
+
+    private AwsDurableActionResponse interactionView(AwsDurableActionRequest request) {
+        var identity = scopedInteraction(request);
+        var pin = semanticPin(request);
+        var observed = controlPlane.getAwaitInteractionView(pin, identity.interactionId()).await().atMost(actionTimeout);
+        observed.ifPresent(view -> {
+            var checkpoint = view.checkpoint();
+            if (!pin.tenantId().equals(checkpoint.tenantId()) || !pin.executionId().equals(checkpoint.executionId())
+                || !identity.interactionId().equals(checkpoint.interactionId()) || !identity.correlationId().equals(checkpoint.correlationId())
+                || !pin.pipelineId().equals(checkpoint.pipelineId()) || !pin.contractVersion().equals(checkpoint.contractVersion())
+                || !pin.releaseVersion().equals(checkpoint.releaseVersion())) {
+                throw new IllegalStateException("Await interaction differs from requested execution and Release");
+            }
+        });
+        return AwsDurableActionResponse.result(json(observed.orElse(null)));
+    }
+
+    static AwsDurableAwaitIdentity scopedInteraction(AwsDurableActionRequest request) {
+        var identity = request.awaitIdentity().orElseThrow(() -> new IllegalArgumentException("awaitIdentity is required"));
+        if (!request.tenantId().equals(identity.tenantId()) || !required(request.executionId(), "executionId").equals(identity.executionId())) {
+            throw new IllegalArgumentException("Await identity differs from requested execution");
+        }
+        return identity;
+    }
+
+    static ExecutionSemanticCheckpoint semanticPin(AwsDurableActionRequest request) {
+        return new ExecutionSemanticCheckpoint(request.tenantId(), required(request.executionId(), "executionId"),
+            required(request.pipelineId(), "pipelineId"), required(request.contractVersion(), "contractVersion"),
+            required(request.releaseVersion(), "releaseVersion"), org.pipelineframework.orchestrator.ExecutionStatus.WAITING_EXTERNAL);
     }
 
     private AwsDurableActionResponse executionAwaits(AwsDurableActionRequest request) {
