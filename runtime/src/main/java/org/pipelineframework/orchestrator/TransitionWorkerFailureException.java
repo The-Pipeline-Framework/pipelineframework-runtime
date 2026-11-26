@@ -37,9 +37,18 @@ public class TransitionWorkerFailureException extends RuntimeException {
     }
 
     public TransitionWorkerFailureException(String message, Throwable cause, int failedStepIndex) {
+        this(message, cause, failedStepIndex, Optional.empty());
+    }
+
+    public TransitionWorkerFailureException(
+        String message,
+        Throwable cause,
+        int failedStepIndex,
+        Optional<String> failedCommandId
+    ) {
         super(message, cause);
         this.failedStepIndex = failedStepIndex;
-        this.failedCommandId = Optional.empty();
+        this.failedCommandId = Optional.ofNullable(failedCommandId).orElseGet(Optional::empty);
     }
 
     public int failedStepIndex() {

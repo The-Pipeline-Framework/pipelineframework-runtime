@@ -19,12 +19,28 @@ final class TransitionFailureRuntimeAdapter {
             .<Throwable>map(unknown -> unknown).orElseGet(() -> findNonRetryable(failure)
             .<Throwable>map(nonRetryable -> nonRetryable)
             .orElse(failure));
+        Optional<TransitionWorkerFailureException> workerFailure = findWorkerFailure(failure);
+        int resolvedStepIndex = failedStepIndex >= 0
+            ? failedStepIndex
+            : workerFailure.map(TransitionWorkerFailureException::failedStepIndex).orElse(-1);
+        Optional<String> resolvedCommandId = CommandRetryableEffectException.find(failure)
+            .map(CommandRetryableEffectException::commandId)
+            .or(() -> workerFailure.flatMap(TransitionWorkerFailureException::failedCommandId));
         return new TransitionFailureEnvelope(
             classifiedFailure.getClass().getName(),
             Optional.ofNullable(classifiedFailure.getMessage()).orElse(""),
-            failedStepIndex,
-            CommandRetryableEffectException.find(failure)
-                .map(CommandRetryableEffectException::commandId));
+            resolvedStepIndex,
+            resolvedCommandId);
+    }
+
+    private static Optional<TransitionWorkerFailureException> findWorkerFailure(Throwable failure) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable current = failure; current != null && seen.add(current); current = current.getCause()) {
+            if (current instanceof TransitionWorkerFailureException workerFailure) {
+                return Optional.of(workerFailure);
+            }
+        }
+        return Optional.empty();
     }
 
     private static Optional<RemoteTransitionOutcomeUnknownException> findRemoteUnknown(Throwable failure) {
@@ -55,10 +71,16 @@ final class TransitionFailureRuntimeAdapter {
                 new IllegalStateException(failure.message()));
         }
         if (isNonRetryableFailureClass(failure.failureClass())) {
-            return new NonRetryableException(
-                failure.message() == null || failure.message().isBlank()
-                    ? failure.failureClass()
-                    : failure.message());
+            String message = failure.message() == null || failure.message().isBlank()
+                ? failure.failureClass()
+                : failure.message();
+            if (failure.failedStepIndex() >= 0 || failure.failedCommandId().isPresent()) {
+                return new NonRetryableException(
+                    message,
+                    new TransitionWorkerFailureException(
+                        message, failure.failedStepIndex(), failure.failedCommandId()));
+            }
+            return new NonRetryableException(message);
         }
         String suffix = failure.message() == null || failure.message().isBlank()
             ? ""

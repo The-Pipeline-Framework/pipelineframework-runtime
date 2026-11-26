@@ -75,7 +75,7 @@ public interface StepManyToOne<I, O> extends Configurable, ManyToOne<I, O>, Item
         final AtomicReference<List<I>> lastAttemptSample = new AtomicReference<>(List.of());
         final AtomicLong lastAttemptTotal = new AtomicLong(0L);
 
-        return Uni.createFrom().deferred(() -> {
+        Uni<O> executed = Uni.createFrom().deferred(() -> {
             final ArrayList<I> attemptSample = new ArrayList<>();
             final AtomicLong attemptTotal = new AtomicLong();
             final Multi<I> finalInput = configuredInput.onItem().invoke(item -> {
@@ -100,14 +100,18 @@ public interface StepManyToOne<I, O> extends Configurable, ManyToOne<I, O>, Item
                     }
                     lastAttemptTotal.set(attemptTotal.get());
                 });
-        })
-            .onFailure(this::shouldRetry)
-            .invoke(t -> PipelineRetryTelemetry.recordRetry(this.getClass(), t))
-            .onFailure(this::shouldRetry)
-            .retry()
-            .withBackOff(retryWait(), maxBackoff())
-            .withJitter(jitter() ? 0.5 : 0.0)
-            .atMost(retryLimit())
+        });
+        Uni<O> maybeRetried = retryLimit() > 0
+            ? executed
+                .onFailure(this::shouldRetry)
+                .invoke(t -> PipelineRetryTelemetry.recordRetry(this.getClass(), t))
+                .onFailure(this::shouldRetry)
+                .retry()
+                .withBackOff(retryWait(), maxBackoff())
+                .withJitter(jitter() ? 0.5 : 0.0)
+                .atMost(retryLimit())
+            : executed;
+        return maybeRetried
             .onFailure().recoverWithUni(error -> {
                 if (shouldPropagateWithoutRecovery(error)) {
                     return Uni.createFrom().failure(error);

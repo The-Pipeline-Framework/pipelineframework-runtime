@@ -1256,24 +1256,28 @@ class PipelineStepExecutor {
     }
 
     private static <I, O> Multi<O> applyOneToManyForAwaitParent(StepOneToMany<I, O> step, Uni<I> input) {
-        return input.onItem().transformToMulti(item -> step.applyOneToMany(item)
-            .onItem().transform(output -> {
-                if (logger.isDebugEnabled()) {
-                    logger.debugf(
-                        "Step %s emitted item: %s",
-                        step.getClass().getSimpleName(),
-                        output);
-                }
-                return output;
-            })
-            .onFailure(step::shouldRetry)
-            .invoke(t -> PipelineRetryTelemetry.recordRetry(step.getClass(), t))
-            .onFailure(step::shouldRetry)
-            .retry()
-            .withBackOff(step.retryWait(), step.maxBackoff())
-            .withJitter(step.jitter() ? 0.5 : 0.0)
-            .atMost(step.retryLimit())
-            .onFailure().recoverWithMulti(t -> {
+        return input.onItem().transformToMulti(item -> {
+            Multi<O> produced = step.applyOneToMany(item)
+                .onItem().transform(output -> {
+                    if (logger.isDebugEnabled()) {
+                        logger.debugf(
+                            "Step %s emitted item: %s",
+                            step.getClass().getSimpleName(),
+                            output);
+                    }
+                    return output;
+                });
+            Multi<O> maybeRetried = step.retryLimit() > 0
+                ? produced
+                    .onFailure(step::shouldRetry)
+                    .invoke(t -> PipelineRetryTelemetry.recordRetry(step.getClass(), t))
+                    .onFailure(step::shouldRetry)
+                    .retry()
+                    .withBackOff(step.retryWait(), step.maxBackoff())
+                    .withJitter(step.jitter() ? 0.5 : 0.0)
+                    .atMost(step.retryLimit())
+                : produced;
+            return maybeRetried.onFailure().recoverWithMulti(t -> {
                 if (step.shouldPropagateWithoutRecovery(t)) {
                     return Multi.createFrom().failure(t);
                 }
@@ -1289,7 +1293,8 @@ class PipelineStepExecutor {
                         .onItem().transformToMulti(ignored -> Multi.createFrom().empty());
                 }
                 return Multi.createFrom().failure(t);
-            }));
+            });
+        });
     }
 
     @SuppressWarnings("unchecked")

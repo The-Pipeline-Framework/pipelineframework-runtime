@@ -80,14 +80,17 @@ public interface StepOneToMany<I, O> extends OneToMany<I, O>, Configurable, Item
             if (this instanceof TransportBoundaryInvocation) {
                 return output;
             }
-            return output
-            .onFailure(this::shouldRetry)
-            .invoke(t -> PipelineRetryTelemetry.recordRetry(this.getClass(), t))
-            .onFailure(this::shouldRetry)
-            .retry()
-            .withBackOff(retryWait(), maxBackoff())
-            .withJitter(jitter() ? 0.5 : 0.0)
-            .atMost(retryLimit())
+            Multi<O> maybeRetried = retryLimit() > 0
+                ? output
+                    .onFailure(this::shouldRetry)
+                    .invoke(t -> PipelineRetryTelemetry.recordRetry(this.getClass(), t))
+                    .onFailure(this::shouldRetry)
+                    .retry()
+                    .withBackOff(retryWait(), maxBackoff())
+                    .withJitter(jitter() ? 0.5 : 0.0)
+                    .atMost(retryLimit())
+                : output;
+            return maybeRetried
             .onFailure().recoverWithMulti(t -> {
                 if (shouldPropagateWithoutRecovery(t)) {
                     return Multi.createFrom().failure(t);
