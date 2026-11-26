@@ -494,8 +494,6 @@ class CanonicalFunctionHostCoordinatorTest {
             @Override public ReleasesConfig releases() { return null; }
             @Override public WorkerConfig worker() { return WORKER_CONFIG; }
             @Override public boolean strictStartup() { return false; }
-            @Override public ExperimentalConfig experimental() { return () -> () -> false; }
-            @Override public boolean experimentalNativeWorkerEnabled() { return false; }
         };
     }
 
