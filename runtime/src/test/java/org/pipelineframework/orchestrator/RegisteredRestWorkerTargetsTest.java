@@ -29,6 +29,7 @@ public class RegisteredRestWorkerTargetsTest {
     private final AtomicReference<String> aDigest = new AtomicReference<>("sha256:A");
     private final AtomicReference<String> aArtifactId = new AtomicReference<>("app");
     private final AtomicReference<String> capabilityRelease = new AtomicReference<>("A");
+    private final AtomicReference<List<String>> capabilityProtocols = new AtomicReference<>(List.of("rest"));
     private final AtomicReference<Integer> executeStatus = new AtomicReference<>(200);
     private final java.util.concurrent.atomic.AtomicLong executionDelayMillis = new java.util.concurrent.atomic.AtomicLong();
     private final AtomicInteger redirected = new AtomicInteger();
@@ -73,7 +74,8 @@ public class RegisteredRestWorkerTargetsTest {
             if (exchange.getRequestURI().getPath().endsWith("capabilities")) {
                 response = PipelineJson.mapper().writeValueAsBytes(new PipelineWorkerCapability("1", "rest", "pipeline",
                     "contract", calls == aCalls ? capabilityRelease.get() : release, calls == aCalls ? aArtifactId.get() : "app",
-                    calls == aCalls ? aDigest.get() : "sha256:" + release, List.of(TransitionPayloadEncoding.JSON), List.of("rest")));
+                    calls == aCalls ? aDigest.get() : "sha256:" + release, List.of(TransitionPayloadEncoding.JSON),
+                    calls == aCalls ? capabilityProtocols.get() : List.of("rest")));
             } else if (exchange.getRequestURI().getPath().endsWith("execute")) {
                 calls.incrementAndGet();
                 if (calls == aCalls) java.util.concurrent.locks.LockSupport.parkNanos(
@@ -334,6 +336,36 @@ public class RegisteredRestWorkerTargetsTest {
         capabilityRelease.set("B");
         assertFalse(targets.check(request).await().indefinitely().available());
         assertThrows(RuntimeException.class, () -> execute("A"));
+    }
+
+    @Test void commandContractRejectsWorkerWithoutRecoverableCommandAuthorityBeforeDispatch() throws Exception {
+        var commandContract = new PipelineContractDescriptor(1, "pipeline", "contract", "hash", "COMPUTE", "REST", "app",
+            false, "monolith", List.of(new PipelineBundleStepDescriptor(0, "Submit", "command", "ONE_TO_ONE",
+                "java.lang.String", "java.lang.String", "Runtime", "Client", null)), PipelineBundleCapabilities.defaults());
+        var artifact = new PipelineReleaseArtifactDescriptor("app", "application-archive", "maven:example:app:zip:A",
+            "sha256:A", List.of("Submit"), List.of("local", "rest", "grpc", "sqs"));
+        var descriptor = new PipelineReleaseDescriptor(1, "pipeline", "contract", "A", "app", List.of(artifact));
+        var commandRelease = new PipelineReleaseRecord("tenant", "pipeline", "contract", "A", PipelineReleaseStatus.REGISTERED,
+            descriptor, "app", artifact.digest(), "", 0, "", commandContract, 1, 1, 0);
+        releases = new InMemoryPipelineReleaseRegistry();
+        releases.register(commandRelease).await().indefinitely();
+        configure(Map.of());
+        byte[] commandContractBytes = PipelineJson.mapper().writeValueAsBytes(commandContract);
+        targets.contractLoader = new PipelineContractDescriptorLoader() {
+            @Override public Optional<PipelineContractDescriptor> load() {
+                return Optional.of(load(new java.io.ByteArrayInputStream(commandContractBytes)));
+            }
+        };
+
+        var request = new PipelineWorkerAvailabilityRequest("tenant", "pipeline", "contract", "A", "app", "sha256:A");
+        assertFalse(targets.check(request).await().indefinitely().available());
+        assertThrows(RuntimeException.class, () -> execute("A"));
+        assertEquals(0, aCalls.get());
+
+        capabilityProtocols.set(List.of("rest", org.pipelineframework.command.CommandStepSupport.COMMAND_AUTHORITY_CAPABILITY));
+        assertTrue(targets.check(request).await().indefinitely().available());
+        assertEquals(List.of("A"), execute("A"));
+        assertEquals(1, aCalls.get());
     }
 
     @TestFactory Stream<DynamicTest> unsafeOrUnsupportedConfigurationRejected() {

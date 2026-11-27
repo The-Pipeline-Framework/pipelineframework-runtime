@@ -41,6 +41,8 @@ public class CommandDeferredCompletionSupport {
         }
         PipelineExecutionContext execution = PipelineExecutionContextHolder.get()
             .orElseThrow(() -> new IllegalStateException("Command callback requires execution context"));
+        org.pipelineframework.command.CommandReexecutionScope.Snapshot commandScope =
+            org.pipelineframework.command.CommandReexecutionScope.capture();
         AwaitExecutionContext context = Optional.ofNullable(AwaitExecutionContextHolder.get())
             .map(current -> new AwaitExecutionContext(current.tenantId(), current.executionId(),
                 current.currentStepIndex(), current.continuationMode(), current.terminalOutputOwnership(),
@@ -92,7 +94,7 @@ public class CommandDeferredCompletionSupport {
                     if (claim.isEmpty()) {
                         return suspended(record, context);
                     }
-                    return invoke(execution, command, callback)
+                    return invoke(execution, commandScope, command, callback)
                         .onItem().transform(acknowledgement -> descriptor.acknowledgementAwareCommandCompletion()
                             && acknowledgement == null
                             ? new DispatchResult(CommandDispatchSettlement.AMBIGUOUS, Optional.empty(), Optional.empty())
@@ -116,15 +118,21 @@ public class CommandDeferredCompletionSupport {
             });
     }
 
-    private Uni<?> invoke(PipelineExecutionContext execution, Function<ConnectorCallbackContext, Uni<?>> command,
+    private Uni<?> invoke(PipelineExecutionContext execution,
+        org.pipelineframework.command.CommandReexecutionScope.Snapshot commandScope,
+        Function<ConnectorCallbackContext, Uni<?>> command,
         ConnectorCallbackContext callback) {
         Optional<PipelineExecutionContext> previous = PipelineExecutionContextHolder.get();
+        org.pipelineframework.command.CommandReexecutionScope.Snapshot previousCommandScope =
+            org.pipelineframework.command.CommandReexecutionScope.capture();
         PipelineExecutionContextHolder.set(execution);
+        org.pipelineframework.command.CommandReexecutionScope.restore(commandScope);
         try {
             return Objects.requireNonNull(command.apply(callback), "Command returned no asynchronous result");
         } catch (RuntimeException failure) {
             return Uni.createFrom().failure(failure);
         } finally {
+            org.pipelineframework.command.CommandReexecutionScope.restore(previousCommandScope);
             previous.ifPresentOrElse(PipelineExecutionContextHolder::set, PipelineExecutionContextHolder::clear);
         }
     }

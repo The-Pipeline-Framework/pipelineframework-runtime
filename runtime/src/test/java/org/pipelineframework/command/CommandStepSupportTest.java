@@ -1,6 +1,7 @@
 package org.pipelineframework.command;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -274,7 +275,58 @@ class CommandStepSupportTest {
                 new CommandInput("doc-1"))
             .await().atMost(Duration.ofSeconds(5)));
 
-    assertEquals("Command steps require pipeline.orchestrator.mode=QUEUE_ASYNC.", error.getMessage());
+    assertEquals(
+        "Command steps require pipeline.orchestrator.mode=QUEUE_ASYNC or an admitted leased transition-worker scope.",
+        error.getMessage());
+  }
+
+  @Test
+  void syncWorkerRejectsDefaultInMemoryStoreEvenWithAdmittedScope() {
+    var scope = new CommandWorkerExecutionScope(
+        "tenant", "exec-1", "pipeline-1", "contract-1", "release-1", 1L, "exec-1:4:0", 4, -1, "rest", "app", "sha256:app");
+    var context = new PipelineExecutionContext(
+        "tenant", "exec-1", "pipeline-1", "contract-1", "release-1", 4, Optional.empty(), Optional.empty());
+    var syncSupport = new CommandStepSupport(List.of(connector), List.of(store), config(OrchestratorMode.SYNC));
+    assertFalse(syncSupport.supportsRemoteCommandAuthority());
+
+    var command = new org.pipelineframework.orchestrator.TransitionWorkerCommand(
+        "tenant", "exec-1", 4, 0, org.pipelineframework.orchestrator.ExecutionResultShape.SINGLE, 1L, "exec-1:4:0", "input");
+    IllegalStateException error = assertThrows(IllegalStateException.class, () ->
+        CommandReexecutionBoundary.invokeTransitionWorker(command, Optional.of(scope), () -> {
+          PipelineExecutionContextHolder.set(context);
+          try {
+            return syncSupport.<CommandInput, CommandOutput>execute(
+                descriptor, new StaticCommandIdGenerator(), new CommandInput("doc-1")).toMulti();
+          } finally {
+            PipelineExecutionContextHolder.clear();
+          }
+        }).collect().asList().await().atMost(Duration.ofSeconds(5)));
+
+    assertTrue(error.getMessage().contains("explicit recoverable CommandEffectStore"));
+  }
+
+  @Test
+  void syncWorkerRejectsMismatchedTenantOrReleaseScope() {
+    var scope = new CommandWorkerExecutionScope(
+        "tenant-a", "exec-1", "pipeline-1", "contract-1", "release-1", 1L, "exec-1:4:0", 4, 5, "rest", "app", "sha256:app");
+    var mismatchedContext = new PipelineExecutionContext(
+        "tenant-b", "exec-1", "pipeline-1", "contract-1", "release-1", 4, Optional.empty(), Optional.empty());
+    var syncSupport = new CommandStepSupport(List.of(connector), List.of(store), config(OrchestratorMode.SYNC));
+    var command = new org.pipelineframework.orchestrator.TransitionWorkerCommand(
+        "tenant-a", "exec-1", 4, 5, 0, org.pipelineframework.orchestrator.ExecutionResultShape.SINGLE, 1L, "exec-1:4:0", "input");
+
+    IllegalStateException error = assertThrows(IllegalStateException.class, () ->
+        CommandReexecutionBoundary.invokeTransitionWorker(command, Optional.of(scope), () -> {
+          PipelineExecutionContextHolder.set(mismatchedContext);
+          try {
+            return syncSupport.<CommandInput, CommandOutput>execute(
+                descriptor, new StaticCommandIdGenerator(), new CommandInput("doc-1")).toMulti();
+          } finally {
+            PipelineExecutionContextHolder.clear();
+          }
+        }).collect().asList().await().atMost(Duration.ofSeconds(5)));
+
+    assertEquals("Command execution context does not match the admitted transition-worker scope.", error.getMessage());
   }
 
   @Test
@@ -858,6 +910,42 @@ class CommandStepSupportTest {
     assertEquals(1, connector.calls.get());
     assertTransitionCount("dlq", 1);
     assertDurationCount("dlq", 1);
+  }
+
+  @Test
+  void asyncDescriptorResolutionPreservesCommandReexecutionScope() {
+    PipelineExecutionContextHolder.set(new PipelineExecutionContext("tenant", "exec-1", 4));
+    connector.failure = new RuntimeException("transient-outage");
+    assertThrows(RuntimeException.class,
+        () -> support.<CommandInput, CommandOutput>execute(
+            descriptor, new StaticCommandIdGenerator(), new CommandInput("doc-async-retry"))
+            .await().atMost(Duration.ofSeconds(5)));
+    connector.failure = null;
+
+    var asyncExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
+    try {
+      CommandReexecutionScope.Snapshot previous = CommandReexecutionScope.capture();
+      CommandReexecutionScope.AdmissionHandle admission =
+          CommandReexecutionScope.installRetry("cmd-doc-async-retry", "exec-1:1");
+      try {
+        Uni<CommandDescriptor> coldDescriptor = Uni.createFrom().item(descriptor).emitOn(asyncExecutor);
+        CommandOutput output = support.<CommandInput, CommandOutput>execute(
+            coldDescriptor, new StaticCommandIdGenerator(), new CommandInput("doc-async-retry"))
+            .await().atMost(Duration.ofSeconds(5));
+        assertEquals("cmd-doc-async-retry", output.commandId);
+        admission.requireConsumed();
+        assertEquals(2, connector.calls.get());
+        CommandEffectRecord record = store.find("tenant", "cmd-doc-async-retry")
+            .await().atMost(Duration.ofSeconds(5)).orElseThrow();
+        assertEquals(CommandEffectStatus.SUCCEEDED, record.status());
+        assertEquals(2, record.attempts().size());
+        assertEquals(CommandAttemptPurpose.RETRY, record.currentAttempt().purpose());
+      } finally {
+        CommandReexecutionScope.restore(previous);
+      }
+    } finally {
+      asyncExecutor.close();
+    }
   }
 
   private void assertTransitionCount(String status, long expected) {

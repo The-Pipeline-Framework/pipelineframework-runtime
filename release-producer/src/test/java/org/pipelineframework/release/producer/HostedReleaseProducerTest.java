@@ -200,6 +200,77 @@ class HostedReleaseProducerTest {
         assertTrue(failure.getMessage().contains("placement"), failure.getMessage());
     }
 
+    @Test void restWorkerCommandReleaseRejectsNonRecoverableMemoryStoreAndAcceptsDynamoStore() throws Exception {
+        var contract = new PipelineContractDescriptor(
+            PipelineContractDescriptor.CURRENT_SCHEMA_VERSION,
+            "rest-worker-command",
+            "contract-rw-cmd",
+            "hash-rw-cmd",
+            "FUNCTION",
+            "REST",
+            "worker-app",
+            false,
+            "PIPELINE_RUNTIME",
+            List.of(new PipelineBundleStepDescriptor(0, "Submit", "command", "ONE_TO_ONE",
+                "com.example.Input", "com.example.Output", "com.example.SubmitStep", "", Map.of())),
+            new PipelineBundleCapabilities(true, List.of("rest")),
+            Map.of(
+                "Input", Map.of("runtimeClass", "com.example.Input", "definitionFingerprint", "fp-in"),
+                "Output", Map.of("runtimeClass", "com.example.Output", "definitionFingerprint", "fp-out")),
+            "catalog-rw-cmd");
+        var payload = Map.of("payloadTypeId", "com.example.Input", "payloadEncoding", "json", "payload", "{}");
+        var deployment = new PipelineReleaseDeployment(
+            "aws-durable-java21-rest-worker-v1",
+            List.of(new PipelineReleaseDeployment.Entry(
+                "worker", "worker", "worker-app", ".", getClass().getName(),
+                "AWS_DURABLE_REST_WORKER", List.of("command-effects"))),
+            List.of(new PipelineReleaseDeployment.Binding("command-effects", "aws:dynamodb:command-effects")),
+            new PipelineReleaseDeployment.Check("worker", payload, payload, 1000));
+
+        // 1. Default in-memory store fact is rejected before Release production succeeds.
+        Path memoryRoot = Files.createDirectories(directory.resolve("rest-worker-memory"));
+        var memoryRequest = restWorkerCommandRequest(memoryRoot, contract, deployment,
+            "schemaVersion=1\ncommandEffectStore.provider=memory\ncommandEffectStore.recoverySupported=false\n"
+                + "commandEffectStore.selectedBeans=org.pipelineframework.command.InMemoryCommandEffectStore\n");
+        var rejected = assertThrows(IllegalArgumentException.class,
+            () -> new DefaultPipelineReleaseProducer().produce(memoryRequest));
+        assertTrue(rejected.getMessage().contains("command-effects") || rejected.getMessage().contains("recovery"),
+            rejected.getMessage());
+
+        // 2. Explicit Dynamo recoverable store fact is accepted.
+        Path dynamoRoot = Files.createDirectories(directory.resolve("rest-worker-dynamo"));
+        var dynamoRequest = restWorkerCommandRequest(dynamoRoot, contract, deployment,
+            "schemaVersion=1\ncommandEffectStore.provider=dynamo\ncommandEffectStore.recoverySupported=true\n"
+                + "commandEffectStore.selectedBeans=org.pipelineframework.command.DynamoCommandEffectStore\n");
+        var produced = new DefaultPipelineReleaseProducer().produce(dynamoRequest);
+        assertEquals(2, produced.schemaVersion());
+        assertEquals("aws-durable-java21-rest-worker-v1", produced.deployment().profile());
+    }
+
+    private ReleaseProductionRequest restWorkerCommandRequest(
+        Path root,
+        PipelineContractDescriptor contract,
+        PipelineReleaseDeployment deployment,
+        String capabilitiesProperties
+    ) throws Exception {
+        Path metadata = Files.createDirectories(root.resolve("classes/META-INF/pipeline"));
+        Files.write(metadata.resolve("pipeline-contract.json"), PipelineJson.mapper().writeValueAsBytes(contract));
+        Files.writeString(metadata.resolve("order.json"), "{\"order\":[\"com.example.SubmitStep\"]}");
+        Path zip = root.resolve("function.zip");
+        try (var out = new JarOutputStream(Files.newOutputStream(zip))) {
+            add(out, PipelineContractDescriptor.RESOURCE_PATH, PipelineJson.mapper().writeValueAsBytes(contract));
+            add(out, "META-INF/pipeline/order.json", "{\"order\":[\"com.example.SubmitStep\"]}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            add(out, PipelineReleaseRuntimeCapabilities.RESOURCE_PATH,
+                capabilitiesProperties.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            try (var in = getClass().getResourceAsStream("/" + getClass().getName().replace('.', '/') + ".class")) {
+                add(out, getClass().getName().replace('.', '/') + ".class", in.readAllBytes());
+            }
+        }
+        var inputs = List.of(new ReleaseArtifactInput(
+            "worker", "lambda-zip", zip, zip.toUri().toString(), List.of("Submit"), List.of("local", "rest")));
+        return new ReleaseProductionRequest(contract, "1.0.0", "worker", metadata, inputs, true, deployment);
+    }
+
     private ReleaseProductionRequest request(Path root, String name, String packagedName) throws Exception {
         return request(root, name, packagedName, Optional.of("[\"Transform\"]"));
     }

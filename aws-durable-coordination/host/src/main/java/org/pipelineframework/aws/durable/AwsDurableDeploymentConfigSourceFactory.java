@@ -343,7 +343,9 @@ public final class AwsDurableDeploymentConfigSourceFactory implements ConfigSour
         required(context, PREFIX + "rest-signing-region");
         required(context, "pipeline.orchestrator.worker.artifact-id");
         required(context, "pipeline.orchestrator.worker.artifact-digest");
+        var commandSettings = storeSettings(context, "command-effect-table", "pipeline.command.effect-store");
         var resolved = new java.util.HashMap<>(settings);
+        resolved.putAll(commandSettings);
         boolean useParameter = value(context, PREFIX + "worker-parameter-arn").isPresent()
             || value(context, PREFIX + "worker-parameter-version").isPresent();
         if (useParameter) {
