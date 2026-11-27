@@ -25,12 +25,16 @@ class PolyglotDeploymentBuildStepsTest {
     }
 
     @Test
-    void rejectsManyToManyCardinalityAtBuildTime() {
-        PipelineContractDescriptor contract = contractWithSteps(List.of(
+    void acceptsManyToManyCardinalityAtBuildTimeAndRejectsUnsupportedCardinality() {
+        PipelineContractDescriptor duplex = contractWithSteps(List.of(
             new PipelineBundleStepDescriptor(0, "Duplex", "internal", "MANY_TO_MANY", "Order", "Summary", null, null, Map.of())));
+        assertDoesNotThrow(() -> PolyglotDeploymentBuildSteps.validateClassFreeContract(duplex));
+
+        PipelineContractDescriptor bad = contractWithSteps(List.of(
+            new PipelineBundleStepDescriptor(0, "Weird", "internal", "ZERO_TO_ZERO", "Order", "Summary", null, null, Map.of())));
         IllegalStateException failure = assertThrows(IllegalStateException.class,
-            () -> PolyglotDeploymentBuildSteps.validateClassFreeContract(contract));
-        assertTrue(failure.getMessage().contains("MANY_TO_MANY"));
+            () -> PolyglotDeploymentBuildSteps.validateClassFreeContract(bad));
+        assertTrue(failure.getMessage().contains("ZERO_TO_ZERO"));
     }
 
     @Test

@@ -34,7 +34,8 @@ public class PolyglotDeploymentBuildSteps {
     private static final Set<String> SUPPORTED_CARDINALITIES = Set.of(
         "ONE_TO_ONE", "UNARY", "SIDE_EFFECT",
         "ONE_TO_MANY", "EXPANSION",
-        "MANY_TO_ONE", "REDUCTION");
+        "MANY_TO_ONE", "REDUCTION",
+        "MANY_TO_MANY");
 
     @BuildStep
     void registerClassFreePolyglotDeployment(
@@ -80,11 +81,6 @@ public class PolyglotDeploymentBuildSteps {
         }
         for (PipelineBundleStepDescriptor step : contract.steps()) {
             String card = step.cardinality() == null ? "ONE_TO_ONE" : step.cardinality().trim().toUpperCase(Locale.ROOT);
-            if ("MANY_TO_MANY".equals(card)) {
-                throw new IllegalStateException(
-                    "Class-free polyglot step '" + step.authoredName()
-                        + "' declares unsupported cardinality MANY_TO_MANY (deferred in ADR-0092)");
-            }
             if (!SUPPORTED_CARDINALITIES.contains(card)) {
                 throw new IllegalStateException(
                     "Class-free polyglot step '" + step.authoredName()
