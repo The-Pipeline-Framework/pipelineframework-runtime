@@ -56,11 +56,25 @@ new ZipFile(new File(basedir, 'target/function.zip')).withCloseable { zip ->
         }
     }
 }
-def javaExecutable = new File(System.getProperty('java.home'), 'bin/java').path
+def javaHome = new File(System.getProperty('java.home'))
 def classpath = [unpacked.path, new File(unpacked, 'lib/*').path].join(File.pathSeparator)
-def builder = new ProcessBuilder(javaExecutable, '--enable-preview', '--source', '21',
-    '-Djava.util.logging.manager=org.jboss.logmanager.LogManager', '-cp', classpath,
-    new File(basedir, 'TransitionWorkerSmoke.java').path, release.pipelineId, release.contractVersion, release.releaseVersion)
+def proofClasses = new File(basedir, 'target/transition-worker-proof-classes')
+def compileLog = new File(basedir, 'target/transition-worker-proof-compile.log')
+proofClasses.mkdirs()
+def compile = new ProcessBuilder(new File(javaHome, 'bin/javac').path, '--enable-preview', '--release', '21',
+    '-cp', classpath, '-d', proofClasses.path, new File(basedir, 'TransitionWorkerSmoke.java').path)
+    .redirectErrorStream(true).redirectOutput(compileLog).start()
+try {
+    assert compile.waitFor(30, java.util.concurrent.TimeUnit.SECONDS) : "Transition proof compilation timed out: ${compileLog.text}"
+    assert compile.exitValue() == 0 : "Transition proof compilation failed: ${compileLog.text}"
+} finally {
+    if (compile.isAlive()) {
+        compile.destroyForcibly()
+    }
+}
+def builder = new ProcessBuilder(new File(javaHome, 'bin/java').path, '--enable-preview',
+    '-Djava.util.logging.manager=org.jboss.logmanager.LogManager', '-cp', [proofClasses.path, classpath].join(File.pathSeparator),
+    'org.pipelineframework.orchestrator.TransitionWorkerSmoke', release.pipelineId, release.contractVersion, release.releaseVersion)
 def environment = builder.environment()
 environment.keySet().removeIf { key -> key.startsWith('AWS_') || key.startsWith('TPF_') || key.startsWith('PIPELINE_') || key.startsWith('QUARKUS_') }
 environment.putAll([
