@@ -105,10 +105,18 @@ public record SpringCanonicalPayload(
                 stringField(map, "catalogFingerprint"),
                 stringField(map, "encoding"),
                 version,
-                Base64.getDecoder().decode(stringField(map, "payload"))));
+                Base64.getDecoder().decode(base64StringField(map, "payload"))));
         } catch (IllegalArgumentException | ArithmeticException invalid) {
             return Optional.empty();
         }
+    }
+
+    private static String base64StringField(Map<?, ?> map, String key) {
+        Object value = map.get(key);
+        if (!(value instanceof String str)) {
+            throw new IllegalArgumentException("Field '" + key + "' must be a string");
+        }
+        return str;
     }
 
     private static String stringField(Map<?, ?> map, String key) {

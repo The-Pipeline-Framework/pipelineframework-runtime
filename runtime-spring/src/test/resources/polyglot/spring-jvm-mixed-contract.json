@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 3,
+  "pipelineId": "spring-jvm-mixed",
+  "contractVersion": "v1",
+  "contractHash": "hash-spring-jvm-mixed",
+  "platform": "COMPUTE",
+  "transport": "LOCAL",
+  "pluginHost": false,
+  "runtimeLayout": "MONOLITH",
+  "canonicalCatalogFingerprint": "catalog-fp-jvm-mixed-1",
+  "canonicalTypes": {
+    "Order": {
+      "definitionFingerprint": "fp-Order",
+      "definition": { "kind": "record", "id": "Order", "fields": [] }
+    },
+    "Receipt": {
+      "definitionFingerprint": "fp-Receipt",
+      "definition": { "kind": "record", "id": "Receipt", "fields": [] }
+    }
+  },
+  "steps": [
+    {
+      "stepIndex": 0,
+      "authoredName": "Prepare Locally",
+      "kind": "internal",
+      "runtimeClass": "org.pipelineframework.examples.PrepareLocalStep",
+      "cardinality": "ONE_TO_ONE",
+      "inputType": "Order",
+      "outputType": "Receipt"
+    }
+  ]
+}

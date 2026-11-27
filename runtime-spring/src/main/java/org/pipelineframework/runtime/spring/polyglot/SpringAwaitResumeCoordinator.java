@@ -19,6 +19,7 @@ package org.pipelineframework.runtime.spring.polyglot;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -26,7 +27,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.pipelineframework.awaitable.AwaitUnitRecord;
 import org.pipelineframework.awaitable.AwaitUnitStatus;
@@ -35,23 +36,35 @@ import org.pipelineframework.runtime.core.TpfExecutionContext;
 import org.pipelineframework.runtime.spring.SpringPipelineRunner;
 
 /**
- * Durable Await suspension and idempotent resume coordinator for Spring-hosted polyglot pipelines.
+ * Durable Await suspension and two-phase recoverable resume coordinator for Spring-hosted polyglot pipelines.
  *
- * <p>Uses {@link AwaitUnitRecord}, {@link AwaitUnitStatus}, and {@link TransitionAwaitSuspension}
- * from {@code pipelineframework-runtime-core}/{@code pipelineframework-runtime-protocol} so
- * pre-Await and post-Await polyglot {@link SpringCanonicalFunctionHostStep} stages preserve
- * durable wait state, correlation, duplicate-completion suppression, timeout handling,
- * {@link TpfExecutionContext}, and {@link SpringTransitionDispatchScope}.</p>
+ * <p>Persists all suspended, resuming, completed, and timed-out Await state through a pluggable
+ * {@link SpringAwaitStateStore} so units survive process restarts. Admission transitions a unit to
+ * {@link ResumePhase#RESUMING} (non-terminal) with its admitted payload and stable replay identity
+ * before executing {@code postAwaitRunner}, and marks the unit {@link AwaitUnitStatus#COMPLETED}
+ * only after post-Await execution succeeds. If post-Await execution fails or crashes mid-flight,
+ * {@link #retryPendingResume(String, String, SpringPipelineRunner)} (or retrying the same
+ * {@code completionKey}) recovers using the persisted payload and stable dispatch scope.</p>
  */
 public final class SpringAwaitResumeCoordinator {
 
-    /** Durable state persisted while a Spring-hosted polyglot pipeline awaits external completion. */
+    /** Two-phase durability lifecycle of a suspended Spring Await unit. */
+    public enum ResumePhase {
+        WAITING,
+        RESUMING,
+        COMPLETED,
+        TIMED_OUT
+    }
+
+    /** Durable state persisted while a Spring-hosted polyglot pipeline awaits or resumes completion. */
     public record SuspendedAwaitState(
         AwaitUnitRecord unit,
         TransitionAwaitSuspension suspension,
         SpringCanonicalPayload suspendedPayload,
         TpfExecutionContext.Snapshot capturedContext,
-        Optional<SpringCanonicalPayload> completionPayload
+        Optional<SpringCanonicalPayload> completionPayload,
+        ResumePhase phase,
+        Optional<String> admittedCompletionKey
     ) {
         public SuspendedAwaitState {
             Objects.requireNonNull(unit, "unit");
@@ -59,6 +72,8 @@ public final class SpringAwaitResumeCoordinator {
             Objects.requireNonNull(suspendedPayload, "suspendedPayload");
             Objects.requireNonNull(capturedContext, "capturedContext");
             Objects.requireNonNull(completionPayload, "completionPayload");
+            Objects.requireNonNull(phase, "phase");
+            Objects.requireNonNull(admittedCompletionKey, "admittedCompletionKey");
         }
     }
 
@@ -80,7 +95,8 @@ public final class SpringAwaitResumeCoordinator {
         RESUMED,
         DUPLICATE_IGNORED,
         TERMINAL_REJECTED,
-        UNKNOWN_UNIT
+        UNKNOWN_UNIT,
+        RESUME_IN_PROGRESS
     }
 
     /** Result of admitting an external completion and resuming post-Await steps. */
@@ -96,14 +112,16 @@ public final class SpringAwaitResumeCoordinator {
         }
     }
 
+    private final SpringAwaitStateStore store;
     private final Clock clock;
-    private final ConcurrentMap<String, SuspendedAwaitState> units = new ConcurrentHashMap<>();
+    private final Set<String> activeResumes = ConcurrentHashMap.newKeySet();
 
-    public SpringAwaitResumeCoordinator() {
-        this(Clock.systemUTC());
+    public SpringAwaitResumeCoordinator(SpringAwaitStateStore store) {
+        this(store, Clock.systemUTC());
     }
 
-    public SpringAwaitResumeCoordinator(Clock clock) {
+    public SpringAwaitResumeCoordinator(SpringAwaitStateStore store, Clock clock) {
+        this.store = Objects.requireNonNull(store, "store");
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
@@ -159,17 +177,25 @@ public final class SpringAwaitResumeCoordinator {
                 nowMs,
                 ttlEpochS);
             TransitionAwaitSuspension suspension = new TransitionAwaitSuspension(
-                tenantId, executionId, unitId, awaitStepIndex, unit, java.util.List.of());
+                tenantId, executionId, unitId, awaitStepIndex, unit, List.of());
             SuspendedAwaitState state = new SuspendedAwaitState(
-                unit, suspension, suspendedPayload, capturedContext, Optional.empty());
-            units.put(unitKey(tenantId, unitId), state);
+                unit,
+                suspension,
+                suspendedPayload,
+                capturedContext,
+                Optional.empty(),
+                ResumePhase.WAITING,
+                Optional.empty());
+            store.saveNew(unitKey(tenantId, unitId), state);
             return new StartResult(unit, suspension, suspendedPayload);
         });
     }
 
     /**
-     * Admits an external completion idempotently and resumes {@code postAwaitRunner} with the
-     * restored {@link TpfExecutionContext} and a fresh {@link SpringTransitionDispatchScope}.
+     * Admits an external completion durably into {@link ResumePhase#RESUMING} and executes
+     * {@code postAwaitRunner} with the restored {@link TpfExecutionContext} and a deterministic
+     * {@link SpringTransitionDispatchScope}. Transitions to {@link AwaitUnitStatus#COMPLETED}
+     * only after {@code postAwaitRunner} succeeds; failures leave the unit recoverable.
      */
     public CompletionStage<ResumeResult> admitCompletionAndResume(
         String tenantId,
@@ -185,45 +211,59 @@ public final class SpringAwaitResumeCoordinator {
         Objects.requireNonNull(postAwaitRunner, "postAwaitRunner");
 
         String key = unitKey(tenantId, unitId);
-        AdmissionOutcome admission = admitAtomically(key, completionKey, completionPayload);
+        AdmissionOutcome admission = admitForResumeAtomically(key, completionKey, completionPayload);
         if (admission.status() != ResumeStatus.RESUMED) {
             return CompletableFuture.completedFuture(
                 new ResumeResult(admission.status(), admission.updatedUnit(), Optional.empty()));
         }
-
-        SuspendedAwaitState admittedState = admission.state().orElseThrow();
-        AwaitUnitRecord completedUnit = admittedState.unit();
-        TpfExecutionContext.Snapshot previous = TpfExecutionContext.capture();
-        SpringTransitionDispatchScope resumeScope = new SpringTransitionDispatchScope(
-            tenantId,
-            completedUnit.executionId(),
-            completedUnit.version(),
-            1,
-            "await-resume:" + unitId + ":" + completionKey);
-        try {
-            TpfExecutionContext.restore(admittedState.capturedContext());
-            try (SpringTransitionDispatchScope.Scope ignored = SpringTransitionDispatchScope.open(resumeScope)) {
-                return postAwaitRunner.run(completionPayload).thenApply(rawOutput -> {
-                    if (!(rawOutput instanceof SpringCanonicalPayload output)) {
-                        throw new IllegalStateException(
-                            "Post-Await runner must produce SpringCanonicalPayload, got "
-                                + (rawOutput == null ? "null" : rawOutput.getClass().getName()));
-                    }
-                    return new ResumeResult(ResumeStatus.RESUMED, Optional.of(completedUnit), Optional.of(output));
-                });
-            }
-        } finally {
-            TpfExecutionContext.restore(previous);
-        }
+        return executePostAwaitAndFinalize(key, admission.state().orElseThrow(), postAwaitRunner);
     }
 
-    /** Transitions an active {@code WAITING_EXTERNAL} await unit to {@code TIMED_OUT}. */
+    /**
+     * Recovers a unit that was durably admitted into {@link ResumePhase#RESUMING} (for example
+     * after a post-Await failure or process restart), replaying with the persisted completion
+     * payload, captured context, and identical {@link SpringTransitionDispatchScope} identity.
+     */
+    public CompletionStage<ResumeResult> retryPendingResume(
+        String tenantId,
+        String unitId,
+        SpringPipelineRunner postAwaitRunner
+    ) {
+        requireNonBlank(tenantId, "tenantId");
+        requireNonBlank(unitId, "unitId");
+        Objects.requireNonNull(postAwaitRunner, "postAwaitRunner");
+
+        String key = unitKey(tenantId, unitId);
+        Optional<SuspendedAwaitState> existingOpt = store.find(key);
+        if (existingOpt.isEmpty()) {
+            return CompletableFuture.completedFuture(
+                new ResumeResult(ResumeStatus.UNKNOWN_UNIT, Optional.empty(), Optional.empty()));
+        }
+        SuspendedAwaitState state = existingOpt.orElseThrow();
+        if (state.phase() == ResumePhase.COMPLETED) {
+            return CompletableFuture.completedFuture(
+                new ResumeResult(ResumeStatus.DUPLICATE_IGNORED, Optional.of(state.unit()), Optional.empty()));
+        }
+        if (state.phase() == ResumePhase.TIMED_OUT || state.unit().status().terminal()) {
+            return CompletableFuture.completedFuture(
+                new ResumeResult(ResumeStatus.TERMINAL_REJECTED, Optional.of(state.unit()), Optional.empty()));
+        }
+        if (state.phase() != ResumePhase.RESUMING
+            || state.completionPayload().isEmpty()
+            || state.admittedCompletionKey().isEmpty()) {
+            throw new IllegalStateException(
+                "Await unit '" + unitId + "' has no durably admitted completion pending resume");
+        }
+        return executePostAwaitAndFinalize(key, state, postAwaitRunner);
+    }
+
+    /** Transitions an active {@link ResumePhase#WAITING} await unit to {@link AwaitUnitStatus#TIMED_OUT}. */
     public Optional<AwaitUnitRecord> timeoutUnit(String tenantId, String unitId) {
         requireNonBlank(tenantId, "tenantId");
         requireNonBlank(unitId, "unitId");
         String key = unitKey(tenantId, unitId);
-        SuspendedAwaitState updated = units.computeIfPresent(key, (k, existing) -> {
-            if (existing.unit().status().terminal()) {
+        Optional<SuspendedAwaitState> updated = store.updateAtomically(key, existing -> {
+            if (existing.phase() != ResumePhase.WAITING || existing.unit().status().terminal()) {
                 return existing;
             }
             AwaitUnitRecord u = existing.unit();
@@ -235,33 +275,159 @@ public final class SpringAwaitResumeCoordinator {
             TransitionAwaitSuspension updatedSuspension = new TransitionAwaitSuspension(
                 u.tenantId(), u.executionId(), u.unitId(), u.stepIndex(), timedOut, existing.suspension().interactions());
             return new SuspendedAwaitState(
-                timedOut, updatedSuspension, existing.suspendedPayload(), existing.capturedContext(), existing.completionPayload());
+                timedOut,
+                updatedSuspension,
+                existing.suspendedPayload(),
+                existing.capturedContext(),
+                existing.completionPayload(),
+                ResumePhase.TIMED_OUT,
+                existing.admittedCompletionKey());
         });
-        return Optional.ofNullable(updated).map(SuspendedAwaitState::unit);
+        return updated.map(SuspendedAwaitState::unit);
     }
 
     public Optional<SuspendedAwaitState> findUnit(String tenantId, String unitId) {
         requireNonBlank(tenantId, "tenantId");
         requireNonBlank(unitId, "unitId");
-        return Optional.ofNullable(units.get(unitKey(tenantId, unitId)));
+        return store.find(unitKey(tenantId, unitId));
     }
 
-    private AdmissionOutcome admitAtomically(String key, String completionKey, SpringCanonicalPayload completionPayload) {
-        final AdmissionOutcome[] holder = new AdmissionOutcome[] {
-            new AdmissionOutcome(ResumeStatus.UNKNOWN_UNIT, Optional.empty(), Optional.empty())
-        };
-        units.computeIfPresent(key, (k, existing) -> {
+    private CompletionStage<ResumeResult> executePostAwaitAndFinalize(
+        String key,
+        SuspendedAwaitState admittedState,
+        SpringPipelineRunner postAwaitRunner
+    ) {
+        if (!activeResumes.add(key)) {
+            return CompletableFuture.completedFuture(
+                new ResumeResult(ResumeStatus.RESUME_IN_PROGRESS, Optional.of(admittedState.unit()), Optional.empty()));
+        }
+        AwaitUnitRecord resumingUnit = admittedState.unit();
+        String completionKey = admittedState.admittedCompletionKey().orElseThrow();
+        SpringCanonicalPayload payloadToRun = admittedState.completionPayload().orElseThrow();
+        SpringTransitionDispatchScope resumeScope = new SpringTransitionDispatchScope(
+            resumingUnit.tenantId(),
+            resumingUnit.executionId(),
+            resumingUnit.version(),
+            1,
+            "await-resume:" + resumingUnit.unitId() + ":" + completionKey);
+
+        CompletionStage<Object> runStage;
+        TpfExecutionContext.Snapshot previous = TpfExecutionContext.capture();
+        try {
+            TpfExecutionContext.restore(admittedState.capturedContext());
+            try (SpringTransitionDispatchScope.Scope ignored = SpringTransitionDispatchScope.open(resumeScope)) {
+                runStage = postAwaitRunner.run(payloadToRun);
+            }
+        } catch (Throwable synchronousFailure) {
+            activeResumes.remove(key);
+            CompletableFuture<ResumeResult> failed = new CompletableFuture<>();
+            failed.completeExceptionally(synchronousFailure);
+            return failed;
+        } finally {
+            TpfExecutionContext.restore(previous);
+        }
+
+        CompletableFuture<ResumeResult> outcome = new CompletableFuture<>();
+        runStage.whenComplete((rawOutput, failure) -> {
+            try {
+                if (failure != null) {
+                    outcome.completeExceptionally(failure);
+                    return;
+                }
+                if (!(rawOutput instanceof SpringCanonicalPayload output)) {
+                    outcome.completeExceptionally(new IllegalStateException(
+                        "Post-Await runner must produce SpringCanonicalPayload, got "
+                            + (rawOutput == null ? "null" : rawOutput.getClass().getName())));
+                    return;
+                }
+                AwaitUnitRecord completedUnit = markCompletedAtomically(key, completionKey);
+                outcome.complete(new ResumeResult(ResumeStatus.RESUMED, Optional.of(completedUnit), Optional.of(output)));
+            } catch (Throwable finalizationFailure) {
+                outcome.completeExceptionally(finalizationFailure);
+            } finally {
+                activeResumes.remove(key);
+            }
+        });
+        return outcome;
+    }
+
+    private AdmissionOutcome admitForResumeAtomically(
+        String key,
+        String completionKey,
+        SpringCanonicalPayload completionPayload
+    ) {
+        AtomicReference<AdmissionOutcome> holder = new AtomicReference<>(
+            new AdmissionOutcome(ResumeStatus.UNKNOWN_UNIT, Optional.empty(), Optional.empty()));
+        store.updateAtomically(key, existing -> {
             AwaitUnitRecord current = existing.unit();
-            if (current.completedItemKeys().contains(completionKey)) {
-                holder[0] = new AdmissionOutcome(
-                    ResumeStatus.DUPLICATE_IGNORED, Optional.of(current), Optional.of(existing));
+            if (existing.phase() == ResumePhase.COMPLETED) {
+                if (current.completedItemKeys().contains(completionKey)
+                    || existing.admittedCompletionKey().map(completionKey::equals).orElse(false)) {
+                    holder.set(new AdmissionOutcome(
+                        ResumeStatus.DUPLICATE_IGNORED, Optional.of(current), Optional.of(existing)));
+                } else {
+                    holder.set(new AdmissionOutcome(
+                        ResumeStatus.TERMINAL_REJECTED, Optional.of(current), Optional.of(existing)));
+                }
                 return existing;
             }
-            if (current.status().terminal()) {
-                holder[0] = new AdmissionOutcome(
-                    ResumeStatus.TERMINAL_REJECTED, Optional.of(current), Optional.of(existing));
+            if (existing.phase() == ResumePhase.TIMED_OUT || current.status().terminal()) {
+                holder.set(new AdmissionOutcome(
+                    ResumeStatus.TERMINAL_REJECTED, Optional.of(current), Optional.of(existing)));
                 return existing;
             }
+            if (existing.phase() == ResumePhase.RESUMING) {
+                if (existing.admittedCompletionKey().map(completionKey::equals).orElse(false)) {
+                    // Recoverable retry of the same admitted completion key with the persisted payload & version.
+                    holder.set(new AdmissionOutcome(
+                        ResumeStatus.RESUMED, Optional.of(current), Optional.of(existing)));
+                } else {
+                    holder.set(new AdmissionOutcome(
+                        ResumeStatus.TERMINAL_REJECTED, Optional.of(current), Optional.of(existing)));
+                }
+                return existing;
+            }
+            // WAITING -> RESUMING (non-terminal; preserves admitted payload and stable replay version)
+            AwaitUnitRecord resuming = new AwaitUnitRecord(
+                current.tenantId(),
+                current.unitId(),
+                current.executionId(),
+                current.stepId(),
+                current.stepIndex(),
+                current.cardinality(),
+                current.version() + 1L,
+                AwaitUnitStatus.WAITING_EXTERNAL,
+                current.primaryInteractionId(),
+                current.expectedItemCount(),
+                current.completedItemCount(),
+                current.completedItemKeys(),
+                current.dispatchComplete(),
+                current.createdAtEpochMs(),
+                clock.millis(),
+                current.ttlEpochS());
+            TransitionAwaitSuspension updatedSuspension = new TransitionAwaitSuspension(
+                resuming.tenantId(), resuming.executionId(), resuming.unitId(), resuming.stepIndex(),
+                resuming, existing.suspension().interactions());
+            SuspendedAwaitState nextState = new SuspendedAwaitState(
+                resuming,
+                updatedSuspension,
+                existing.suspendedPayload(),
+                existing.capturedContext(),
+                Optional.of(completionPayload),
+                ResumePhase.RESUMING,
+                Optional.of(completionKey));
+            holder.set(new AdmissionOutcome(ResumeStatus.RESUMED, Optional.of(resuming), Optional.of(nextState)));
+            return nextState;
+        });
+        return holder.get();
+    }
+
+    private AwaitUnitRecord markCompletedAtomically(String key, String completionKey) {
+        Optional<SuspendedAwaitState> updated = store.updateAtomically(key, existing -> {
+            if (existing.phase() == ResumePhase.COMPLETED) {
+                return existing;
+            }
+            AwaitUnitRecord current = existing.unit();
             Set<String> nextKeys = new HashSet<>(current.completedItemKeys());
             nextKeys.add(completionKey);
             AwaitUnitRecord completed = new AwaitUnitRecord(
@@ -284,13 +450,17 @@ public final class SpringAwaitResumeCoordinator {
             TransitionAwaitSuspension updatedSuspension = new TransitionAwaitSuspension(
                 completed.tenantId(), completed.executionId(), completed.unitId(), completed.stepIndex(),
                 completed, existing.suspension().interactions());
-            SuspendedAwaitState nextState = new SuspendedAwaitState(
-                completed, updatedSuspension, existing.suspendedPayload(),
-                existing.capturedContext(), Optional.of(completionPayload));
-            holder[0] = new AdmissionOutcome(ResumeStatus.RESUMED, Optional.of(completed), Optional.of(nextState));
-            return nextState;
+            return new SuspendedAwaitState(
+                completed,
+                updatedSuspension,
+                existing.suspendedPayload(),
+                existing.capturedContext(),
+                existing.completionPayload(),
+                ResumePhase.COMPLETED,
+                Optional.of(completionKey));
         });
-        return holder[0];
+        return updated.map(SuspendedAwaitState::unit)
+            .orElseThrow(() -> new IllegalStateException("Persisted Await unit disappeared before completion: " + key));
     }
 
     private record AdmissionOutcome(
@@ -301,7 +471,7 @@ public final class SpringAwaitResumeCoordinator {
     }
 
     private static String unitKey(String tenantId, String unitId) {
-        return tenantId + "::" + unitId;
+        return tenantId.length() + ":" + tenantId + ":" + unitId;
     }
 
     private static void requireNonBlank(String value, String name) {

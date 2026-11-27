@@ -38,6 +38,8 @@ public class SpringPolyglotProperties {
     private Duration streamIdleTimeout = Duration.ofSeconds(60);
     private int maxResponseBytes = SpringCanonicalFunctionHostStep.DEFAULT_MAX_RESPONSE_BYTES;
     private String contractResourcePath = PipelineContractDescriptor.RESOURCE_PATH;
+    private String stateDir = "";
+    private boolean allowInMemoryStores = false;
 
     public boolean isEnabled() {
         return enabled;
@@ -111,5 +113,30 @@ public class SpringPolyglotProperties {
         this.contractResourcePath = contractResourcePath == null || contractResourcePath.isBlank()
             ? PipelineContractDescriptor.RESOURCE_PATH
             : contractResourcePath;
+    }
+
+    /**
+     * Directory for durable file-backed dispatch-intent and Await state stores when custom store
+     * beans are not supplied.
+     */
+    public String getStateDir() {
+        return stateDir;
+    }
+
+    public void setStateDir(String stateDir) {
+        this.stateDir = stateDir == null ? "" : stateDir.trim();
+    }
+
+    /**
+     * Explicit opt-in for local- and test-only in-memory dispatch-intent and Await state stores.
+     * Defaults to {@code false} so production Spring polyglot deployments fail closed if no
+     * durable store is configured.
+     */
+    public boolean isAllowInMemoryStores() {
+        return allowInMemoryStores;
+    }
+
+    public void setAllowInMemoryStores(boolean allowInMemoryStores) {
+        this.allowInMemoryStores = allowInMemoryStores;
     }
 }

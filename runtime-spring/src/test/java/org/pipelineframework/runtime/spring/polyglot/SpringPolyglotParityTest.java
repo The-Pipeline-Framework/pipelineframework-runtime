@@ -16,9 +16,11 @@
 
 package org.pipelineframework.runtime.spring.polyglot;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -28,11 +30,16 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -51,6 +58,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.pipelineframework.awaitable.AwaitUnitStatus;
 import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 import org.pipelineframework.orchestrator.TransitionPayloadEncoding;
@@ -69,7 +77,8 @@ import org.springframework.context.event.EventListener;
 
 /**
  * End-to-end qualification of Spring-hosted polyglot {@link SpringCanonicalFunctionHostStep}
- * execution, durable Await resume, and cross-pipeline checkpoint interoperability.
+ * execution, durable Await resume, crash/restart recovery, and cross-pipeline checkpoint
+ * interoperability.
  */
 class SpringPolyglotParityTest {
 
@@ -99,7 +108,9 @@ class SpringPolyglotParityTest {
     }
 
     @Test
-    void autoWiredSpringPipelineRunnerExecutesPolyglotStepsPreservingPrecisionContextAndDispatchIntent() throws Exception {
+    void autoWiredSpringPipelineRunnerExecutesPolyglotStepsPreservingPrecisionContextAndDurableDispatchIntent(
+        @TempDir Path stateDir
+    ) throws Exception {
         AtomicReference<String> seenVersionTag = new AtomicReference<>();
         AtomicInteger validateCalls = new AtomicInteger();
 
@@ -136,27 +147,29 @@ class SpringPolyglotParityTest {
             sendJson(exchange, 404, "{\"status\":\"ERROR\",\"code\":\"NOT_FOUND\"}");
         });
 
+        SpringCanonicalPayload input = SpringCanonicalPayload.ofJson(
+            "Order", "fp-Order", "catalog-fp-spring-1",
+            "{\"orderId\":\"ord-1\",\"amount\":" + EXACT_DECIMAL + ",\"seq\":" + EXACT_INT64 + "}");
+        SpringTransitionDispatchScope scope = new SpringTransitionDispatchScope(
+            "tenant-s", "exec-1", 1L, 1, "tx-1");
+
+        // Run #1: backed by durable file store in stateDir
         contextRunner
             .withPropertyValues(
                 "pipeline.polyglot.enabled=true",
                 "pipeline.polyglot.function-host-uri=" + host,
                 "pipeline.polyglot.shared-secret=" + SHARED_SECRET,
                 "pipeline.polyglot.allow-loopback-http=true",
+                "pipeline.polyglot.state-dir=" + stateDir,
                 "pipeline.polyglot.contract-resource-path=polyglot/spring-unary-contract.json")
             .run(context -> {
                 assertNullStartupFailure(context);
                 SpringPipelineRunner runner = context.getBean(SpringPipelineRunner.class);
-                SpringForeignDispatchIntentStore.InMemory intentStore =
-                    assertInstanceOf(SpringForeignDispatchIntentStore.InMemory.class,
-                        context.getBean(SpringForeignDispatchIntentStore.class));
+                assertInstanceOf(
+                    SpringForeignDispatchIntentStore.FileBacked.class,
+                    context.getBean(SpringForeignDispatchIntentStore.class));
 
                 assertEquals(2, runner.stepCount());
-                SpringCanonicalPayload input = SpringCanonicalPayload.ofJson(
-                    "Order", "fp-Order", "catalog-fp-spring-1",
-                    "{\"orderId\":\"ord-1\",\"amount\":" + EXACT_DECIMAL + ",\"seq\":" + EXACT_INT64 + "}");
-
-                SpringTransitionDispatchScope scope = new SpringTransitionDispatchScope(
-                    "tenant-s", "exec-1", 1L, 1, "tx-1");
                 SpringCanonicalPayload output;
                 try (var ctxScope = TpfExecutionContext.withHeaders("v-spring-42", "LIVE", "DEFAULT");
                      var dispatchScope = SpringTransitionDispatchScope.open(scope)) {
@@ -170,11 +183,23 @@ class SpringPolyglotParityTest {
                     "29-digit exact decimal must survive Spring polyglot hops: " + output.payloadJson());
                 assertTrue(output.payloadJson().contains(EXACT_INT64),
                     "int64 > 2^53 must survive Spring polyglot hops: " + output.payloadJson());
-                assertEquals(2, intentStore.reservationCount());
                 assertTrue(TpfExecutionContext.versionTag().isEmpty());
+            });
 
-                // Replaying the same transitionKey must fail closed BEFORE hitting the foreign host
-                int callsBeforeReplay = validateCalls.get();
+        // Run #2 (simulated process restart with fresh Spring context pointing at same stateDir):
+        // Replaying the same transitionKey MUST fail closed BEFORE hitting the foreign host!
+        int callsAfterRestart = validateCalls.get();
+        contextRunner
+            .withPropertyValues(
+                "pipeline.polyglot.enabled=true",
+                "pipeline.polyglot.function-host-uri=" + host,
+                "pipeline.polyglot.shared-secret=" + SHARED_SECRET,
+                "pipeline.polyglot.allow-loopback-http=true",
+                "pipeline.polyglot.state-dir=" + stateDir,
+                "pipeline.polyglot.contract-resource-path=polyglot/spring-unary-contract.json")
+            .run(context -> {
+                assertNullStartupFailure(context);
+                SpringPipelineRunner runner = context.getBean(SpringPipelineRunner.class);
                 try (var dispatchScope = SpringTransitionDispatchScope.open(scope)) {
                     CompletionException failure = assertThrows(CompletionException.class,
                         () -> runner.run(input).toCompletableFuture().join());
@@ -183,19 +208,20 @@ class SpringPolyglotParityTest {
                     assertTrue(unknown.isOutcomeUnknown());
                     assertFalse(unknown.isRetryable());
                 }
-                assertEquals(callsBeforeReplay, validateCalls.get(),
-                    "Duplicate pre-send intent must suppress automatic wire resend");
             });
+        assertEquals(callsAfterRestart, validateCalls.get(),
+            "Durable pre-send intent must suppress automatic wire resend across restarts");
     }
 
     @Test
-    void enforcesHttpsByDefaultAndFailsClosedWhenSharedSecretMissing() {
+    void enforcesHttpsSharedSecretAndDurableStoreRequirementsOnStartup() {
         contextRunner
             .withPropertyValues(
                 "pipeline.polyglot.enabled=true",
                 "pipeline.polyglot.function-host-uri=http://127.0.0.1:8080",
                 "pipeline.polyglot.shared-secret=" + SHARED_SECRET,
                 "pipeline.polyglot.allow-loopback-http=false",
+                "pipeline.polyglot.allow-in-memory-stores=true",
                 "pipeline.polyglot.contract-resource-path=polyglot/spring-unary-contract.json")
             .run(context -> {
                 assertNotNull(context.getStartupFailure());
@@ -206,15 +232,57 @@ class SpringPolyglotParityTest {
             .withPropertyValues(
                 "pipeline.polyglot.enabled=true",
                 "pipeline.polyglot.function-host-uri=https://node.example.com",
+                "pipeline.polyglot.allow-in-memory-stores=true",
                 "pipeline.polyglot.contract-resource-path=polyglot/spring-unary-contract.json")
             .run(context -> {
                 assertNotNull(context.getStartupFailure());
                 assertTrue(rootMessage(context.getStartupFailure()).contains("shared-secret"));
             });
+
+        // Enabled polyglot without custom durable store bean, state-dir, or allow-in-memory-stores MUST fail closed
+        contextRunner
+            .withPropertyValues(
+                "pipeline.polyglot.enabled=true",
+                "pipeline.polyglot.function-host-uri=https://node.example.com",
+                "pipeline.polyglot.shared-secret=" + SHARED_SECRET,
+                "pipeline.polyglot.contract-resource-path=polyglot/spring-unary-contract.json")
+            .run(context -> {
+                assertNotNull(context.getStartupFailure());
+                assertTrue(rootMessage(context.getStartupFailure()).contains("durable"));
+            });
+
+        // Null entry in stepUris falls back cleanly to functionHostUri instead of throwing NPE
+        SpringPolyglotProperties props = new SpringPolyglotProperties();
+        props.setEnabled(true);
+        props.setFunctionHostUri("https://node.example.com");
+        props.setSharedSecret(SHARED_SECRET);
+        props.setContractResourcePath("polyglot/spring-unary-contract.json");
+        Map<String, String> overrides = new LinkedHashMap<>();
+        overrides.put("validate-order", null);
+        props.setStepUris(overrides);
+        SpringPolyglotAutoConfiguration.SpringPolyglotStepRegistry registry =
+            SpringPolyglotAutoConfiguration.buildRegistry(
+                props, SpringForeignDispatchIntentStore.noop(), getClass().getClassLoader());
+        assertEquals(2, registry.orderedSteps().size());
     }
 
     @Test
-    void classifiesPortableBusinessRejectionTransientAuthAndUnknownFailures() throws Exception {
+    void rejectsNonClassFreeJvmRuntimeStepsAndUnsupportedStepKinds() {
+        SpringPolyglotProperties props = new SpringPolyglotProperties();
+        props.setEnabled(true);
+        props.setFunctionHostUri("https://node.example.com");
+        props.setSharedSecret(SHARED_SECRET);
+        props.setContractResourcePath("polyglot/spring-jvm-mixed-contract.json");
+
+        IllegalStateException err = assertThrows(
+            IllegalStateException.class,
+            () -> SpringPolyglotAutoConfiguration.buildRegistry(
+                props, SpringForeignDispatchIntentStore.noop(), getClass().getClassLoader()));
+        assertTrue(err.getMessage().contains("runtimeClass"));
+    }
+
+    @Test
+    void classifiesPortableBusinessRejectionTransientAuthUnknownAndBoundedResponseSize() throws Exception {
         AtomicReference<String> mode = new AtomicReference<>("BUSINESS");
         URI host = startServer(exchange -> {
             exchange.getRequestBody().readAllBytes();
@@ -225,6 +293,9 @@ class SpringPolyglotParityTest {
                     "{\"status\":\"ERROR\",\"disposition\":\"TRANSIENT\",\"code\":\"RATE_LIMITED\",\"message\":\"Retry later\"}");
                 case "AUTH" -> sendJson(exchange, 401,
                     "{\"status\":\"ERROR\",\"code\":\"UNAUTHORIZED\"}");
+                case "OVERSIZED" -> sendJson(exchange, 200,
+                    "{\"status\":\"OK\",\"outputTypeId\":\"EnrichedOrder\",\"payload\":{\"blob\":\""
+                        + "x".repeat(2048) + "\"}}");
                 default -> sendJson(exchange, 503, "upstream down");
             }
         });
@@ -234,7 +305,7 @@ class SpringPolyglotParityTest {
                 "validate-order", 0, "ONE_TO_ONE",
                 "Order", "fp-Order", "EnrichedOrder", "fp-EnrichedOrder", "catalog-fp-spring-1",
                 host, SHARED_SECRET, Duration.ofSeconds(5), Duration.ofSeconds(5),
-                SpringForeignDispatchIntentStore.noop(), SpringCanonicalFunctionHostStep.DEFAULT_MAX_RESPONSE_BYTES),
+                SpringForeignDispatchIntentStore.noop(), 512),
             true);
         SpringCanonicalPayload input = SpringCanonicalPayload.ofJson(
             "Order", "fp-Order", "catalog-fp-spring-1", "{\"orderId\":\"o1\"}");
@@ -266,10 +337,19 @@ class SpringPolyglotParityTest {
         CompletionException unknownErr = assertThrows(CompletionException.class,
             () -> step.apply(input).toCompletableFuture().join());
         assertInstanceOf(SpringForeignStepException.OutcomeUnknown.class, unknownErr.getCause());
+
+        mode.set("OVERSIZED");
+        CompletionException oversizedErr = assertThrows(CompletionException.class,
+            () -> step.apply(input).toCompletableFuture().join());
+        SpringForeignStepException.OutcomeUnknown oversized =
+            assertInstanceOf(SpringForeignStepException.OutcomeUnknown.class, oversizedErr.getCause());
+        assertTrue(oversized.getMessage().contains("512 byte limit"));
     }
 
     @Test
-    void supportsOneToManyManyToOneAndTrueInterleavedFullDuplexManyToManyUnderSpring() throws Exception {
+    void supportsOneToManyManyToOneAndTrueInterleavedFullDuplexManyToManyIncludingMixedRunner(
+        @TempDir Path stateDir
+    ) throws Exception {
         URI host = startServer(exchange -> {
             String path = exchange.getRequestURI().getPath();
             if ("/tpf/functions/split-batch/stream".equals(path)) {
@@ -344,19 +424,28 @@ class SpringPolyglotParityTest {
             sendJson(exchange, 404, "{\"status\":\"ERROR\",\"code\":\"NOT_FOUND\"}");
         });
 
+        // Auto-configured SpringPipelineRunner MUST execute ALL 3 mixed-cardinality steps (never 0 steps)!
         contextRunner
             .withPropertyValues(
                 "pipeline.polyglot.enabled=true",
                 "pipeline.polyglot.function-host-uri=" + host,
                 "pipeline.polyglot.shared-secret=" + SHARED_SECRET,
                 "pipeline.polyglot.allow-loopback-http=true",
+                "pipeline.polyglot.state-dir=" + stateDir,
                 "pipeline.polyglot.contract-resource-path=polyglot/spring-streaming-contract.json")
             .run(context -> {
                 assertNullStartupFailure(context);
                 SpringPolyglotAutoConfiguration.SpringPolyglotStepRegistry registry =
                     context.getBean(SpringPolyglotAutoConfiguration.SpringPolyglotStepRegistry.class);
                 assertEquals(3, registry.orderedSteps().size());
-                assertEquals(0, context.getBean(SpringPipelineRunner.class).stepCount());
+                SpringPipelineRunner runner = context.getBean(SpringPipelineRunner.class);
+                assertEquals(1, runner.stepCount());
+                SpringCanonicalPayload batchInput = SpringCanonicalPayload.ofJson(
+                    "Batch", "fp-Batch", "catalog-fp-stream-1", "{\"id\":\"b-runner\"}");
+                SpringCanonicalPayload summary = (SpringCanonicalPayload) runner.run(batchInput)
+                    .toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertEquals("Summary", summary.canonicalTypeId());
+                assertTrue(summary.payloadJson().contains("\"count\":2"));
             });
 
         SpringPolyglotProperties props = new SpringPolyglotProperties();
@@ -454,8 +543,142 @@ class SpringPolyglotParityTest {
     }
 
     @Test
-    void durableAwaitSuspendAndIdempotentResumeUnderSpringRestoresContextAndSuppressesDuplicates() throws Exception {
+    void enforcesStreamingCancellationInvalidDemandDeferredReservation103HintsAndContentLength() throws Exception {
+        // Test 1: Cancelling ONE_TO_MANY in onSubscribe never reserves or records UNCERTAIN
+        SpringForeignDispatchIntentStore.InMemory intentStore = SpringForeignDispatchIntentStore.inMemory();
+        URI host = startServer(exchange -> sendJson(exchange, 200, "{}"));
+        SpringCanonicalFunctionHostStep oneToManyStep = new SpringCanonicalFunctionHostStep(
+            new SpringCanonicalFunctionHostStep.Spec(
+                "split-batch", 0, "ONE_TO_MANY",
+                "Batch", "fp-Batch", "Frame", "fp-Frame", "cat-1",
+                host, SHARED_SECRET, Duration.ofSeconds(2), Duration.ofMillis(300),
+                intentStore, SpringCanonicalFunctionHostStep.DEFAULT_MAX_RESPONSE_BYTES),
+            true);
+        SpringCanonicalPayload batch = SpringCanonicalPayload.ofJson("Batch", "fp-Batch", "cat-1", "{\"id\":\"b1\"}");
+        SpringTransitionDispatchScope scope = new SpringTransitionDispatchScope("t1", "e1", 1L, 1, "tx-cancel-early");
+        try (var ignored = SpringTransitionDispatchScope.open(scope)) {
+            oneToManyStep.applyOneToMany(batch).subscribe(new Flow.Subscriber<>() {
+                @Override
+                public void onSubscribe(Flow.Subscription s) {
+                    s.cancel();
+                }
+
+                @Override
+                public void onNext(SpringCanonicalPayload item) {
+                }
+
+                @Override
+                public void onError(Throwable t) {
+                }
+
+                @Override
+                public void onComplete() {
+                }
+            });
+        }
+        assertEquals(0, intentStore.reservationCount(),
+            "Cancelling in onSubscribe before request() must not reserve or mark UNCERTAIN");
+
+        // Test 2: request(0) signals IllegalArgumentException on onError
+        AtomicReference<Throwable> invalidDemandError = new AtomicReference<>();
+        oneToManyStep.applyOneToMany(batch).subscribe(new Flow.Subscriber<>() {
+            @Override
+            public void onSubscribe(Flow.Subscription s) {
+                s.request(0L);
+            }
+
+            @Override
+            public void onNext(SpringCanonicalPayload item) {
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                invalidDemandError.set(t);
+            }
+
+            @Override
+            public void onComplete() {
+            }
+        });
+        assertInstanceOf(IllegalArgumentException.class, invalidDemandError.get());
+
+        // Test 3: Raw TCP server sending 103 Early Hints + exact Content-Length + premature EOF / interior CR checks
+        try (ServerSocket rawServer = new ServerSocket(0, 10, java.net.InetAddress.getByName("127.0.0.1"))) {
+            URI rawOrigin = URI.create("http://127.0.0.1:" + rawServer.getLocalPort());
+            SpringCanonicalFunctionHostStep rawStep = new SpringCanonicalFunctionHostStep(
+                new SpringCanonicalFunctionHostStep.Spec(
+                    "split-batch", 0, "ONE_TO_MANY",
+                    "Batch", "fp-Batch", "Frame", "fp-Frame", "cat-1",
+                    rawOrigin, SHARED_SECRET, Duration.ofSeconds(2), Duration.ofMillis(400),
+                    SpringForeignDispatchIntentStore.noop(), SpringCanonicalFunctionHostStep.DEFAULT_MAX_RESPONSE_BYTES),
+                true);
+
+            // 3a: 103 Early Hints followed by 200 with exact Content-Length
+            Thread.startVirtualThread(() -> {
+                try (Socket client = rawServer.accept()) {
+                    drainHeaders(client);
+                    String body = "{\"event\":\"item\",\"outputTypeId\":\"Frame\",\"payload\":{\"seq\":7}}\r\n"
+                        + "{\"event\":\"complete\"}\r\n";
+                    byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
+                    String resp = "HTTP/1.1 103 Early Hints\r\nLink: </preload>; rel=preload\r\n\r\n"
+                        + "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n"
+                        + "Content-Length: " + bodyBytes.length + "\r\n\r\n";
+                    OutputStream out = client.getOutputStream();
+                    out.write(resp.getBytes(StandardCharsets.US_ASCII));
+                    out.write(bodyBytes);
+                    out.flush();
+                } catch (IOException ignored) {
+                    // test socket closed
+                }
+            });
+            List<SpringCanonicalPayload> hinted = collectPublisher(rawStep.applyOneToMany(batch));
+            assertEquals(1, hinted.size());
+            assertTrue(hinted.get(0).payloadJson().contains("\"seq\":7"));
+
+            // 3b: Content-Length shorter than complete frame -> MUST NOT read past boundary and MUST fail!
+            Thread.startVirtualThread(() -> {
+                try (Socket client = rawServer.accept()) {
+                    drainHeaders(client);
+                    String firstLine = "{\"event\":\"item\",\"outputTypeId\":\"Frame\",\"payload\":{\"seq\":8}}\n";
+                    String smuggledComplete = "{\"event\":\"complete\"}\n";
+                    String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n"
+                        + "Content-Length: " + firstLine.getBytes(StandardCharsets.UTF_8).length + "\r\n\r\n"
+                        + firstLine + smuggledComplete;
+                    OutputStream out = client.getOutputStream();
+                    out.write(resp.getBytes(StandardCharsets.UTF_8));
+                    out.flush();
+                } catch (IOException ignored) {
+                    // test socket closed
+                }
+            });
+            Exception boundaryErr = assertThrows(Exception.class, () -> collectPublisher(rawStep.applyOneToMany(batch)));
+            assertInstanceOf(SpringForeignStepException.OutcomeUnknown.class, boundaryErr.getCause());
+
+            // 3c: Interior CR inside number (1\r2) MUST NOT be stripped into 12!
+            Thread.startVirtualThread(() -> {
+                try (Socket client = rawServer.accept()) {
+                    drainHeaders(client);
+                    String badBody = "{\"event\":\"item\",\"outputTypeId\":\"Frame\",\"payload\":{\"seq\":1\r2}}\n"
+                        + "{\"event\":\"complete\"}\n";
+                    String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n"
+                        + "Content-Length: " + badBody.getBytes(StandardCharsets.UTF_8).length + "\r\n\r\n"
+                        + badBody;
+                    OutputStream out = client.getOutputStream();
+                    out.write(resp.getBytes(StandardCharsets.UTF_8));
+                    out.flush();
+                } catch (IOException ignored) {
+                    // test socket closed
+                }
+            });
+            Exception crErr = assertThrows(Exception.class, () -> collectPublisher(rawStep.applyOneToMany(batch)));
+            assertInstanceOf(SpringForeignStepException.OutcomeUnknown.class, crErr.getCause());
+        }
+    }
+
+    @Test
+    void durableAwaitSurvivesRestartRecoversFailedPostAwaitAndIsolatesTenants(@TempDir Path awaitDir) throws Exception {
         AtomicInteger postAwaitCalls = new AtomicInteger();
+        AtomicBoolean failFirstPostAwait = new AtomicBoolean(true);
         AtomicReference<String> resumedVersionTag = new AtomicReference<>();
 
         URI host = startServer(exchange -> {
@@ -472,8 +695,13 @@ class SpringPolyglotParityTest {
                 return;
             }
             if ("/tpf/functions/finalize-payment".equals(path)) {
-                postAwaitCalls.incrementAndGet();
+                int call = postAwaitCalls.incrementAndGet();
                 resumedVersionTag.set(req.path("context").path("versionTag").asText(""));
+                if (call == 1 && failFirstPostAwait.get()) {
+                    sendJson(exchange, 200,
+                        "{\"status\":\"ERROR\",\"disposition\":\"TRANSIENT\",\"code\":\"TEMP_DOWN\",\"message\":\"Try again\"}");
+                    return;
+                }
                 JsonNode p = req.path("payload");
                 sendJson(exchange, 200,
                     "{\"status\":\"OK\",\"outputTypeId\":\"FinalizedPayment\",\"payload\":{"
@@ -485,80 +713,113 @@ class SpringPolyglotParityTest {
             sendJson(exchange, 404, "{\"status\":\"ERROR\",\"code\":\"NOT_FOUND\"}");
         });
 
-        contextRunner.run(context -> {
-            assertNullStartupFailure(context);
-            SpringAwaitResumeCoordinator coordinator = context.getBean(SpringAwaitResumeCoordinator.class);
-            PipelineRunnerCore runnerCore = context.getBean(PipelineRunnerCore.class);
-            SpringForeignDispatchIntentStore intentStore = context.getBean(SpringForeignDispatchIntentStore.class);
+        SpringAwaitStateStore.FileBacked store1 = SpringAwaitStateStore.fileBacked(awaitDir);
+        SpringAwaitResumeCoordinator coordinatorBeforeRestart = new SpringAwaitResumeCoordinator(store1);
+        PipelineRunnerCore runnerCore = new PipelineRunnerCore();
 
-            SpringCanonicalFunctionHostStep preStep = new SpringCanonicalFunctionHostStep(
-                new SpringCanonicalFunctionHostStep.Spec(
-                    "prepare-payment", 0, "ONE_TO_ONE",
-                    "Order", "fp-Order", "PreparedPayment", "fp-Prepared", "cat-await-1",
-                    host, SHARED_SECRET, Duration.ofSeconds(5), Duration.ofSeconds(5),
-                    intentStore, SpringCanonicalFunctionHostStep.DEFAULT_MAX_RESPONSE_BYTES),
-                true);
-            SpringCanonicalFunctionHostStep postStep = new SpringCanonicalFunctionHostStep(
-                new SpringCanonicalFunctionHostStep.Spec(
-                    "finalize-payment", 2, "ONE_TO_ONE",
-                    "WebhookCompletion", "fp-Completion", "FinalizedPayment", "fp-Finalized", "cat-await-1",
-                    host, SHARED_SECRET, Duration.ofSeconds(5), Duration.ofSeconds(5),
-                    intentStore, SpringCanonicalFunctionHostStep.DEFAULT_MAX_RESPONSE_BYTES),
-                true);
+        SpringCanonicalFunctionHostStep preStep = new SpringCanonicalFunctionHostStep(
+            new SpringCanonicalFunctionHostStep.Spec(
+                "prepare-payment", 0, "ONE_TO_ONE",
+                "Order", "fp-Order", "PreparedPayment", "fp-Prepared", "cat-await-1",
+                host, SHARED_SECRET, Duration.ofSeconds(5), Duration.ofSeconds(5),
+                SpringForeignDispatchIntentStore.noop(), SpringCanonicalFunctionHostStep.DEFAULT_MAX_RESPONSE_BYTES),
+            true);
+        SpringCanonicalFunctionHostStep postStep = new SpringCanonicalFunctionHostStep(
+            new SpringCanonicalFunctionHostStep.Spec(
+                "finalize-payment", 2, "ONE_TO_ONE",
+                "WebhookCompletion", "fp-Completion", "FinalizedPayment", "fp-Finalized", "cat-await-1",
+                host, SHARED_SECRET, Duration.ofSeconds(5), Duration.ofSeconds(5),
+                SpringForeignDispatchIntentStore.noop(), SpringCanonicalFunctionHostStep.DEFAULT_MAX_RESPONSE_BYTES),
+            true);
 
-            SpringPipelineRunner preRunner = new SpringPipelineRunner(runnerCore, List.of(preStep));
-            SpringPipelineRunner postRunner = new SpringPipelineRunner(runnerCore, List.of(postStep));
+        SpringPipelineRunner preRunner = new SpringPipelineRunner(runnerCore, List.of(preStep));
+        SpringPipelineRunner postRunner = new SpringPipelineRunner(runnerCore, List.of(postStep));
 
-            SpringAwaitResumeCoordinator.StartResult started;
-            try (var ctx = TpfExecutionContext.withHeaders("v-await-99", "LIVE", "DEFAULT")) {
-                started = coordinator.startAndSuspend(
-                    "tenant-a", "exec-await-1", "await-webhook", 1, Duration.ofMinutes(5),
-                    preRunner,
-                    SpringCanonicalPayload.ofJson("Order", "fp-Order", "cat-await-1", "{\"id\":\"pay-1\"}"))
-                    .toCompletableFuture().get(5, TimeUnit.SECONDS);
-            }
-            assertEquals(AwaitUnitStatus.WAITING_EXTERNAL, started.unit().status());
-            assertEquals(started.unit().unitId(), started.suspension().unitId());
-
-            SpringCanonicalPayload completion = SpringCanonicalPayload.ofJson(
-                "WebhookCompletion", "fp-Completion", "cat-await-1",
-                "{\"id\":\"pay-1\",\"settledAmount\":" + EXACT_DECIMAL + "}");
-
-            // Resume outside original TpfExecutionContext scope — coordinator must restore v-await-99!
-            SpringAwaitResumeCoordinator.ResumeResult resumed = coordinator.admitCompletionAndResume(
-                "tenant-a", started.unit().unitId(), "webhook-evt-1", completion, postRunner)
-                .toCompletableFuture().get(5, TimeUnit.SECONDS);
-            assertEquals(SpringAwaitResumeCoordinator.ResumeStatus.RESUMED, resumed.status());
-            assertEquals(AwaitUnitStatus.COMPLETED, resumed.unit().orElseThrow().status());
-            assertEquals("v-await-99", resumedVersionTag.get());
-            assertTrue(resumed.resumedOutput().orElseThrow().payloadJson().contains(EXACT_DECIMAL));
-            assertEquals(1, postAwaitCalls.get());
-
-            // Duplicate completion delivery must be ignored idempotently without re-invoking foreign host
-            SpringAwaitResumeCoordinator.ResumeResult dup = coordinator.admitCompletionAndResume(
-                "tenant-a", started.unit().unitId(), "webhook-evt-1", completion, postRunner)
-                .toCompletableFuture().get(5, TimeUnit.SECONDS);
-            assertEquals(SpringAwaitResumeCoordinator.ResumeStatus.DUPLICATE_IGNORED, dup.status());
-            assertEquals(1, postAwaitCalls.get());
-
-            // Timed-out unit rejects late completion
-            SpringAwaitResumeCoordinator.StartResult timedOutStart = coordinator.startAndSuspend(
-                "tenant-a", "exec-await-2", "await-webhook", 1, Duration.ofMinutes(5),
+        // 1) Suspend in coordinator #1 (including :: in tenantId to test unambiguous tenant key isolation)
+        SpringAwaitResumeCoordinator.StartResult started;
+        try (var ctx = TpfExecutionContext.withHeaders("v-await-99", "LIVE", "DEFAULT")) {
+            started = coordinatorBeforeRestart.startAndSuspend(
+                "tenant::a", "exec-await-1", "await-webhook", 1, Duration.ofMinutes(5),
                 preRunner,
-                SpringCanonicalPayload.ofJson("Order", "fp-Order", "cat-await-1", "{\"id\":\"pay-2\"}"))
+                SpringCanonicalPayload.ofJson("Order", "fp-Order", "cat-await-1", "{\"id\":\"pay-1\"}"))
                 .toCompletableFuture().get(5, TimeUnit.SECONDS);
-            assertEquals(AwaitUnitStatus.TIMED_OUT,
-                coordinator.timeoutUnit("tenant-a", timedOutStart.unit().unitId()).orElseThrow().status());
-            SpringAwaitResumeCoordinator.ResumeResult late = coordinator.admitCompletionAndResume(
-                "tenant-a", timedOutStart.unit().unitId(), "late-evt", completion, postRunner)
-                .toCompletableFuture().get(5, TimeUnit.SECONDS);
-            assertEquals(SpringAwaitResumeCoordinator.ResumeStatus.TERMINAL_REJECTED, late.status());
-            assertEquals(1, postAwaitCalls.get());
-        });
+        }
+        assertEquals(AwaitUnitStatus.WAITING_EXTERNAL, started.unit().status());
+
+        // Tenant aliasing attempt ("tenant" + "a::" + unitId) MUST NOT see tenant::a's unit!
+        assertTrue(coordinatorBeforeRestart.findUnit("tenant", "a::" + started.unit().unitId()).isEmpty());
+
+        // 2) Simulate full restart: brand-new coordinator instance pointing at same durable directory!
+        SpringAwaitResumeCoordinator coordinatorAfterRestart =
+            new SpringAwaitResumeCoordinator(SpringAwaitStateStore.fileBacked(awaitDir));
+
+        SpringCanonicalPayload completion = SpringCanonicalPayload.ofJson(
+            "WebhookCompletion", "fp-Completion", "cat-await-1",
+            "{\"id\":\"pay-1\",\"settledAmount\":" + EXACT_DECIMAL + "}");
+
+        // 3) First post-Await attempt fails transiently -> unit MUST stay RESUMING (non-terminal), NOT COMPLETED!
+        CompletionException firstFailure = assertThrows(CompletionException.class,
+            () -> coordinatorAfterRestart.admitCompletionAndResume(
+                "tenant::a", started.unit().unitId(), "webhook-evt-1", completion, postRunner)
+                .toCompletableFuture().join());
+        assertInstanceOf(SpringForeignStepException.TransientFailure.class, firstFailure.getCause());
+        SpringAwaitResumeCoordinator.SuspendedAwaitState pendingState =
+            coordinatorAfterRestart.findUnit("tenant::a", started.unit().unitId()).orElseThrow();
+        assertEquals(SpringAwaitResumeCoordinator.ResumePhase.RESUMING, pendingState.phase());
+        assertFalse(pendingState.unit().status().terminal());
+
+        // 4) Simulate ANOTHER restart and recover via retryPendingResume using persisted payload & context!
+        failFirstPostAwait.set(false);
+        SpringAwaitResumeCoordinator coordinatorRecovery =
+            new SpringAwaitResumeCoordinator(SpringAwaitStateStore.fileBacked(awaitDir));
+        SpringAwaitResumeCoordinator.ResumeResult resumed = coordinatorRecovery.retryPendingResume(
+            "tenant::a", started.unit().unitId(), postRunner)
+            .toCompletableFuture().get(5, TimeUnit.SECONDS);
+        assertEquals(SpringAwaitResumeCoordinator.ResumeStatus.RESUMED, resumed.status());
+        assertEquals(AwaitUnitStatus.COMPLETED, resumed.unit().orElseThrow().status());
+        assertEquals("v-await-99", resumedVersionTag.get());
+        assertTrue(resumed.resumedOutput().orElseThrow().payloadJson().contains(EXACT_DECIMAL));
+        assertEquals(2, postAwaitCalls.get());
+
+        // 5) Duplicate completion delivery after COMPLETED is ignored idempotently without re-invoking host
+        SpringAwaitResumeCoordinator.ResumeResult dup = coordinatorRecovery.admitCompletionAndResume(
+            "tenant::a", started.unit().unitId(), "webhook-evt-1", completion, postRunner)
+            .toCompletableFuture().get(5, TimeUnit.SECONDS);
+        assertEquals(SpringAwaitResumeCoordinator.ResumeStatus.DUPLICATE_IGNORED, dup.status());
+        assertEquals(2, postAwaitCalls.get());
+
+        // 6) Timed-out unit rejects late completion
+        SpringAwaitResumeCoordinator.StartResult timedOutStart = coordinatorRecovery.startAndSuspend(
+            "tenant::a", "exec-await-2", "await-webhook", 1, Duration.ofMinutes(5),
+            preRunner,
+            SpringCanonicalPayload.ofJson("Order", "fp-Order", "cat-await-1", "{\"id\":\"pay-2\"}"))
+            .toCompletableFuture().get(5, TimeUnit.SECONDS);
+        assertEquals(AwaitUnitStatus.TIMED_OUT,
+            coordinatorRecovery.timeoutUnit("tenant::a", timedOutStart.unit().unitId()).orElseThrow().status());
+        SpringAwaitResumeCoordinator.ResumeResult late = coordinatorRecovery.admitCompletionAndResume(
+            "tenant::a", timedOutStart.unit().unitId(), "late-evt", completion, postRunner)
+            .toCompletableFuture().get(5, TimeUnit.SECONDS);
+        assertEquals(SpringAwaitResumeCoordinator.ResumeStatus.TERMINAL_REJECTED, late.status());
     }
 
     @Test
-    void checkpointHandoffInteroperatesAcrossPipelinesWithFingerprintVerificationAndWorkDispatcher() throws Exception {
+    void checkpointHandoffValidatesSchemaVersionEmptyPayloadsAndUnambiguousIntentKeys() throws Exception {
+        // Empty payload survives durable-map round trip
+        SpringCanonicalPayload emptyPayload = new SpringCanonicalPayload(
+            "Empty", "fp-Empty", "cat-1",
+            SpringCanonicalPayload.CANONICAL_JSON_ENCODING, SpringCanonicalPayload.CANONICAL_JSON_VERSION,
+            new byte[0]);
+        SpringCanonicalPayload decodedEmpty = SpringCanonicalPayload.fromDurableMap(emptyPayload.toDurableMap())
+            .orElseThrow();
+        assertArrayEquals(new byte[0], decodedEmpty.payload());
+
+        // Unambiguous length-prefixed storageKey prevents delimiter injection collisions
+        SpringForeignDispatchIntent intentA = new SpringForeignDispatchIntent(
+            "a\nb", "c", 1L, 1, "tx", 0, "step", "https://host/x", "digest", 1L);
+        SpringForeignDispatchIntent intentB = new SpringForeignDispatchIntent(
+            "a", "b\nc", 1L, 1, "tx", 0, "step", "https://host/x", "digest", 1L);
+        assertNotEquals(intentA.storageKey(), intentB.storageKey());
+
         URI host = startServer(exchange -> {
             byte[] body = exchange.getRequestBody().readAllBytes();
             String path = exchange.getRequestURI().getPath();
@@ -628,12 +889,42 @@ class SpringPolyglotParityTest {
             assertTrue(ledgerOut.payloadJson().contains(EXACT_DECIMAL));
             assertTrue(ledgerOut.payloadJson().contains("\"versionTag\":\"v-ckpt-7\""));
 
-            // Fingerprint mismatches fail closed
+            // Fingerprint mismatches and invalid/unsupported schemaVersion fail closed
             assertThrows(IllegalArgumentException.class, () -> codec.decodeAndVerify(
                 delivered, "Settlement", "fp-WRONG", "cat-handoff-1"));
             assertThrows(IllegalArgumentException.class, () -> codec.decodeAndVerify(
                 delivered, "Settlement", "fp-Settlement", "cat-WRONG"));
+            SerializedTransitionPayload badVersion = new SerializedTransitionPayload(
+                delivered.payloadTypeId(),
+                delivered.payloadEncoding(),
+                delivered.payload().replace("\"schemaVersion\":1", "\"schemaVersion\":2"));
+            assertThrows(IllegalArgumentException.class, () -> codec.decodeAndVerify(
+                badVersion, "Settlement", "fp-Settlement", "cat-handoff-1"));
+            SerializedTransitionPayload missingVersion = new SerializedTransitionPayload(
+                delivered.payloadTypeId(),
+                delivered.payloadEncoding(),
+                delivered.payload().replace("\"schemaVersion\":1,", ""));
+            assertThrows(IllegalArgumentException.class, () -> codec.decodeAndVerify(
+                missingVersion, "Settlement", "fp-Settlement", "cat-handoff-1"));
         });
+    }
+
+    private static void drainHeaders(Socket client) throws IOException {
+        var in = client.getInputStream();
+        int state = 0;
+        while (state < 4) {
+            int b = in.read();
+            if (b == -1) {
+                return;
+            }
+            if ((state == 0 || state == 2) && b == '\r') {
+                state++;
+            } else if ((state == 1 || state == 3) && b == '\n') {
+                state++;
+            } else {
+                state = (b == '\r') ? 1 : 0;
+            }
+        }
     }
 
     private URI startServer(com.sun.net.httpserver.HttpHandler handler) throws IOException {

@@ -30,12 +30,14 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -75,6 +77,8 @@ public final class SpringCanonicalFunctionHostStep
     public static final String STREAMING_BODY_DIGEST_SENTINEL = "STREAMING-NDJSON-V1";
     public static final int DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
     private static final int MAX_HEADER_BYTES = 64 * 1024;
+    private static final int MAX_CHUNK_LINE_BYTES = 8 * 1024;
+    private static final int MAX_INFORMATIONAL_RESPONSES = 16;
     private static final Set<String> LOOPBACK_HOSTS = Set.of("127.0.0.1", "::1", "[::1]");
 
     /** Immutable binding for one Spring-hosted foreign business-function step. */
@@ -183,17 +187,15 @@ public final class SpringCanonicalFunctionHostStep
             String path = FUNCTION_PATH_PREFIX + spec.stepId() + "/stream";
             URI targetUri = normalizedOrigin.resolve(path);
             byte[] bodyBytes;
-            Optional<SpringForeignDispatchIntent> reserved;
             try {
                 String canonicalJson = validateCanonicalInput(input);
                 bodyBytes = buildRequestBody(canonicalJson, contextSnapshot);
-                reserved = reserveDispatchIntent(dispatchScope, targetUri, bodyBytes);
             } catch (RuntimeException failure) {
                 subscriber.onSubscribe(new EmptySubscription());
                 subscriber.onError(failure);
                 return;
             }
-            new OneToManySubscription(subscriber, targetUri, path, bodyBytes, reserved).start();
+            new OneToManySubscription(subscriber, targetUri, path, bodyBytes, dispatchScope).start();
         };
     }
 
@@ -290,9 +292,9 @@ public final class SpringCanonicalFunctionHostStep
             .POST(HttpRequest.BodyPublishers.ofByteArray(bodyBytes));
         signHeaders(requestBuilder, path, bodyBytes);
 
-        HttpResponse<byte[]> response;
+        HttpResponse<InputStream> response;
         try {
-            response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofByteArray());
+            response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofInputStream());
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             settleDispatchIntent(reserved, SpringForeignDispatchIntentStore.SettlementStatus.UNCERTAIN);
@@ -351,9 +353,9 @@ public final class SpringCanonicalFunctionHostStep
             .POST(HttpRequest.BodyPublishers.ofByteArray(ndjson.toByteArray()));
         signHeaders(requestBuilder, path, sentinel);
 
-        HttpResponse<byte[]> response;
+        HttpResponse<InputStream> response;
         try {
-            response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofByteArray());
+            response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofInputStream());
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             settleDispatchIntent(reserved, SpringForeignDispatchIntentStore.SettlementStatus.UNCERTAIN);
@@ -439,29 +441,57 @@ public final class SpringCanonicalFunctionHostStep
         }
     }
 
-    private SpringCanonicalPayload decodeJsonResponse(HttpResponse<byte[]> response, URI targetUri) {
+    private SpringCanonicalPayload decodeJsonResponse(HttpResponse<InputStream> response, URI targetUri) {
         int status = response.statusCode();
-        if (status == 401 || status == 403) {
-            throw new SpringForeignStepException.AuthenticationFailure(
-                spec.stepId(), spec.stepIndex(), status,
-                "Foreign function host rejected authentication for step " + spec.stepId() + " (HTTP " + status + ")");
-        }
-        if (status != 200) {
+        try (InputStream body = response.body()) {
+            if (status == 401 || status == 403) {
+                throw new SpringForeignStepException.AuthenticationFailure(
+                    spec.stepId(), spec.stepIndex(), status,
+                    "Foreign function host rejected authentication for step " + spec.stepId() + " (HTTP " + status + ")");
+            }
+            if (status != 200) {
+                throw new SpringForeignStepException.OutcomeUnknown(
+                    spec.stepId(), spec.stepIndex(), targetUri.toString(),
+                    "Uncertain HTTP status " + status + " from foreign function host for step " + spec.stepId(),
+                    Optional.empty());
+            }
+            byte[] bytes = readBoundedBytes(body, spec.maxResponseBytes(), targetUri);
+            JsonNode root = readStrictObject(bytes, targetUri);
+            String outcomeStatus = root.path("status").asText("");
+            return switch (outcomeStatus) {
+                case "OK" -> validateCanonicalOutput(root, targetUri);
+                case "ERROR" -> throw decodePortableError(root, targetUri);
+                default -> throw new SpringForeignStepException.OutcomeUnknown(
+                    spec.stepId(), spec.stepIndex(), targetUri.toString(),
+                    "Unknown function host status '" + outcomeStatus + "' for step " + spec.stepId(),
+                    Optional.empty());
+            };
+        } catch (IOException readFailure) {
             throw new SpringForeignStepException.OutcomeUnknown(
                 spec.stepId(), spec.stepIndex(), targetUri.toString(),
-                "Uncertain HTTP status " + status + " from foreign function host for step " + spec.stepId(),
-                Optional.empty());
+                "Uncertain transport failure reading response body for step " + spec.stepId()
+                    + ": " + readFailure.getMessage(),
+                Optional.of(readFailure));
         }
-        JsonNode root = readStrictObject(response.body(), targetUri);
-        String outcomeStatus = root.path("status").asText("");
-        return switch (outcomeStatus) {
-            case "OK" -> validateCanonicalOutput(root, targetUri);
-            case "ERROR" -> throw decodePortableError(root, targetUri);
-            default -> throw new SpringForeignStepException.OutcomeUnknown(
-                spec.stepId(), spec.stepIndex(), targetUri.toString(),
-                "Unknown function host status '" + outcomeStatus + "' for step " + spec.stepId(),
-                Optional.empty());
-        };
+    }
+
+    private byte[] readBoundedBytes(InputStream in, int maxBytes, URI targetUri) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(Math.min(maxBytes, 8192));
+        byte[] buf = new byte[8192];
+        int total = 0;
+        int n;
+        while ((n = in.read(buf)) != -1) {
+            if (total + n > maxBytes) {
+                throw new SpringForeignStepException.OutcomeUnknown(
+                    spec.stepId(), spec.stepIndex(), targetUri.toString(),
+                    "Foreign function host response exceeded " + maxBytes
+                        + " byte limit for step " + spec.stepId(),
+                    Optional.empty());
+            }
+            out.write(buf, 0, n);
+            total += n;
+        }
+        return out.toByteArray();
     }
 
     private SpringCanonicalPayload validateCanonicalOutput(JsonNode root, URI targetUri) {
@@ -629,19 +659,28 @@ public final class SpringCanonicalFunctionHostStep
         return failure;
     }
 
-    private Socket openSocket() throws IOException {
+    private Socket openSocket(AtomicReference<Socket> socketRef, AtomicBoolean cancelled) throws IOException {
         String host = normalizedOrigin.getHost();
         int port = normalizedOrigin.getPort();
         int connectTimeoutMs = (int) Math.min(Integer.MAX_VALUE, Math.max(1L, spec.requestTimeout().toMillis()));
         int readTimeoutMs = (int) Math.min(Integer.MAX_VALUE, Math.max(1L, spec.streamIdleTimeout().toMillis()));
         Socket raw = new Socket();
         raw.setTcpNoDelay(true);
-        raw.connect(new InetSocketAddress(host, port), connectTimeoutMs);
-        raw.setSoTimeout(readTimeoutMs);
-        if (!"https".equalsIgnoreCase(normalizedOrigin.getScheme())) {
-            return raw;
+        socketRef.set(raw);
+        if (cancelled.get()) {
+            closeQuietly(socketRef.getAndSet(null));
+            throw new IOException("Subscription cancelled before connecting");
         }
         try {
+            raw.connect(new InetSocketAddress(host, port), connectTimeoutMs);
+            raw.setSoTimeout(readTimeoutMs);
+            if (cancelled.get()) {
+                closeQuietly(socketRef.getAndSet(null));
+                throw new IOException("Subscription cancelled during connect");
+            }
+            if (!"https".equalsIgnoreCase(normalizedOrigin.getScheme())) {
+                return raw;
+            }
             SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
             SSLSocket ssl = (SSLSocket) factory.createSocket(raw, host, port, true);
             SSLParameters params = ssl.getSSLParameters();
@@ -651,11 +690,17 @@ public final class SpringCanonicalFunctionHostStep
             }
             ssl.setSSLParameters(params);
             ssl.setSoTimeout(readTimeoutMs);
+            socketRef.set(ssl);
+            if (cancelled.get()) {
+                closeQuietly(socketRef.getAndSet(null));
+                throw new IOException("Subscription cancelled before TLS handshake");
+            }
             ssl.startHandshake();
             return ssl;
-        } catch (IOException | RuntimeException tlsFailure) {
+        } catch (IOException | RuntimeException failure) {
+            closeQuietly(socketRef.getAndSet(null));
             closeQuietly(raw);
-            throw tlsFailure;
+            throw failure;
         }
     }
 
@@ -697,7 +742,24 @@ public final class SpringCanonicalFunctionHostStep
         out.flush();
     }
 
+    /**
+     * Reads the final HTTP/1.1 response header block, consuming supported interim {@code 1xx}
+     * informational responses (such as {@code 100 Continue} or {@code 103 Early Hints}) while
+     * keeping {@code 101 Switching Protocols} distinct as a non-interim response.
+     */
     private static ResponseHeaders readResponseHeaders(BufferedInputStream in) throws IOException {
+        for (int attempt = 0; attempt <= MAX_INFORMATIONAL_RESPONSES; attempt++) {
+            ResponseHeaders headers = readSingleResponseHeaderBlock(in);
+            int code = headers.statusCode();
+            if (code >= 100 && code < 200 && code != 101) {
+                continue;
+            }
+            return headers;
+        }
+        throw new IOException("Exceeded maximum interim 1xx HTTP responses (" + MAX_INFORMATIONAL_RESPONSES + ")");
+    }
+
+    private static ResponseHeaders readSingleResponseHeaderBlock(BufferedInputStream in) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream(256);
         int state = 0;
         while (true) {
@@ -736,20 +798,235 @@ public final class SpringCanonicalFunctionHostStep
             throw new IOException("Invalid HTTP status code: " + parts[1], badStatus);
         }
         boolean chunked = false;
+        OptionalLong contentLength = OptionalLong.empty();
         for (int i = 1; i < lines.length; i++) {
             int colon = lines[i].indexOf(':');
             if (colon > 0) {
                 String name = lines[i].substring(0, colon).trim().toLowerCase(Locale.ROOT);
-                String value = lines[i].substring(colon + 1).trim().toLowerCase(Locale.ROOT);
-                if ("transfer-encoding".equals(name) && value.contains("chunked")) {
+                String value = lines[i].substring(colon + 1).trim();
+                if ("transfer-encoding".equals(name) && value.toLowerCase(Locale.ROOT).contains("chunked")) {
                     chunked = true;
+                } else if ("content-length".equals(name)) {
+                    long parsed = parseContentLength(value);
+                    if (contentLength.isPresent() && contentLength.getAsLong() != parsed) {
+                        throw new IOException("Conflicting Content-Length headers: "
+                            + contentLength.getAsLong() + " vs " + parsed);
+                    }
+                    contentLength = OptionalLong.of(parsed);
                 }
             }
         }
-        return new ResponseHeaders(statusCode, chunked);
+        return new ResponseHeaders(statusCode, chunked, contentLength);
     }
 
-    private record ResponseHeaders(int statusCode, boolean chunked) {
+    private static long parseContentLength(String raw) throws IOException {
+        String trimmed = raw.trim();
+        if (trimmed.isEmpty()) {
+            throw new IOException("Empty Content-Length header");
+        }
+        try {
+            long value = Long.parseLong(trimmed);
+            if (value < 0L) {
+                throw new IOException("Negative Content-Length header: " + value);
+            }
+            return value;
+        } catch (NumberFormatException badLength) {
+            throw new IOException("Invalid Content-Length header: " + raw, badLength);
+        }
+    }
+
+    private static Optional<String> readAsciiLine(BufferedInputStream in) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream(32);
+        while (true) {
+            int b = in.read();
+            if (b == -1) {
+                return buf.size() == 0
+                    ? Optional.empty()
+                    : Optional.of(buf.toString(StandardCharsets.ISO_8859_1));
+            }
+            if (b == '\n') {
+                byte[] raw = buf.toByteArray();
+                int len = (raw.length > 0 && raw[raw.length - 1] == '\r') ? raw.length - 1 : raw.length;
+                return Optional.of(new String(raw, 0, len, StandardCharsets.ISO_8859_1));
+            }
+            if (buf.size() >= MAX_CHUNK_LINE_BYTES) {
+                throw new IOException("HTTP chunk metadata line exceeded " + MAX_CHUNK_LINE_BYTES + " bytes");
+            }
+            buf.write(b);
+        }
+    }
+
+    /**
+     * Strips at most one trailing {@code \r} immediately preceding a line-ending {@code \n} while
+     * preserving all interior bytes (including stray interior {@code \r}) for strict JSON validation.
+     */
+    private byte[] extractLinePreservingInteriorBytes(
+        ByteArrayOutputStream lineBuf,
+        boolean stripTrailingCr,
+        URI targetUri,
+        String cardinalityLabel
+    ) {
+        byte[] raw = lineBuf.toByteArray();
+        lineBuf.reset();
+        int len = (stripTrailingCr && raw.length > 0 && raw[raw.length - 1] == '\r')
+            ? raw.length - 1
+            : raw.length;
+        if (len > spec.maxResponseBytes()) {
+            throw new SpringForeignStepException.OutcomeUnknown(
+                spec.stepId(), spec.stepIndex(), targetUri.toString(),
+                cardinalityLabel + " NDJSON frame exceeded " + spec.maxResponseBytes() + " bytes",
+                Optional.empty());
+        }
+        return len == raw.length ? raw : Arrays.copyOf(raw, len);
+    }
+
+    private void appendLineByteBounded(
+        ByteArrayOutputStream lineBuf,
+        int b,
+        URI targetUri,
+        String cardinalityLabel
+    ) {
+        // Allow one extra byte so a trailing CR before LF at the exact limit is still accepted
+        // after extractLinePreservingInteriorBytes strips the single trailing CR.
+        if (lineBuf.size() > spec.maxResponseBytes()) {
+            throw new SpringForeignStepException.OutcomeUnknown(
+                spec.stepId(), spec.stepIndex(), targetUri.toString(),
+                cardinalityLabel + " NDJSON frame exceeded " + spec.maxResponseBytes() + " bytes",
+                Optional.empty());
+        }
+        lineBuf.write(b);
+    }
+
+    private static boolean isWhitespaceOnly(byte[] bytes) {
+        for (byte b : bytes) {
+            if (b != ' ' && b != '\t' && b != '\r' && b != '\n') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean readChunkedNdjson(
+        BufferedInputStream in,
+        AtomicBoolean cancelled,
+        AtomicBoolean terminated,
+        URI targetUri,
+        String cardinalityLabel,
+        FrameHandler frameHandler
+    ) throws IOException, InterruptedException {
+        ByteArrayOutputStream lineBuf = new ByteArrayOutputStream();
+        while (!cancelled.get() && !terminated.get()) {
+            Optional<String> sizeLineOpt = readAsciiLine(in);
+            if (sizeLineOpt.isEmpty()) {
+                return false;
+            }
+            String hex = sizeLineOpt.orElseThrow().split(";", 2)[0].trim();
+            if (hex.isEmpty()) {
+                continue;
+            }
+            int chunkSize;
+            try {
+                chunkSize = Integer.parseInt(hex, 16);
+                if (chunkSize < 0) {
+                    throw new IOException("Negative HTTP chunk size: " + hex);
+                }
+            } catch (NumberFormatException badChunk) {
+                throw new IOException("Malformed HTTP chunk size: " + hex, badChunk);
+            }
+            if (chunkSize == 0) {
+                readAsciiLine(in);
+                if (lineBuf.size() > 0) {
+                    byte[] trailing = extractLinePreservingInteriorBytes(lineBuf, false, targetUri, cardinalityLabel);
+                    if (frameHandler.handle(trailing)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            int remaining = chunkSize;
+            while (remaining > 0 && !cancelled.get() && !terminated.get()) {
+                int b = in.read();
+                if (b == -1) {
+                    throw new IOException("Unexpected EOF inside HTTP chunk");
+                }
+                remaining--;
+                if (b == '\n') {
+                    byte[] line = extractLinePreservingInteriorBytes(lineBuf, true, targetUri, cardinalityLabel);
+                    if (frameHandler.handle(line)) {
+                        return true;
+                    }
+                } else {
+                    appendLineByteBounded(lineBuf, b, targetUri, cardinalityLabel);
+                }
+            }
+            if (!cancelled.get() && !terminated.get()) {
+                readAsciiLine(in); // trailing CRLF after chunk data
+            }
+        }
+        return false;
+    }
+
+    private boolean readPlainNdjson(
+        BufferedInputStream in,
+        OptionalLong contentLength,
+        AtomicBoolean cancelled,
+        AtomicBoolean terminated,
+        URI targetUri,
+        String cardinalityLabel,
+        FrameHandler frameHandler
+    ) throws IOException, InterruptedException {
+        ByteArrayOutputStream lineBuf = new ByteArrayOutputStream();
+        if (contentLength.isPresent()) {
+            long remaining = contentLength.getAsLong();
+            while (remaining > 0L && !cancelled.get() && !terminated.get()) {
+                int b = in.read();
+                if (b == -1) {
+                    throw new IOException(
+                        "Premature EOF reading HTTP response body (" + remaining + " bytes remaining)");
+                }
+                remaining--;
+                if (b == '\n') {
+                    byte[] line = extractLinePreservingInteriorBytes(lineBuf, true, targetUri, cardinalityLabel);
+                    if (frameHandler.handle(line)) {
+                        return true;
+                    }
+                } else {
+                    appendLineByteBounded(lineBuf, b, targetUri, cardinalityLabel);
+                }
+            }
+            if (!cancelled.get() && !terminated.get() && lineBuf.size() > 0) {
+                byte[] trailing = extractLinePreservingInteriorBytes(lineBuf, false, targetUri, cardinalityLabel);
+                return frameHandler.handle(trailing);
+            }
+            return false;
+        }
+        while (!cancelled.get() && !terminated.get()) {
+            int b = in.read();
+            if (b == -1) {
+                if (lineBuf.size() > 0) {
+                    byte[] trailing = extractLinePreservingInteriorBytes(lineBuf, false, targetUri, cardinalityLabel);
+                    return frameHandler.handle(trailing);
+                }
+                return false;
+            }
+            if (b == '\n') {
+                byte[] line = extractLinePreservingInteriorBytes(lineBuf, true, targetUri, cardinalityLabel);
+                if (frameHandler.handle(line)) {
+                    return true;
+                }
+            } else {
+                appendLineByteBounded(lineBuf, b, targetUri, cardinalityLabel);
+            }
+        }
+        return false;
+    }
+
+    @FunctionalInterface
+    private interface FrameHandler {
+        boolean handle(byte[] lineBytes) throws InterruptedException;
+    }
+
+    private record ResponseHeaders(int statusCode, boolean chunked, OptionalLong contentLength) {
     }
 
     private static final class EmptySubscription implements Flow.Subscription {
@@ -762,31 +1039,39 @@ public final class SpringCanonicalFunctionHostStep
         }
     }
 
-    /** Demand-driven ONE_TO_MANY NDJSON reader over JDK HttpClient. */
+    /**
+     * Demand-driven {@code ONE_TO_MANY} NDJSON reader over a cancellable HTTP/1.1 socket with
+     * {@code streamIdleTimeout} enforced on header and body reads, and pre-send dispatch reservation
+     * deferred until commitment so cancelling in {@code onSubscribe} never records {@code UNCERTAIN}.
+     */
     private final class OneToManySubscription implements Flow.Subscription {
         private final Flow.Subscriber<? super SpringCanonicalPayload> downstream;
         private final URI targetUri;
         private final String path;
         private final byte[] bodyBytes;
-        private final Optional<SpringForeignDispatchIntent> reserved;
+        private final Optional<SpringTransitionDispatchScope> dispatchScope;
+        private final AtomicReference<Socket> socketRef = new AtomicReference<>();
         private final AtomicLong demand = new AtomicLong();
         private final AtomicBoolean cancelled = new AtomicBoolean();
         private final AtomicBoolean terminated = new AtomicBoolean();
         private final AtomicBoolean readerStarted = new AtomicBoolean();
+        private final Object reservationLock = new Object();
         private final Object demandLock = new Object();
+        private final Object signalLock = new Object();
+        private volatile Optional<SpringForeignDispatchIntent> reserved = Optional.empty();
 
         private OneToManySubscription(
             Flow.Subscriber<? super SpringCanonicalPayload> downstream,
             URI targetUri,
             String path,
             byte[] bodyBytes,
-            Optional<SpringForeignDispatchIntent> reserved
+            Optional<SpringTransitionDispatchScope> dispatchScope
         ) {
             this.downstream = downstream;
             this.targetUri = targetUri;
             this.path = path;
             this.bodyBytes = bodyBytes;
-            this.reserved = reserved;
+            this.dispatchScope = dispatchScope;
         }
 
         void start() {
@@ -795,8 +1080,10 @@ public final class SpringCanonicalFunctionHostStep
 
         @Override
         public void request(long n) {
+            if (cancelled.get() || terminated.get()) {
+                return;
+            }
             if (n <= 0) {
-                cancel();
                 terminateError(new IllegalArgumentException("Demand must be positive: " + n));
                 return;
             }
@@ -814,77 +1101,69 @@ public final class SpringCanonicalFunctionHostStep
 
         @Override
         public void cancel() {
-            if (cancelled.compareAndSet(false, true)) {
-                synchronized (demandLock) {
-                    demandLock.notifyAll();
+            Optional<SpringForeignDispatchIntent> toSettle = Optional.empty();
+            synchronized (reservationLock) {
+                if (!cancelled.compareAndSet(false, true)) {
+                    return;
                 }
                 if (terminated.compareAndSet(false, true)) {
-                    settleDispatchIntent(reserved, SpringForeignDispatchIntentStore.SettlementStatus.UNCERTAIN);
+                    toSettle = reserved;
                 }
             }
+            synchronized (demandLock) {
+                demandLock.notifyAll();
+            }
+            closeQuietly(socketRef.getAndSet(null));
+            settleDispatchIntent(toSettle, SpringForeignDispatchIntentStore.SettlementStatus.UNCERTAIN);
         }
 
         private void runReader() {
-            HttpRequest.Builder req = HttpRequest.newBuilder(targetUri)
-                .timeout(spec.requestTimeout())
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/x-ndjson")
-                .POST(HttpRequest.BodyPublishers.ofByteArray(bodyBytes));
-            signHeaders(req, path, bodyBytes);
+            synchronized (reservationLock) {
+                if (cancelled.get() || terminated.get()) {
+                    return;
+                }
+                try {
+                    reserved = reserveDispatchIntent(dispatchScope, targetUri, bodyBytes);
+                } catch (RuntimeException failure) {
+                    terminateError(failure);
+                    return;
+                }
+            }
             try {
-                HttpResponse<InputStream> response = httpClient.send(req.build(), HttpResponse.BodyHandlers.ofInputStream());
-                int status = response.statusCode();
+                Socket socket = openSocket(socketRef, cancelled);
+                OutputStream rawOut = socket.getOutputStream();
+                BufferedInputStream rawIn = new BufferedInputStream(socket.getInputStream());
+                sendRequest(rawOut);
+
+                ResponseHeaders headers = readResponseHeaders(rawIn);
+                int status = headers.statusCode();
                 if (status == 401 || status == 403) {
-                    response.body().close();
                     terminateError(new SpringForeignStepException.AuthenticationFailure(
                         spec.stepId(), spec.stepIndex(), status,
                         "Foreign function host rejected authentication for step " + spec.stepId() + " (HTTP " + status + ")"));
                     return;
                 }
                 if (status != 200) {
-                    response.body().close();
                     terminateError(new SpringForeignStepException.OutcomeUnknown(
                         spec.stepId(), spec.stepIndex(), targetUri.toString(),
                         "Uncertain HTTP status " + status + " from ONE_TO_MANY step " + spec.stepId(),
                         Optional.empty()));
                     return;
                 }
-                try (InputStream body = response.body()) {
-                    ByteArrayOutputStream lineBuf = new ByteArrayOutputStream();
-                    boolean sawComplete = false;
-                    while (!cancelled.get()) {
-                        int b = body.read();
-                        if (b == -1) {
-                            if (lineBuf.size() > 0 && handleFrame(lineBuf.toByteArray())) {
-                                sawComplete = true;
-                            }
-                            break;
-                        }
-                        if (b == '\n') {
-                            byte[] line = lineBuf.toByteArray();
-                            lineBuf.reset();
-                            if (handleFrame(line)) {
-                                sawComplete = true;
-                                break;
-                            }
-                        } else if (b != '\r') {
-                            if (lineBuf.size() >= spec.maxResponseBytes()) {
-                                throw new SpringForeignStepException.OutcomeUnknown(
-                                    spec.stepId(), spec.stepIndex(), targetUri.toString(),
-                                    "ONE_TO_MANY NDJSON frame exceeded " + spec.maxResponseBytes() + " bytes",
-                                    Optional.empty());
-                            }
-                            lineBuf.write(b);
-                        }
-                    }
-                    if (!cancelled.get()) {
-                        if (!sawComplete) {
-                            terminateError(new SpringForeignStepException.OutcomeUnknown(
-                                spec.stepId(), spec.stepIndex(), targetUri.toString(),
-                                "Truncated ONE_TO_MANY stream without complete sentinel for step " + spec.stepId(),
-                                Optional.empty()));
-                        } else if (terminated.compareAndSet(false, true)) {
-                            settleDispatchIntent(reserved, SpringForeignDispatchIntentStore.SettlementStatus.VALIDATED_SUCCEEDED);
+                boolean sawComplete = headers.chunked()
+                    ? readChunkedNdjson(rawIn, cancelled, terminated, targetUri, "ONE_TO_MANY", this::handleFrame)
+                    : readPlainNdjson(
+                        rawIn, headers.contentLength(), cancelled, terminated, targetUri, "ONE_TO_MANY", this::handleFrame);
+                if (!cancelled.get() && !terminated.get()) {
+                    if (!sawComplete) {
+                        terminateError(new SpringForeignStepException.OutcomeUnknown(
+                            spec.stepId(), spec.stepIndex(), targetUri.toString(),
+                            "Truncated ONE_TO_MANY stream without complete sentinel for step " + spec.stepId(),
+                            Optional.empty()));
+                    } else if (terminated.compareAndSet(false, true)) {
+                        closeQuietly(socketRef.getAndSet(null));
+                        settleDispatchIntent(reserved, SpringForeignDispatchIntentStore.SettlementStatus.VALIDATED_SUCCEEDED);
+                        synchronized (signalLock) {
                             downstream.onComplete();
                         }
                     }
@@ -895,7 +1174,7 @@ public final class SpringCanonicalFunctionHostStep
                     spec.stepId(), spec.stepIndex(), targetUri.toString(),
                     "Interrupted reading ONE_TO_MANY stream", Optional.of(interrupted)));
             } catch (IOException ioError) {
-                if (!cancelled.get()) {
+                if (!cancelled.get() && !terminated.get()) {
                     terminateError(new SpringForeignStepException.OutcomeUnknown(
                         spec.stepId(), spec.stepIndex(), targetUri.toString(),
                         "Uncertain transport failure reading ONE_TO_MANY stream: " + ioError.getMessage(),
@@ -903,22 +1182,48 @@ public final class SpringCanonicalFunctionHostStep
                 }
             } catch (RuntimeException failure) {
                 terminateError(failure);
+            } finally {
+                closeQuietly(socketRef.getAndSet(null));
             }
         }
 
+        private void sendRequest(OutputStream rawOut) throws IOException {
+            String ts = Instant.now().toString();
+            String nonce = UUID.randomUUID().toString();
+            String sig = TransitionWorkerSignature.sign(
+                spec.sharedSecret(), "POST", path, ts, nonce, bodyBytes);
+            StringBuilder hdr = new StringBuilder(256);
+            hdr.append("POST ").append(path).append(" HTTP/1.1\r\n");
+            hdr.append("Host: ").append(normalizedOrigin.getHost()).append(':').append(normalizedOrigin.getPort()).append("\r\n");
+            hdr.append("Content-Type: application/json\r\n");
+            hdr.append("Accept: application/x-ndjson\r\n");
+            hdr.append("Content-Length: ").append(bodyBytes.length).append("\r\n");
+            hdr.append("Connection: close\r\n");
+            hdr.append(TransitionWorkerSignature.TIMESTAMP_HEADER).append(": ").append(ts).append("\r\n");
+            hdr.append(TransitionWorkerSignature.NONCE_HEADER).append(": ").append(nonce).append("\r\n");
+            hdr.append(TransitionWorkerSignature.SIGNATURE_HEADER).append(": ").append(sig).append("\r\n");
+            hdr.append(STEP_ID_HEADER).append(": ").append(spec.stepId()).append("\r\n");
+            hdr.append(STEP_INDEX_HEADER).append(": ").append(spec.stepIndex()).append("\r\n");
+            hdr.append("\r\n");
+            rawOut.write(hdr.toString().getBytes(StandardCharsets.US_ASCII));
+            rawOut.write(bodyBytes);
+            rawOut.flush();
+        }
+
         private boolean handleFrame(byte[] lineBytes) throws InterruptedException {
-            String trimmed = new String(lineBytes, StandardCharsets.UTF_8).trim();
-            if (trimmed.isEmpty()) {
+            if (isWhitespaceOnly(lineBytes)) {
                 return false;
             }
-            JsonNode frame = readStrictObject(trimmed.getBytes(StandardCharsets.UTF_8), targetUri);
+            JsonNode frame = readStrictObject(lineBytes, targetUri);
             String event = frame.path("event").asText("");
             return switch (event) {
                 case "item" -> {
                     SpringCanonicalPayload payload = validateCanonicalOutput(frame, targetUri);
                     awaitDemand();
-                    if (!cancelled.get() && !terminated.get()) {
-                        downstream.onNext(payload);
+                    synchronized (signalLock) {
+                        if (!cancelled.get() && !terminated.get()) {
+                            downstream.onNext(payload);
+                        }
                     }
                     yield false;
                 }
@@ -933,18 +1238,30 @@ public final class SpringCanonicalFunctionHostStep
 
         private void awaitDemand() throws InterruptedException {
             synchronized (demandLock) {
-                while (!cancelled.get() && demand.get() <= 0) {
+                while (!cancelled.get() && !terminated.get() && demand.get() <= 0) {
                     demandLock.wait(50L);
                 }
-                if (!cancelled.get()) {
+                if (!cancelled.get() && !terminated.get()) {
                     demand.updateAndGet(cur -> cur == Long.MAX_VALUE ? Long.MAX_VALUE : Math.max(0L, cur - 1L));
                 }
             }
         }
 
         private void terminateError(Throwable failure) {
-            if (terminated.compareAndSet(false, true)) {
-                settleDispatchIntent(reserved, settlementForFailure(failure));
+            Optional<SpringForeignDispatchIntent> toSettle;
+            synchronized (reservationLock) {
+                if (!terminated.compareAndSet(false, true)) {
+                    return;
+                }
+                cancelled.set(true);
+                toSettle = reserved;
+            }
+            synchronized (demandLock) {
+                demandLock.notifyAll();
+            }
+            closeQuietly(socketRef.getAndSet(null));
+            settleDispatchIntent(toSettle, settlementForFailure(failure));
+            synchronized (signalLock) {
                 downstream.onError(failure);
             }
         }
@@ -967,6 +1284,7 @@ public final class SpringCanonicalFunctionHostStep
         private final ConcurrentLinkedQueue<Runnable> writeQueue = new ConcurrentLinkedQueue<>();
         private final AtomicBoolean writeDraining = new AtomicBoolean();
         private final Object demandLock = new Object();
+        private final Object signalLock = new Object();
         private volatile OutputStream rawOut;
         private volatile BufferedInputStream rawIn;
 
@@ -986,8 +1304,7 @@ public final class SpringCanonicalFunctionHostStep
 
         void start() {
             try {
-                Socket socket = openSocket();
-                socketRef.set(socket);
+                Socket socket = openSocket(socketRef, cancelled);
                 rawOut = socket.getOutputStream();
                 rawIn = new BufferedInputStream(socket.getInputStream());
                 sendRequestHeaders();
@@ -1032,8 +1349,10 @@ public final class SpringCanonicalFunctionHostStep
 
         @Override
         public void request(long n) {
+            if (cancelled.get() || terminated.get()) {
+                return;
+            }
             if (n <= 0) {
-                cancel();
                 terminateError(new IllegalArgumentException("Demand must be positive: " + n));
                 return;
             }
@@ -1055,14 +1374,18 @@ public final class SpringCanonicalFunctionHostStep
                 synchronized (demandLock) {
                     demandLock.notifyAll();
                 }
-                Flow.Subscription up = upstreamSubRef.getAndSet(null);
-                if (up != null) {
-                    up.cancel();
-                }
+                cancelUpstream();
                 closeSocket();
                 if (terminated.compareAndSet(false, true)) {
                     settleDispatchIntent(reserved, SpringForeignDispatchIntentStore.SettlementStatus.UNCERTAIN);
                 }
+            }
+        }
+
+        private void cancelUpstream() {
+            Flow.Subscription up = upstreamSubRef.getAndSet(null);
+            if (up != null) {
+                up.cancel();
             }
         }
 
@@ -1074,6 +1397,7 @@ public final class SpringCanonicalFunctionHostStep
         }
 
         private void drainWrites() {
+            boolean owned = true;
             try {
                 while (true) {
                     Runnable task;
@@ -1083,13 +1407,17 @@ public final class SpringCanonicalFunctionHostStep
                         }
                         task.run();
                     }
+                    owned = false;
                     writeDraining.set(false);
                     if (writeQueue.isEmpty() || !writeDraining.compareAndSet(false, true)) {
                         return;
                     }
+                    owned = true;
                 }
             } finally {
-                writeDraining.set(false);
+                if (owned) {
+                    writeDraining.set(false);
+                }
             }
         }
 
@@ -1111,18 +1439,26 @@ public final class SpringCanonicalFunctionHostStep
                     return;
                 }
                 boolean sawComplete = headers.chunked()
-                    ? readChunkedNdjson(rawIn)
-                    : readPlainNdjson(rawIn);
-                if (!cancelled.get()) {
+                    ? readChunkedNdjson(rawIn, cancelled, terminated, targetUri, "MANY_TO_MANY", this::handleFrame)
+                    : readPlainNdjson(
+                        rawIn, headers.contentLength(), cancelled, terminated, targetUri, "MANY_TO_MANY", this::handleFrame);
+                if (!cancelled.get() && !terminated.get()) {
                     if (!sawComplete) {
                         terminateError(new SpringForeignStepException.OutcomeUnknown(
                             spec.stepId(), spec.stepIndex(), targetUri.toString(),
                             "Truncated MANY_TO_MANY stream without complete sentinel for step " + spec.stepId(),
                             Optional.empty()));
                     } else if (terminated.compareAndSet(false, true)) {
+                        cancelled.set(true);
+                        synchronized (demandLock) {
+                            demandLock.notifyAll();
+                        }
+                        cancelUpstream();
                         settleDispatchIntent(reserved, SpringForeignDispatchIntentStore.SettlementStatus.VALIDATED_SUCCEEDED);
                         closeSocket();
-                        downstream.onComplete();
+                        synchronized (signalLock) {
+                            downstream.onComplete();
+                        }
                     }
                 }
             } catch (InterruptedException interrupted) {
@@ -1131,7 +1467,7 @@ public final class SpringCanonicalFunctionHostStep
                     spec.stepId(), spec.stepIndex(), targetUri.toString(),
                     "Interrupted reading MANY_TO_MANY stream", Optional.of(interrupted)));
             } catch (IOException ioError) {
-                if (!cancelled.get()) {
+                if (!cancelled.get() && !terminated.get()) {
                     terminateError(new SpringForeignStepException.OutcomeUnknown(
                         spec.stepId(), spec.stepIndex(), targetUri.toString(),
                         "Uncertain transport failure reading MANY_TO_MANY stream: " + ioError.getMessage(),
@@ -1142,115 +1478,20 @@ public final class SpringCanonicalFunctionHostStep
             }
         }
 
-        private boolean readChunkedNdjson(BufferedInputStream in) throws IOException, InterruptedException {
-            ByteArrayOutputStream lineBuf = new ByteArrayOutputStream();
-            while (!cancelled.get()) {
-                Optional<String> sizeLineOpt = readAsciiLine(in);
-                if (sizeLineOpt.isEmpty()) {
-                    return false;
-                }
-                String hex = sizeLineOpt.orElseThrow().split(";", 2)[0].trim();
-                if (hex.isEmpty()) {
-                    continue;
-                }
-                int chunkSize;
-                try {
-                    chunkSize = Integer.parseInt(hex, 16);
-                } catch (NumberFormatException badChunk) {
-                    throw new IOException("Malformed HTTP chunk size: " + hex, badChunk);
-                }
-                if (chunkSize == 0) {
-                    readAsciiLine(in);
-                    if (lineBuf.size() > 0 && handleFrame(lineBuf.toByteArray())) {
-                        return true;
-                    }
-                    return false;
-                }
-                int remaining = chunkSize;
-                while (remaining > 0) {
-                    int b = in.read();
-                    if (b == -1) {
-                        throw new IOException("Unexpected EOF inside HTTP chunk");
-                    }
-                    remaining--;
-                    if (b == '\n') {
-                        byte[] line = lineBuf.toByteArray();
-                        lineBuf.reset();
-                        if (handleFrame(line)) {
-                            return true;
-                        }
-                    } else if (b != '\r') {
-                        if (lineBuf.size() >= spec.maxResponseBytes()) {
-                            throw new SpringForeignStepException.OutcomeUnknown(
-                                spec.stepId(), spec.stepIndex(), targetUri.toString(),
-                                "MANY_TO_MANY NDJSON frame exceeded " + spec.maxResponseBytes() + " bytes",
-                                Optional.empty());
-                        }
-                        lineBuf.write(b);
-                    }
-                }
-                readAsciiLine(in); // trailing CRLF after chunk data
-            }
-            return false;
-        }
-
-        private boolean readPlainNdjson(BufferedInputStream in) throws IOException, InterruptedException {
-            ByteArrayOutputStream lineBuf = new ByteArrayOutputStream();
-            while (!cancelled.get()) {
-                int b = in.read();
-                if (b == -1) {
-                    return lineBuf.size() > 0 && handleFrame(lineBuf.toByteArray());
-                }
-                if (b == '\n') {
-                    byte[] line = lineBuf.toByteArray();
-                    lineBuf.reset();
-                    if (handleFrame(line)) {
-                        return true;
-                    }
-                } else if (b != '\r') {
-                    if (lineBuf.size() >= spec.maxResponseBytes()) {
-                        throw new SpringForeignStepException.OutcomeUnknown(
-                            spec.stepId(), spec.stepIndex(), targetUri.toString(),
-                            "MANY_TO_MANY NDJSON frame exceeded " + spec.maxResponseBytes() + " bytes",
-                            Optional.empty());
-                    }
-                    lineBuf.write(b);
-                }
-            }
-            return false;
-        }
-
-        private Optional<String> readAsciiLine(BufferedInputStream in) throws IOException {
-            ByteArrayOutputStream buf = new ByteArrayOutputStream(32);
-            while (true) {
-                int b = in.read();
-                if (b == -1) {
-                    return buf.size() == 0
-                        ? Optional.empty()
-                        : Optional.of(buf.toString(StandardCharsets.ISO_8859_1));
-                }
-                if (b == '\n') {
-                    byte[] raw = buf.toByteArray();
-                    int len = (raw.length > 0 && raw[raw.length - 1] == '\r') ? raw.length - 1 : raw.length;
-                    return Optional.of(new String(raw, 0, len, StandardCharsets.ISO_8859_1));
-                }
-                buf.write(b);
-            }
-        }
-
         private boolean handleFrame(byte[] lineBytes) throws InterruptedException {
-            String trimmed = new String(lineBytes, StandardCharsets.UTF_8).trim();
-            if (trimmed.isEmpty()) {
+            if (isWhitespaceOnly(lineBytes)) {
                 return false;
             }
-            JsonNode frame = readStrictObject(trimmed.getBytes(StandardCharsets.UTF_8), targetUri);
+            JsonNode frame = readStrictObject(lineBytes, targetUri);
             String event = frame.path("event").asText("");
             return switch (event) {
                 case "item" -> {
                     SpringCanonicalPayload payload = validateCanonicalOutput(frame, targetUri);
                     awaitDemand();
-                    if (!cancelled.get() && !terminated.get()) {
-                        downstream.onNext(payload);
+                    synchronized (signalLock) {
+                        if (!cancelled.get() && !terminated.get()) {
+                            downstream.onNext(payload);
+                        }
                     }
                     yield false;
                 }
@@ -1265,10 +1506,10 @@ public final class SpringCanonicalFunctionHostStep
 
         private void awaitDemand() throws InterruptedException {
             synchronized (demandLock) {
-                while (!cancelled.get() && demand.get() <= 0) {
+                while (!cancelled.get() && !terminated.get() && demand.get() <= 0) {
                     demandLock.wait(50L);
                 }
-                if (!cancelled.get()) {
+                if (!cancelled.get() && !terminated.get()) {
                     demand.updateAndGet(cur -> cur == Long.MAX_VALUE ? Long.MAX_VALUE : Math.max(0L, cur - 1L));
                 }
             }
@@ -1280,13 +1521,16 @@ public final class SpringCanonicalFunctionHostStep
 
         private void terminateError(Throwable failure) {
             if (terminated.compareAndSet(false, true)) {
-                Flow.Subscription up = upstreamSubRef.getAndSet(null);
-                if (up != null) {
-                    up.cancel();
+                cancelled.set(true);
+                synchronized (demandLock) {
+                    demandLock.notifyAll();
                 }
+                cancelUpstream();
                 closeSocket();
                 settleDispatchIntent(reserved, settlementForFailure(failure));
-                downstream.onError(failure);
+                synchronized (signalLock) {
+                    downstream.onError(failure);
+                }
             }
         }
 
@@ -1295,7 +1539,7 @@ public final class SpringCanonicalFunctionHostStep
             public void onSubscribe(Flow.Subscription subscription) {
                 upstreamSubRef.set(subscription);
                 if (cancelled.get() || terminated.get()) {
-                    subscription.cancel();
+                    cancelUpstream();
                 } else {
                     subscription.request(1L);
                 }
@@ -1318,7 +1562,7 @@ public final class SpringCanonicalFunctionHostStep
                             up.request(1L);
                         }
                     } catch (IOException writeFailure) {
-                        if (!cancelled.get()) {
+                        if (!cancelled.get() && !terminated.get()) {
                             terminateError(new SpringForeignStepException.OutcomeUnknown(
                                 spec.stepId(), spec.stepIndex(), targetUri.toString(),
                                 "Uncertain write failure streaming MANY_TO_MANY input: " + writeFailure.getMessage(),
@@ -1355,7 +1599,7 @@ public final class SpringCanonicalFunctionHostStep
                         writeHttpChunk(rawOut, "{\"event\":\"complete\"}\n".getBytes(StandardCharsets.UTF_8));
                         writeFinalHttpChunk(rawOut);
                     } catch (IOException writeFailure) {
-                        if (!cancelled.get()) {
+                        if (!cancelled.get() && !terminated.get()) {
                             terminateError(new SpringForeignStepException.OutcomeUnknown(
                                 spec.stepId(), spec.stepIndex(), targetUri.toString(),
                                 "Failed finishing MANY_TO_MANY request stream: " + writeFailure.getMessage(),

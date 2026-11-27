@@ -19,6 +19,7 @@ package org.pipelineframework.runtime.spring.polyglot;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -33,22 +34,42 @@ import org.pipelineframework.runtime.core.PipelineUnaryStep;
 import org.pipelineframework.runtime.spring.SpringPipelineRunner;
 import org.pipelineframework.runtime.spring.SpringRuntimeAdaptersAutoConfiguration;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Condition;
+import org.springframework.context.annotation.ConditionContext;
+import org.springframework.context.annotation.Conditional;
+import org.springframework.core.type.AnnotatedTypeMetadata;
 
 /**
  * Spring Boot auto-configuration that wires {@link SpringCanonicalFunctionHostStep} instances,
- * pre-send {@link SpringForeignDispatchIntentStore}, {@link SpringAwaitResumeCoordinator}, and
- * {@link SpringCheckpointHandoffCodec} from compiler-emitted {@code META-INF/pipeline/pipeline-contract.json}.
+ * durable pre-send {@link SpringForeignDispatchIntentStore}, durable {@link SpringAwaitStateStore},
+ * {@link SpringAwaitResumeCoordinator}, and {@link SpringCheckpointHandoffCodec} from
+ * compiler-emitted class-free canonical v3 {@code META-INF/pipeline/pipeline-contract.json}.
  */
 @AutoConfiguration(before = SpringRuntimeAdaptersAutoConfiguration.class)
 @EnableConfigurationProperties(SpringPolyglotProperties.class)
 public class SpringPolyglotAutoConfiguration {
 
+    private static final int MIN_CLASS_FREE_SCHEMA_VERSION = 3;
     private static final Set<String> SUPPORTED_CARDINALITIES =
         Set.of("ONE_TO_ONE", "ONE_TO_MANY", "MANY_TO_ONE", "MANY_TO_MANY");
+
+    /** Activates store auto-configuration when polyglot is enabled or a store option is configured. */
+    static final class PolyglotStoreConfiguredCondition implements Condition {
+        @Override
+        public boolean matches(ConditionContext context, AnnotatedTypeMetadata metadata) {
+            boolean enabled = "true".equalsIgnoreCase(
+                context.getEnvironment().getProperty("pipeline.polyglot.enabled"));
+            String stateDir = context.getEnvironment().getProperty("pipeline.polyglot.state-dir");
+            boolean allowInMemory = "true".equalsIgnoreCase(
+                context.getEnvironment().getProperty("pipeline.polyglot.allow-in-memory-stores"));
+            return enabled || (stateDir != null && !stateDir.isBlank()) || allowInMemory;
+        }
+    }
 
     /** Immutable registry of contract-derived Spring polyglot steps in pipeline order. */
     public record SpringPolyglotStepRegistry(
@@ -68,9 +89,36 @@ public class SpringPolyglotAutoConfiguration {
     }
 
     @Bean
+    @Conditional(PolyglotStoreConfiguredCondition.class)
     @ConditionalOnMissingBean
-    public SpringForeignDispatchIntentStore springForeignDispatchIntentStore() {
-        return SpringForeignDispatchIntentStore.inMemory();
+    public SpringForeignDispatchIntentStore springForeignDispatchIntentStore(SpringPolyglotProperties properties) {
+        if (!properties.getStateDir().isBlank()) {
+            return SpringForeignDispatchIntentStore.fileBacked(
+                Path.of(properties.getStateDir()).resolve("dispatch-intents"));
+        }
+        if (properties.isAllowInMemoryStores()) {
+            return SpringForeignDispatchIntentStore.inMemory();
+        }
+        throw new IllegalStateException(
+            "Spring polyglot execution requires a durable SpringForeignDispatchIntentStore bean or "
+                + "pipeline.polyglot.state-dir (set pipeline.polyglot.allow-in-memory-stores=true "
+                + "only for local development and tests)");
+    }
+
+    @Bean
+    @Conditional(PolyglotStoreConfiguredCondition.class)
+    @ConditionalOnMissingBean
+    public SpringAwaitStateStore springAwaitStateStore(SpringPolyglotProperties properties) {
+        if (!properties.getStateDir().isBlank()) {
+            return SpringAwaitStateStore.fileBacked(Path.of(properties.getStateDir()).resolve("await-units"));
+        }
+        if (properties.isAllowInMemoryStores()) {
+            return SpringAwaitStateStore.inMemory();
+        }
+        throw new IllegalStateException(
+            "Spring polyglot Await execution requires a durable SpringAwaitStateStore bean or "
+                + "pipeline.polyglot.state-dir (set pipeline.polyglot.allow-in-memory-stores=true "
+                + "only for local development and tests)");
     }
 
     @Bean
@@ -80,9 +128,10 @@ public class SpringPolyglotAutoConfiguration {
     }
 
     @Bean
+    @ConditionalOnBean(SpringAwaitStateStore.class)
     @ConditionalOnMissingBean
-    public SpringAwaitResumeCoordinator springAwaitResumeCoordinator() {
-        return new SpringAwaitResumeCoordinator();
+    public SpringAwaitResumeCoordinator springAwaitResumeCoordinator(SpringAwaitStateStore awaitStateStore) {
+        return new SpringAwaitResumeCoordinator(awaitStateStore);
     }
 
     @Bean
@@ -100,16 +149,18 @@ public class SpringPolyglotAutoConfiguration {
     @ConditionalOnMissingBean(SpringPipelineRunner.class)
     public SpringPipelineRunner polyglotSpringPipelineRunner(
         PipelineRunnerCore runnerCore,
-        SpringPolyglotStepRegistry registry,
-        List<PipelineUnaryStep<?, ?>> registeredUnarySteps
+        SpringPolyglotStepRegistry registry
     ) {
         boolean allUnary = registry.orderedSteps().stream()
             .allMatch(step -> "ONE_TO_ONE".equals(step.spec().cardinality()));
-        if (!allUnary) {
-            return new SpringPipelineRunner(runnerCore, registeredUnarySteps);
+        if (allUnary) {
+            List<PipelineUnaryStep<?, ?>> unarySteps = new ArrayList<>(registry.orderedSteps());
+            return new SpringPipelineRunner(runnerCore, unarySteps);
         }
-        List<PipelineUnaryStep<?, ?>> unarySteps = new ArrayList<>(registry.orderedSteps());
-        return new SpringPipelineRunner(runnerCore, unarySteps);
+        // Mixed-cardinality registries either run all steps via SpringPolyglotPipelineExecutor
+        // (for valid unary-bounded fan-out/duplex/collect shapes) or fail fast at startup.
+        SpringPolyglotPipelineExecutor executor = new SpringPolyglotPipelineExecutor(registry.orderedSteps());
+        return new SpringPipelineRunner(runnerCore, List.of(executor));
     }
 
     public static SpringPolyglotStepRegistry buildRegistry(
@@ -124,6 +175,14 @@ public class SpringPolyglotAutoConfiguration {
                 "pipeline.polyglot.shared-secret must be configured when pipeline.polyglot.enabled=true");
         }
         JsonNode contract = loadContractJson(properties.getContractResourcePath(), classLoader);
+        int schemaVersion = contract.path("schemaVersion").asInt(0);
+        if (schemaVersion < MIN_CLASS_FREE_SCHEMA_VERSION) {
+            throw new IllegalStateException(
+                "Compiled contract at " + properties.getContractResourcePath()
+                    + " has schemaVersion " + schemaVersion
+                    + "; Spring polyglot auto-wiring requires a class-free schemaVersion >= "
+                    + MIN_CLASS_FREE_SCHEMA_VERSION + " contract");
+        }
         String pipelineId = contract.path("pipelineId").asText("local-pipeline");
         String catalogFingerprint = contract.path("canonicalCatalogFingerprint").asText("");
         if (catalogFingerprint.isBlank()) {
@@ -146,16 +205,37 @@ public class SpringPolyglotAutoConfiguration {
         List<SpringCanonicalFunctionHostStep> steps = new ArrayList<>();
         for (int i = 0; i < stepsNode.size(); i++) {
             JsonNode stepNode = stepsNode.get(i);
-            int stepIndex = stepNode.path("stepIndex").asInt(i);
+            int stepIndex = stepNode.has("stepIndex")
+                ? stepNode.path("stepIndex").asInt(i)
+                : stepNode.path("index").asInt(i);
             String authoredName = stepNode.path("authoredName").asText("");
             String stepId = toKebabCase(authoredName);
+
+            String runtimeClass = stepNode.path("runtimeClass").asText("").trim();
+            if (!runtimeClass.isEmpty()) {
+                throw new IllegalStateException(
+                    "Contract step '" + authoredName + "' declares JVM runtimeClass '" + runtimeClass
+                        + "'; Spring polyglot auto-wiring only binds class-free foreign function steps and "
+                        + "must not route JVM-local steps over HTTP");
+            }
+            String kind = stepNode.path("kind").asText("internal").trim().toLowerCase(Locale.ROOT);
+            if (!"internal".equals(kind)) {
+                throw new IllegalStateException(
+                    "Unsupported polyglot step kind '" + kind + "' for step '" + authoredName
+                        + "'; Spring foreign-function auto-wiring supports only class-free 'internal' function steps");
+            }
+
             String cardinality = stepNode.path("cardinality").asText("ONE_TO_ONE").toUpperCase(Locale.ROOT);
             if (!SUPPORTED_CARDINALITIES.contains(cardinality)) {
                 throw new IllegalArgumentException(
                     "Unsupported polyglot step cardinality '" + cardinality + "' for step '" + stepId + "'");
             }
-            String inputTypeId = stepNode.path("inputType").asText("");
-            String outputTypeId = stepNode.path("outputType").asText("");
+            String inputTypeId = stepNode.has("inputType")
+                ? stepNode.path("inputType").asText("")
+                : stepNode.path("inputTypeId").asText("");
+            String outputTypeId = stepNode.has("outputType")
+                ? stepNode.path("outputType").asText("")
+                : stepNode.path("outputTypeId").asText("");
             String inputFp = definitionFingerprint(canonicalTypes, inputTypeId);
             String outputFp = definitionFingerprint(canonicalTypes, outputTypeId);
             String uriText = resolveStepUri(stepId, properties);
@@ -207,8 +287,9 @@ public class SpringPolyglotAutoConfiguration {
 
     private static String resolveStepUri(String stepId, SpringPolyglotProperties properties) {
         Map<String, String> overrides = properties.getStepUris();
-        if (overrides.containsKey(stepId) && !overrides.get(stepId).isBlank()) {
-            return overrides.get(stepId);
+        String override = overrides.get(stepId);
+        if (override != null && !override.isBlank()) {
+            return override;
         }
         if (!properties.getFunctionHostUri().isBlank()) {
             return properties.getFunctionHostUri();

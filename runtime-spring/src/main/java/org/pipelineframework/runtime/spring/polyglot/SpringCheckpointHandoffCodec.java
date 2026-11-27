@@ -17,6 +17,7 @@
 package org.pipelineframework.runtime.spring.polyglot;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -136,6 +137,20 @@ public final class SpringCheckpointHandoffCodec {
             root = SpringPolyglotJson.exactMapper().readValue(serialized.payload(), MAP_TYPE);
         } catch (IOException malformed) {
             throw new IllegalArgumentException("Malformed checkpoint handoff JSON", malformed);
+        }
+
+        Object schemaVersionObj = root.get("schemaVersion");
+        if (!(schemaVersionObj instanceof Number schemaNumber)) {
+            throw new IllegalArgumentException("Missing or non-numeric checkpoint schemaVersion");
+        }
+        int schemaVersion;
+        try {
+            schemaVersion = new BigDecimal(schemaNumber.toString()).intValueExact();
+        } catch (ArithmeticException | NumberFormatException invalid) {
+            throw new IllegalArgumentException("Invalid checkpoint schemaVersion: " + schemaVersionObj, invalid);
+        }
+        if (schemaVersion != 1) {
+            throw new IllegalArgumentException("Unsupported checkpoint schemaVersion: " + schemaVersion);
         }
 
         SpringCanonicalPayload payload = SpringCanonicalPayload.fromDurableMap(root.get("canonicalPayload"))

@@ -61,8 +61,16 @@ public record SpringForeignDispatchIntent(
      * omits {@code executionVersion} so a reclaimed expired lease collides and fails closed.
      */
     public String storageKey() {
-        String raw = tenantId + "\n" + executionId + "\n" + transitionKey + "\n" + stepIndex + "\n" + stepId;
+        String raw = lengthPrefixed(tenantId)
+            + lengthPrefixed(executionId)
+            + lengthPrefixed(transitionKey)
+            + lengthPrefixed(Integer.toString(stepIndex))
+            + lengthPrefixed(stepId);
         return "foreign-dispatch:v1:" + sha256Hex(raw.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String lengthPrefixed(String value) {
+        return value.length() + ":" + value + ";";
     }
 
     public static String sha256Hex(byte[] bytes) {
