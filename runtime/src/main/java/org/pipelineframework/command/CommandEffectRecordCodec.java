@@ -43,7 +43,22 @@ final class CommandEffectRecordCodec {
     private final ClassLoader classLoader;
 
     CommandEffectRecordCodec() {
-        this(PipelineJson.mapper(), Thread.currentThread().getContextClassLoader());
+        this(PipelineJson.mapper(), defaultClassLoader());
+    }
+
+    private static ClassLoader defaultClassLoader() {
+        ClassLoader own = CommandEffectRecordCodec.class.getClassLoader();
+        ClassLoader tccl = Thread.currentThread().getContextClassLoader();
+        if (tccl == null || tccl == own) {
+            return own;
+        }
+        try {
+            return tccl.loadClass(CommandEffectRecordCodec.class.getName()) == CommandEffectRecordCodec.class
+                ? tccl
+                : own;
+        } catch (ClassNotFoundException ignored) {
+            return own;
+        }
     }
 
     CommandEffectRecordCodec(ObjectMapper json, ClassLoader classLoader) {

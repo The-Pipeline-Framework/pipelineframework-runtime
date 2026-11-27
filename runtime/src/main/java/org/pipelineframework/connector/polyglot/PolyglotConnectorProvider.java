@@ -93,8 +93,18 @@ public final class PolyglotConnectorProvider
     public record ProviderConfig(
         String connection,
         Optional<String> recoveryTargetIdentity,
-        Optional<Integer> timeoutMs
+        Optional<Integer> timeoutMs,
+        Optional<Boolean> reconciliationSupported,
+        Optional<String> receiptReferenceKind
     ) {
+        public ProviderConfig(
+            String connection,
+            Optional<String> recoveryTargetIdentity,
+            Optional<Integer> timeoutMs
+        ) {
+            this(connection, recoveryTargetIdentity, timeoutMs, Optional.empty(), Optional.empty());
+        }
+
         public ProviderConfig {
             if (Objects.requireNonNull(connection, "connection must not be null").isBlank()) {
                 throw new IllegalArgumentException("connection must not be blank");
@@ -102,6 +112,9 @@ public final class PolyglotConnectorProvider
             recoveryTargetIdentity = Objects.requireNonNull(recoveryTargetIdentity, "recoveryTargetIdentity")
                 .filter(v -> !v.isBlank());
             timeoutMs = Objects.requireNonNull(timeoutMs, "timeoutMs");
+            reconciliationSupported = Objects.requireNonNull(reconciliationSupported, "reconciliationSupported");
+            receiptReferenceKind = Objects.requireNonNull(receiptReferenceKind, "receiptReferenceKind")
+                .filter(v -> !v.isBlank());
         }
 
         Duration effectiveTimeout() {

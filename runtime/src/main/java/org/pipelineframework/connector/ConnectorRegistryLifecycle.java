@@ -51,6 +51,11 @@ public class ConnectorRegistryLifecycle {
     private Optional<ConnectorBindingRegistry> bindingRegistry = Optional.empty();
 
     void onStart(@Observes StartupEvent event) {
+        // Initialize ConnectorRuntimeContext eagerly on the Quarkus startup thread so CDI lookup
+        // proxies (such as @LookupIfProperty ConnectionResolver beans) resolve with Quarkus TCCL.
+        if (runtimeContext != null) {
+            runtimeContext.connectionResolver();
+        }
         List<ConnectorProvider<?>> providers = providerInstances.stream().toList();
         List<CommandConnector<?, ?>> legacy = legacyCommandConnectors.stream().toList();
         registry = createRegistry(providers, legacy);
@@ -158,6 +163,10 @@ public class ConnectorRegistryLifecycle {
                 new ConnectorConfigurationDocument(binding.config())))
             .forEach(definitions::add);
         return List.copyOf(definitions);
+    }
+
+    public static Optional<PipelineYamlConfig> loadPipelineYamlConfig() {
+        return loadPipelineConfig();
     }
 
     private static Optional<PipelineYamlConfig> loadPipelineConfig() {

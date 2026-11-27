@@ -321,19 +321,21 @@ final class CanonicalFunctionHostSupport {
         }
     }
 
-    /** Immutable snapshot of TPF thread-local execution contexts for propagation across worker pools. */
+    /** Immutable snapshot of TPF thread-local execution contexts and TCCL for propagation across worker pools. */
     record CapturedContext(
         Optional<PipelineExecutionContext> execution,
         Optional<PipelineContext> pipeline,
         Optional<AwaitExecutionContext> await,
-        Optional<TransitionDispatchScope> dispatchScope
+        Optional<TransitionDispatchScope> dispatchScope,
+        ClassLoader contextClassLoader
     ) {
         static CapturedContext capture() {
             return new CapturedContext(
                 PipelineExecutionContextHolder.get(),
                 Optional.ofNullable(PipelineContextHolder.get()),
                 Optional.ofNullable(AwaitExecutionContextHolder.get()),
-                TransitionDispatchScopeHolder.get());
+                TransitionDispatchScopeHolder.get(),
+                Thread.currentThread().getContextClassLoader());
         }
 
         CapturedContext install() {
@@ -342,6 +344,9 @@ final class CanonicalFunctionHostSupport {
             pipeline.ifPresentOrElse(PipelineContextHolder::set, PipelineContextHolder::clear);
             await.ifPresentOrElse(AwaitExecutionContextHolder::set, AwaitExecutionContextHolder::clear);
             dispatchScope.ifPresentOrElse(TransitionDispatchScopeHolder::set, TransitionDispatchScopeHolder::clear);
+            if (contextClassLoader != null) {
+                Thread.currentThread().setContextClassLoader(contextClassLoader);
+            }
             return previous;
         }
     }

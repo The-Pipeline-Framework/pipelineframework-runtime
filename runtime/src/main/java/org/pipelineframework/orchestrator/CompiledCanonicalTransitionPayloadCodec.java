@@ -7,11 +7,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.type.TypeFactory;
+import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
 
 /** Materializes canonical transition values using only the worker's compiled boundary contract. */
 public final class CompiledCanonicalTransitionPayloadCodec implements TransitionPayloadCodec {
+    private static final ObjectMapper EXACT_JSON = PipelineJson.mapper().copy()
+        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
     private final TransitionPayloadCodec framing;
     private final JsonDurablePayloadCodec canonical = new JsonDurablePayloadCodec();
     private final Boundary input;
@@ -119,11 +124,11 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
     }
 
     private TypedDurablePayload encodeClassFreeCollection(List<?> items, Boundary boundary) {
-        var array = org.pipelineframework.config.pipeline.PipelineJson.mapper().createArrayNode();
+        var array = EXACT_JSON.createArrayNode();
         for (Object item : items) {
             TypedDurablePayload normalized = validateAndNormalizeClassFree(item, boundary, false, false);
             try {
-                array.add(org.pipelineframework.config.pipeline.PipelineJson.mapper().readTree(normalized.payload()));
+                array.add(EXACT_JSON.readTree(normalized.payload()));
             } catch (java.io.IOException failure) {
                 throw new IllegalArgumentException("Invalid canonical JSON element", failure);
             }
@@ -173,17 +178,16 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
 
     private String validateSchema(TypedDurablePayload payload, Boundary boundary) {
         try {
-            var body = org.pipelineframework.config.pipeline.PipelineJson.mapper().reader()
-                .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+            var body = EXACT_JSON.reader()
+                .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
                 .with(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
                 .readTree(payload.payload());
             String identity = boundary.canonicalTypeId();
             if (payload.canonicalTypeId().equals(boundary.collectionTypeId())) {
                 if (!body.isArray()) throw new IllegalArgumentException("Canonical collection requires a JSON array");
-                var normalized = org.pipelineframework.config.pipeline.PipelineJson.mapper().createArrayNode();
+                var normalized = EXACT_JSON.createArrayNode();
                 for (var item : (com.fasterxml.jackson.databind.JsonNode) body) {
-                    normalized.add(org.pipelineframework.config.pipeline.PipelineJson.mapper()
-                        .readTree(catalogue.validateAndCanonicalize(identity, item.toString())));
+                    normalized.add(EXACT_JSON.readTree(catalogue.validateAndCanonicalize(identity, item.toString())));
                 }
                 return normalized.toString();
             } else {
