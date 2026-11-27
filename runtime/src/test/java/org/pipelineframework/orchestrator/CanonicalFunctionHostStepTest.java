@@ -102,6 +102,37 @@ class CanonicalFunctionHostStepTest {
     }
 
     @Test
+    void oneToOnePreservesArbitraryPrecision29DigitDecimalsAcrossInputAndOutput() {
+        String inputDecimal = "99999999999999999999.123456789";
+        String outputDecimal = "12345678901234567890.987654321";
+        AtomicReference<String> receivedRequestBody = new AtomicReference<>();
+        server.createContext("/tpf/functions/decimalStep", exchange -> {
+            receivedRequestBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            respondJson(exchange, 200,
+                "{\"status\":\"OK\",\"outputTypeId\":\"DecimalAmount\",\"payload\":{\"amount\":" + outputDecimal + "}}");
+        });
+
+        CanonicalTypeCatalogue decimalCatalogue = CanonicalTypeCatalogue.fromCanonicalTypes(Map.of(
+            "DecimalAmount", recordDef("DecimalAmount", List.of(field("amount", "decimal")))));
+        var step = new CanonicalFunctionHostStep(
+            new CanonicalFunctionHostStep.Spec(
+                "decimalStep", 0, "DecimalAmount", "fp-DecimalAmount", "DecimalAmount", "fp-DecimalAmount",
+                CATALOG_FP, decimalCatalogue, baseUri, SECRET, Duration.ofSeconds(3), Optional.empty()),
+            true);
+        TypedDurablePayload input = new TypedDurablePayload(
+            "DecimalAmount", "fp-DecimalAmount", CATALOG_FP,
+            JsonDurablePayloadCodec.ENCODING, JsonDurablePayloadCodec.ENCODING_VERSION,
+            ("{\"amount\":" + inputDecimal + "}").getBytes(StandardCharsets.UTF_8));
+
+        TypedDurablePayload out = step.applyOneToOne(input).await().atMost(TIMEOUT);
+
+        assertTrue(receivedRequestBody.get().contains(inputDecimal),
+            "Request body must preserve 29-digit decimal without double rounding, got: " + receivedRequestBody.get());
+        assertEquals("{\"amount\":" + outputDecimal + "}",
+            new String(out.payload(), StandardCharsets.UTF_8));
+    }
+
+    @Test
     void oneToOneRejectsRedirectsAuthFailuresAndOversizedResponsesFailClosed() {
         AtomicInteger calls = new AtomicInteger();
         server.createContext("/tpf/functions/redirStep", exchange -> {

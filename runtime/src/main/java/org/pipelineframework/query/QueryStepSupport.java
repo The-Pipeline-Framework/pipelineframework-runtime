@@ -19,6 +19,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.smallrye.mutiny.Multi;
@@ -51,7 +52,8 @@ public class QueryStepSupport {
     private final Optional<ConnectorBindingRegistry> bindingRegistry;
     private final ConnectorRuntimeContext runtimeContext;
     private final QueryObservationTelemetry observationTelemetry;
-    private final ObjectMapper json = PipelineJson.mapper();
+    private final ObjectMapper json = PipelineJson.mapper().copy()
+        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
     private final QueryCapturePayloadCodec capturePayloadCodec = new QueryCapturePayloadCodec(json);
     private final ConnectorOperationInvocationCoordinator invocationCoordinator =
         new ConnectorOperationInvocationCoordinator();

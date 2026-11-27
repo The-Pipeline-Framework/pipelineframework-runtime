@@ -9,6 +9,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.Message;
 import org.pipelineframework.config.pipeline.PipelineJson;
@@ -28,7 +29,8 @@ final class QueryCaptureEventCodec {
     private final QueryCapturePayloadCodec payloadCodec;
 
     QueryCaptureEventCodec() {
-        this(PipelineJson.mapper(), Thread.currentThread().getContextClassLoader());
+        this(PipelineJson.mapper().copy().enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS),
+            Thread.currentThread().getContextClassLoader());
     }
 
     QueryCaptureEventCodec(ObjectMapper json, ClassLoader classLoader) {

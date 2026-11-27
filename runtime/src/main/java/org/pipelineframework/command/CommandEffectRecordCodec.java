@@ -10,6 +10,7 @@ import java.security.MessageDigest;
 import org.pipelineframework.connector.CommandRecoveryBinding;
 
 import com.fasterxml.jackson.core.StreamReadFeature;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.Message;
@@ -32,7 +33,8 @@ final class CommandEffectRecordCodec {
     private final ClassLoader classLoader;
 
     CommandEffectRecordCodec() {
-        this(PipelineJson.mapper(), Thread.currentThread().getContextClassLoader());
+        this(PipelineJson.mapper().copy().enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS),
+            Thread.currentThread().getContextClassLoader());
     }
 
     CommandEffectRecordCodec(ObjectMapper json, ClassLoader classLoader) {
