@@ -33,8 +33,7 @@ final class CommandEffectRecordCodec {
     private final ClassLoader classLoader;
 
     CommandEffectRecordCodec() {
-        this(PipelineJson.mapper().copy().enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS),
-            Thread.currentThread().getContextClassLoader());
+        this(PipelineJson.mapper(), Thread.currentThread().getContextClassLoader());
     }
 
     CommandEffectRecordCodec(ObjectMapper json, ClassLoader classLoader) {
@@ -327,8 +326,11 @@ final class CommandEffectRecordCodec {
         try {
             return Optional.of(switch (snapshot.encoding()) {
                 // Read typed JSON directly: an intermediate JsonNode would round decimal timestamps through Double.
-                // The declared/runtime checks above still apply, and the original numeric coercions remain intact.
-                case JSON_ENCODING -> json.readerFor(runtimeType).at(pointer).readValue(encoded);
+                // Preserve exact BigDecimal precision when decoding untyped JsonNode values without altering
+                // IEEE-754 floating-point semantics (such as signed -0.0) for typed Java records/maps.
+                case JSON_ENCODING -> (JsonNode.class.isAssignableFrom(runtimeType)
+                    ? json.readerFor(runtimeType).with(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
+                    : json.readerFor(runtimeType)).at(pointer).readValue(encoded);
                 case PROTOBUF_JSON_ENCODING -> decodeProtobuf(snapshot.value(), runtimeType);
                 default -> throw new CommandEffectStoreException(
                     "Unsupported durable Command value encoding " + snapshot.encoding());

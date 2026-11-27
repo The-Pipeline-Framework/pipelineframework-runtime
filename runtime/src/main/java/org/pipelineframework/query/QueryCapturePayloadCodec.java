@@ -5,6 +5,7 @@ import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.Objects;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -56,7 +57,9 @@ final class QueryCapturePayloadCodec {
                 return outputType.cast(builder.build());
             }
             if (!outputType.isSealed()) {
-                return json.readValue(payload, outputType);
+                return JsonNode.class.isAssignableFrom(outputType)
+                    ? json.readerFor(outputType).with(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS).readValue(payload)
+                    : json.readValue(payload, outputType);
             }
             JsonNode envelope = json.readTree(payload);
             String caseName = requiredText(envelope, "case");
