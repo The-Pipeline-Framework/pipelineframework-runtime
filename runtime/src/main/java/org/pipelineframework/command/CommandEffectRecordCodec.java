@@ -415,18 +415,15 @@ final class CommandEffectRecordCodec {
     }
 
     private static JsonNode decodeExactFloatingNode(JsonNodeFactory factory, String rawText) {
-        if (isNegativeZeroText(rawText) || isCanonicalDoubleExponentText(rawText)) {
+        BigDecimal exact = new BigDecimal(rawText);
+        if (isNegativeZeroText(rawText, exact) || isCanonicalDoubleExponentText(rawText)) {
             return factory.numberNode(Double.parseDouble(rawText));
         }
-        return factory.numberNode(new BigDecimal(rawText));
+        return factory.numberNode(exact);
     }
 
-    private static boolean isNegativeZeroText(String rawText) {
-        if (!rawText.startsWith("-")) {
-            return false;
-        }
-        double parsed = Double.parseDouble(rawText);
-        return Double.doubleToRawLongBits(parsed) == Double.doubleToRawLongBits(-0.0d);
+    private static boolean isNegativeZeroText(String rawText, BigDecimal exact) {
+        return exact.signum() == 0 && "-0.0".equals(rawText);
     }
 
     private static boolean isCanonicalDoubleExponentText(String rawText) {

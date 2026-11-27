@@ -163,6 +163,7 @@ class CommandRecoveryRecordCodecTest {
             .put("hugeExp", 1.0E20d);
         ObjectNode mixedNode = PipelineJson.mapper().createObjectNode()
             .put("negativeZero", -0.0d)
+            .put("negativeUnderflow", new BigDecimal("-1E-400"))
             .put("largeExp", 1.0E7d)
             .put("smallExp", 1.0E-4d)
             .put("exactDecimal", new BigDecimal(exact29));
@@ -190,6 +191,8 @@ class CommandRecoveryRecordCodecTest {
             .record().input();
         assertEquals(Double.doubleToRawLongBits(-0.0d),
             Double.doubleToRawLongBits(restoredMixed.path("negativeZero").doubleValue()));
+        assertTrue(restoredMixed.path("negativeUnderflow").isBigDecimal());
+        assertEquals(new BigDecimal("-1E-400"), restoredMixed.path("negativeUnderflow").decimalValue());
         assertTrue(restoredMixed.path("exactDecimal").isBigDecimal());
         assertEquals(exact29, restoredMixed.path("exactDecimal").decimalValue().toPlainString());
         assertTrue(restoredMixed.path("values").get(2).isBigDecimal());
