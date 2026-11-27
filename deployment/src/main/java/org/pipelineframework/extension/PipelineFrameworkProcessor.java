@@ -21,6 +21,7 @@ import io.quarkus.deployment.builditem.ConfigMappingBuildItem;
 import io.quarkus.deployment.builditem.FeatureBuildItem;
 import io.quarkus.deployment.builditem.IndexDependencyBuildItem;
 import org.pipelineframework.command.CommandEffectStoreConfig;
+import org.pipelineframework.orchestrator.PolyglotRuntimeConfig;
 import org.pipelineframework.query.QueryCaptureStoreConfig;
 
 /**
@@ -54,5 +55,10 @@ public class PipelineFrameworkProcessor {
     @BuildStep
     ConfigMappingBuildItem commandEffectStoreConfig() {
         return new ConfigMappingBuildItem(CommandEffectStoreConfig.class, "pipeline.command.effect-store");
+    }
+
+    @BuildStep
+    ConfigMappingBuildItem polyglotRuntimeConfig() {
+        return new ConfigMappingBuildItem(PolyglotRuntimeConfig.class, "pipeline.polyglot");
     }
 }

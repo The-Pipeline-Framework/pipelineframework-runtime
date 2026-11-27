@@ -34,8 +34,7 @@ import org.pipelineframework.type.CanonicalTypeCatalogue;
 final class CanonicalFunctionHostSupport {
 
     static final int DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
-    private static final ObjectMapper JSON = PipelineJson.mapper().copy()
-        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
+    private static final ObjectMapper JSON = CanonicalTypeCatalogue.exactJsonMapper();
 
     private CanonicalFunctionHostSupport() {
     }
@@ -321,19 +320,21 @@ final class CanonicalFunctionHostSupport {
         }
     }
 
-    /** Immutable snapshot of TPF thread-local execution contexts for propagation across worker pools. */
+    /** Immutable snapshot of TPF thread-local execution contexts and TCCL for propagation across worker pools. */
     record CapturedContext(
         Optional<PipelineExecutionContext> execution,
         Optional<PipelineContext> pipeline,
         Optional<AwaitExecutionContext> await,
-        Optional<TransitionDispatchScope> dispatchScope
+        Optional<TransitionDispatchScope> dispatchScope,
+        ClassLoader contextClassLoader
     ) {
         static CapturedContext capture() {
             return new CapturedContext(
                 PipelineExecutionContextHolder.get(),
                 Optional.ofNullable(PipelineContextHolder.get()),
                 Optional.ofNullable(AwaitExecutionContextHolder.get()),
-                TransitionDispatchScopeHolder.get());
+                TransitionDispatchScopeHolder.get(),
+                Thread.currentThread().getContextClassLoader());
         }
 
         CapturedContext install() {
@@ -342,7 +343,18 @@ final class CanonicalFunctionHostSupport {
             pipeline.ifPresentOrElse(PipelineContextHolder::set, PipelineContextHolder::clear);
             await.ifPresentOrElse(AwaitExecutionContextHolder::set, AwaitExecutionContextHolder::clear);
             dispatchScope.ifPresentOrElse(TransitionDispatchScopeHolder::set, TransitionDispatchScopeHolder::clear);
+            if (contextClassLoader != null) {
+                Thread.currentThread().setContextClassLoader(contextClassLoader);
+            }
             return previous;
+        }
+
+        void restore() {
+            execution.ifPresentOrElse(PipelineExecutionContextHolder::set, PipelineExecutionContextHolder::clear);
+            pipeline.ifPresentOrElse(PipelineContextHolder::set, PipelineContextHolder::clear);
+            await.ifPresentOrElse(AwaitExecutionContextHolder::set, AwaitExecutionContextHolder::clear);
+            dispatchScope.ifPresentOrElse(TransitionDispatchScopeHolder::set, TransitionDispatchScopeHolder::clear);
+            Thread.currentThread().setContextClassLoader(contextClassLoader);
         }
     }
 }

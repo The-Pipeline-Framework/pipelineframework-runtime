@@ -197,7 +197,7 @@ public final class CanonicalFunctionHostManyToOneStep extends ConfigurableStep
                             CanonicalFunctionHostSupport.settlementForFailure(failure));
                         throw failure;
                     } finally {
-                        previous.install();
+                        previous.restore();
                     }
                 });
         });

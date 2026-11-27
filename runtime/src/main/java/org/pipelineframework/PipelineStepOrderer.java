@@ -27,6 +27,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
+import jakarta.inject.Inject;
 
 import org.jboss.logging.Logger;
 import org.pipelineframework.config.pipeline.PipelineOrderResourceLoader;
@@ -36,9 +38,17 @@ class PipelineStepOrderer {
 
     private static final Logger logger = Logger.getLogger(PipelineStepOrderer.class);
 
+    @Inject
+    Instance<PolyglotStepAutoWirer> polyglotStepAutoWirer;
+
     List<Object> orderSteps(List<Object> steps) {
         Optional<List<String>> resourceOrder = PipelineOrderResourceLoader.loadOrder();
         if (resourceOrder.isEmpty()) {
+            if (polyglotStepAutoWirer != null
+                && polyglotStepAutoWirer.isResolvable()
+                && polyglotStepAutoWirer.get().isActive()) {
+                return steps;
+            }
             if (!PipelineOrderResourceLoader.requiresOrder()) {
                 logger.debug("Pipeline order metadata not found and not required; preserving existing step order.");
                 return steps;

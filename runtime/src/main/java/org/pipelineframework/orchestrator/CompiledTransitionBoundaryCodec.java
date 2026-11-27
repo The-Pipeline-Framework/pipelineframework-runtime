@@ -21,7 +21,7 @@ public final class CompiledTransitionBoundaryCodec implements TransitionPayloadC
         TransitionCommandEnvelope command) {
         this.framing = framing;
         this.contract = contract;
-        List<StepBoundary> root = PipelineOrderResourceLoader.loadBoundaries().orElseThrow(() ->
+        List<StepBoundary> root = loadRootBoundaries(contract).orElseThrow(() ->
             new IllegalStateException("Canonical transitions require compiled physical boundary metadata"));
         int current = command.currentStepIndex();
         int stop = command.stopBeforeStepIndex() < 0 ? root.size() : command.stopBeforeStepIndex();
@@ -65,7 +65,7 @@ public final class CompiledTransitionBoundaryCodec implements TransitionPayloadC
 
     public static boolean supports(PipelineContractDescriptor contract) {
         try {
-            var root = PipelineOrderResourceLoader.loadBoundaries();
+            var root = loadRootBoundaries(contract);
             if (root.isEmpty() || contract.rootBoundary().isEmpty()
                 || !contract.canonicalTypes().containsKey(contract.rootBoundary().get("inputCanonicalTypeId"))
                 || !contract.canonicalTypes().containsKey(contract.rootBoundary().get("outputCanonicalTypeId"))) return false;
@@ -95,6 +95,32 @@ public final class CompiledTransitionBoundaryCodec implements TransitionPayloadC
             }
             return visitedClasses.size() == nested.size();
         } catch (RuntimeException unavailable) { return false; }
+    }
+
+    private static Optional<List<StepBoundary>> loadRootBoundaries(PipelineContractDescriptor contract) {
+        Optional<List<StepBoundary>> physical = PipelineOrderResourceLoader.loadBoundaries();
+        if (physical.isPresent()) {
+            return physical;
+        }
+        if (contract == null || contract.schemaVersion() < 3
+            || contract.steps().isEmpty() || contract.canonicalTypes().isEmpty()
+            || contract.composition().present()) {
+            return Optional.empty();
+        }
+        boolean allClassFree = contract.steps().stream().allMatch(step ->
+            (step.runtimeClass() == null || step.runtimeClass().isBlank())
+                && step.inputTypeId() != null && !step.inputTypeId().isBlank()
+                && step.outputTypeId() != null && !step.outputTypeId().isBlank());
+        if (!allClassFree) {
+            return Optional.empty();
+        }
+        List<StepBoundary> boundaries = contract.steps().stream()
+            .map(step -> new StepBoundary(
+                "polyglot:" + step.index() + ":" + step.authoredName(),
+                step.inputTypeId(),
+                step.outputTypeId()))
+            .toList();
+        return Optional.of(boundaries);
     }
 
     private static boolean hasCanonicalIdentity(PipelineContractDescriptor contract, String id) {

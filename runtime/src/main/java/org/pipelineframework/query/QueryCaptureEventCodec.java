@@ -28,7 +28,22 @@ final class QueryCaptureEventCodec {
     private final QueryCapturePayloadCodec payloadCodec;
 
     QueryCaptureEventCodec() {
-        this(PipelineJson.mapper(), Thread.currentThread().getContextClassLoader());
+        this(PipelineJson.mapper(), defaultClassLoader());
+    }
+
+    private static ClassLoader defaultClassLoader() {
+        ClassLoader own = QueryCaptureEventCodec.class.getClassLoader();
+        ClassLoader tccl = Thread.currentThread().getContextClassLoader();
+        if (tccl == null || tccl == own) {
+            return own;
+        }
+        try {
+            return tccl.loadClass(QueryCaptureEventCodec.class.getName()) == QueryCaptureEventCodec.class
+                ? tccl
+                : own;
+        } catch (ClassNotFoundException ignored) {
+            return own;
+        }
     }
 
     QueryCaptureEventCodec(ObjectMapper json, ClassLoader classLoader) {

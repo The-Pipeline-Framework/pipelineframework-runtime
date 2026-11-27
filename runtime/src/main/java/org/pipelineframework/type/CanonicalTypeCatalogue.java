@@ -26,6 +26,7 @@ import java.util.regex.PatternSyntaxException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.cfg.JsonNodeFeature;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.pipelineframework.config.pipeline.PipelineJson;
@@ -42,8 +43,14 @@ import org.pipelineframework.orchestrator.release.PipelineContractDescriptorLoad
 public final class CanonicalTypeCatalogue {
     private static final String DEFINITIONS_REFERENCE_PREFIX = "#/$defs/";
     private static final ObjectMapper JSON = PipelineJson.mapper().copy()
-        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
+        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
+        .configure(JsonNodeFeature.STRIP_TRAILING_BIGDECIMAL_ZEROES, false);
     private static final Pattern EMAIL = Pattern.compile("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$");
+
+    /** Shared exact-decimal JSON mapper preserving full BigDecimal precision and trailing zeroes. */
+    public static ObjectMapper exactJsonMapper() {
+        return JSON;
+    }
     private final Map<String, TypeBinding> types;
 
     private CanonicalTypeCatalogue(Map<String, TypeBinding> types) {

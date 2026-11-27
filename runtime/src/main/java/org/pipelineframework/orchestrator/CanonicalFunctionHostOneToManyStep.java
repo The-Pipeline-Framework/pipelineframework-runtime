@@ -244,7 +244,7 @@ public final class CanonicalFunctionHostOneToManyStep extends ConfigurableStep
                     fail(failure);
                 }
             } finally {
-                previous.install();
+                previous.restore();
                 draining.set(false);
                 if (!cancelled.get() && !terminated.get() && requested.get() > 0L) {
                     scheduleDrain();

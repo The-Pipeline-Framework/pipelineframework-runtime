@@ -81,8 +81,7 @@ public final class PolyglotConnectorProvider
     public static final String QUERY_PATH_PREFIX = "/tpf/connector/query/";
     public static final String COMMAND_PATH_PREFIX = "/tpf/connector/command/";
 
-    private static final ObjectMapper JSON = PipelineJson.mapper().copy()
-        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
+    private static final ObjectMapper JSON = org.pipelineframework.type.CanonicalTypeCatalogue.exactJsonMapper();
     private static final int DEFAULT_TIMEOUT_MS = 5_000;
     private static final ConnectorConfigSchema<ProviderConfig> PROVIDER_SCHEMA =
         ConnectorConfigSchema.record(ProviderConfig.class, "polyglot.connector.provider", 1);
@@ -93,8 +92,18 @@ public final class PolyglotConnectorProvider
     public record ProviderConfig(
         String connection,
         Optional<String> recoveryTargetIdentity,
-        Optional<Integer> timeoutMs
+        Optional<Integer> timeoutMs,
+        Optional<Boolean> reconciliationSupported,
+        Optional<String> receiptReferenceKind
     ) {
+        public ProviderConfig(
+            String connection,
+            Optional<String> recoveryTargetIdentity,
+            Optional<Integer> timeoutMs
+        ) {
+            this(connection, recoveryTargetIdentity, timeoutMs, Optional.empty(), Optional.empty());
+        }
+
         public ProviderConfig {
             if (Objects.requireNonNull(connection, "connection must not be null").isBlank()) {
                 throw new IllegalArgumentException("connection must not be blank");
@@ -102,6 +111,9 @@ public final class PolyglotConnectorProvider
             recoveryTargetIdentity = Objects.requireNonNull(recoveryTargetIdentity, "recoveryTargetIdentity")
                 .filter(v -> !v.isBlank());
             timeoutMs = Objects.requireNonNull(timeoutMs, "timeoutMs");
+            reconciliationSupported = Objects.requireNonNull(reconciliationSupported, "reconciliationSupported");
+            receiptReferenceKind = Objects.requireNonNull(receiptReferenceKind, "receiptReferenceKind")
+                .filter(v -> !v.isBlank());
         }
 
         Duration effectiveTimeout() {

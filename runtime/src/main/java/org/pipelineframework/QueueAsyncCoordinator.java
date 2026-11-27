@@ -982,6 +982,11 @@ class QueueAsyncCoordinator {
     return PipelineOrderResourceLoader.loadOrder()
         .filter(order -> !order.isEmpty())
         .map(List::size)
+        .or(() -> releaseIdentityResolver == null
+            ? java.util.Optional.empty()
+            : releaseIdentityResolver.compiledContract()
+                .filter(PolyglotStepAutoWirer::isClassFreeContract)
+                .map(contract -> contract.steps().size()))
         .orElseThrow(() -> new IllegalStateException(
             "Pipeline order metadata is required to resolve a terminal queue segment"));
   }
