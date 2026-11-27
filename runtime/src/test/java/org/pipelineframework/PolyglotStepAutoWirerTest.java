@@ -24,6 +24,7 @@ import org.pipelineframework.connector.ConnectionResolutionException;
 import org.pipelineframework.connector.ConnectionResolutionRequest;
 import org.pipelineframework.connector.ConnectorExecutionContext;
 import org.pipelineframework.connector.polyglot.PolyglotConnectorConnection;
+import org.pipelineframework.orchestrator.CanonicalFunctionHostManyToManyStep;
 import org.pipelineframework.orchestrator.CanonicalFunctionHostManyToOneStep;
 import org.pipelineframework.orchestrator.CanonicalFunctionHostOneToManyStep;
 import org.pipelineframework.orchestrator.CanonicalFunctionHostStep;
@@ -60,11 +61,11 @@ class PolyglotStepAutoWirerTest {
             noSecret, resolver, new InMemoryForeignDispatchIntentStore(), Optional.empty(), Optional.empty()));
         assertTrue(missingSecret.getMessage().contains("shared-secret"));
 
-        // HTTPS + per-step override builds 1:1 -> 1:N -> N:1 cleanly
+        // HTTPS + per-step override builds 1:1 -> 1:N -> N:N -> N:1 cleanly
         PolyglotRuntimeConfig valid = config(
             true,
             Optional.of("https://node.example.com"),
-            Map.of("split-lines", "https://python.example.com"),
+            Map.of("split-lines", "https://python.example.com", "enrich-stream", "https://python.example.com"),
             Optional.of("prod-hmac-secret"),
             false,
             "memory",
@@ -75,13 +76,15 @@ class PolyglotStepAutoWirerTest {
         assertTrue(wirer.isActive());
 
         List<Object> steps = wirer.loadOrderedSteps();
-        assertEquals(3, steps.size());
+        assertEquals(4, steps.size());
         CanonicalFunctionHostStep step0 = assertInstanceOf(CanonicalFunctionHostStep.class, steps.get(0));
         CanonicalFunctionHostOneToManyStep step1 = assertInstanceOf(CanonicalFunctionHostOneToManyStep.class, steps.get(1));
-        CanonicalFunctionHostManyToOneStep step2 = assertInstanceOf(CanonicalFunctionHostManyToOneStep.class, steps.get(2));
+        CanonicalFunctionHostManyToManyStep step2 = assertInstanceOf(CanonicalFunctionHostManyToManyStep.class, steps.get(2));
+        CanonicalFunctionHostManyToOneStep step3 = assertInstanceOf(CanonicalFunctionHostManyToOneStep.class, steps.get(3));
         assertEquals(URI.create("https://node.example.com"), step0.spec().baseUri());
         assertEquals(URI.create("https://python.example.com"), step1.spec().baseUri());
-        assertEquals(URI.create("https://node.example.com"), step2.spec().baseUri());
+        assertEquals(URI.create("https://python.example.com"), step2.spec().baseUri());
+        assertEquals(URI.create("https://node.example.com"), step3.spec().baseUri());
     }
 
     @Test
@@ -152,7 +155,8 @@ class PolyglotStepAutoWirerTest {
             List.of(
                 new PipelineBundleStepDescriptor(0, "Validate Order", "internal", "ONE_TO_ONE", "Order", "Order", null, null, Map.of()),
                 new PipelineBundleStepDescriptor(1, "Split Lines", "internal", "ONE_TO_MANY", "Order", "Line", null, null, Map.of()),
-                new PipelineBundleStepDescriptor(2, "Summarize", "internal", "MANY_TO_ONE", "Line", "Summary", null, null, Map.of())),
+                new PipelineBundleStepDescriptor(2, "Enrich Stream", "internal", "MANY_TO_MANY", "Line", "Line", null, null, Map.of()),
+                new PipelineBundleStepDescriptor(3, "Summarize", "internal", "MANY_TO_ONE", "Line", "Summary", null, null, Map.of())),
             PipelineBundleCapabilities.defaults(),
             types,
             "catalog-fp-1",

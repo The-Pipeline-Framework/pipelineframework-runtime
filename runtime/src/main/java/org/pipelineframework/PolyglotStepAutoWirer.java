@@ -41,6 +41,7 @@ import org.pipelineframework.connector.ConnectorProviderId;
 import org.pipelineframework.connector.ConnectorRegistryLifecycle;
 import org.pipelineframework.execution.PipelineExecutionContext;
 import org.pipelineframework.execution.PipelineExecutionContextHolder;
+import org.pipelineframework.orchestrator.CanonicalFunctionHostManyToManyStep;
 import org.pipelineframework.orchestrator.CanonicalFunctionHostManyToOneStep;
 import org.pipelineframework.orchestrator.CanonicalFunctionHostOneToManyStep;
 import org.pipelineframework.orchestrator.CanonicalFunctionHostStep;
@@ -293,9 +294,13 @@ public class PolyglotStepAutoWirer {
                             catalogFingerprint, catalogue, targetUri, secret,
                             config.requestTimeout(), commandId, intentStore, config.maxResponseBytes()),
                         config.allowLoopbackHttp());
-                    case "MANY_TO_MANY" -> throw new IllegalStateException(
-                        "Full-duplex MANY_TO_MANY polyglot streaming is not yet supported for step '"
-                            + step.authoredName() + "' (ADR-0092)");
+                    case "MANY_TO_MANY" -> new CanonicalFunctionHostManyToManyStep(
+                        new CanonicalFunctionHostManyToManyStep.Spec(
+                            stepId, step.index(), inputType, inputFp, outputType, outputFp,
+                            catalogFingerprint, catalogue, targetUri, secret,
+                            config.requestTimeout(), config.streamIdleTimeout(), commandId, intentStore,
+                            config.maxResponseBytes()),
+                        config.allowLoopbackHttp());
                     default -> throw new IllegalStateException(
                         "Unsupported polyglot step cardinality '" + step.cardinality() + "' for step '" + step.authoredName() + "'");
                 };

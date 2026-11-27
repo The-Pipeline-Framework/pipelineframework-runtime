@@ -31,7 +31,12 @@ import org.pipelineframework.query.QueryStepSupport;
  */
 public class PolyglotDeploymentBuildSteps {
 
-    private static final Set<String> SUPPORTED_CARDINALITIES = Set.of(
+    private static final Set<String> SUPPORTED_INTERNAL_CARDINALITIES = Set.of(
+        "ONE_TO_ONE", "UNARY", "SIDE_EFFECT",
+        "ONE_TO_MANY", "EXPANSION",
+        "MANY_TO_ONE", "REDUCTION",
+        "MANY_TO_MANY");
+    private static final Set<String> SUPPORTED_CONNECTOR_CARDINALITIES = Set.of(
         "ONE_TO_ONE", "UNARY", "SIDE_EFFECT",
         "ONE_TO_MANY", "EXPANSION",
         "MANY_TO_ONE", "REDUCTION");
@@ -79,16 +84,17 @@ public class PolyglotDeploymentBuildSteps {
                 "Class-free canonical v3 contract '" + contract.pipelineId() + "' is missing canonicalCatalogFingerprint");
         }
         for (PipelineBundleStepDescriptor step : contract.steps()) {
+            String kind = step.kind() == null || step.kind().isBlank()
+                ? "internal"
+                : step.kind().trim().toLowerCase(Locale.ROOT);
             String card = step.cardinality() == null ? "ONE_TO_ONE" : step.cardinality().trim().toUpperCase(Locale.ROOT);
-            if ("MANY_TO_MANY".equals(card)) {
+            Set<String> allowed = "internal".equals(kind)
+                ? SUPPORTED_INTERNAL_CARDINALITIES
+                : SUPPORTED_CONNECTOR_CARDINALITIES;
+            if (!allowed.contains(card)) {
                 throw new IllegalStateException(
                     "Class-free polyglot step '" + step.authoredName()
-                        + "' declares unsupported cardinality MANY_TO_MANY (deferred in ADR-0092)");
-            }
-            if (!SUPPORTED_CARDINALITIES.contains(card)) {
-                throw new IllegalStateException(
-                    "Class-free polyglot step '" + step.authoredName()
-                        + "' declares unsupported cardinality '" + step.cardinality() + "'");
+                        + "' (kind='" + kind + "') declares unsupported cardinality '" + step.cardinality() + "'");
             }
             requireCanonicalType(contract, step.authoredName(), "inputTypeId", step.inputTypeId());
             requireCanonicalType(contract, step.authoredName(), "outputTypeId", step.outputTypeId());
