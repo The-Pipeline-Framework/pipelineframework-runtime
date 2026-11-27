@@ -10,13 +10,12 @@ import java.util.Objects;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.type.TypeFactory;
-import org.pipelineframework.config.pipeline.PipelineJson;
 import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
+import org.pipelineframework.type.CanonicalTypeCatalogue;
 
 /** Materializes canonical transition values using only the worker's compiled boundary contract. */
 public final class CompiledCanonicalTransitionPayloadCodec implements TransitionPayloadCodec {
-    private static final ObjectMapper EXACT_JSON = PipelineJson.mapper().copy()
-        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
+    private static final ObjectMapper EXACT_JSON = CanonicalTypeCatalogue.exactJsonMapper();
     private final TransitionPayloadCodec framing;
     private final JsonDurablePayloadCodec canonical = new JsonDurablePayloadCodec();
     private final Boundary input;

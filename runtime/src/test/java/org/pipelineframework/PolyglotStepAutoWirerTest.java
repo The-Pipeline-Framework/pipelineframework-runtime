@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import java.net.URI;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -75,9 +76,12 @@ class PolyglotStepAutoWirerTest {
 
         List<Object> steps = wirer.loadOrderedSteps();
         assertEquals(3, steps.size());
-        assertInstanceOf(CanonicalFunctionHostStep.class, steps.get(0));
-        assertInstanceOf(CanonicalFunctionHostOneToManyStep.class, steps.get(1));
-        assertInstanceOf(CanonicalFunctionHostManyToOneStep.class, steps.get(2));
+        CanonicalFunctionHostStep step0 = assertInstanceOf(CanonicalFunctionHostStep.class, steps.get(0));
+        CanonicalFunctionHostOneToManyStep step1 = assertInstanceOf(CanonicalFunctionHostOneToManyStep.class, steps.get(1));
+        CanonicalFunctionHostManyToOneStep step2 = assertInstanceOf(CanonicalFunctionHostManyToOneStep.class, steps.get(2));
+        assertEquals(URI.create("https://node.example.com"), step0.spec().baseUri());
+        assertEquals(URI.create("https://python.example.com"), step1.spec().baseUri());
+        assertEquals(URI.create("https://node.example.com"), step2.spec().baseUri());
     }
 
     @Test

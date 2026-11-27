@@ -34,8 +34,7 @@ import org.pipelineframework.type.CanonicalTypeCatalogue;
 final class CanonicalFunctionHostSupport {
 
     static final int DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
-    private static final ObjectMapper JSON = PipelineJson.mapper().copy()
-        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
+    private static final ObjectMapper JSON = CanonicalTypeCatalogue.exactJsonMapper();
 
     private CanonicalFunctionHostSupport() {
     }
@@ -348,6 +347,14 @@ final class CanonicalFunctionHostSupport {
                 Thread.currentThread().setContextClassLoader(contextClassLoader);
             }
             return previous;
+        }
+
+        void restore() {
+            execution.ifPresentOrElse(PipelineExecutionContextHolder::set, PipelineExecutionContextHolder::clear);
+            pipeline.ifPresentOrElse(PipelineContextHolder::set, PipelineContextHolder::clear);
+            await.ifPresentOrElse(AwaitExecutionContextHolder::set, AwaitExecutionContextHolder::clear);
+            dispatchScope.ifPresentOrElse(TransitionDispatchScopeHolder::set, TransitionDispatchScopeHolder::clear);
+            Thread.currentThread().setContextClassLoader(contextClassLoader);
         }
     }
 }

@@ -147,7 +147,7 @@ public final class CanonicalFunctionHostStep extends ConfigurableStep
                 } catch (Throwable failure) {
                     emitter.fail(failure);
                 } finally {
-                    previous.install();
+                    previous.restore();
                 }
             }));
     }

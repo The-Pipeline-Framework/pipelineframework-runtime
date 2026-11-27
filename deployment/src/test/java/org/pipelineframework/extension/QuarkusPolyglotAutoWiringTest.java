@@ -166,7 +166,8 @@ class QuarkusPolyglotAutoWiringTest {
     static final QuarkusExtensionTest APPLICATION = buildApplication();
 
     private static QuarkusExtensionTest buildApplication() {
-        HttpServer foreignHost = startForeignHost();
+        var foreignHostExecutor = Executors.newCachedThreadPool();
+        HttpServer foreignHost = startForeignHost(foreignHostExecutor);
         String hostUri = "http://127.0.0.1:" + foreignHost.getAddress().getPort();
         return new QuarkusExtensionTest()
             .withApplicationRoot(archive -> archive
@@ -191,7 +192,10 @@ class QuarkusPolyglotAutoWiringTest {
             .overrideConfigKey("pipeline.polyglot.connector.host-uri", hostUri)
             .overrideConfigKey("pipeline.polyglot.connector.secrets.fx-api-key", FX_SECRET)
             .overrideConfigKey("pipeline.polyglot.connector.secrets.ledger-api-key", LEDGER_SECRET)
-            .setAfterAllCustomizer(() -> foreignHost.stop(0));
+            .setAfterAllCustomizer(() -> {
+                foreignHost.stop(0);
+                foreignHostExecutor.shutdownNow();
+            });
     }
 
     @Inject PolyglotStepAutoWirer autoWirer;
@@ -352,7 +356,7 @@ class QuarkusPolyglotAutoWiringTest {
         return EXACT_JSON.readTree(resp.body());
     }
 
-    private static HttpServer startForeignHost() {
+    private static HttpServer startForeignHost(java.util.concurrent.ExecutorService executor) {
         AtomicBoolean allSignaturesValid = new AtomicBoolean(true);
         AtomicBoolean functionSawConnectorSecret = new AtomicBoolean(false);
         AtomicBoolean fxQuerySawSecret = new AtomicBoolean(false);
@@ -361,7 +365,7 @@ class QuarkusPolyglotAutoWiringTest {
         AtomicInteger requestCount = new AtomicInteger(0);
         try {
             HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-            server.setExecutor(Executors.newCachedThreadPool());
+            server.setExecutor(executor);
 
             server.createContext("/_test/stats", exchange -> {
                 String json = "{\"requestCount\":" + requestCount.get()

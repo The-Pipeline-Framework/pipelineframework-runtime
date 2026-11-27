@@ -70,6 +70,10 @@ public class PolyglotDeploymentBuildSteps {
     }
 
     static void validateClassFreeContract(PipelineContractDescriptor contract) {
+        if (contract.canonicalTypes() == null || contract.canonicalTypes().isEmpty()) {
+            throw new IllegalStateException(
+                "Class-free canonical v3 contract '" + contract.pipelineId() + "' is missing canonicalTypes");
+        }
         if (contract.canonicalCatalogFingerprint() == null || contract.canonicalCatalogFingerprint().isBlank()) {
             throw new IllegalStateException(
                 "Class-free canonical v3 contract '" + contract.pipelineId() + "' is missing canonicalCatalogFingerprint");
@@ -119,7 +123,7 @@ public class PolyglotDeploymentBuildSteps {
             }
             try (var in = Files.newInputStream(path.orElseThrow())) {
                 PipelineContractDescriptor contract = PipelineJson.mapper().readValue(in, PipelineContractDescriptor.class);
-                if (PolyglotStepAutoWirer.isClassFreeContract(contract)) {
+                if (isClassFreeCandidate(contract)) {
                     return Optional.of(contract);
                 }
             } catch (IOException failure) {
@@ -128,6 +132,16 @@ public class PolyglotDeploymentBuildSteps {
             }
         }
         return Optional.empty();
+    }
+
+    static boolean isClassFreeCandidate(PipelineContractDescriptor contract) {
+        if (contract == null || contract.schemaVersion() < 3 || contract.steps().isEmpty()) {
+            return false;
+        }
+        return contract.steps().stream().allMatch(step ->
+            (step.runtimeClass() == null || step.runtimeClass().isBlank())
+                && step.inputTypeId() != null && !step.inputTypeId().isBlank()
+                && step.outputTypeId() != null && !step.outputTypeId().isBlank());
     }
 
     private static boolean hasPackagedResource(ApplicationArchivesBuildItem archives, String resourcePath) {

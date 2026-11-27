@@ -35,8 +35,8 @@ public class ExecutionDurablePayloadResolver {
     private final BoundedExpiringCache<ReleaseCacheKey, PipelineReleaseRecord> releases =
         new BoundedExpiringCache<>(RELEASE_CACHE_MAXIMUM_SIZE, RELEASE_CACHE_EXPIRY);
     private static final Duration RELEASE_LOOKUP_TIMEOUT = Duration.ofSeconds(10);
-    private static final com.fasterxml.jackson.databind.ObjectMapper EXACT_JSON = PipelineJson.mapper().copy()
-        .enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
+    private static final com.fasterxml.jackson.databind.ObjectMapper EXACT_JSON =
+        org.pipelineframework.type.CanonicalTypeCatalogue.exactJsonMapper();
 
     public String encode(ExecutionRecord<?, ?> execution, Slot slot, Object value) {
         if (serializedMode()) {
@@ -192,9 +192,9 @@ public class ExecutionDurablePayloadResolver {
             throw new IllegalArgumentException("Durable payload identity differs from pinned release");
         }
         // Validate canonical schema using compiler-owned definitions without Java materialization.
-        try (var parser = PipelineJson.mapper().createParser(payload.payload())) {
+        try (var parser = EXACT_JSON.createParser(payload.payload())) {
             parser.enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
-            com.fasterxml.jackson.databind.JsonNode body = PipelineJson.mapper().readTree(parser);
+            com.fasterxml.jackson.databind.JsonNode body = EXACT_JSON.readTree(parser);
             if (body == null || parser.nextToken() != null
                 || (stored.collection() && !body.isArray())) {
                 throw new IllegalArgumentException("Invalid canonical JSON payload framing");

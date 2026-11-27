@@ -57,6 +57,20 @@ class PolyglotDeploymentBuildStepsTest {
         assertTrue(failure.getMessage().contains("definitionFingerprint"));
     }
 
+    @Test
+    void rejectsEmptyCanonicalTypesOnClassFreeCandidateAtBuildTime() {
+        PipelineContractDescriptor contract = new PipelineContractDescriptor(
+            3, "polyglot-build-test", "v1", "hash1", "COMPUTE", "LOCAL", null, false, "MONOLITH",
+            List.of(new PipelineBundleStepDescriptor(0, "Validate", "internal", "ONE_TO_ONE", "Order", "Order", null, null, Map.of())),
+            PipelineBundleCapabilities.defaults(), Map.of(), "catalog-fp-1",
+            null, List.of(), List.of(), List.of(),
+            Map.of("schemaVersion", 1, "inputCanonicalTypeId", "Order", "outputCanonicalTypeId", "Order"));
+        assertTrue(PolyglotDeploymentBuildSteps.isClassFreeCandidate(contract));
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+            () -> PolyglotDeploymentBuildSteps.validateClassFreeContract(contract));
+        assertTrue(failure.getMessage().contains("canonicalTypes"));
+    }
+
     private static PipelineContractDescriptor contractWithSteps(List<PipelineBundleStepDescriptor> steps) {
         Map<String, Map<String, Object>> types = new LinkedHashMap<>();
         types.put("Order", Map.of("definitionFingerprint", "fp-Order", "definition", Map.of("kind", "record", "id", "Order", "fields", List.of())));

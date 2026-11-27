@@ -81,8 +81,7 @@ public final class PolyglotConnectorProvider
     public static final String QUERY_PATH_PREFIX = "/tpf/connector/query/";
     public static final String COMMAND_PATH_PREFIX = "/tpf/connector/command/";
 
-    private static final ObjectMapper JSON = PipelineJson.mapper().copy()
-        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
+    private static final ObjectMapper JSON = org.pipelineframework.type.CanonicalTypeCatalogue.exactJsonMapper();
     private static final int DEFAULT_TIMEOUT_MS = 5_000;
     private static final ConnectorConfigSchema<ProviderConfig> PROVIDER_SCHEMA =
         ConnectorConfigSchema.record(ProviderConfig.class, "polyglot.connector.provider", 1);

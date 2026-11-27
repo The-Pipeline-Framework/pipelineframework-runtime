@@ -66,8 +66,7 @@ import org.pipelineframework.type.CanonicalTypeCatalogue;
 @ApplicationScoped
 public class PolyglotStepAutoWirer {
 
-    private static final ObjectMapper EXACT_JSON = PipelineJson.mapper().copy()
-        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
+    private static final ObjectMapper EXACT_JSON = CanonicalTypeCatalogue.exactJsonMapper();
 
     @Inject
     PolyglotRuntimeConfig config;
@@ -173,6 +172,11 @@ public class PolyglotStepAutoWirer {
         Optional<CommandStepSupport> commandSupport
     ) {
         CanonicalTypeCatalogue catalogue = CanonicalTypeCatalogue.fromCanonicalTypes(contract.canonicalTypes());
+        if (yamlConfigOpt.isPresent()) {
+            // Enforce identical operation-level polyglot.connector capability/type validation as PolyglotConnectorAutoConfiguration.
+            org.pipelineframework.connector.polyglot.PolyglotConnectorAutoConfiguration.buildSpec(
+                contract, yamlConfigOpt.orElseThrow());
+        }
         Map<String, String> definitionFingerprints = extractDefinitionFingerprints(contract);
         String catalogFingerprint = contract.canonicalCatalogFingerprint();
         if (catalogFingerprint == null || catalogFingerprint.isBlank()) {
@@ -223,7 +227,7 @@ public class PolyglotStepAutoWirer {
                 steps.add(new BoundPolyglotQueryStep(
                     querySupport.orElseThrow(() -> new IllegalStateException(
                         "Query step '" + step.authoredName() + "' requires a QueryStepSupport CDI bean")),
-                    descriptor, outputType, outputFp, catalogFingerprint));
+                    descriptor, catalogue, outputType, outputFp, catalogFingerprint));
             } else if ("command".equals(kind)) {
                 String commandCardinality = normalizeCardinality(step.cardinality());
                 if (!"ONE_TO_ONE".equals(commandCardinality)) {
@@ -263,8 +267,8 @@ public class PolyglotStepAutoWirer {
                 steps.add(new BoundPolyglotCommandStep(
                     commandSupport.orElseThrow(() -> new IllegalStateException(
                         "Command step '" + step.authoredName() + "' requires a CommandStepSupport CDI bean")),
-                    descriptor, stepId, outputType, outputFp, catalogFingerprint));
-            } else {
+                    descriptor, catalogue, stepId, inputType, outputType, outputFp, catalogFingerprint));
+            } else if ("internal".equals(kind)) {
                 URI targetUri = resolveStepHostUri(stepId);
                 String secret = requireSharedSecret(stepId);
                 String cardinality = normalizeCardinality(step.cardinality());
@@ -296,6 +300,9 @@ public class PolyglotStepAutoWirer {
                         "Unsupported polyglot step cardinality '" + step.cardinality() + "' for step '" + step.authoredName() + "'");
                 };
                 steps.add(instance);
+            } else {
+                throw new IllegalStateException(
+                    "Unsupported polyglot step kind '" + step.kind() + "' for step '" + step.authoredName() + "'");
             }
         }
         return List.copyOf(steps);
@@ -422,6 +429,7 @@ public class PolyglotStepAutoWirer {
         implements StepOneToOne<TypedDurablePayload, TypedDurablePayload> {
         private final QueryStepSupport querySupport;
         private final QueryStepDescriptor descriptor;
+        private final CanonicalTypeCatalogue catalogue;
         private final String outputType;
         private final String outputFp;
         private final String catalogFp;
@@ -429,12 +437,14 @@ public class PolyglotStepAutoWirer {
         BoundPolyglotQueryStep(
             QueryStepSupport querySupport,
             QueryStepDescriptor descriptor,
+            CanonicalTypeCatalogue catalogue,
             String outputType,
             String outputFp,
             String catalogFp
         ) {
             this.querySupport = querySupport;
             this.descriptor = descriptor;
+            this.catalogue = catalogue;
             this.outputType = outputType;
             this.outputFp = outputFp;
             this.catalogFp = catalogFp;
@@ -446,10 +456,12 @@ public class PolyglotStepAutoWirer {
                 JsonNode node = EXACT_JSON.readTree(input.payload());
                 return querySupport.queryOneToOne(descriptor, node, JsonNode.class).map(out -> {
                     try {
+                        String canonicalOutput = catalogue.validateAndCanonicalize(
+                            outputType, EXACT_JSON.writeValueAsString(out));
                         return new TypedDurablePayload(
                             outputType, outputFp, catalogFp,
                             JsonDurablePayloadCodec.ENCODING, JsonDurablePayloadCodec.ENCODING_VERSION,
-                            EXACT_JSON.writeValueAsBytes(out));
+                            canonicalOutput.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                     } catch (IOException failure) {
                         throw new IllegalStateException("Failed encoding polyglot query output", failure);
                     }
@@ -464,7 +476,9 @@ public class PolyglotStepAutoWirer {
         implements StepOneToOne<TypedDurablePayload, TypedDurablePayload> {
         private final CommandStepSupport commandSupport;
         private final CommandDescriptor descriptor;
+        private final CanonicalTypeCatalogue catalogue;
         private final String stepId;
+        private final String inputType;
         private final String outputType;
         private final String outputFp;
         private final String catalogFp;
@@ -472,14 +486,18 @@ public class PolyglotStepAutoWirer {
         BoundPolyglotCommandStep(
             CommandStepSupport commandSupport,
             CommandDescriptor descriptor,
+            CanonicalTypeCatalogue catalogue,
             String stepId,
+            String inputType,
             String outputType,
             String outputFp,
             String catalogFp
         ) {
             this.commandSupport = commandSupport;
             this.descriptor = descriptor;
+            this.catalogue = catalogue;
             this.stepId = stepId;
+            this.inputType = inputType;
             this.outputType = outputType;
             this.outputFp = outputFp;
             this.catalogFp = catalogFp;
@@ -488,7 +506,9 @@ public class PolyglotStepAutoWirer {
         @Override
         public Uni<TypedDurablePayload> applyOneToOne(TypedDurablePayload input) {
             try {
-                JsonNode node = EXACT_JSON.readTree(input.payload());
+                String canonicalInput = catalogue.validateAndCanonicalize(
+                    inputType, new String(input.payload(), java.nio.charset.StandardCharsets.UTF_8));
+                JsonNode node = EXACT_JSON.readTree(canonicalInput);
                 String executionScope = PipelineExecutionContextHolder.get()
                     .map(PipelineExecutionContext::executionId)
                     .orElse("direct");
@@ -497,14 +517,16 @@ public class PolyglotStepAutoWirer {
                 digest.update((byte) ':');
                 digest.update(stepId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                 digest.update((byte) ':');
-                digest.update(input.payload());
+                digest.update(canonicalInput.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                 String commandId = stepId + "-" + HexFormat.of().formatHex(digest.digest()).substring(0, 16);
                 return commandSupport.<JsonNode, JsonNode>execute(descriptor, (d, i) -> commandId, node).map(out -> {
                     try {
+                        String canonicalOutput = catalogue.validateAndCanonicalize(
+                            outputType, EXACT_JSON.writeValueAsString(out));
                         return new TypedDurablePayload(
                             outputType, outputFp, catalogFp,
                             JsonDurablePayloadCodec.ENCODING, JsonDurablePayloadCodec.ENCODING_VERSION,
-                            EXACT_JSON.writeValueAsBytes(out));
+                            canonicalOutput.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                     } catch (IOException failure) {
                         throw new IllegalStateException("Failed encoding polyglot command output", failure);
                     }
