@@ -34,7 +34,8 @@ import org.pipelineframework.type.CanonicalTypeCatalogue;
 final class CanonicalFunctionHostSupport {
 
     static final int DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
-    private static final ObjectMapper JSON = PipelineJson.mapper();
+    private static final ObjectMapper JSON = PipelineJson.mapper().copy()
+        .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
 
     private CanonicalFunctionHostSupport() {
     }

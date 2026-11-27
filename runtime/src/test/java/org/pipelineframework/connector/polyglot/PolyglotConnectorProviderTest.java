@@ -436,6 +436,85 @@ class PolyglotConnectorProviderTest {
         return CanonicalTypeCatalogue.fromCanonicalTypes(defs);
     }
 
+    @Test
+    void queryPreservesArbitraryPrecision29DigitDecimals() throws Exception {
+        String inputDecimal = "99999999999999999999.123456789";
+        String outputDecimal = "12345678901234567890.987654321";
+        AtomicReference<String> receivedBody = new AtomicReference<>();
+        server.createContext("/tpf/connector/query/custom.fx.quote", exchange -> {
+            receivedBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            byte[] resp = ("{\"outcome\":\"FOUND\",\"payload\":{\"converted\":" + outputDecimal + "}}")
+                .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, resp.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(resp);
+            }
+        });
+
+        CanonicalTypeCatalogue decimalCatalogue = CanonicalTypeCatalogue.fromCanonicalTypes(Map.of(
+            "QuoteRequest", recordDef("QuoteRequest", List.of(field("amount", "decimal"))),
+            "QuoteResult", recordDef("QuoteResult", List.of(field("converted", "decimal")))));
+        PolyglotConnectorSpec spec = new PolyglotConnectorSpec(
+            decimalCatalogue,
+            List.of(new PolyglotConnectorSpec.QueryOperationSpec(
+                "custom.fx.quote", 1, "QuoteRequest", "QuoteResult")),
+            List.of());
+        PolyglotConnectorProvider provider = new PolyglotConnectorProvider(spec);
+
+        ConnectionResolver resolver = new ConnectionResolver() {
+            @Override
+            public <T extends ResolvedConnection> java.util.concurrent.CompletionStage<T> resolve(
+                ConnectionResolutionRequest<T> request
+            ) {
+                PolyglotConnectorConnection conn = new PolyglotConnectorConnection(
+                    hostUri, SHARED_SECRET, Map.of("fx-api-key", "secret-fx"), true);
+                return CompletableFuture.completedStage(request.connectionType().cast(conn));
+            }
+        };
+        var decimalExecutor = Executors.newCachedThreadPool();
+        ConnectorRuntimeContext runtimeContext = ConnectorRuntimeContext.of(
+            "polyglot-decimal-test", decimalExecutor, Clock.systemUTC(), Optional.of(resolver));
+        ConnectorBindingName binding = ConnectorBindingName.of("fx-decimal");
+        ConnectorBindingRegistry registry = ConnectorBindingRegistry.fromProviders(
+            List.of(new ConnectorBindingDefinition(
+                binding, PolyglotConnectorProvider.PROVIDER_ID, 1,
+                new ConnectorConfigurationDocument(Map.of("connection", "node-custom-host")))),
+            List.of(provider),
+            p -> ConnectorProviderLease.of(p, () -> { }));
+        registry.start(runtimeContext).toCompletableFuture().join();
+        try {
+            QueryStepSupport qSupport = new QueryStepSupport(
+                List.of(), List.of(new InMemoryQueryCaptureStore()), registry, runtimeContext);
+            QueryStepDescriptor desc = QueryStepDescriptor.nativeQuery(
+                "fx-quote-step", JsonNode.class.getName(), JsonNode.class.getName(), "ONE_TO_ONE",
+                new NativeQuerySelector(
+                    binding,
+                    new ConnectorOperationIdentity(PolyglotConnectorProvider.PROVIDER_ID, "custom.fx.quote",
+                        ConnectorOperationKind.QUERY, 1),
+                    1),
+                Map.of());
+            ObjectMapper exactMapper = JSON.copy()
+                .enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
+            JsonNode req = exactMapper.readTree("{\"amount\":" + inputDecimal + "}");
+
+            PipelineExecutionContextHolder.set(new PipelineExecutionContext("tenant-1", "exec-dec-1", 0));
+            JsonNode res = qSupport.queryOneToOne(desc, req, JsonNode.class).await().atMost(TIMEOUT);
+            JsonNode replayed = qSupport.queryOneToOne(desc, req, JsonNode.class).await().atMost(TIMEOUT);
+
+            assertTrue(receivedBody.get().contains(inputDecimal),
+                "Connector request must preserve 29-digit decimal, got: " + receivedBody.get());
+            assertTrue(res.path("converted").isBigDecimal(), "Connector response must decode decimal as BigDecimal");
+            assertEquals(outputDecimal, res.path("converted").decimalValue().toPlainString());
+            assertTrue(replayed.path("converted").isBigDecimal(), "Captured replay must preserve decimal as BigDecimal");
+            assertEquals(outputDecimal, replayed.path("converted").decimalValue().toPlainString());
+        } finally {
+            PipelineExecutionContextHolder.clear();
+            registry.stop(runtimeContext).toCompletableFuture().join();
+            decimalExecutor.shutdownNow();
+        }
+    }
+
     private static Map<String, Object> recordDef(String id, List<Map<String, Object>> fields) {
         Map<String, Object> def = new LinkedHashMap<>();
         def.put("kind", "record");

@@ -1,6 +1,7 @@
 package org.pipelineframework.command;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
@@ -9,9 +10,19 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import org.pipelineframework.connector.CommandRecoveryBinding;
 
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.StreamReadFeature;
+import com.fasterxml.jackson.core.filter.FilteringParserDelegate;
+import com.fasterxml.jackson.core.filter.JsonPointerBasedFilter;
+import com.fasterxml.jackson.core.filter.TokenFilter;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.DecimalNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.protobuf.Message;
 import com.google.protobuf.MessageOrBuilder;
 import com.google.protobuf.util.JsonFormat;
@@ -325,8 +336,9 @@ final class CommandEffectRecordCodec {
         try {
             return Optional.of(switch (snapshot.encoding()) {
                 // Read typed JSON directly: an intermediate JsonNode would round decimal timestamps through Double.
-                // The declared/runtime checks above still apply, and the original numeric coercions remain intact.
-                case JSON_ENCODING -> json.readerFor(runtimeType).at(pointer).readValue(encoded);
+                // For container JsonNode types, preserve exact numeric token representations so both
+                // 29-digit decimals and IEEE-754 double forms (-0.0, 1.0E7, 1.0E-4) reproduce identical digests.
+                case JSON_ENCODING -> decodeJsonValue(runtimeType, encoded, pointer);
                 case PROTOBUF_JSON_ENCODING -> decodeProtobuf(snapshot.value(), runtimeType);
                 default -> throw new CommandEffectStoreException(
                     "Unsupported durable Command value encoding " + snapshot.encoding());
@@ -337,6 +349,89 @@ final class CommandEffectRecordCodec {
             throw new CommandEffectStoreException(
                 "Failed decoding durable value as " + runtimeType.getName(), failure);
         }
+    }
+
+    private Object decodeJsonValue(Class<?> runtimeType, String encoded, String pointer) throws IOException {
+        if (runtimeType == JsonNode.class || runtimeType == ObjectNode.class || runtimeType == ArrayNode.class) {
+            return decodeExactJsonNode(encoded, pointer, runtimeType);
+        }
+        if (runtimeType == DecimalNode.class) {
+            return json.readerFor(runtimeType)
+                .with(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
+                .at(pointer)
+                .readValue(encoded);
+        }
+        return json.readerFor(runtimeType).at(pointer).readValue(encoded);
+    }
+
+    private JsonNode decodeExactJsonNode(String encoded, String pointer, Class<?> runtimeType) throws IOException {
+        try (JsonParser raw = json.getFactory().createParser(encoded);
+             JsonParser filtered = new FilteringParserDelegate(
+                 raw, new JsonPointerBasedFilter(pointer), TokenFilter.Inclusion.ONLY_INCLUDE_ALL, false)) {
+            JsonToken token = filtered.nextToken();
+            if (token == null) {
+                throw new IllegalArgumentException("Missing JSON value at pointer " + pointer);
+            }
+            JsonNode decoded = readExactNode(filtered, token);
+            if (!runtimeType.isInstance(decoded)) {
+                throw new IllegalArgumentException(
+                    "Expected " + runtimeType.getName() + " at " + pointer + " but decoded " + decoded.getClass().getName());
+            }
+            return decoded;
+        }
+    }
+
+    private JsonNode readExactNode(JsonParser parser, JsonToken token) throws IOException {
+        JsonNodeFactory factory = json.getNodeFactory();
+        return switch (token) {
+            case START_OBJECT -> {
+                ObjectNode obj = factory.objectNode();
+                while (parser.nextToken() != JsonToken.END_OBJECT) {
+                    String fieldName = parser.currentName();
+                    JsonToken valueToken = parser.nextToken();
+                    obj.set(fieldName, readExactNode(parser, valueToken));
+                }
+                yield obj;
+            }
+            case START_ARRAY -> {
+                ArrayNode arr = factory.arrayNode();
+                while (parser.nextToken() != JsonToken.END_ARRAY) {
+                    arr.add(readExactNode(parser, parser.currentToken()));
+                }
+                yield arr;
+            }
+            case VALUE_STRING -> factory.textNode(parser.getText());
+            case VALUE_NUMBER_INT -> switch (parser.getNumberType()) {
+                case INT -> factory.numberNode(parser.getIntValue());
+                case LONG -> factory.numberNode(parser.getLongValue());
+                default -> factory.numberNode(parser.getBigIntegerValue());
+            };
+            case VALUE_NUMBER_FLOAT -> decodeExactFloatingNode(factory, parser.getText());
+            case VALUE_TRUE -> factory.booleanNode(true);
+            case VALUE_FALSE -> factory.booleanNode(false);
+            case VALUE_NULL -> factory.nullNode();
+            default -> throw new IllegalArgumentException("Unexpected JSON token " + token);
+        };
+    }
+
+    private static JsonNode decodeExactFloatingNode(JsonNodeFactory factory, String rawText) {
+        BigDecimal exact = new BigDecimal(rawText);
+        if (isNegativeZeroText(rawText, exact) || isCanonicalDoubleExponentText(rawText)) {
+            return factory.numberNode(Double.parseDouble(rawText));
+        }
+        return factory.numberNode(exact);
+    }
+
+    private static boolean isNegativeZeroText(String rawText, BigDecimal exact) {
+        return exact.signum() == 0 && "-0.0".equals(rawText);
+    }
+
+    private static boolean isCanonicalDoubleExponentText(String rawText) {
+        if (rawText.indexOf('e') < 0 && rawText.indexOf('E') < 0) {
+            return false;
+        }
+        double parsed = Double.parseDouble(rawText);
+        return Double.isFinite(parsed) && Double.toString(parsed).equals(rawText);
     }
 
     private Object decodeProtobuf(JsonNode value, Class<?> runtimeType) throws Exception {
