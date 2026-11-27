@@ -190,9 +190,12 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
         private final AtomicReference<Throwable> upstreamFailure = new AtomicReference<>();
         private final AtomicReference<Optional<ForeignDispatchIntent>> reservedIntent =
             new AtomicReference<>(Optional.empty());
+        private final AtomicBoolean intentSettled = new AtomicBoolean(false);
         private final Object writeLock = new Object();
+        private final Object signalLock = new Object();
         private final long startNanos = System.nanoTime();
         private volatile URI targetUri;
+        private volatile TypedDurablePayload pendingItem;
 
         private DuplexStreamSubscription(
             Multi<TypedDurablePayload> upstream,
@@ -221,9 +224,7 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
         public void cancel() {
             if (cancelled.compareAndSet(false, true)) {
                 closeResources();
-                CanonicalFunctionHostSupport.settleDispatchIntent(
-                    spec.dispatchIntentStore(), reservedIntent.get(),
-                    ForeignDispatchIntentStore.SettlementStatus.UNCERTAIN);
+                settleIntentOnce(ForeignDispatchIntentStore.SettlementStatus.UNCERTAIN);
             }
         }
 
@@ -243,7 +244,20 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
                     return;
                 }
                 DuplexResponseReader reader = activeReader.get();
-                while (!cancelled.get() && !terminated.get() && requested.get() > 0L) {
+                while (!cancelled.get() && !terminated.get()) {
+                    TypedDurablePayload buffered = pendingItem;
+                    if (buffered != null) {
+                        if (requested.get() <= 0L) {
+                            break;
+                        }
+                        pendingItem = null;
+                        if (!deliverItem(buffered)) {
+                            return;
+                        }
+                        continue;
+                    }
+                    // Bounded 1-frame lookahead when item demand reaches 0 so terminal frames
+                    // (complete / error / EOF) are delivered immediately per Reactive Streams spec.
                     Optional<String> lineOpt = readNextLine(reader);
                     if (cancelled.get() || terminated.get()) {
                         return;
@@ -268,14 +282,15 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
                     }
                 }
             } catch (Throwable failure) {
-                if (!cancelled.get()) {
+                if (!cancelled.get() && !terminated.get()) {
                     Throwable upErr = upstreamFailure.get();
                     fail(upErr != null ? upErr : failure);
                 }
             } finally {
                 previous.restore();
                 draining.set(false);
-                if (!cancelled.get() && !terminated.get() && requested.get() > 0L) {
+                if (!cancelled.get() && !terminated.get()
+                    && (requested.get() > 0L || pendingItem == null)) {
                     scheduleDrain();
                 }
             }
@@ -287,9 +302,14 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
             byte[] sentinelBytes = STREAMING_BODY_DIGEST_SENTINEL.getBytes(StandardCharsets.UTF_8);
 
             try {
-                reservedIntent.set(CanonicalFunctionHostSupport.reserveDispatchIntent(
+                Optional<ForeignDispatchIntent> intent = CanonicalFunctionHostSupport.reserveDispatchIntent(
                     spec.dispatchIntentStore(), captured.dispatchScope(), spec.stepIndex(), spec.stepId(),
-                    targetUri, sentinelBytes, PROTOCOL, startNanos, spec.itemIdleTimeout().toMillis()));
+                    targetUri, sentinelBytes, PROTOCOL, startNanos, spec.itemIdleTimeout().toMillis());
+                reservedIntent.set(intent);
+                if (cancelled.get() || terminated.get()) {
+                    settleIntentOnce(ForeignDispatchIntentStore.SettlementStatus.UNCERTAIN);
+                    return false;
+                }
             } catch (RuntimeException reservationRejected) {
                 fail(reservationRejected);
                 return false;
@@ -299,17 +319,21 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
             OutputStream output;
             BufferedInputStream input;
             try {
-                socket = openSocket(targetUri);
-                activeSocket.set(socket);
-                if (cancelled.get()) {
+                socket = openSocket(targetUri, activeSocket, cancelled);
+                if (cancelled.get() || terminated.get()) {
                     closeResources();
+                    settleIntentOnce(ForeignDispatchIntentStore.SettlementStatus.UNCERTAIN);
                     return false;
                 }
                 output = socket.getOutputStream();
                 input = new BufferedInputStream(socket.getInputStream());
                 writeRequestHeaders(output, targetUri, path, sentinelBytes);
             } catch (IOException transportFailure) {
-                closeResources();
+                if (cancelled.get() || terminated.get()) {
+                    closeResources();
+                    settleIntentOnce(ForeignDispatchIntentStore.SettlementStatus.UNCERTAIN);
+                    return false;
+                }
                 fail(unknownOutcome("Transport failure opening foreign duplex stream: " + transportFailure.getMessage(),
                     Optional.of(transportFailure)));
                 return false;
@@ -323,13 +347,14 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
             try {
                 headerInfo = readResponseHeaders(input);
             } catch (SocketTimeoutException timeout) {
-                closeResources();
                 fail(unknownOutcome(
                     "Timed out awaiting response headers from foreign duplex stream",
                     Optional.of(timeout)));
                 return false;
             } catch (IOException io) {
-                closeResources();
+                if (cancelled.get() || terminated.get()) {
+                    return false;
+                }
                 Throwable upErr = upstreamFailure.get();
                 fail(upErr != null
                     ? upErr
@@ -339,7 +364,6 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
 
             int status = headerInfo.statusCode();
             if (status == 401 || status == 403) {
-                closeResources();
                 fail(CanonicalFunctionHostSupport.nonRetryable(
                     "Foreign function host rejected authentication for duplex step " + spec.stepId()
                         + " (HTTP " + status + ")",
@@ -347,7 +371,6 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
                 return false;
             }
             if (status != 200) {
-                closeResources();
                 fail(unknownOutcome("Foreign duplex stream returned HTTP " + status, Optional.empty()));
                 return false;
             }
@@ -391,6 +414,10 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
                         return;
                     }
                     if (upstreamSubscription.compareAndSet(null, sub)) {
+                        if (cancelled.get() || terminated.get()) {
+                            cancelUpstream();
+                            return;
+                        }
                         sub.request(1L);
                     } else {
                         sub.cancel();
@@ -420,21 +447,22 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
                                 sub.request(1L);
                             }
                         } catch (Throwable failure) {
-                            upstreamFailure.compareAndSet(null, failure);
-                            cancelUpstream();
-                            writeUpstreamErrorBestEffort(output, failure);
-                            fail(failure);
+                            if (!cancelled.get() && !terminated.get()) {
+                                upstreamFailure.compareAndSet(null, failure);
+                                fail(failure);
+                            }
                         }
                     });
                 }
 
                 @Override
                 public void onError(Throwable throwable) {
-                    upstreamFailure.compareAndSet(null, throwable);
-                    enqueueWrite(() -> {
-                        writeUpstreamErrorBestEffort(output, throwable);
+                    if (!cancelled.get() && !terminated.get()) {
+                        upstreamFailure.compareAndSet(null, throwable);
+                        // Deliver upstream failure immediately (closing the socket notifies the host
+                        // without risking a blocking write on a full TCP send buffer).
                         fail(throwable);
-                    });
+                    }
                 }
 
                 @Override
@@ -459,25 +487,6 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
             });
         }
 
-        private void writeUpstreamErrorBestEffort(OutputStream output, Throwable failure) {
-            synchronized (writeLock) {
-                if (upstreamEnded.compareAndSet(false, true)) {
-                    try {
-                        Map<String, Object> errFrame = new LinkedHashMap<>();
-                        errFrame.put("event", "error");
-                        errFrame.put("message", failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage());
-                        byte[] bytes = (CanonicalFunctionHostSupport.json().writeValueAsString(errFrame) + "\n")
-                            .getBytes(StandardCharsets.UTF_8);
-                        writeChunk(output, bytes);
-                        output.write(ZERO_CHUNK);
-                        output.flush();
-                    } catch (IOException ignored) {
-                        // Best-effort abort notification.
-                    }
-                }
-            }
-        }
-
         private byte[] encodeValidatedItemFrame(TypedDurablePayload item) {
             String canonicalJson = CanonicalFunctionHostSupport.validateCanonicalInput(
                 item, spec.stepId(), spec.stepIndex(), spec.commandId(),
@@ -499,20 +508,23 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
             try {
                 return reader.readLine();
             } catch (SocketTimeoutException timeout) {
-                closeResources();
-                throw unknownOutcome(
+                // Claim the timeout as the terminal unknown outcome BEFORE closing the socket so
+                // any SocketException triggered in a concurrent writer cannot replace it.
+                fail(unknownOutcome(
                     "Foreign duplex stream exceeded item idle deadline of " + spec.itemIdleTimeout().toMillis() + "ms",
-                    Optional.of(timeout));
+                    Optional.of(timeout)));
+                return Optional.empty();
             } catch (IOException io) {
-                closeResources();
-                if (cancelled.get()) {
+                if (cancelled.get() || terminated.get()) {
                     return Optional.empty();
                 }
                 Throwable upErr = upstreamFailure.get();
-                if (upErr instanceof RuntimeException runtime) {
-                    throw runtime;
+                if (upErr != null) {
+                    fail(upErr);
+                    return Optional.empty();
                 }
-                throw unknownOutcome("Duplex stream read interrupted mid-flight: " + io.getMessage(), Optional.of(io));
+                fail(unknownOutcome("Duplex stream read interrupted mid-flight: " + io.getMessage(), Optional.of(io)));
+                return Optional.empty();
             }
         }
 
@@ -528,9 +540,11 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
                         root, spec.stepId(), spec.outputCanonicalTypeId(), spec.outputDefinitionFingerprint(),
                         spec.catalogFingerprint(), spec.catalogue(), PROTOCOL, uri,
                         startNanos, spec.itemIdleTimeout().toMillis());
-                    requested.updateAndGet(cur -> cur == Long.MAX_VALUE ? Long.MAX_VALUE : Math.max(0L, cur - 1L));
-                    subscriber.onNext(validated);
-                    yield true;
+                    if (requested.get() > 0L) {
+                        yield deliverItem(validated);
+                    }
+                    pendingItem = validated;
+                    yield false;
                 }
                 case "complete" -> {
                     complete();
@@ -549,23 +563,41 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
             };
         }
 
+        private boolean deliverItem(TypedDurablePayload validated) {
+            synchronized (signalLock) {
+                if (cancelled.get() || terminated.get()) {
+                    return false;
+                }
+                requested.updateAndGet(cur -> cur == Long.MAX_VALUE ? Long.MAX_VALUE : Math.max(0L, cur - 1L));
+                subscriber.onNext(validated);
+                return true;
+            }
+        }
+
         private void complete() {
             if (terminated.compareAndSet(false, true)) {
                 closeResources();
-                CanonicalFunctionHostSupport.settleDispatchIntent(
-                    spec.dispatchIntentStore(), reservedIntent.get(),
-                    ForeignDispatchIntentStore.SettlementStatus.VALIDATED_SUCCEEDED);
-                subscriber.onComplete();
+                settleIntentOnce(ForeignDispatchIntentStore.SettlementStatus.VALIDATED_SUCCEEDED);
+                synchronized (signalLock) {
+                    subscriber.onComplete();
+                }
             }
         }
 
         private void fail(Throwable failure) {
             if (terminated.compareAndSet(false, true)) {
                 closeResources();
-                CanonicalFunctionHostSupport.settleDispatchIntent(
-                    spec.dispatchIntentStore(), reservedIntent.get(),
-                    CanonicalFunctionHostSupport.settlementForFailure(failure));
-                subscriber.onError(failure);
+                settleIntentOnce(CanonicalFunctionHostSupport.settlementForFailure(failure));
+                synchronized (signalLock) {
+                    subscriber.onError(failure);
+                }
+            }
+        }
+
+        private void settleIntentOnce(ForeignDispatchIntentStore.SettlementStatus status) {
+            Optional<ForeignDispatchIntent> intent = reservedIntent.get();
+            if (intent.isPresent() && intentSettled.compareAndSet(false, true)) {
+                CanonicalFunctionHostSupport.settleDispatchIntent(spec.dispatchIntentStore(), intent, status);
             }
         }
 
@@ -595,7 +627,11 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
         }
     }
 
-    private Socket openSocket(URI targetUri) throws IOException {
+    private Socket openSocket(
+        URI targetUri,
+        AtomicReference<Socket> activeSocketRef,
+        AtomicBoolean cancelledFlag
+    ) throws IOException {
         boolean https = "https".equalsIgnoreCase(targetUri.getScheme());
         String host = targetUri.getHost();
         int port = targetUri.getPort() > 0 ? targetUri.getPort() : (https ? 443 : 80);
@@ -603,8 +639,12 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
         int idleMs = (int) Math.min(Integer.MAX_VALUE, Math.max(1L, spec.itemIdleTimeout().toMillis()));
 
         Socket socket = https ? sslSocketFactory.createSocket() : new Socket();
+        activeSocketRef.set(socket);
         boolean configured = false;
         try {
+            if (cancelledFlag.get()) {
+                throw new IOException("Duplex stream cancelled before connecting");
+            }
             socket.connect(new InetSocketAddress(host, port), connectMs);
             socket.setTcpNoDelay(true);
             socket.setSoTimeout(idleMs);
@@ -617,10 +657,14 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
                 sslSocket.setSSLParameters(params);
                 sslSocket.startHandshake();
             }
+            if (cancelledFlag.get()) {
+                throw new IOException("Duplex stream cancelled during handshake");
+            }
             configured = true;
             return socket;
         } finally {
             if (!configured) {
+                activeSocketRef.compareAndSet(socket, null);
                 try {
                     socket.close();
                 } catch (IOException ignored) {
@@ -772,7 +816,7 @@ public final class CanonicalFunctionHostManyToManyStep extends ConfigurableStep
             if (lineBuffer.size() == 0) {
                 return Optional.empty();
             }
-            return Optional.of(stripTrailingCr(lineBuffer.toString(StandardCharsets.UTF_8)));
+            throw new IOException("Foreign duplex NDJSON stream ended with unterminated frame (missing newline)");
         }
 
         private static String stripTrailingCr(String s) {

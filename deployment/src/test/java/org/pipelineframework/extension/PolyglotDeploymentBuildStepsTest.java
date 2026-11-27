@@ -25,10 +25,26 @@ class PolyglotDeploymentBuildStepsTest {
     }
 
     @Test
-    void acceptsManyToManyCardinalityAtBuildTimeAndRejectsUnsupportedCardinality() {
+    void acceptsManyToManyCardinalityAtBuildTimeForInternalOnlyAndRejectsUnsupportedCardinality() {
         PipelineContractDescriptor duplex = contractWithSteps(List.of(
             new PipelineBundleStepDescriptor(0, "Duplex", "internal", "MANY_TO_MANY", "Order", "Summary", null, null, Map.of())));
         assertDoesNotThrow(() -> PolyglotDeploymentBuildSteps.validateClassFreeContract(duplex));
+
+        PipelineContractDescriptor nullKindDuplex = contractWithSteps(List.of(
+            new PipelineBundleStepDescriptor(0, "DuplexDefault", null, "MANY_TO_MANY", "Order", "Summary", null, null, Map.of())));
+        assertDoesNotThrow(() -> PolyglotDeploymentBuildSteps.validateClassFreeContract(nullKindDuplex));
+
+        PipelineContractDescriptor queryDuplex = contractWithSteps(List.of(
+            new PipelineBundleStepDescriptor(0, "BadQuery", "query", "MANY_TO_MANY", "Order", "Summary", null, null, Map.of())));
+        IllegalStateException queryFailure = assertThrows(IllegalStateException.class,
+            () -> PolyglotDeploymentBuildSteps.validateClassFreeContract(queryDuplex));
+        assertTrue(queryFailure.getMessage().contains("MANY_TO_MANY"));
+
+        PipelineContractDescriptor commandDuplex = contractWithSteps(List.of(
+            new PipelineBundleStepDescriptor(0, "BadCommand", "command", "MANY_TO_MANY", "Order", "Summary", null, null, Map.of())));
+        IllegalStateException cmdFailure = assertThrows(IllegalStateException.class,
+            () -> PolyglotDeploymentBuildSteps.validateClassFreeContract(commandDuplex));
+        assertTrue(cmdFailure.getMessage().contains("MANY_TO_MANY"));
 
         PipelineContractDescriptor bad = contractWithSteps(List.of(
             new PipelineBundleStepDescriptor(0, "Weird", "internal", "ZERO_TO_ZERO", "Order", "Summary", null, null, Map.of())));

@@ -3,6 +3,7 @@ package org.pipelineframework.orchestrator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -19,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -100,7 +102,20 @@ class CanonicalFunctionHostManyToManyStepTest {
             }
         });
 
-        InMemoryForeignDispatchIntentStore intentStore = new InMemoryForeignDispatchIntentStore();
+        var recordedSettlements = new java.util.concurrent.ConcurrentHashMap<ForeignDispatchIntent, ForeignDispatchIntentStore.SettlementStatus>();
+        InMemoryForeignDispatchIntentStore delegateIntentStore = new InMemoryForeignDispatchIntentStore();
+        ForeignDispatchIntentStore intentStore = new ForeignDispatchIntentStore() {
+            @Override
+            public ReservationOutcome reserve(ForeignDispatchIntent intent) {
+                return delegateIntentStore.reserve(intent);
+            }
+
+            @Override
+            public void recordSettlement(ForeignDispatchIntent intent, SettlementStatus status, long settledAtEpochMs) {
+                recordedSettlements.put(intent, status);
+                delegateIntentStore.recordSettlement(intent, status, settledAtEpochMs);
+            }
+        };
         TransitionDispatchScopeHolder.set(new TransitionDispatchScope("t1", "exec-duplex-1", 0L, 0, "tk-duplex-1"));
         CanonicalFunctionHostManyToManyStep step = new CanonicalFunctionHostManyToManyStep(
             baseSpec("stream-transform", intentStore, Duration.ofSeconds(5)), true);
@@ -171,7 +186,11 @@ class CanonicalFunctionHostManyToManyStepTest {
         assertEquals("42.50", EXACT_JSON.readTree(received.get(1).payload()).path("amount").decimalValue().toPlainString());
         assertTrue(sawValidSignature.get(), "HMAC signature over STREAMING-NDJSON-V1 must validate");
         assertEquals(2, itemsReceivedByHost.get());
-        assertEquals(1, intentStore.reservationCount());
+        assertEquals(1, delegateIntentStore.reservationCount());
+        assertEquals(1, recordedSettlements.size(), "Original reservation must be settled once");
+        assertEquals(ForeignDispatchIntentStore.SettlementStatus.VALIDATED_SUCCEEDED,
+            recordedSettlements.values().iterator().next(),
+            "Successful duplex stream must settle reservation as VALIDATED_SUCCEEDED");
 
         // Duplicate dispatch with the same TransitionDispatchScope must be suppressed fail-closed!
         Throwable duplicateErr = assertThrows(Throwable.class, () ->
@@ -179,6 +198,63 @@ class CanonicalFunctionHostManyToManyStepTest {
                 .collect().asList().await().atMost(Duration.ofSeconds(5)));
         assertInstanceOf(RemoteTransitionOutcomeUnknownException.class, duplicateErr);
         assertEquals(2, itemsReceivedByHost.get(), "Duplicate resend must be suppressed before opening socket");
+    }
+
+    @Test
+    void deliversTerminalCompleteWhenDemandReachesZeroAndRejectsUnterminatedNdjsonFrame() throws Exception {
+        // 1. Subscriber requests exactly 1 item; host emits 1 item + complete -> onComplete must fire with 0 remaining demand!
+        startServer("/tpf/functions/exact-demand/duplex", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "application/x-ndjson");
+            exchange.sendResponseHeaders(200, 0);
+            try (var reader = new BufferedReader(new InputStreamReader(exchange.getRequestBody(), StandardCharsets.UTF_8));
+                 var out = exchange.getResponseBody()) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.isBlank()) continue;
+                    JsonNode f = EXACT_JSON.readTree(line);
+                    if ("item".equals(f.path("event").asText())) {
+                        out.write("{\"event\":\"item\",\"outputTypeId\":\"OutFrame\",\"payload\":{\"id\":\"only-1\",\"amount\":9.99}}\n"
+                            .getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                    } else if ("complete".equals(f.path("event").asText())) {
+                        out.write("{\"event\":\"complete\",\"itemCount\":1}\n".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        break;
+                    }
+                }
+            }
+        });
+        CanonicalFunctionHostManyToManyStep exactStep = new CanonicalFunctionHostManyToManyStep(
+            baseSpec("exact-demand", ForeignDispatchIntentStore.noop(), Duration.ofSeconds(5)), true);
+        List<TypedDurablePayload> received = new CopyOnWriteArrayList<>();
+        CountDownLatch done = new CountDownLatch(1);
+        AtomicReference<Throwable> err = new AtomicReference<>();
+        exactStep.applyTransform(Multi.createFrom().item(inFrame("only", "9.99")))
+            .subscribe().withSubscriber(new Flow.Subscriber<>() {
+                @Override public void onSubscribe(Flow.Subscription s) { s.request(1L); }
+                @Override public void onNext(TypedDurablePayload item) { received.add(item); }
+                @Override public void onError(Throwable t) { err.set(t); done.countDown(); }
+                @Override public void onComplete() { done.countDown(); }
+            });
+        assertTrue(done.await(5, TimeUnit.SECONDS), "onComplete must arrive even after demand hits 0");
+        assertNull(err.get(), () -> "Unexpected error: " + err.get());
+        assertEquals(1, received.size());
+
+        // 2. Unterminated NDJSON frame (missing trailing newline before EOF) must fail closed!
+        server.createContext("/tpf/functions/unterminated/duplex", exchange -> {
+            byte[] body = "{\"event\":\"complete\",\"itemCount\":0}".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/x-ndjson");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(body);
+            }
+        });
+        CanonicalFunctionHostManyToManyStep unterminatedStep = new CanonicalFunctionHostManyToManyStep(
+            baseSpec("unterminated", ForeignDispatchIntentStore.noop(), Duration.ofSeconds(5)), true);
+        Throwable unterminatedErr = assertThrows(Throwable.class, () ->
+            unterminatedStep.applyTransform(Multi.createFrom().item(inFrame("u1", "1.00")))
+                .collect().asList().await().atMost(Duration.ofSeconds(5)));
+        assertInstanceOf(RemoteTransitionOutcomeUnknownException.class, unterminatedErr);
     }
 
     @Test
