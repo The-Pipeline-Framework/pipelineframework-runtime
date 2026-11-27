@@ -8,6 +8,8 @@ import java.util.Objects;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.DecimalNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.protobuf.Message;
 import com.google.protobuf.MessageOrBuilder;
@@ -57,9 +59,10 @@ final class QueryCapturePayloadCodec {
                 return outputType.cast(builder.build());
             }
             if (!outputType.isSealed()) {
-                return JsonNode.class.isAssignableFrom(outputType)
+                O decoded = isBigDecimalJsonNodeType(outputType)
                     ? json.readerFor(outputType).with(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS).readValue(payload)
                     : json.readValue(payload, outputType);
+                return outputType.cast(decoded);
             }
             JsonNode envelope = json.readTree(payload);
             String caseName = requiredText(envelope, "case");
@@ -89,6 +92,13 @@ final class QueryCapturePayloadCodec {
             throw new QueryCaptureStoreException(
                 "Failed decoding captured query output as " + outputType.getName(), failure);
         }
+    }
+
+    private static boolean isBigDecimalJsonNodeType(Class<?> outputType) {
+        return outputType == JsonNode.class
+            || outputType == ObjectNode.class
+            || outputType == ArrayNode.class
+            || outputType == DecimalNode.class;
     }
 
     private static String requiredText(JsonNode node, String field) {
