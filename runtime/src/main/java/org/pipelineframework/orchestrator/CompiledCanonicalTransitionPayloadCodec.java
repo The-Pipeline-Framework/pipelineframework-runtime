@@ -236,8 +236,8 @@ public final class CompiledCanonicalTransitionPayloadCodec implements Transition
                 catalog, List.class, TypeFactory.defaultInstance().constructCollectionType(List.class, type));
             return new Boundary(identity, fingerprint, collectionTypeId, collectionFingerprint, catalog,
                 java.util.Optional.of(new TypedPlans(
-                    CompiledDurablePayloadPlan.compile(scalar),
-                    CompiledDurablePayloadPlan.compile(collection))));
+                    CompiledDurablePayloadPlan.compile(scalar, contract.canonicalTypes()),
+                    CompiledDurablePayloadPlan.compile(collection, contract.canonicalTypes()))));
         } catch (ClassNotFoundException error) {
             throw new IllegalArgumentException("Compiled canonical boundary class is unavailable: " + identity, error);
         }

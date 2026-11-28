@@ -345,7 +345,7 @@ public class ExecutionDurablePayloadResolver {
             : TypeFactory.defaultInstance().constructType(runtimeClass);
         String identity = collection ? "List<" + canonicalTypeId + ">" : canonicalTypeId;
         CanonicalPayloadBinding binding = new CanonicalPayloadBinding(identity, expression, catalog, collection ? List.class : runtimeClass, runtimeType);
-        plans.activate(coordinate, Map.of(expression, binding));
+        plans.activate(coordinate, Map.of(expression, binding), release.contract().canonicalTypes());
         return plans.plan(coordinate, expression);
     }
 
