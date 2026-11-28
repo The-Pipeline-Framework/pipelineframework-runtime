@@ -25,6 +25,7 @@ coords = [
     ("org.pipelineframework", "pipelineframework", "jar"),
     ("org.pipelineframework", "pipelineframework-deployment", "jar"),
     ("org.pipelineframework", "pipelineframework-runtime-spring", "jar"),
+    ("org.pipelineframework", "pipelineframework-spring-host-starter", "jar"),
     ("org.pipelineframework", "pipelineframework-release-maven-plugin", "jar"),
     ("org.pipelineframework", "pipelineframework-release-producer", "jar"),
     ("org.pipelineframework", "pipelineframework-release-resolver", "jar"),
