@@ -35,6 +35,8 @@ public class ExecutionDurablePayloadResolver {
     private final BoundedExpiringCache<ReleaseCacheKey, PipelineReleaseRecord> releases =
         new BoundedExpiringCache<>(RELEASE_CACHE_MAXIMUM_SIZE, RELEASE_CACHE_EXPIRY);
     private static final Duration RELEASE_LOOKUP_TIMEOUT = Duration.ofSeconds(10);
+    private static final com.fasterxml.jackson.databind.ObjectMapper EXACT_JSON =
+        org.pipelineframework.type.CanonicalTypeCatalogue.exactJsonMapper();
 
     public String encode(ExecutionRecord<?, ?> execution, Slot slot, Object value) {
         if (serializedMode()) {
@@ -101,7 +103,7 @@ public class ExecutionDurablePayloadResolver {
             return List.of(payload);
         }
         try {
-            var json = PipelineJson.mapper();
+            var json = EXACT_JSON;
             var items = json.readTree(payload.payload());
             if (execution.resultShape() == ExecutionResultShape.SINGLE && items.size() > 1) {
                 throw new IllegalStateException("A single result cannot contain multiple canonical items");
@@ -190,9 +192,9 @@ public class ExecutionDurablePayloadResolver {
             throw new IllegalArgumentException("Durable payload identity differs from pinned release");
         }
         // Validate canonical schema using compiler-owned definitions without Java materialization.
-        try (var parser = PipelineJson.mapper().createParser(payload.payload())) {
+        try (var parser = EXACT_JSON.createParser(payload.payload())) {
             parser.enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
-            com.fasterxml.jackson.databind.JsonNode body = PipelineJson.mapper().readTree(parser);
+            com.fasterxml.jackson.databind.JsonNode body = EXACT_JSON.readTree(parser);
             if (body == null || parser.nextToken() != null
                 || (stored.collection() && !body.isArray())) {
                 throw new IllegalArgumentException("Invalid canonical JSON payload framing");

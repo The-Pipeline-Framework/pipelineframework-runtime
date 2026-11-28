@@ -1703,7 +1703,9 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         long nowEpochMs
     ) {
         Optional<ExecutionRecord<Object, Object>> current = getExecutionBlocking(tenantId, executionId, nowEpochMs);
-        if (current.isEmpty() || current.orElseThrow().version() != expectedVersion) return Optional.empty();
+        if (current.filter(record -> record.version() == expectedVersion).isEmpty()) {
+            return Optional.empty();
+        }
         Map<String, String> names = Map.ofEntries(
             Map.entry("#status", STATUS),
             Map.entry("#version", VERSION),
@@ -1749,9 +1751,9 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             .expressionAttributeValues(values)
             .returnValues(ReturnValue.ALL_NEW)
             .build();
-        ExecutionRecord<Object, Object> execution = current.orElseThrow();
-        if (execution.status() == ExecutionStatus.WAITING_EXTERNAL
-            && execution.awaitUnitId() != null && !execution.awaitUnitId().isBlank()) {
+        if (current.filter(execution -> execution.status() == ExecutionStatus.WAITING_EXTERNAL
+            && execution.awaitUnitId() != null && !execution.awaitUnitId().isBlank()).isPresent()) {
+            ExecutionRecord<Object, Object> execution = current.orElseThrow();
             return commitAwaitRelease(request, execution, execution.awaitUnitId(),
                 AwaitReleaseDisposition.TERMINAL_FAILED, nowEpochMs);
         }
@@ -2175,15 +2177,15 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
         Object originalInput,
         Object inputPayload
     ) {
-        SerializedTransitionPayload legacyPayload = null;
+        SerializedTransitionPayload transitionPayload = null;
         String serialized;
         if (writesTypedDurablePayloads(record)) {
             serialized = serializePayload(record, inputCanonicalTypeId, inputWriteSlot(record), inputPayload);
         } else {
             // Schema-v1 releases still own the external input representation at their worker boundary.
             // Preserve its concrete identity instead of collapsing it into an untyped JSON object.
-            legacyPayload = transitionPayloadCodec.encode(inputPayload);
-            serialized = legacyPayload.payload();
+            transitionPayload = transitionPayloadCodec.encode(inputPayload);
+            serialized = transitionPayload.payload();
         }
         StoredPayload storedInput = storeInputPayload(
             record.tenantId(),
@@ -2194,9 +2196,9 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             record.updatedAtEpochMs(),
             record.ttlEpochS());
         putStoredPayload(item, INPUT_PAYLOAD_JSON, INPUT_PAYLOAD_REFERENCE, INPUT_PAYLOAD_DIGEST, storedInput);
-        if (legacyPayload != null) {
-            putIfPresent(item, INPUT_PAYLOAD_TYPE_ID, legacyPayload.payloadTypeId());
-            putIfPresent(item, INPUT_PAYLOAD_ENCODING, legacyPayload.payloadEncoding());
+        if (transitionPayload != null) {
+            putIfPresent(item, INPUT_PAYLOAD_TYPE_ID, transitionPayload.payloadTypeId());
+            putIfPresent(item, INPUT_PAYLOAD_ENCODING, transitionPayload.payloadEncoding());
         } else if (isTypedDurablePayload(serialized)) {
             putIfPresent(item, INPUT_PAYLOAD_TYPE_ID, "typed-durable");
             putIfPresent(item, INPUT_PAYLOAD_ENCODING, JsonDurablePayloadCodec.ENCODING);
@@ -2261,6 +2263,7 @@ public class DynamoExecutionStateStore implements ExecutionStateStore, NativeExe
             record.updatedAtEpochMs(),
             record.ttlEpochS());
     }
+
 
     private Object canonicalResultPayload(Object resultPayload) {
         if (resultPayload instanceof Iterable<?> items) {

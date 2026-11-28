@@ -16,6 +16,11 @@ Parameters:
   DurableAlias: {Type: String, Default: platform}
   DurableExecutionTimeoutSeconds: {Type: Number, Default: 86400}
   DurableRetentionDays: {Type: Number, Default: 30}
+  WorkMaxConcurrency: {Type: Number, Default: 10, MinValue: 2}
+  AwaitCompletionMaxConcurrency: {Type: Number, Default: 5, MinValue: 2}
+  DueWorkMaxConcurrency: {Type: Number, Default: 2, MinValue: 2}
+  MaxInFlightTransitionsPerTenant: {Type: Number, Default: 0, MinValue: 0}
+  DistributedTransitionAdmission: {Type: String, Default: 'false', AllowedValues: ['true', 'false']}
   ResumeTokenSecretArn: {Type: String, Default: ''}
   ResumeTokenSecretVersion: {Type: String, Default: ''}
   ResumeTokenParameterArn: {Type: String, Default: ''}
@@ -489,6 +494,8 @@ Resources:
           PIPELINE_ORCHESTRATOR_CONTROL_PLANE_PAYLOAD_MATERIALIZATION: SERIALIZED
           PIPELINE_ORCHESTRATOR_WORKER_TARGETING_MODE: registered-rest
           PIPELINE_ORCHESTRATOR_WORKER_LIFECYCLE_PROVIDER: dynamo
+          PIPELINE_ORCHESTRATOR_QUOTAS_MAX_IN_FLIGHT_TRANSITIONS_PER_TENANT: !Ref MaxInFlightTransitionsPerTenant
+          PIPELINE_ORCHESTRATOR_QUOTAS_DISTRIBUTED_TRANSITION_ADMISSION: !Ref DistributedTransitionAdmission
           TPF_AWS_DURABLE_CONFIGURATION: !Sub >-
             {"mode":"QUEUE_ASYNC","strict-startup":"true","idempotency-policy":"CLIENT_KEY_REQUIRED","state-provider":"dynamo","dispatcher-provider":"sqs","sqs.local-loopback":"false","dlq-provider":"sqs","coordination-host":"AWS_DURABLE","process-loops-disabled":"true","queue-url":"${WorkQueue}","dlq-url":"${WorkDlq}","dynamo.execution-table":"${ExecutionTable}","dynamo.execution-key-table":"${ExecutionKeyTable}","dynamo.execution-payload-table":"${ExecutionPayloadTable}","dynamo.await-interaction-table":"${AwaitInteractionTable}","dynamo.await-interaction-key-table":"${AwaitInteractionKeyTable}","dynamo.await-completion-lifecycle-table":"${AwaitCompletionLifecycleTable}","dynamo.await-unit-table":"${AwaitUnitTable}","dynamo.await-admission-table":"${AwaitAdmissionTable}","dynamo.release-table":"${ReleaseTable}","dynamo.worker-table":"${WorkerTable}","dynamo.region":"${AWS::Region}","releases.registry.provider":"dynamo","releases.storage.provider":"s3","releases.storage.s3.bucket":"${ReleaseArtifactBucket}"}
   WorkVersion:
@@ -881,6 +888,7 @@ Resources:
       FunctionName: !Ref WorkVersion
       EventSourceArn: !GetAtt WorkQueue.Arn
       BatchSize: 1
+      ScalingConfig: {MaximumConcurrency: !Ref WorkMaxConcurrency}
       FunctionResponseTypes: [ReportBatchItemFailures]
 
   AwaitCompletionFunctionAwaitCompletion:
@@ -891,6 +899,7 @@ Resources:
       FunctionName: !Ref AwaitCompletionVersion
       EventSourceArn: !GetAtt AwaitCompletionQueue.Arn
       BatchSize: 1
+      ScalingConfig: {MaximumConcurrency: !Ref AwaitCompletionMaxConcurrency}
       FunctionResponseTypes: [ReportBatchItemFailures]
 
   DueWorkFunctionTick:
@@ -901,6 +910,7 @@ Resources:
       FunctionName: !Ref DueWorkVersion
       EventSourceArn: !GetAtt DueWorkQueue.Arn
       BatchSize: 1
+      ScalingConfig: {MaximumConcurrency: !Ref DueWorkMaxConcurrency}
       FunctionResponseTypes: [ReportBatchItemFailures]
 
   AwaitWakeupFunctionAwaitState:
@@ -1063,6 +1073,13 @@ Resources:
       TargetFunctionArn: !Ref LifecycleFunction
       Qualifier: lifecycle
 Outputs:
+  AwaitCompletionQueueUrl: {Value: !Ref AwaitCompletionQueue}
+  AwaitCompletionQueueArn: {Value: !GetAtt AwaitCompletionQueue.Arn}
+  WorkDlqName: {Value: !GetAtt WorkDlq.QueueName}
+  AwaitCompletionDlqName: {Value: !GetAtt AwaitCompletionDlq.QueueName}
+  DurableDlqName: {Value: !GetAtt DurableDlq.QueueName}
+  RepairFailureDlqName: {Value: !GetAtt RepairFailureDlq.QueueName}
+  StreamFailureDlqName: {Value: !GetAtt StreamFailureDlq.QueueName}
   LifecycleAliasArn: {Value: !Ref LifecycleAlias}
   LifecycleOrigin: {Value: !GetAtt LifecycleUrl.FunctionUrl}
   CoordinatorInvokerRoleArn: {Value: !GetAtt CoordinationRole.Arn}

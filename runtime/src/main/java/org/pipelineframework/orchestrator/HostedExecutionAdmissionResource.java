@@ -83,7 +83,9 @@ public class HostedExecutionAdmissionResource {
                         return Uni.createFrom().item(Response.status(404).build());
                     }
                     var release = registered.get();
-                    if (!release.contractVersion().equals(request.contractVersion())) {
+                    if (!tenant.equals(release.tenantId()) || !pipeline.equals(release.pipelineId())
+                        || !request.releaseVersion().equals(release.releaseVersion())
+                        || !request.contractVersion().equals(release.contractVersion())) {
                         return Uni.createFrom().item(Response.status(409).build());
                     }
                     hosted.registrar().verify(release);

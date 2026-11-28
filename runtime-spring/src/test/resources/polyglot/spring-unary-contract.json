@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 3,
+  "pipelineId": "spring-polyglot-unary",
+  "contractVersion": "v1",
+  "contractHash": "hash-spring-unary",
+  "platform": "COMPUTE",
+  "transport": "LOCAL",
+  "pluginHost": false,
+  "runtimeLayout": "MONOLITH",
+  "canonicalCatalogFingerprint": "catalog-fp-spring-1",
+  "canonicalTypes": {
+    "Order": {
+      "definitionFingerprint": "fp-Order",
+      "definition": { "kind": "record", "id": "Order", "fields": [] }
+    },
+    "EnrichedOrder": {
+      "definitionFingerprint": "fp-EnrichedOrder",
+      "definition": { "kind": "record", "id": "EnrichedOrder", "fields": [] }
+    },
+    "Receipt": {
+      "definitionFingerprint": "fp-Receipt",
+      "definition": { "kind": "record", "id": "Receipt", "fields": [] }
+    }
+  },
+  "steps": [
+    {
+      "stepIndex": 0,
+      "authoredName": "Validate Order",
+      "kind": "internal",
+      "cardinality": "ONE_TO_ONE",
+      "inputType": "Order",
+      "outputType": "EnrichedOrder"
+    },
+    {
+      "stepIndex": 1,
+      "authoredName": "Issue Receipt",
+      "kind": "internal",
+      "cardinality": "ONE_TO_ONE",
+      "inputType": "EnrichedOrder",
+      "outputType": "Receipt"
+    }
+  ]
+}

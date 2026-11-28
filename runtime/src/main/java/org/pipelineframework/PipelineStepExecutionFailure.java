@@ -11,23 +11,29 @@ final class PipelineStepExecutionFailure extends RuntimeException {
   private static final long serialVersionUID = 1L;
 
   private final int stepIndex;
+  private final boolean root;
 
-  private PipelineStepExecutionFailure(int stepIndex, Throwable cause) {
+  private PipelineStepExecutionFailure(int stepIndex, boolean root, Throwable cause) {
     super(cause.getMessage(), cause);
     this.stepIndex = stepIndex;
+    this.root = root;
   }
 
   static Throwable at(int stepIndex, Throwable failure) {
     Objects.requireNonNull(failure, "failure");
     return find(failure).isPresent()
         ? failure
-        : new PipelineStepExecutionFailure(stepIndex, failure);
+        : new PipelineStepExecutionFailure(stepIndex, false, failure);
   }
 
   /** Records the resumable root step while discarding any nested definition-local index. */
   static Throwable atRoot(int stepIndex, Throwable failure) {
     Objects.requireNonNull(failure, "failure");
-    return new PipelineStepExecutionFailure(stepIndex, source(failure));
+    Optional<PipelineStepExecutionFailure> existing = find(failure);
+    if (existing.isPresent() && existing.orElseThrow().root) {
+      return failure;
+    }
+    return new PipelineStepExecutionFailure(stepIndex, true, source(failure));
   }
 
   static int stepIndex(Throwable failure) {

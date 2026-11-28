@@ -1,6 +1,9 @@
 package org.pipelineframework;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import java.util.function.Supplier;
 
 import io.smallrye.mutiny.Multi;
@@ -8,6 +11,8 @@ import io.smallrye.mutiny.Uni;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -17,6 +22,8 @@ import org.pipelineframework.orchestrator.ControlPlaneAdmissionException;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionPolicy;
 import org.pipelineframework.orchestrator.ControlPlaneAdmissionRequest;
 import org.pipelineframework.orchestrator.CreateExecutionResult;
+import org.pipelineframework.orchestrator.ExecutionAdmissionIntent;
+import org.pipelineframework.orchestrator.ExecutionAdmissionResult;
 import org.pipelineframework.orchestrator.ExecutionCreateCommand;
 import org.pipelineframework.orchestrator.ExecutionInputShape;
 import org.pipelineframework.orchestrator.ExecutionInputSnapshot;
@@ -26,12 +33,22 @@ import org.pipelineframework.orchestrator.ExecutionResultShapeResolver;
 import org.pipelineframework.orchestrator.ExecutionStateStore;
 import org.pipelineframework.orchestrator.ExecutionStatus;
 import org.pipelineframework.orchestrator.ExecutionWorkItem;
+import org.pipelineframework.orchestrator.InMemoryExecutionStateStore;
+import org.pipelineframework.orchestrator.NativeExecutionAdmissionStore;
 import org.pipelineframework.orchestrator.OrchestratorIdempotencyPolicy;
 import org.pipelineframework.orchestrator.OrchestratorMode;
+import org.pipelineframework.orchestrator.PipelineBundleCapabilities;
 import org.pipelineframework.orchestrator.PipelineOrchestratorConfig;
+import org.pipelineframework.orchestrator.SerializedTransitionPayload;
 import org.pipelineframework.orchestrator.WorkDispatcher;
 import org.pipelineframework.orchestrator.controlplane.SegmentBoundaryLedger;
 import org.pipelineframework.orchestrator.dto.RunAsyncAcceptedDto;
+import org.pipelineframework.orchestrator.release.ExecutionAdmissionReleaseEvidence;
+import org.pipelineframework.orchestrator.release.PipelineContractDescriptor;
+import org.pipelineframework.orchestrator.release.PipelineReleaseDescriptor;
+import org.pipelineframework.orchestrator.release.PipelineReleaseEvidence;
+import org.pipelineframework.orchestrator.release.PipelineReleaseRecord;
+import org.pipelineframework.orchestrator.release.PipelineReleaseStatus;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -43,7 +60,9 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -206,6 +225,23 @@ class QueueAsyncSubmissionFlowTest {
   }
 
   @Test
+  void pagedSubmissionPersistsFirstPageWhenStoreSupportsFencedProgress() {
+    when(executionStateStore.supportsPagedProgress()).thenReturn(true);
+    when(executionStateStore.createOrGetExecution(any()))
+        .thenReturn(Uni.createFrom().item(new CreateExecutionResult(record("exec-1", "key-1"), false)));
+    when(workDispatcher.enqueueNow(any())).thenReturn(Uni.createFrom().voidItem());
+
+    pagedFlow().submit("input", "tenant-1", "idem-1", false).await().indefinitely();
+
+    var command = ArgumentCaptor.forClass(ExecutionCreateCommand.class);
+    verify(executionStateStore).createOrGetExecution(command.capture());
+    var firstPage = command.getValue().pagingState().orElseThrow();
+    assertEquals(0, firstPage.pageIndex());
+    assertEquals(32, firstPage.maxRecords());
+    verify(workDispatcher).enqueueNow(new ExecutionWorkItem("tenant-1", "exec-1"));
+  }
+
+    @Test
   void duplicateExecutionSkipsLedgerAndEnqueue() {
     when(executionStateStore.createOrGetExecution(any()))
         .thenReturn(Uni.createFrom().item(new CreateExecutionResult(record("exec-1", "key-1"), true)));
@@ -272,6 +308,14 @@ class QueueAsyncSubmissionFlowTest {
     verify(activation).apply(submission.capture());
     assertEquals("restaurant-demo", submission.getValue().tenantId());
     verify(executionStateStore).createOrGetExecution(any());
+  }
+
+  private QueueAsyncSubmissionFlow pagedFlow() {
+    return new QueueAsyncSubmissionFlow(
+        orchestratorConfig, inputPolicy, resultShapeResolver, executionStateStore, workDispatcher,
+        admissionPolicy, () -> "pipeline-a", () -> "contract-a", () -> "release-a",
+        () -> segmentBoundaryLedger, ignored -> Uni.createFrom().voidItem(),
+        ignored -> Uni.createFrom().item(Optional.of(new PipelinePagingPlan(32))));
   }
 
   private QueueAsyncSubmissionFlow newFlow(

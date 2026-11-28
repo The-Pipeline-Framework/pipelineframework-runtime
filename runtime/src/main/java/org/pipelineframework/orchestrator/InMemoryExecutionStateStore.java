@@ -766,39 +766,44 @@ public class InMemoryExecutionStateStore implements ExecutionStateStore, NativeE
                 if (current == null || current.version() != expectedVersion) {
                     return Optional.empty();
                 }
-                ExecutionRecord<Object, Object> updated = new ExecutionRecord<>(
-                    current.tenantId(),
-                    current.executionId(),
-                    current.executionKey(),
-                    current.pipelineId(),
-                    current.contractVersion(),
-                    current.releaseVersion(),
-                    current.resultShape(),
-                    ExecutionStatus.REMOTE_OUTCOME_UNKNOWN,
-                    current.version() + 1,
-                    current.currentStepIndex(),
-                    current.attempt(),
-                    null,
-                    0L,
-                    Long.MAX_VALUE,
-                    transitionKey,
-                    current.inputPayload(),
-                    current.awaitUnitId(),
-                    null,
-                    errorCode,
-                    truncate(errorMessage),
-                    current.createdAtEpochMs(),
-                    nowEpochMs,
-                    current.ttlEpochS(),
-                    current.firstCircuitDeferredAtEpochMs(),
-                    current.circuitDeferralCount(),
-                    current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
-                    current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
-                    current.awaitOccurrenceCause(), current.dispatchPin());
+                var updated = unknownRecord(current, transitionKey, errorCode, errorMessage, nowEpochMs);
                 executionsByScopedId.put(scopedId, updated);
                 return Optional.of(updated);
             }
         });
+    }
+
+    private static ExecutionRecord<Object, Object> unknownRecord(ExecutionRecord<Object, Object> current,
+            String transitionKey, String errorCode, String errorMessage, long nowEpochMs) {
+        return new ExecutionRecord<>(
+            current.tenantId(),
+            current.executionId(),
+            current.executionKey(),
+            current.pipelineId(),
+            current.contractVersion(),
+            current.releaseVersion(),
+            current.resultShape(),
+            ExecutionStatus.REMOTE_OUTCOME_UNKNOWN,
+            current.version() + 1,
+            current.currentStepIndex(),
+            current.attempt(),
+            null,
+            0L,
+            Long.MAX_VALUE,
+            transitionKey,
+            current.inputPayload(),
+            current.awaitUnitId(),
+            null,
+            errorCode,
+            truncate(errorMessage),
+            current.createdAtEpochMs(),
+            nowEpochMs,
+            current.ttlEpochS(),
+            current.firstCircuitDeferredAtEpochMs(),
+            current.circuitDeferralCount(),
+            current.circuitIdentity(), current.redriveIntent(), current.failedStepIndex(),
+            current.failedCommandId(), current.redriveTargetCommandId(), current.redriveReason(), current.pagingState(),
+            current.awaitOccurrenceCause(), current.dispatchPin());
     }
 
     @Override

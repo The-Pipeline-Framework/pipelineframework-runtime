@@ -96,6 +96,43 @@ class CompiledCanonicalTransitionPayloadCodecTest {
         assertThrows(IllegalArgumentException.class, () -> codec("Primary", "Primary").decode(framing.encode(malformed)));
     }
 
+    @Test
+    void classFreeCanonicalBoundaryValidatesSchemaWithoutLoadingRuntimeClass() {
+        Map<String, Object> classFreeDef = Map.of(
+            "definitionFingerprint", "fp-order",
+            "definition", Map.of("kind", "record", "id", "OrderRecord", "fields", List.of(
+                Map.of("name", "orderId", "presence", "REQUIRED", "nullability", "NON_NULL",
+                    "type", Map.of("kind", "scalar", "id", "string")),
+                Map.of("name", "amountCents", "presence", "REQUIRED", "nullability", "NON_NULL",
+                    "type", Map.of("kind", "scalar", "id", "int32")))));
+        var contract = contract(Map.of("OrderRecord", classFreeDef));
+        var codec = new CompiledCanonicalTransitionPayloadCodec(framing, contract, "OrderRecord", "OrderRecord");
+
+        var valid = new TypedDurablePayload(
+            "OrderRecord", "fp-order", "catalog", JsonDurablePayloadCodec.ENCODING,
+            JsonDurablePayloadCodec.ENCODING_VERSION,
+            "{\"amountCents\":1500,\"orderId\":\"ord-1\"}".getBytes(StandardCharsets.UTF_8));
+        var encoded = codec.encode(valid);
+        var decoded = assertInstanceOf(TypedDurablePayload.class, codec.decode(encoded));
+        assertEquals("OrderRecord", decoded.canonicalTypeId());
+        assertEquals("{\"amountCents\":1500,\"orderId\":\"ord-1\"}",
+            new String(decoded.payload(), StandardCharsets.UTF_8));
+
+        // Class-free collection support
+        var encodedList = codec.encode(List.of(valid));
+        var decodedList = assertInstanceOf(TypedDurablePayload.class, codec.decode(encodedList));
+        assertEquals("List<OrderRecord>", decodedList.canonicalTypeId());
+
+        // Rejects raw POJOs, wrong type/fingerprint, and invalid canonical schema
+        assertThrows(IllegalArgumentException.class, () -> codec.encode(new Value("not-canonical")));
+        var badSchema = new TypedDurablePayload(
+            "OrderRecord", "fp-order", "catalog", JsonDurablePayloadCodec.ENCODING,
+            JsonDurablePayloadCodec.ENCODING_VERSION,
+            "{\"orderId\":\"ord-1\",\"amountCents\":\"not-an-int\"}".getBytes(StandardCharsets.UTF_8));
+        assertThrows(IllegalArgumentException.class, () -> codec.encode(badSchema));
+        assertThrows(IllegalArgumentException.class, () -> codec.decode(framing.encode(badSchema)));
+    }
+
     private CompiledCanonicalTransitionPayloadCodec codec(String input, String output) {
         return new CompiledCanonicalTransitionPayloadCodec(framing,
             contract(Map.of("Primary", definition("primary"), "Secondary", definition("secondary"))), input, output);

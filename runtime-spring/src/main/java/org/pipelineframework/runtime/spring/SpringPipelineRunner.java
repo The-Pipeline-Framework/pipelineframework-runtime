@@ -18,11 +18,13 @@ package org.pipelineframework.runtime.spring;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletionStage;
 
 import org.pipelineframework.runtime.core.PipelineRunnerCore;
 import org.pipelineframework.runtime.core.PipelineUnaryStep;
 import org.pipelineframework.runtime.core.TpfExecutionContext;
+import org.pipelineframework.runtime.spring.polyglot.SpringTransitionDispatchScope;
 
 /**
  * Spring adapter for the framework-neutral pipeline runner core.
@@ -44,8 +46,9 @@ public class SpringPipelineRunner {
      */
     public CompletionStage<Object> run(Object input) {
         TpfExecutionContext.Snapshot context = TpfExecutionContext.capture();
+        Optional<SpringTransitionDispatchScope> dispatchScope = SpringTransitionDispatchScope.current();
         return runnerCore.runAsync(input, steps,
-            (step, value, index) -> applyInContext(step, value, context));
+            (step, value, index) -> applyInContext(step, value, context, dispatchScope));
     }
 
     public int stepCount() {
@@ -54,9 +57,12 @@ public class SpringPipelineRunner {
 
     @SuppressWarnings("unchecked")
     private CompletionStage<Object> applyInContext(
-            PipelineUnaryStep<?, ?> step, Object input, TpfExecutionContext.Snapshot context) {
+            PipelineUnaryStep<?, ?> step,
+            Object input,
+            TpfExecutionContext.Snapshot context,
+            Optional<SpringTransitionDispatchScope> dispatchScope) {
         TpfExecutionContext.Snapshot previous = TpfExecutionContext.capture();
-        try {
+        try (SpringTransitionDispatchScope.Scope ignored = SpringTransitionDispatchScope.withOptional(dispatchScope)) {
             TpfExecutionContext.restore(context);
             PipelineUnaryStep<Object, Object> typedStep = (PipelineUnaryStep<Object, Object>) step;
             return typedStep.apply(input);

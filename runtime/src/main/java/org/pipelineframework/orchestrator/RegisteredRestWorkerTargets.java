@@ -390,22 +390,29 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
         Optional<ExecutionDispatchPin> pin) {
         if (index >= targets.size()) return Uni.createFrom().failure(new IllegalStateException("No verified registered REST worker available"));
         var target = targets.get(index);
-        Uni<Boolean> requiresAwait = serializedCoordination()
-            ? releases.get(target.tenantId(), target.pipelineId(), target.releaseVersion())
-                .chain(found -> {
-                    var release = found.orElseThrow();
-                    return retainedBinding(release, target).map(binding -> {
-                        if (pin.isPresent() && !pin.orElseThrow().deploymentOperationId().equals(binding.deploymentOperationId())) {
-                            throw new IllegalStateException("Execution dispatch revision differs from retained binding");
-                        }
-                        return release.contract().steps().stream().anyMatch(step -> !step.deferredCompletion().isEmpty());
-                    });
-                })
-            : Uni.createFrom().item(false);
-        return requiresAwait.chain(await -> prepareCredential(target.sharedSecretRef())
+        Uni<RequiredCapabilities> requirements = releases.get(target.tenantId(), target.pipelineId(), target.releaseVersion())
+            .chain(found -> {
+                var release = found.orElseThrow();
+                boolean requiresAwait = serializedCoordination()
+                    && release.contract().steps().stream().anyMatch(step -> !step.deferredCompletion().isEmpty());
+                boolean requiresCommand = release.contract().steps().stream()
+                    .anyMatch(step -> "command".equals(step.kind()));
+                if (!serializedCoordination()) {
+                    return Uni.createFrom().item(new RequiredCapabilities(requiresAwait, requiresCommand));
+                }
+                return retainedBinding(release, target).map(binding -> {
+                    if (pin.isPresent() && !pin.orElseThrow().deploymentOperationId().equals(binding.deploymentOperationId())) {
+                        throw new IllegalStateException("Execution dispatch revision differs from retained binding");
+                    }
+                    return new RequiredCapabilities(requiresAwait, requiresCommand);
+                });
+            });
+        return requirements.chain(required -> prepareCredential(target.sharedSecretRef())
             .chain(() -> rest.capabilities(endpoint(target.endpoint()), target.sharedSecretRef())).chain(capability -> {
             if ((serializedCoordination() && !capability.workerProtocols().contains("canonical-transition-values-v1"))
-                || (await && !capability.workerProtocols().contains("await-authority-v1"))
+                || (required.awaitAuthority() && !capability.workerProtocols().contains("await-authority-v1"))
+                || (required.commandAuthority() && !capability.workerProtocols().contains(
+                    org.pipelineframework.command.CommandStepSupport.COMMAND_AUTHORITY_CAPABILITY))
                 || !PipelineWorkerCapability.PROTOCOL_VERSION.equals(capability.protocolVersion())
                 || !"rest".equals(capability.providerName()) || !capability.workerProtocols().contains("rest")
                 || !capability.payloadEncodings().contains(TransitionPayloadEncoding.JSON)
@@ -423,6 +430,8 @@ public class RegisteredRestWorkerTargets implements PipelineTransitionWorker {
             target.tenantId(), target.workerId(), failure.getClass().getName()))
             .onFailure().recoverWithUni(failure -> probe(targets, index + 1, pin));
     }
+
+    private record RequiredCapabilities(boolean awaitAuthority, boolean commandAuthority) {}
 
     private record Selection(PipelineOrchestratorConfig.RegisteredRestTargetConfig target, PipelineWorkerCapability capability) {}
 }

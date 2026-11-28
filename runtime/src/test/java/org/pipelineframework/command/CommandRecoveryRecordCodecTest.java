@@ -5,6 +5,8 @@ import java.util.*;
 import java.math.BigDecimal;
 import java.time.Instant;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.config.pipeline.PipelineJson;
@@ -146,6 +148,55 @@ class CommandRecoveryRecordCodecTest {
         assertBoundInputRoundTrip(map, Map.class.getName());
         assertBoundInputRoundTrip(-0.0d, Double.class.getName());
         assertBoundInputRoundTrip(-0.0f, Float.class.getName());
+    }
+
+    @Test
+    void jsonNodeInputsPreserveDigestsForNegativeZeroExponentDoublesAnd29DigitDecimals() {
+        String exact29 = "99999999999999999999.123456789";
+        String nested29 = "12345678901234567890.987654321";
+
+        ObjectNode negZeroNode = PipelineJson.mapper().createObjectNode()
+            .put("negativeZero", -0.0d);
+        ObjectNode exponentNode = PipelineJson.mapper().createObjectNode()
+            .put("largeExp", 1.0E7d)
+            .put("smallExp", 1.0E-4d)
+            .put("hugeExp", 1.0E20d);
+        ObjectNode mixedNode = PipelineJson.mapper().createObjectNode()
+            .put("negativeZero", -0.0d)
+            .put("negativeUnderflow", new BigDecimal("-1E-400"))
+            .put("largeExp", 1.0E7d)
+            .put("smallExp", 1.0E-4d)
+            .put("exactDecimal", new BigDecimal(exact29));
+        ArrayNode arr = mixedNode.putArray("values");
+        arr.add(-0.0d);
+        arr.add(1.0E-4d);
+        arr.add(new BigDecimal(nested29));
+
+        for (ObjectNode input : List.of(negZeroNode, exponentNode, mixedNode)) {
+            String declaredType = JsonNode.class.getName();
+            var binding = binding(input, declaredType, Result.class.getName());
+            var pending = pending(input).bindRecovery(binding);
+            String encoded = codec.encode(pending, declaredType, Result.class.getName());
+            var restored = codec.decode(encoded).record();
+
+            assertDoesNotThrow(() -> codec.validateRecovery(restored, declaredType, Result.class.getName()));
+            assertEquals(binding.inputDigest(), codec.digest(restored.input(), declaredType));
+            assertEquals(pending, restored);
+        }
+
+        String declaredType = JsonNode.class.getName();
+        var mixedBinding = binding(mixedNode, declaredType, Result.class.getName());
+        var restoredMixed = (JsonNode) codec.decode(
+            codec.encode(pending(mixedNode).bindRecovery(mixedBinding), declaredType, Result.class.getName()))
+            .record().input();
+        assertEquals(Double.doubleToRawLongBits(-0.0d),
+            Double.doubleToRawLongBits(restoredMixed.path("negativeZero").doubleValue()));
+        assertTrue(restoredMixed.path("negativeUnderflow").isBigDecimal());
+        assertEquals(new BigDecimal("-1E-400"), restoredMixed.path("negativeUnderflow").decimalValue());
+        assertTrue(restoredMixed.path("exactDecimal").isBigDecimal());
+        assertEquals(exact29, restoredMixed.path("exactDecimal").decimalValue().toPlainString());
+        assertTrue(restoredMixed.path("values").get(2).isBigDecimal());
+        assertEquals(nested29, restoredMixed.path("values").get(2).decimalValue().toPlainString());
     }
 
     @Test

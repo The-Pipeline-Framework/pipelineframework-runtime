@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 3,
+  "pipelineId": "spring-polyglot-streaming",
+  "contractVersion": "v1",
+  "contractHash": "hash-spring-streaming",
+  "platform": "COMPUTE",
+  "transport": "LOCAL",
+  "pluginHost": false,
+  "runtimeLayout": "MONOLITH",
+  "canonicalCatalogFingerprint": "catalog-fp-stream-1",
+  "canonicalTypes": {
+    "Batch": {
+      "definitionFingerprint": "fp-Batch",
+      "definition": { "kind": "record", "id": "Batch", "fields": [] }
+    },
+    "Frame": {
+      "definitionFingerprint": "fp-Frame",
+      "definition": { "kind": "record", "id": "Frame", "fields": [] }
+    },
+    "Summary": {
+      "definitionFingerprint": "fp-Summary",
+      "definition": { "kind": "record", "id": "Summary", "fields": [] }
+    }
+  },
+  "steps": [
+    {
+      "stepIndex": 0,
+      "authoredName": "Split Batch",
+      "kind": "internal",
+      "cardinality": "ONE_TO_MANY",
+      "inputType": "Batch",
+      "outputType": "Frame"
+    },
+    {
+      "stepIndex": 1,
+      "authoredName": "Transform Stream",
+      "kind": "internal",
+      "cardinality": "MANY_TO_MANY",
+      "inputType": "Frame",
+      "outputType": "Frame"
+    },
+    {
+      "stepIndex": 2,
+      "authoredName": "Collect Summary",
+      "kind": "internal",
+      "cardinality": "MANY_TO_ONE",
+      "inputType": "Frame",
+      "outputType": "Summary"
+    }
+  ]
+}

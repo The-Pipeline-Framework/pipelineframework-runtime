@@ -8,15 +8,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.pipelineframework.runtime.core.RuntimeAdapters;
 
-/** Internal invocation-scoped authority for one control-plane-admitted Command attempt. */
+/** Internal invocation-scoped authority for one control-plane-admitted Command attempt and worker segment. */
 public final class CommandReexecutionScope {
     private static final String CONTEXT_KEY = CommandReexecutionScope.class.getName() + ".admission";
+    private static final String WORKER_SCOPE_KEY = CommandReexecutionScope.class.getName() + ".workerScope";
 
     private CommandReexecutionScope() {
     }
 
     public static Snapshot capture() {
-        return new Snapshot(current());
+        return new Snapshot(current(), currentWorkerScope());
     }
 
     static AdmissionHandle installRetry(String targetCommandId, String admissionKey) {
@@ -25,6 +26,13 @@ public final class CommandReexecutionScope {
 
     static AdmissionHandle installReissue(String targetCommandId, String admissionKey, String reason) {
         return install(targetCommandId, admissionKey, CommandAttemptAdmission.reissue(reason));
+    }
+
+    static void installWorkerScope(Optional<CommandWorkerExecutionScope> workerScope) {
+        Objects.requireNonNull(workerScope, "workerScope must not be null");
+        workerScope.ifPresentOrElse(
+            scope -> RuntimeAdapters.setExecutionContext(WORKER_SCOPE_KEY, scope),
+            CommandReexecutionScope::clearWorkerScope);
     }
 
     private static AdmissionHandle install(
@@ -41,11 +49,22 @@ public final class CommandReexecutionScope {
         RuntimeAdapters.clearExecutionContext(CONTEXT_KEY);
     }
 
+    static void clearWorkerScope() {
+        RuntimeAdapters.clearExecutionContext(WORKER_SCOPE_KEY);
+    }
+
     public static void restore(Snapshot snapshot) {
         Objects.requireNonNull(snapshot, "snapshot must not be null");
         snapshot.admission.ifPresentOrElse(
             admission -> RuntimeAdapters.setExecutionContext(CONTEXT_KEY, admission),
             CommandReexecutionScope::clear);
+        snapshot.workerScope.ifPresentOrElse(
+            scope -> RuntimeAdapters.setExecutionContext(WORKER_SCOPE_KEY, scope),
+            CommandReexecutionScope::clearWorkerScope);
+    }
+
+    static Optional<CommandWorkerExecutionScope> currentWorkerScope() {
+        return Optional.ofNullable(RuntimeAdapters.executionContext(WORKER_SCOPE_KEY, CommandWorkerExecutionScope.class));
     }
 
     static Optional<Claim> claimAttempt(String commandId, String currentOccurrenceId) {
@@ -69,9 +88,11 @@ public final class CommandReexecutionScope {
 
     public static final class Snapshot {
         private final Optional<Admission> admission;
+        private final Optional<CommandWorkerExecutionScope> workerScope;
 
-        private Snapshot(Optional<Admission> admission) {
+        private Snapshot(Optional<Admission> admission, Optional<CommandWorkerExecutionScope> workerScope) {
             this.admission = Objects.requireNonNull(admission, "admission must not be null");
+            this.workerScope = Objects.requireNonNull(workerScope, "workerScope must not be null");
         }
     }
 

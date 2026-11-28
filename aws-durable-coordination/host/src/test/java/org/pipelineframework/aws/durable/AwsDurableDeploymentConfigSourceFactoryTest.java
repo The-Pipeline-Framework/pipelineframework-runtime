@@ -538,6 +538,23 @@ class AwsDurableDeploymentConfigSourceFactoryTest {
         assertThat(parameters).containsExactly(GetParameterRequest.builder()
             .name(values.get("tpf.aws.durable.worker-parameter-arn") + ":7").withDecryption(true).build());
         assertThat(parameterWorker.getValue("tpf.aws.durable.worker-signing-key", String.class)).isEqualTo(SECRET);
+
+        values.put("tpf.aws.durable.command-effect-table", "worker-command-effects");
+        parameters.clear();
+        var commandWorker = buildSsm(values, new ArrayList<>(), parameters, this::validParameterResponse);
+        assertThat(commandWorker.getValue("pipeline.command.effect-store.provider", String.class)).isEqualTo("dynamo");
+        assertThat(commandWorker.getValue("pipeline.command.effect-store.dynamo.table", String.class))
+            .isEqualTo("worker-command-effects");
+
+        parameters.clear();
+        assertThatThrownBy(() -> new SmallRyeConfigBuilder().withMapping(PipelineOrchestratorConfig.class)
+            .withSources(new PropertiesConfigSource(values, "deployment", 300))
+            .withSources(new PropertiesConfigSource(Map.of("pipeline.command.effect-store.provider", "memory"), "override", 600))
+            .withSources(new AwsDurableDeploymentConfigSourceFactory(
+                request -> { throw new AssertionError("Secrets Manager must not be read"); },
+                request -> { parameters.add(request); return validParameterResponse(request); })).build())
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThat(parameters).isEmpty();
     }
 
     private SmallRyeConfig build(Map<String, String> values, List<GetSecretValueRequest> requests, org.eclipse.microprofile.config.spi.ConfigSource... overrides) {

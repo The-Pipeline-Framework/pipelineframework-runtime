@@ -87,15 +87,18 @@ public interface StepOneToOne<I, O> extends OneToOne<I, O>, Configurable, ItemRe
         }
       });
     }
-    return output
-        // Step 3: Apply retry policy for transient failures
-        .onFailure(this::shouldRetry)
-        .invoke(t -> PipelineRetryTelemetry.recordRetry(this.getClass(), t))
-        .onFailure(this::shouldRetry)
-        .retry()
-        .withBackOff(retryWait(), maxBackoff())
-        .withJitter(jitter() ? 0.5 : 0.0)
-        .atMost(retryLimit())
+    Uni<O> maybeRetried = retryLimit() > 0
+        ? output
+            // Step 3: Apply retry policy for transient failures
+            .onFailure(this::shouldRetry)
+            .invoke(t -> PipelineRetryTelemetry.recordRetry(this.getClass(), t))
+            .onFailure(this::shouldRetry)
+            .retry()
+            .withBackOff(retryWait(), maxBackoff())
+            .withJitter(jitter() ? 0.5 : 0.0)
+            .atMost(retryLimit())
+        : output;
+    return maybeRetried
         .onItem().invoke(out -> {
           if (LOG.isDebugEnabled()) {
             LOG.debugf("Step %s processed item: %s", this.getClass().getSimpleName(), out);

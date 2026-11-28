@@ -1,0 +1,1 @@
+{"schemaVersion": 7, "providers": [{"id": "fixture.echo", "version": {"major": 1, "minor": 0}, "operations": [{"id": "echo", "kind": "tpf:command", "majorVersion": 1, "typeContract": {"input": "com.example.echo.EchoInput", "output": "com.example.echo.EchoOutput"}, "configurationSchema": {"id": "fixture.echo.config", "version": 1, "fields": []}}]}]}

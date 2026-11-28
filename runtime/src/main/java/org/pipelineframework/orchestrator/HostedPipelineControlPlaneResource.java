@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 import io.smallrye.common.annotation.Blocking;
 import io.smallrye.mutiny.Multi;

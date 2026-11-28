@@ -88,12 +88,16 @@ class QueueAsyncSegmentPipeline {
         transitionPermit.close();
         return handleDeniedAdmission(workItem, tenantAdmission);
       }
-      return executionLease.run(workItem,
-          (segment, claimedAt) -> runClaimed(segment, worker, itemContinuationHandler, claimedAt))
-          .onTermination().invoke(() -> {
-            transitionPermit.close();
-            tenantAdmission.permit().close();
-          });
+      Uni<Void> execution = executionLease.run(workItem,
+          (segment, claimedAt) -> runClaimed(segment, worker, itemContinuationHandler, claimedAt));
+      Uni<Void> bounded = tenantAdmission.permit().maxActiveDuration()
+          .map(limit -> execution.ifNoItem().after(limit).failWith(() -> new IllegalStateException(
+              "Transition exceeded distributed admission lease limit " + limit + " for execution " + workItem.executionId())))
+          .orElse(execution);
+      return bounded.onTermination().invoke(() -> {
+        transitionPermit.close();
+        tenantAdmission.permit().close();
+      });
     });
   }
 
@@ -129,12 +133,16 @@ class QueueAsyncSegmentPipeline {
     return segmentBoundaryLedger.get()
         .recordSegmentAttemptStarted(record, segment.transitionKey(), claimedAtEpochMs)
         .chain(() -> executeTransition(segment, worker))
-        .onItem().transform(result -> SegmentCommitPlan.from(segment, result, payloadCodec.get()))
-        .onItem().transformToUni(plan -> segmentCommitEffects.commit(plan, itemContinuationHandler))
+        .chain(result -> commitTransition(segment, result, itemContinuationHandler))
         .onFailure(AwaitThrowableSupport::containsAwaitSuspension)
         .recoverWithUni(failure -> suspendedPlan(segment, failure)
             .onItem().transformToUni(plan -> segmentCommitEffects.commit(plan, itemContinuationHandler)))
         .onFailure().recoverWithUni(failure -> segmentCommitEffects.fail(segment, failure));
+  }
+
+  private Uni<Void> commitTransition(ClaimedSegment segment, TransitionResultEnvelope result,
+      AwaitItemContinuationHandler itemContinuationHandler) {
+    return segmentCommitEffects.commit(SegmentCommitPlan.from(segment, result, payloadCodec.get()), itemContinuationHandler);
   }
 
   private Uni<TransitionResultEnvelope> executeTransition(

@@ -22,11 +22,21 @@ public final class CommandReexecutionBoundary {
         TransitionWorkerCommand command,
         Supplier<Multi<?>> execution
     ) {
+        return invokeTransitionWorker(command, Optional.empty(), execution);
+    }
+
+    public static Multi<?> invokeTransitionWorker(
+        TransitionWorkerCommand command,
+        Optional<CommandWorkerExecutionScope> workerScope,
+        Supplier<Multi<?>> execution
+    ) {
         Objects.requireNonNull(command, "command must not be null");
+        Objects.requireNonNull(workerScope, "workerScope must not be null");
         Objects.requireNonNull(execution, "execution must not be null");
         return Multi.createFrom().deferred(() -> {
             CommandReexecutionScope.Snapshot previous = CommandReexecutionScope.capture();
             try {
+                CommandReexecutionScope.installWorkerScope(workerScope);
                 Optional<CommandReexecutionScope.AdmissionHandle> admission = install(command);
                 Multi<?> result = Objects.requireNonNull(
                     execution.get(), "Command reexecution returned a null stream");

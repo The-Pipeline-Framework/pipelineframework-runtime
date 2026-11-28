@@ -58,6 +58,30 @@ class LocalPipelineControlPlaneTest {
   }
 
   @Test
+  void scopedInteractionReadAndHumanCompletionDelegateWithoutDroppingContinuationAuthority() {
+    var pin = new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint("tenant", "execution", "pipeline", "contract", "A1", ExecutionStatus.WAITING_EXTERNAL);
+    var command = new AwaitCompletionCommand("tenant", "interaction", null, "decision", java.util.Map.of("approved", true), "reviewer", System.currentTimeMillis());
+    when(queueAsyncCoordinator.getAwaitInteractionView(pin, "interaction")).thenReturn(Uni.createFrom().item(Optional.empty()));
+    when(queueAsyncCoordinator.completeHumanAwait(pin, command, itemContinuationHandler))
+        .thenReturn(Uni.createFrom().failure(new IllegalStateException("native boundary")));
+    assertEquals(Optional.empty(), controlPlane.getAwaitInteractionView(pin, "interaction").await().indefinitely());
+    assertThrows(IllegalStateException.class, () -> controlPlane.completeHumanAwait(pin, command, itemContinuationHandler).await().indefinitely());
+    verify(queueAsyncCoordinator).completeHumanAwait(same(pin), same(command), same(itemContinuationHandler));
+    verify(queueAsyncCoordinator).getAwaitInteractionView(same(pin), eq("interaction"));
+  }
+
+  @Test
+  void otherControlPlanesFailClosedUntilTheyImplementTheExplicitHumanBoundary() {
+    var unsupported = org.mockito.Mockito.mock(org.pipelineframework.orchestrator.PipelineControlPlane.class,
+        org.mockito.Mockito.CALLS_REAL_METHODS);
+    var pin = new org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint("tenant", "execution", "pipeline", "contract", "A1", ExecutionStatus.WAITING_EXTERNAL);
+    var command = new AwaitCompletionCommand("tenant", "interaction", null, "decision", java.util.Map.of("approved", true), "reviewer", System.currentTimeMillis());
+    assertThrows(UnsupportedOperationException.class, () -> unsupported.getAwaitInteractionView(pin, "interaction").await().indefinitely());
+    assertThrows(UnsupportedOperationException.class, () -> unsupported.completeHumanAwait(pin, command, itemContinuationHandler).await().indefinitely());
+    org.mockito.Mockito.verify(unsupported, org.mockito.Mockito.never()).completeAwait(org.mockito.ArgumentMatchers.any());
+  }
+
+  @Test
   void runtimeIdentityRequiresSuccessfulStartupBeforeReadingRelease() {
     when(pipelineExecutionService.getStartupHealthState())
         .thenReturn(PipelineExecutionService.StartupHealthState.PENDING);

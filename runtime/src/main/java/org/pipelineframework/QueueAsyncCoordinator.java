@@ -333,7 +333,8 @@ class QueueAsyncCoordinator {
       }
       if (org.pipelineframework.orchestrator.RegisteredRestWorkerTargets.enabled(orchestratorConfig)) {
         return executionStateStore.getExecution(workItem.tenantId(), workItem.executionId())
-            .chain(execution -> execution.map(registeredTargets::validateExecutionPin)
+            .chain(execution -> execution
+                .map(registeredTargets::validateExecutionPin)
                 .orElseGet(() -> Uni.createFrom().voidItem()))
             .chain(() -> segmentPipeline().process(workItem, worker, itemContinuationHandler));
       }
@@ -379,6 +380,19 @@ class QueueAsyncCoordinator {
 
   Uni<AwaitCompletionResult> completeAwait(AwaitCompletionCommand command) {
     return completeAwait(command, NOOP_ITEM_CONTINUATION_HANDLER);
+  }
+
+  Uni<Optional<org.pipelineframework.orchestrator.AwaitInteractionView>> getAwaitInteractionView(
+      org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin, String interactionId) {
+    return Uni.createFrom().deferred(() -> executionReadModel().getAwaitInteractionView(pin, interactionId));
+  }
+
+  Uni<AwaitCompletionResult> completeHumanAwait(org.pipelineframework.orchestrator.ExecutionSemanticCheckpoint pin,
+      AwaitCompletionCommand command, AwaitItemContinuationHandler itemContinuationHandler) {
+    return Uni.createFrom().deferred(() -> {
+      if (!ensureQueueModeReady()) return Uni.createFrom().failure(queueModeDisabledException());
+      return awaitBoundaryAdmission().completeHuman(pin, command, itemContinuationHandler, executionReadModel());
+    });
   }
 
   Uni<AwaitCompletionResult> completeAwait(
@@ -810,7 +824,7 @@ class QueueAsyncCoordinator {
 
   private Uni<Optional<PipelinePagingPlan>> pagingPlanFor(PipelineRunSubmission submission) {
     if (targetsLocalContract(submission)) {
-      return validatePagingStore(localPagingPlan());
+      return Uni.createFrom().item(localPagingPlan());
     }
     if (releaseRegistry == null) {
       return Uni.createFrom().failure(new IllegalStateException(
@@ -818,29 +832,19 @@ class QueueAsyncCoordinator {
     }
     return releaseRegistry.get(
             submission.tenantId(), submission.pipelineId(), submission.releaseVersion())
-        .onItem().transformToUni(release -> {
+        .onItem().transform(release -> {
           if (release.isEmpty() || release.orElseThrow().contract() == null) {
-            return Uni.createFrom().failure(new IllegalStateException(
+            throw new IllegalStateException(
                 "submitted release contract is unavailable for paging validation: "
-                    + submission.pipelineId() + ":" + submission.releaseVersion()));
+                    + submission.pipelineId() + ":" + submission.releaseVersion());
           }
           var pinned = release.orElseThrow();
           if (!submission.contractVersion().equals(pinned.contractVersion())) {
-            return Uni.createFrom().failure(new IllegalStateException(
-                "submitted contract version does not match the pinned release contract"));
+            throw new IllegalStateException(
+                "submitted contract version does not match the pinned release contract");
           }
-          return validatePagingStore(PipelinePagingPlan.from(pinned.contract()));
+          return PipelinePagingPlan.from(pinned.contract());
         });
-  }
-
-  private Uni<Optional<PipelinePagingPlan>> validatePagingStore(
-      Optional<PipelinePagingPlan> plan) {
-    if (plan.isPresent() && !executionStateStore.supportsPagedProgress()) {
-      return Uni.createFrom().failure(new IllegalStateException(
-          "ExecutionStateStore(" + executionStateStore.providerName()
-              + ") does not support fenced paged progress"));
-    }
-    return Uni.createFrom().item(plan);
   }
 
   private boolean targetsLocalContract(PipelineRunSubmission submission) {
@@ -978,6 +982,11 @@ class QueueAsyncCoordinator {
     return PipelineOrderResourceLoader.loadOrder()
         .filter(order -> !order.isEmpty())
         .map(List::size)
+        .or(() -> releaseIdentityResolver == null
+            ? java.util.Optional.empty()
+            : releaseIdentityResolver.compiledContract()
+                .filter(PolyglotStepAutoWirer::isClassFreeContract)
+                .map(contract -> contract.steps().size()))
         .orElseThrow(() -> new IllegalStateException(
             "Pipeline order metadata is required to resolve a terminal queue segment"));
   }

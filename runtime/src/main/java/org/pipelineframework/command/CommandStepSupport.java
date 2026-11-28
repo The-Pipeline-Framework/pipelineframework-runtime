@@ -43,11 +43,17 @@ import org.pipelineframework.step.NonRetryableException;
  */
 @ApplicationScoped
 public class CommandStepSupport {
+    /** Worker capability token advertised only when a single explicit recoverable CommandEffectStore is wired. */
+    public static final String COMMAND_AUTHORITY_CAPABILITY = "command-authority-v1";
+
     private final org.pipelineframework.connector.ConnectorOperationInvocationCoordinator invocationCoordinator =
         new org.pipelineframework.connector.ConnectorOperationInvocationCoordinator();
 
     @Inject
     Instance<CommandEffectStore> stores;
+
+    @Inject
+    CommandEffectStoreConfig effectStoreConfig;
 
     @Inject
     ConnectorRegistry connectorRegistry;
@@ -100,10 +106,21 @@ public class CommandStepSupport {
         Collection<CommandEffectStore> stores,
         PipelineOrchestratorConfig orchestratorConfig
     ) {
+        this(registry, bindingRegistry, ConnectorRuntimeContext.empty(), stores, orchestratorConfig);
+    }
+
+    public CommandStepSupport(
+        ConnectorRegistry registry,
+        ConnectorBindingRegistry bindingRegistry,
+        ConnectorRuntimeContext runtimeContext,
+        Collection<CommandEffectStore> stores,
+        PipelineOrchestratorConfig orchestratorConfig
+    ) {
         this.fixedConnectorRegistry = java.util.Objects.requireNonNull(registry, "connector registry must not be null");
         this.fixedConnectorBindingRegistry = java.util.Objects.requireNonNull(
             bindingRegistry, "connector binding registry must not be null");
-        this.fixedConnectorRuntimeContext = ConnectorRuntimeContext.empty();
+        this.fixedConnectorRuntimeContext = java.util.Objects.requireNonNull(
+            runtimeContext, "connector runtime context must not be null");
         this.fixedStores = stores == null ? List.of() : stores;
         this.orchestratorConfig = orchestratorConfig;
     }
@@ -119,14 +136,14 @@ public class CommandStepSupport {
         if (commandIdGenerator == null) {
             return Uni.createFrom().failure(new IllegalArgumentException("commandIdGenerator must not be null"));
         }
-        PipelineExecutionContext context;
+        AuthorizedExecution authorization;
         try {
-            context = captureExecutionContext();
+            authorization = authorizeExecution();
         } catch (RuntimeException failure) {
             return Uni.createFrom().failure(failure);
         }
         return descriptor.onItem().transformToUni(
-            resolved -> execute(resolved, commandIdGenerator, input, context, false));
+            resolved -> executeWithScope(resolved, commandIdGenerator, input, authorization, false, Optional.empty()));
     }
 
     public <I, O> Uni<O> execute(
@@ -140,13 +157,13 @@ public class CommandStepSupport {
         if (commandIdGenerator == null) {
             return Uni.createFrom().failure(new IllegalArgumentException("commandIdGenerator must not be null"));
         }
-        PipelineExecutionContext context;
+        AuthorizedExecution authorization;
         try {
-            context = captureExecutionContext();
+            authorization = authorizeExecution();
         } catch (RuntimeException e) {
             return Uni.createFrom().failure(e);
         }
-        return execute(descriptor, commandIdGenerator, input, context, false);
+        return execute(descriptor, commandIdGenerator, input, authorization, false, Optional.empty());
     }
 
     /**
@@ -164,14 +181,14 @@ public class CommandStepSupport {
         if (commandIdGenerator == null) {
             return Uni.createFrom().failure(new IllegalArgumentException("commandIdGenerator must not be null"));
         }
-        PipelineExecutionContext context;
+        AuthorizedExecution authorization;
         try {
-            context = captureExecutionContext();
+            authorization = authorizeExecution();
         } catch (RuntimeException failure) {
             return Uni.createFrom().failure(failure);
         }
         return descriptor.onItem().transformToUni(
-            resolved -> execute(resolved, commandIdGenerator, input, context, true));
+            resolved -> executeWithScope(resolved, commandIdGenerator, input, authorization, true, Optional.empty()));
     }
 
     /**
@@ -189,23 +206,13 @@ public class CommandStepSupport {
         if (commandIdGenerator == null) {
             return Uni.createFrom().failure(new IllegalArgumentException("commandIdGenerator must not be null"));
         }
-        PipelineExecutionContext context;
+        AuthorizedExecution authorization;
         try {
-            context = captureExecutionContext();
+            authorization = authorizeExecution();
         } catch (RuntimeException failure) {
             return Uni.createFrom().failure(failure);
         }
-        return execute(descriptor, commandIdGenerator, input, context, true);
-    }
-
-    private <I, O> Uni<O> execute(
-        CommandDescriptor descriptor,
-        CommandIdGenerator<? super I> commandIdGenerator,
-        I input,
-        PipelineExecutionContext context,
-        boolean deliberateRetry
-    ) {
-        return execute(descriptor, commandIdGenerator, input, context, deliberateRetry, Optional.empty());
+        return execute(descriptor, commandIdGenerator, input, authorization, true, Optional.empty());
     }
 
     /** Executes an ordinary native Command with transient framework callback authority. */
@@ -227,9 +234,26 @@ public class CommandStepSupport {
             if (descriptor.nativeSelector().isEmpty() || descriptor.nativeSelector().orElseThrow().binding().isEmpty()) {
                 throw new IllegalArgumentException("callback completion requires an application-bound native Command");
             }
-            return execute(descriptor, generator, input, captureExecutionContext(), deliberateRetry, Optional.of(callback));
+            return execute(descriptor, generator, input, authorizeExecution(), deliberateRetry, Optional.of(callback));
         } catch (RuntimeException failure) {
             return Uni.createFrom().failure(failure);
+        }
+    }
+
+    private <I, O> Uni<O> executeWithScope(
+        CommandDescriptor descriptor,
+        CommandIdGenerator<? super I> commandIdGenerator,
+        I input,
+        AuthorizedExecution authorization,
+        boolean deliberateRetry,
+        Optional<org.pipelineframework.connector.ConnectorCallbackContext> callbackContext
+    ) {
+        CommandReexecutionScope.Snapshot previous = CommandReexecutionScope.capture();
+        CommandReexecutionScope.restore(authorization.scopeSnapshot());
+        try {
+            return execute(descriptor, commandIdGenerator, input, authorization, deliberateRetry, callbackContext);
+        } finally {
+            CommandReexecutionScope.restore(previous);
         }
     }
 
@@ -237,7 +261,7 @@ public class CommandStepSupport {
         CommandDescriptor descriptor,
         CommandIdGenerator<? super I> commandIdGenerator,
         I input,
-        PipelineExecutionContext context,
+        AuthorizedExecution authorization,
         boolean deliberateRetry,
         Optional<org.pipelineframework.connector.ConnectorCallbackContext> callbackContext
     ) {
@@ -259,12 +283,21 @@ public class CommandStepSupport {
                 "Command id generator " + descriptor.commandIdGenerator()
                     + " returned a command id with leading or trailing whitespace"));
         }
+        PipelineExecutionContext context = authorization.context();
         CommandRequest<I> request = new CommandRequest<>(
             descriptor, commandId, commandId, CommandRequest.newAttemptId(), input, context, descriptor.config(), callbackContext);
-        CommandEffectStore store = selectStore();
+        CommandEffectStore store = selectStore(authorization.requireRecoverableStore());
+        CommandReexecutionScope.Snapshot scopeSnapshot = authorization.scopeSnapshot();
         return store.find(context.tenantId(), request.commandId())
-            .onItem().transformToUni(existing -> handleExistingOrExecute(
-                existing, store, request, deliberateRetry));
+            .onItem().transformToUni(existing -> {
+                CommandReexecutionScope.Snapshot previous = CommandReexecutionScope.capture();
+                CommandReexecutionScope.restore(scopeSnapshot);
+                try {
+                    return handleExistingOrExecute(existing, store, request, deliberateRetry);
+                } finally {
+                    CommandReexecutionScope.restore(previous);
+                }
+            });
     }
 
     private <I, O> Uni<O> handleExistingOrExecute(
@@ -956,15 +989,60 @@ public class CommandStepSupport {
     private record ConfirmationBarrier(CommandEffectStatus status, String code) {
     }
 
-    private PipelineExecutionContext captureExecutionContext() {
-        if (orchestratorConfig == null || orchestratorConfig.mode() != OrchestratorMode.QUEUE_ASYNC) {
-            throw new IllegalStateException("Command steps require pipeline.orchestrator.mode=QUEUE_ASYNC.");
+    private record AuthorizedExecution(
+        PipelineExecutionContext context,
+        boolean requireRecoverableStore,
+        CommandReexecutionScope.Snapshot scopeSnapshot
+    ) {
+    }
+
+    /** True only when a single explicit recoverable CommandEffectStore is wired (never the default memory store). */
+    public boolean supportsRemoteCommandAuthority() {
+        if (effectStoreConfig != null && effectStoreConfig.provider() == CommandEffectStoreConfig.Provider.MEMORY) {
+            return false;
         }
-        PipelineExecutionContext context = PipelineExecutionContextHolder.get().orElse(null);
-        if (context == null) {
-            throw new IllegalStateException("Command step executed without queue-async execution context.");
+        try {
+            return selectSingleStore().filter(CommandStepSupport::isRecoverableEffectStore).isPresent();
+        } catch (IllegalStateException ambiguous) {
+            return false;
         }
-        return context;
+    }
+
+    /** Recognizes durable recoverable effect stores while excluding the default in-memory store. */
+    public static boolean isRecoverableEffectStore(CommandEffectStore store) {
+        if (store == null || store instanceof InMemoryCommandEffectStore) {
+            return false;
+        }
+        return store.supportsRecovery()
+            && store.supportsNativeOutcomeSnapshots()
+            && store.supportsAttempt(CommandAttemptPurpose.RETRY)
+            && store.supportsAttempt(CommandAttemptPurpose.REISSUE);
+    }
+
+    private AuthorizedExecution authorizeExecution() {
+        if (orchestratorConfig == null) {
+            throw new IllegalStateException(
+                "Command steps require pipeline.orchestrator.mode=QUEUE_ASYNC or an admitted leased transition-worker scope.");
+        }
+        if (orchestratorConfig.mode() == OrchestratorMode.QUEUE_ASYNC) {
+            PipelineExecutionContext context = PipelineExecutionContextHolder.get().orElseThrow(() ->
+                new IllegalStateException("Command step executed without queue-async execution context."));
+            return new AuthorizedExecution(context, false, CommandReexecutionScope.capture());
+        }
+        if (orchestratorConfig.mode() == OrchestratorMode.SYNC) {
+            CommandWorkerExecutionScope workerScope = CommandReexecutionScope.currentWorkerScope().orElseThrow(() ->
+                new IllegalStateException(
+                    "Command steps require pipeline.orchestrator.mode=QUEUE_ASYNC or an admitted leased transition-worker scope."));
+            PipelineExecutionContext context = PipelineExecutionContextHolder.get().orElseThrow(() ->
+                new IllegalStateException("Command step executed without admitted transition-worker execution context."));
+            if (!workerScope.matches(context)) {
+                throw new IllegalStateException(
+                    "Command execution context does not match the admitted transition-worker scope.");
+            }
+            return new AuthorizedExecution(context, true, CommandReexecutionScope.capture());
+        }
+        throw new IllegalStateException(
+            "Command steps require pipeline.orchestrator.mode=QUEUE_ASYNC or an admitted leased transition-worker scope.");
     }
 
     private LegacyCommandConnectorProvider.LegacyCommandOperation requireLegacyOperation(String command) {
@@ -1067,21 +1145,35 @@ public class CommandStepSupport {
      * Returns the single configured effect store. Command v1 does not support store routing;
      * multiple stores are treated as a misconfiguration rather than silently picking one.
      */
-    private CommandEffectStore selectStore() {
-        CommandEffectStore fixedStore = selectSingleStore(fixedStores);
-        if (fixedStore != null) {
-            return fixedStore;
+    private CommandEffectStore selectStore(boolean requireRecoverableStore) {
+        CommandEffectStore selected = selectSingleStore()
+            .orElseThrow(() -> new IllegalStateException("No CommandEffectStore configured for command step"));
+        if (requireRecoverableStore) {
+            if (effectStoreConfig != null && effectStoreConfig.provider() == CommandEffectStoreConfig.Provider.MEMORY) {
+                throw new IllegalStateException(
+                    "Admitted transition-worker Command execution requires an explicit recoverable CommandEffectStore; "
+                        + "pipeline.command.effect-store.provider=memory is not allowed.");
+            }
+            if (!isRecoverableEffectStore(selected)) {
+                throw new IllegalStateException(
+                    "Admitted transition-worker Command execution requires an explicit recoverable CommandEffectStore "
+                        + "(default in-memory store is not allowed).");
+            }
         }
-        CommandEffectStore injectedStore = selectSingleStore(stores);
-        if (injectedStore != null) {
-            return injectedStore;
-        }
-        throw new IllegalStateException("No CommandEffectStore configured for command step");
+        return selected;
     }
 
-    private CommandEffectStore selectSingleStore(Iterable<CommandEffectStore> candidates) {
+    private Optional<CommandEffectStore> selectSingleStore() {
+        Optional<CommandEffectStore> fixedStore = selectSingleStore(fixedStores);
+        if (fixedStore.isPresent()) {
+            return fixedStore;
+        }
+        return selectSingleStore(stores);
+    }
+
+    private Optional<CommandEffectStore> selectSingleStore(Iterable<CommandEffectStore> candidates) {
         if (candidates == null) {
-            return null;
+            return Optional.empty();
         }
         CommandEffectStore selected = null;
         for (CommandEffectStore store : candidates) {
@@ -1094,6 +1186,6 @@ public class CommandStepSupport {
             }
             selected = store;
         }
-        return selected;
+        return Optional.ofNullable(selected);
     }
 }

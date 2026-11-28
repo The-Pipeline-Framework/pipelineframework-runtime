@@ -7,8 +7,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
-import java.time.Duration;
 import java.time.Instant;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -119,16 +119,14 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
 
     private Uni<TransitionResultEnvelope> executeRequest(TransitionCommandEnvelope command, URI endpoint, String secret,
                                                        Executor signalContext) {
-        Duration deadline = orchestratorConfig.workerRest().requestTimeout();
-        long deadlineMillis = Math.max(1L, deadline.toMillis());
+        long deadlineMillis = Math.max(1L, orchestratorConfig.workerRest().requestTimeout().toMillis());
         long startedAtNanos = System.nanoTime();
         String target = workerTarget(endpoint);
         ScheduledFuture<?> warning = scheduleDeadlineWarning(command, target, deadlineMillis);
-        return Uni.createFrom().completionStage(() -> CompletableFuture.supplyAsync(() -> request(command, endpoint, secret), blockingExecutor)
-                .thenCompose(request -> httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString()))
-                .thenCompose(response -> CompletableFuture.supplyAsync(
-                    () -> decodeResponse(response, command),
-                    blockingExecutor)))
+        return Uni.createFrom().completionStage(() -> CompletableFuture
+                .supplyAsync(() -> request(command, endpoint, secret), blockingExecutor)
+                .thenCompose(request -> httpClient().sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                    .thenApplyAsync(response -> decodeResponse(response, command), blockingExecutor)))
             .emitOn(signalContext)
             .onItemOrFailure().invoke((ignored, failure) -> warning.cancel(false))
             .onFailure().transform(failure -> classifyFailure(failure, target, startedAtNanos, deadlineMillis));
@@ -366,30 +364,35 @@ public class RestPipelineTransitionWorker implements PipelineTransitionWorker, T
         }
     }
 
-    private HttpRequest request(TransitionCommandEnvelope command, URI endpoint, String secret) {
+    private static byte[] requestBody(TransitionCommandEnvelope command) {
         try {
-            byte[] body = JSON.writeValueAsBytes(command);
-            URI uri = workerUri(endpoint, orchestratorConfig.workerRest().path());
-            String timestamp = Instant.now().toString();
-            String nonce = UUID.randomUUID().toString();
-            String signature = TransitionWorkerSignature.sign(
-                secret,
-                RestTransitionWorkerProtocol.EXECUTE_METHOD,
-                orchestratorConfig.workerRest().path(),
-                timestamp,
-                nonce,
-                body);
-            return WorkerRestRequestSigner.finish(requestSigner, HttpRequest.newBuilder(uri)
-                .timeout(orchestratorConfig.workerRest().requestTimeout())
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header(TransitionWorkerSignature.TIMESTAMP_HEADER, timestamp)
-                .header(TransitionWorkerSignature.NONCE_HEADER, nonce)
-                .header(TransitionWorkerSignature.SIGNATURE_HEADER, signature)
-                .POST(HttpRequest.BodyPublishers.ofByteArray(body)), body);
+            return JSON.writeValueAsBytes(command);
         } catch (IOException e) {
             throw new IllegalStateException("Failed encoding REST transition worker command", e);
         }
+    }
+
+    private HttpRequest request(TransitionCommandEnvelope command, URI endpoint, String secret) {
+        byte[] body = requestBody(command);
+        URI uri = workerUri(endpoint, orchestratorConfig.workerRest().path());
+        String timestamp = Instant.now().toString();
+        String nonce = UUID.randomUUID().toString();
+        String signature = TransitionWorkerSignature.sign(
+            secret,
+            RestTransitionWorkerProtocol.EXECUTE_METHOD,
+            orchestratorConfig.workerRest().path(),
+            timestamp,
+            nonce,
+            body);
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri)
+            .timeout(orchestratorConfig.workerRest().requestTimeout())
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header(TransitionWorkerSignature.TIMESTAMP_HEADER, timestamp)
+            .header(TransitionWorkerSignature.NONCE_HEADER, nonce)
+            .header(TransitionWorkerSignature.SIGNATURE_HEADER, signature)
+            .POST(HttpRequest.BodyPublishers.ofByteArray(body));
+        return WorkerRestRequestSigner.finish(requestSigner, request, body);
     }
 
     private HttpRequest capabilitiesRequest(URI endpoint, String secret) {

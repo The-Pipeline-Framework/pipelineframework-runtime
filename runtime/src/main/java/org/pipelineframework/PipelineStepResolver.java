@@ -6,6 +6,8 @@ import java.util.List;
 import java.util.Map;
 
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
+import jakarta.inject.Inject;
 import org.pipelineframework.runtime.core.RuntimeAdapters;
 
 import org.jboss.logging.Logger;
@@ -20,10 +22,20 @@ class PipelineStepResolver {
 
   private static final Logger LOG = Logger.getLogger(PipelineStepResolver.class);
 
+  @Inject
+  Instance<PolyglotStepAutoWirer> polyglotStepAutoWirer;
+
   List<Object> loadPipelineSteps() {
     try {
       java.util.Optional<List<String>> resourceOrder = PipelineOrderResourceLoader.loadOrder();
       if (resourceOrder.isEmpty()) {
+        if (isPolyglotAutoWiringActive()) {
+          List<Object> polyglotSteps = polyglotStepAutoWirer.get().loadOrderedSteps();
+          if (LOG.isInfoEnabled()) {
+            LOG.infof("Auto-wired %d class-free polyglot pipeline step(s) from canonical contract", polyglotSteps.size());
+          }
+          return polyglotSteps;
+        }
         if (PipelineOrderResourceLoader.requiresOrder()) {
           throw new PipelineExecutionService.PipelineConfigurationException(
               "Pipeline order metadata not found. Ensure META-INF/pipeline/order.json is generated at build time.");
@@ -137,5 +149,11 @@ class PipelineStepResolver {
       LOG.errorf(e, "Failed to instantiate pipeline step: %s, error: %s", stepClassName, e.getMessage());
       return null;
     }
+  }
+
+  private boolean isPolyglotAutoWiringActive() {
+    return polyglotStepAutoWirer != null
+        && polyglotStepAutoWirer.isResolvable()
+        && polyglotStepAutoWirer.get().isActive();
   }
 }

@@ -489,13 +489,44 @@ public interface PipelineOrchestratorConfig {
     interface QuotaConfig {
 
         /**
-         * Maximum active transitions per tenant in this runtime instance. Zero disables the limit.
+         * Maximum active transitions per tenant in this runtime instance, or across shared instances
+         * when {@link #distributedTransitionAdmission()} is enabled. Zero disables the limit.
          *
          * @return max in-flight transitions per tenant
          */
         @WithName("max-in-flight-transitions-per-tenant")
         @WithDefault("0")
         int maxInFlightTransitionsPerTenant();
+
+        /**
+         * Enables distributed per-tenant transition quota leases backed by the configured
+         * {@code AwaitAdmissionStore} so multiple worker instances enforce a shared per-tenant cap.
+         *
+         * @return true to enforce per-tenant transition limits through the shared admission store
+         */
+        @WithName("distributed-transition-admission")
+        @WithDefault("false")
+        boolean distributedTransitionAdmission();
+
+        /**
+         * Lease duration for a distributed per-tenant transition permit so crashed instances
+         * automatically release slots without manual intervention. Active transitions are bounded
+         * strictly within this lease duration.
+         *
+         * @return transition permit lease duration
+         */
+        @WithName("transition-lease-duration")
+        @WithDefault("PT3M")
+        Duration transitionLeaseDuration();
+
+        /**
+         * Optional explicit {@code AwaitAdmissionStore} provider name for distributed transition quotas.
+         * When omitted or blank, falls back to {@code pipeline.await.admission.store}.
+         *
+         * @return optional admission store provider name
+         */
+        @WithName("transition-admission-store")
+        Optional<String> transitionAdmissionStore();
     }
 
     /**

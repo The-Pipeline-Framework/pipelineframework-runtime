@@ -22,6 +22,7 @@ public record TransitionResultEnvelope(
     boolean terminalOutputPublished,
     boolean terminalInputPassthrough,
     Optional<PagedTransitionCompletion> pageCompletion) {
+
     public TransitionResultEnvelope(
         TransitionWorkerOutcome outcome,
         List<SerializedTransitionPayload> outputPayloads,

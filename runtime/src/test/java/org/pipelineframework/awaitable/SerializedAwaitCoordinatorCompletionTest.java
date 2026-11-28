@@ -29,6 +29,57 @@ class SerializedAwaitCoordinatorCompletionTest {
     private long now;
     private final JsonTransitionPayloadCodec wire = new JsonTransitionPayloadCodec();
 
+    @Test void humanCompletionAndReplayKeepOriginalNativeOutcomeWithoutApplicationClasses() throws Exception {
+        var result = coordinator.completeHuman(command(), humanPin("release-original")).await().indefinitely();
+        assertFalse(result.duplicate()); assertEquals("projected", value(result.record()));
+        var replay = coordinator.completeHuman(command(), humanPin("release-original")).await().indefinitely();
+        assertTrue(replay.duplicate()); assertEquals(result.record(), replay.record());
+        var opposing = new AwaitCompletionCommand("tenant", original.interactionId(), null, "opposing-decision",
+            payload("Output", "opposing"), "actor", now + 2);
+        var duplicate = coordinator.completeHuman(opposing, humanPin("release-original")).await().indefinitely();
+        assertTrue(duplicate.duplicate()); assertEquals("projected", value(duplicate.record()));
+        verify(workers, times(1)).executeAwaitValueOperation(any());
+    }
+
+    @Test void safeCanonicalRequestReadNeedsNeitherApplicationClassesNorWorkerAndKeepsA1() throws Exception {
+        var observed = coordinator.canonicalRequestPayload(original);
+        assertEquals("Request", observed.canonicalTypeId()); assertEquals("catalog", observed.catalogFingerprint());
+        assertArrayEquals(payload("Request", "retained-request").payload(), observed.payload());
+        assertEquals("Output", coordinator.canonicalCompletionPayloadTypeId(original));
+        verifyNoInteractions(workers);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void explicitHumanCompletionRejectsOtherTransportCommandAndForeignPinInBothModes(boolean serialized) {
+        if (!serialized) when(config.controlPlane().payloadMaterialization())
+            .thenReturn(PipelineOrchestratorConfig.ControlPlaneConfig.PayloadMaterialization.TYPED);
+        var candidate = spy(original);
+        doReturn(Uni.createFrom().item(Optional.of(candidate))).when(store).get("tenant", original.interactionId());
+        doReturn("webhook").when(candidate).transportType();
+        assertThrows(AwaitResumeTokenRejectedException.class, () -> coordinator.completeHuman(command(), humanPin("release-original")).await().indefinitely());
+        doReturn("interaction-api").when(candidate).transportType(); doReturn(true).when(candidate).commandCallback();
+        assertThrows(AwaitResumeTokenRejectedException.class, () -> coordinator.completeHuman(command(), humanPin("release-original")).await().indefinitely());
+        doReturn(false).when(candidate).commandCallback();
+        assertThrows(AwaitResumeTokenRejectedException.class, () -> coordinator.completeHuman(command(), humanPin("A2")).await().indefinitely());
+        var foreignExecution = new ExecutionSemanticCheckpoint("tenant", "foreign", "pipeline", "contract", "release-original", ExecutionStatus.WAITING_EXTERNAL);
+        assertThrows(AwaitResumeTokenRejectedException.class, () -> coordinator.completeHuman(command(), foreignExecution).await().indefinitely());
+        verify(store, never()).complete(any(AwaitInteractionRecord.class), any(AwaitCompletionCommand.class));
+        verify(store, never()).complete(any(AwaitCompletionCommand.class)); verifyNoInteractions(workers);
+    }
+
+    @Test void humanGuardIsRetainedAcrossSerializedCommitRetry() {
+        doReturn(Uni.createFrom().item(Optional.empty())).doCallRealMethod().when(store)
+            .complete(any(AwaitInteractionRecord.class), any(AwaitCompletionCommand.class));
+        var result = coordinator.completeHuman(command(), humanPin("release-original")).await().indefinitely();
+        assertFalse(result.duplicate()); assertEquals("projected", value(result.record()));
+        verify(workers, times(2)).executeAwaitValueOperation(any());
+    }
+
+    private static ExecutionSemanticCheckpoint humanPin(String release) {
+        return new ExecutionSemanticCheckpoint("tenant", "execution", "pipeline", "contract", release, ExecutionStatus.WAITING_EXTERNAL);
+    }
+
     @Test void typedConnectorIngressFailsClearlyWithoutDescriptorLookup() {
         var failure = assertThrows(UnsupportedOperationException.class,
             () -> coordinator.callbackDescriptor(original));
