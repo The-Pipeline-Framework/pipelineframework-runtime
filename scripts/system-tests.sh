@@ -46,7 +46,7 @@ for pom in [root_pom, *sorted(pathlib.Path(".").glob("*/pom.xml")), *sorted(path
         assert parent.findtext("m:version", namespaces=ns) == expected, pom
     if root.findtext("m:artifactId", namespaces=ns) in {
         "pipelineframework-runtime-parent", "pipelineframework", "pipelineframework-deployment",
-        "pipelineframework-runtime-spring", "pipelineframework-release-maven-plugin",
+        "pipelineframework-runtime-spring", "pipelineframework-spring-host-starter", "pipelineframework-release-maven-plugin",
         "cache-plugin", "persistence-plugin", "repository-plugin",
     }:
         version = root.findtext("m:version", namespaces=ns)

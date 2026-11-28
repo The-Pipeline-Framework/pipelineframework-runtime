@@ -37,6 +37,7 @@ for pom in poms:
         coordinate = (group_match.group(1).strip(), artifact_match.group(1).strip()) if group_match and artifact_match else None
         if coordinate not in reactor or coordinate[0] != "org.pipelineframework" or coordinate[1] not in {
             "pipelineframework", "pipelineframework-deployment", "pipelineframework-runtime-spring",
+            "pipelineframework-spring-host-starter",
             "cache-plugin", "persistence-plugin", "repository-plugin",
         }:
             return block

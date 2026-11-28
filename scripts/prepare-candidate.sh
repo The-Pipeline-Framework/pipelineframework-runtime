@@ -32,7 +32,7 @@ import pathlib, re, sys
 pom = pathlib.Path(sys.argv[1])
 candidate = sys.argv[2]
 source = pom.read_text()
-names = "pipelineframework|pipelineframework-deployment|pipelineframework-runtime-spring|cache-plugin|persistence-plugin|repository-plugin"
+names = "pipelineframework|pipelineframework-deployment|pipelineframework-runtime-spring|pipelineframework-spring-host-starter|cache-plugin|persistence-plugin|repository-plugin"
 pattern = re.compile(r"(<dependency\b[^>]*>.*?<groupId>\s*org\.pipelineframework\s*</groupId>.*?<artifactId>\s*(?:" + names + r")\s*</artifactId>.*?<version>\s*)[^<]+(\s*</version>.*?</dependency>)", re.DOTALL)
 updated = pattern.sub(lambda match: match.group(1) + candidate + match.group(2), source)
 pom.write_text(updated)
