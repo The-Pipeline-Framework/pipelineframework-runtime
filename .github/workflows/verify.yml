@@ -77,9 +77,17 @@ jobs:
       - name: Check spring-host-starter runtime dependency graph
         run: |
           ./mvnw -pl spring-host-starter dependency:tree -Dscope=runtime -DoutputFile=target/spring-host-starter-dependencies.txt --no-transfer-progress -Dmaven.repo.local="$PWD/.m2/repository"
-          if grep -E 'io\.quarkus:|io\.vertx:|io\.smallrye\.reactive:|jakarta\.enterprise:|javax\.enterprise:|org\.eclipse\.microprofile:|jakarta\.ws\.rs:|javax\.ws\.rs:' spring-host-starter/target/spring-host-starter-dependencies.txt; then
+          test -r spring-host-starter/target/spring-host-starter-dependencies.txt
+          set +e
+          grep -E 'io\.quarkus(\.[^:]*)?:|io\.vertx(\.[^:]*)?:|io\.smallrye\.reactive:|jakarta\.enterprise:|javax\.enterprise:|org\.eclipse\.microprofile:|jakarta\.ws\.rs:|javax\.ws\.rs:' spring-host-starter/target/spring-host-starter-dependencies.txt
+          grep_status=$?
+          set -e
+          if [ "$grep_status" -eq 0 ]; then
             echo "spring-host-starter has a forbidden runtime dependency" >&2
             exit 1
+          elif [ "$grep_status" -ne 1 ]; then
+            echo "Failed scanning spring-host-starter dependency tree (grep exit $grep_status)" >&2
+            exit "$grep_status"
           fi
       - name: Summarize Surefire unit coverage
         if: always()

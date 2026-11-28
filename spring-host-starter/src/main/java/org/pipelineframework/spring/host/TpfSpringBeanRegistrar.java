@@ -36,6 +36,7 @@ import org.springframework.aop.support.AopUtils;
 import org.springframework.context.ApplicationContext;
 import org.springframework.core.MethodIntrospector;
 import org.springframework.core.annotation.AnnotatedElementUtils;
+import org.springframework.util.ClassUtils;
 import reactor.adapter.JdkFlowAdapter;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -60,19 +61,38 @@ public final class TpfSpringBeanRegistrar {
     public void registerAll(TpfHostRegistry registry) {
         Objects.requireNonNull(registry, "registry must not be null");
         for (String beanName : applicationContext.getBeanDefinitionNames()) {
-            Class<?> beanType = applicationContext.getType(beanName);
+            Class<?> beanType = applicationContext.getType(beanName, false);
             if (beanType == null || isInfrastructureBean(beanType)) {
+                continue;
+            }
+            Class<?> userClass = ClassUtils.getUserClass(beanType);
+            if (!hasTpfAnnotations(userClass)) {
                 continue;
             }
             Object bean;
             try {
                 bean = applicationContext.getBean(beanName);
-            } catch (RuntimeException unavailable) {
-                continue;
+            } catch (RuntimeException initFailure) {
+                throw new IllegalStateException(
+                    "Failed initializing TPF handler bean '" + beanName + "' (" + userClass.getName() + ")",
+                    initFailure);
             }
             Class<?> targetClass = AopProxyUtils.ultimateTargetClass(bean);
             registerBean(bean, targetClass, registry);
         }
+    }
+
+    private static boolean hasTpfAnnotations(Class<?> candidateClass) {
+        Map<Method, Boolean> matched = MethodIntrospector.selectMethods(
+            candidateClass,
+            (MethodIntrospector.MetadataLookup<Boolean>) method ->
+                AnnotatedElementUtils.hasAnnotation(method, TpfFunction.class)
+                    || AnnotatedElementUtils.hasAnnotation(method, TpfQueryConnector.class)
+                    || AnnotatedElementUtils.hasAnnotation(method, TpfCommandConnector.class)
+                    || AnnotatedElementUtils.hasAnnotation(method, TpfCommandReconciler.class)
+                    ? Boolean.TRUE
+                    : null);
+        return !matched.isEmpty();
     }
 
     void registerBean(Object bean, Class<?> targetClass, TpfHostRegistry registry) {
@@ -122,6 +142,10 @@ public final class TpfSpringBeanRegistrar {
 
         Type inputGenericType = paramTypes[0];
         Class<?> inputRaw = rawClass(inputGenericType);
+        if (Mono.class.isAssignableFrom(inputRaw)) {
+            throw new IllegalStateException("@TpfFunction method " + describe(targetMethod)
+                + " cannot accept Mono as a streaming input; use a plain value type or Flux/Publisher/Flow.Publisher/Stream");
+        }
         boolean manyInput = isStreamingInput(inputRaw);
 
         Type returnGenericType = targetMethod.getGenericReturnType();
@@ -138,6 +162,18 @@ public final class TpfSpringBeanRegistrar {
         if (effective != inferred) {
             throw new IllegalStateException("@TpfFunction method " + describe(targetMethod)
                 + " declares cardinality " + effective + " but signature matches " + inferred);
+        }
+
+        if (effective == TpfCardinality.MANY_TO_ONE && Stream.class.isAssignableFrom(inputRaw)
+            && (Mono.class.isAssignableFrom(returnRaw) || CompletionStage.class.isAssignableFrom(returnRaw))) {
+            throw new IllegalStateException("@TpfFunction reducer " + describe(targetMethod)
+                + " using Java Stream input must return a synchronous value type; use Flux input for Mono/CompletionStage reducers");
+        }
+        if (effective == TpfCardinality.MANY_TO_MANY) {
+            if (!isReactiveStreamType(inputRaw) || !isReactiveStreamType(returnRaw)) {
+                throw new IllegalStateException("@TpfFunction MANY_TO_MANY duplex method " + describe(targetMethod)
+                    + " requires reactive Flux/Publisher/Flow.Publisher for both input and output");
+            }
         }
 
         JavaType inputElementType = manyInput
@@ -355,13 +391,14 @@ public final class TpfSpringBeanRegistrar {
 
         if (Stream.class.isAssignableFrom(inputRaw)) {
             return Mono.fromCallable(() -> {
-                Stream<Object> stream = decodedFlux.toStream();
-                Object[] args = buildArgs(stream, ctx, passContext);
-                Object result = invokeMethod(bean, invocable, args);
-                if (result == null) {
-                    throw new IllegalStateException("Reducer @TpfFunction returned null");
+                try (Stream<Object> stream = decodedFlux.toStream()) {
+                    Object[] args = buildArgs(stream, ctx, passContext);
+                    Object result = invokeMethod(bean, invocable, args);
+                    if (result == null) {
+                        throw new IllegalStateException("Reducer @TpfFunction returned null");
+                    }
+                    return TpfHostJson.encodeValue(result);
                 }
-                return TpfHostJson.encodeValue(result);
             }).subscribeOn(Schedulers.boundedElastic());
         }
 
@@ -380,11 +417,6 @@ public final class TpfSpringBeanRegistrar {
         boolean passContext,
         Class<?> returnRaw
     ) {
-        if (!Flux.class.isAssignableFrom(inputRaw) && !Publisher.class.isAssignableFrom(inputRaw)
-            && !Flow.Publisher.class.isAssignableFrom(inputRaw)) {
-            return Flux.error(new IllegalStateException(
-                "MANY_TO_MANY @TpfFunction requires Flux/Publisher/Flow.Publisher input"));
-        }
         Flux<Object> decodedFlux = inputFlux.concatMap(node -> {
             try {
                 return Mono.just(TpfHostJson.decodeValue(node, inputElementType));
@@ -434,7 +466,10 @@ public final class TpfSpringBeanRegistrar {
                     if (result == null) {
                         return Mono.error(new IllegalStateException("Reactive TPF handler returned null Mono"));
                     }
-                    return ((Mono<?>) result).map(v -> (Object) v);
+                    return ((Mono<?>) result)
+                        .map(v -> (Object) v)
+                        .switchIfEmpty(Mono.error(new IllegalStateException(
+                            "Reactive TPF handler completed empty without producing a result")));
                 } catch (Throwable failure) {
                     return Mono.error(failure);
                 }
@@ -447,7 +482,10 @@ public final class TpfSpringBeanRegistrar {
                     if (result == null) {
                         return Mono.error(new IllegalStateException("Async TPF handler returned null CompletionStage"));
                     }
-                    return Mono.fromCompletionStage((CompletionStage<?>) result).map(v -> (Object) v);
+                    return Mono.fromCompletionStage((CompletionStage<?>) result)
+                        .map(v -> (Object) v)
+                        .switchIfEmpty(Mono.error(new IllegalStateException(
+                            "Async TPF handler completed with null without producing a result")));
                 } catch (Throwable failure) {
                     return Mono.error(failure);
                 }
@@ -481,7 +519,6 @@ public final class TpfSpringBeanRegistrar {
         return passContext ? new Object[] {first, context} : new Object[] {first};
     }
 
-    @SuppressWarnings("unchecked")
     private static TpfQueryResult<JsonNode> normalizeQueryResult(Object raw) {
         if (raw instanceof TpfQueryResult<?> result) {
             return switch (result) {
@@ -530,11 +567,14 @@ public final class TpfSpringBeanRegistrar {
         return Optional.empty();
     }
 
+    private static boolean isReactiveStreamType(Class<?> raw) {
+        return Flux.class.equals(raw)
+            || Publisher.class.equals(raw)
+            || Flow.Publisher.class.equals(raw);
+    }
+
     private static boolean isStreamingInput(Class<?> raw) {
-        return Flux.class.isAssignableFrom(raw)
-            || Publisher.class.isAssignableFrom(raw)
-            || Flow.Publisher.class.isAssignableFrom(raw)
-            || Stream.class.isAssignableFrom(raw);
+        return isReactiveStreamType(raw) || Stream.class.equals(raw);
     }
 
     private static boolean isStreamingOutput(Class<?> raw) {

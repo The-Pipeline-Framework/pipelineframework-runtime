@@ -44,6 +44,7 @@ public final class TpfHostRequestAuthenticator {
     private final Duration maxClockSkew;
     private final int maxNonceCacheSize;
     private final Clock clock;
+    private final Object nonceLock = new Object();
     private final ConcurrentHashMap<String, Long> seenNonces = new ConcurrentHashMap<>();
 
     public TpfHostRequestAuthenticator(String sharedSecret, Duration maxClockSkew, int maxNonceCacheSize) {
@@ -101,12 +102,16 @@ public final class TpfHostRequestAuthenticator {
         if (!TransitionWorkerSignature.matches(expected, signature)) {
             return Optional.of("invalid request signature");
         }
-        evictExpiredNonces(nowMs, skewMs);
-        if (seenNonces.size() >= maxNonceCacheSize) {
-            return Optional.of("nonce replay cache capacity reached");
-        }
-        if (seenNonces.putIfAbsent(nonce, nowMs) != null) {
-            return Optional.of("replayed request nonce");
+        long expiresAtMs = timestampMs > Long.MAX_VALUE - skewMs ? Long.MAX_VALUE : timestampMs + skewMs;
+        synchronized (nonceLock) {
+            evictExpiredNonces(nowMs);
+            if (seenNonces.containsKey(nonce)) {
+                return Optional.of("replayed request nonce");
+            }
+            if (seenNonces.size() >= maxNonceCacheSize) {
+                return Optional.of("nonce replay cache capacity reached");
+            }
+            seenNonces.put(nonce, expiresAtMs);
         }
         return Optional.empty();
     }
@@ -132,11 +137,11 @@ public final class TpfHostRequestAuthenticator {
         }
     }
 
-    private void evictExpiredNonces(long nowMs, long skewMs) {
+    private void evictExpiredNonces(long nowMs) {
         if (seenNonces.isEmpty()) {
             return;
         }
-        long cutoff = nowMs - skewMs;
-        seenNonces.entrySet().removeIf(entry -> entry.getValue() < cutoff);
+        // Retain nonces through the inclusive expiry boundary (expiresAtMs == nowMs).
+        seenNonces.entrySet().removeIf(entry -> entry.getValue() < nowMs);
     }
 }

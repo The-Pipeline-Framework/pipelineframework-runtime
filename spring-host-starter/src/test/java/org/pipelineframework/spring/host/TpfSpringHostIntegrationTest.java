@@ -17,12 +17,14 @@
 package org.pipelineframework.spring.host;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.BufferedReader;
+import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.math.BigDecimal;
 import java.net.Socket;
@@ -33,12 +35,15 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.stream.Stream;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import org.junit.jupiter.api.Test;
@@ -115,6 +120,9 @@ class TpfSpringHostIntegrationTest {
                 if ("transient".equals(input.id())) {
                     throw new TpfTransientException("DOWNSTREAM_BUSY", "Retry later");
                 }
+                if ("boom".equals(input.id())) {
+                    throw new IllegalStateException("SENSITIVE_DB_SECRET_LEAK_GUARD");
+                }
                 return new PaymentReceipt(
                     input.id(),
                     input.amount().add(new BigDecimal("0.00000000000000000000000000001")),
@@ -124,6 +132,9 @@ class TpfSpringHostIntegrationTest {
 
             @TpfFunction(stepId = "price-mono")
             public Mono<PaymentReceipt> priceMono(PaymentInput input) {
+                if ("empty".equals(input.id())) {
+                    return Mono.empty();
+                }
                 return Mono.just(new PaymentReceipt(input.id(), input.amount(), input.sequence(), "mono"));
             }
 
@@ -150,6 +161,11 @@ class TpfSpringHostIntegrationTest {
                 return lines.reduce(
                     new BatchSummary(0, BigDecimal.ZERO),
                     (acc, item) -> new BatchSummary(acc.count() + 1, acc.sum().add(item.portion())));
+            }
+
+            @TpfFunction(stepId = "first-line", outputTypeId = "BatchSummary")
+            public Mono<BatchSummary> firstLine(Flux<LineItem> lines) {
+                return lines.next().map(item -> new BatchSummary(1, item.portion()));
             }
 
             @TpfFunction(stepId = "sum-blocking-stream", outputTypeId = "BatchSummary")
@@ -251,6 +267,25 @@ class TpfSpringHostIntegrationTest {
         HttpResponse<String> stageResp = postSigned("/tpf/functions/price-stage", requestJson, Map.of());
         assertEquals("stage", TpfHostJson.readStrictObject(stageResp.body()).path("payload").path("versionTag").asText());
 
+        // Empty Mono converts cleanly to portable ERROR
+        String emptyReq = """
+            {"stepId":"price-mono","stepIndex":0,"inputTypeId":"PaymentInput","outputTypeId":"PaymentReceipt",
+             "payload":{"id":"empty","amount":1.00,"sequence":1},"context":{}}
+            """;
+        JsonNode emptyResp = TpfHostJson.readStrictObject(postSigned("/tpf/functions/price-mono", emptyReq, Map.of()).body());
+        assertEquals("ERROR", emptyResp.path("status").asText());
+        assertEquals("UNCLASSIFIED", emptyResp.path("disposition").asText());
+
+        // Unclassified exception never leaks internal message
+        String boomReq = """
+            {"stepId":"price-payment","stepIndex":0,"inputTypeId":"PaymentInput","outputTypeId":"PaymentReceipt",
+             "payload":{"id":"boom","amount":10.00,"sequence":1},"context":{}}
+            """;
+        JsonNode boomResp = TpfHostJson.readStrictObject(postSigned("/tpf/functions/price-payment", boomReq, Map.of()).body());
+        assertEquals("ERROR", boomResp.path("status").asText());
+        assertEquals("UNCLASSIFIED", boomResp.path("disposition").asText());
+        assertFalse(boomResp.path("message").asText().contains("SENSITIVE_DB_SECRET_LEAK_GUARD"));
+
         // Business rejection
         String negativeReq = """
             {"stepId":"price-payment","stepIndex":0,"inputTypeId":"PaymentInput","outputTypeId":"PaymentReceipt",
@@ -297,7 +332,7 @@ class TpfSpringHostIntegrationTest {
     }
 
     @Test
-    void manyToOneReducesReactiveAndBlockingNdjsonStreams() throws Exception {
+    void manyToOneReducesReactiveAndBlockingNdjsonStreamsAndEnforcesCompleteSentinelEvenOnEarlyExit() throws Exception {
         String ndjson = """
             {"event":"item","inputTypeId":"LineItem","payload":{"id":"a","index":1,"portion":10.250}}
             {"event":"item","inputTypeId":"LineItem","payload":{"id":"b","index":2,"portion":4.750}}
@@ -318,15 +353,15 @@ class TpfSpringHostIntegrationTest {
         assertEquals(2, blockingRoot.path("payload").path("count").asInt());
         assertEquals(new BigDecimal("15.000"), blockingRoot.path("payload").path("sum").decimalValue());
 
-        // Missing complete sentinel fails closed
+        // Missing complete sentinel fails closed even when reducer uses items.next()
         String truncated = "{\"event\":\"item\",\"inputTypeId\":\"LineItem\",\"payload\":{\"id\":\"a\",\"index\":1,\"portion\":1.0}}\n";
         JsonNode errRoot = TpfHostJson.readStrictObject(
-            postStreamingSigned("/tpf/functions/sum-lines/reduce", truncated).body());
+            postStreamingSigned("/tpf/functions/first-line/reduce", truncated).body());
         assertEquals("ERROR", errRoot.path("status").asText());
     }
 
     @Test
-    void manyToManySupportsTrueInterleavedFullDuplexOverRawHttp11Socket() throws Exception {
+    void manyToManySupportsTrueInterleavedFullDuplexOverRawHttp11SocketWithUtf8AndPromptRejection() throws Exception {
         String path = "/tpf/functions/transform-duplex/duplex";
         String timestamp = Instant.now().toString();
         String nonce = UUID.randomUUID().toString();
@@ -338,7 +373,7 @@ class TpfSpringHostIntegrationTest {
             socket.setSoTimeout(5_000);
             socket.setTcpNoDelay(true);
             OutputStream out = socket.getOutputStream();
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+            BufferedInputStream in = new BufferedInputStream(socket.getInputStream());
 
             // 1. Send HTTP/1.1 chunked headers ONLY (no request items yet)
             String headers = "POST " + path + " HTTP/1.1\r\n"
@@ -357,24 +392,24 @@ class TpfSpringHostIntegrationTest {
             out.flush();
 
             // 2. Assert HTTP/1.1 200 OK response headers arrive BEFORE any request chunk is written!
-            String statusLine = in.readLine();
+            String statusLine = readAsciiLine(in);
             assertNotNull(statusLine);
             assertTrue(statusLine.startsWith("HTTP/1.1 200"), "Expected 200 OK immediately, got: " + statusLine);
             String hdr;
-            while ((hdr = in.readLine()) != null && !hdr.isEmpty()) {
+            while ((hdr = readAsciiLine(in)) != null && !hdr.isEmpty()) {
                 // consume headers
             }
 
-            // 3. Send chunk 1 and verify output item 1 arrives BEFORE chunk 2 is sent!
-            writeChunk(out, "{\"event\":\"item\",\"inputTypeId\":\"LineItem\",\"payload\":{\"id\":\"first\",\"index\":1,\"portion\":3.5}}\n");
+            // 3. Send chunk 1 with multi-byte UTF-8 ("café") and verify output item 1 arrives BEFORE chunk 2!
+            writeChunk(out, "{\"event\":\"item\",\"inputTypeId\":\"LineItem\",\"payload\":{\"id\":\"café-1\",\"index\":1,\"portion\":3.5}}\n");
             JsonNode out1 = readNextChunkedNdjsonFrame(in);
             assertEquals("item", out1.path("event").asText());
             assertEquals("LineItem", out1.path("outputTypeId").asText());
-            assertEquals("first-ack", out1.path("payload").path("id").asText());
+            assertEquals("café-1-ack", out1.path("payload").path("id").asText());
             assertEquals(10, out1.path("payload").path("index").asInt());
             assertEquals(new BigDecimal("7.0"), out1.path("payload").path("portion").decimalValue());
 
-            // 4. Now send chunk 2 and verify output item 2 arrives BEFORE complete is sent!
+            // 4. Send chunk 2 and verify output item 2 arrives BEFORE complete is sent!
             writeChunk(out, "{\"event\":\"item\",\"inputTypeId\":\"LineItem\",\"payload\":{\"id\":\"second\",\"index\":2,\"portion\":5.25}}\n");
             JsonNode out2 = readNextChunkedNdjsonFrame(in);
             assertEquals("item", out2.path("event").asText());
@@ -389,11 +424,27 @@ class TpfSpringHostIntegrationTest {
             JsonNode done = readNextChunkedNdjsonFrame(in);
             assertEquals("complete", done.path("event").asText());
         }
+
+        // Verify unauthorized duplex request responds 401 IMMEDIATELY without waiting for request body EOF
+        try (Socket unauthSocket = new Socket("127.0.0.1", port)) {
+            unauthSocket.setSoTimeout(3_000);
+            OutputStream out = unauthSocket.getOutputStream();
+            BufferedInputStream in = new BufferedInputStream(unauthSocket.getInputStream());
+            String headers = "POST " + path + " HTTP/1.1\r\n"
+                + "Host: 127.0.0.1:" + port + "\r\n"
+                + "Content-Type: application/x-ndjson\r\n"
+                + "Transfer-Encoding: chunked\r\n"
+                + "Connection: close\r\n\r\n";
+            out.write(headers.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+            String statusLine = readAsciiLine(in);
+            assertTrue(statusLine.startsWith("HTTP/1.1 401"), "Expected immediate 401, got: " + statusLine);
+        }
     }
 
     @Test
     void loopbackChallengeAndTier2QueryCommandAndReconcileWorkWithSecretIsolation() throws Exception {
-        // Loopback challenge
+        // Loopback challenge verified independently against protocol specification (domain + challenge)
         String challenge = "0123456789abcdef0123456789abcdef";
         HttpResponse<String> chalResp = postSigned("/tpf/connector/auth/challenge",
             "{\"challenge\":\"" + challenge + "\"}", Map.of());
@@ -401,8 +452,7 @@ class TpfSpringHostIntegrationTest {
         JsonNode chalJson = TpfHostJson.readStrictObject(chalResp.body());
         assertEquals("OK", chalJson.path("status").asText());
         assertEquals(challenge, chalJson.path("challenge").asText());
-        String expectedProof = new TpfHostRequestAuthenticator(SECRET, java.time.Duration.ofMinutes(5), 16)
-            .computeLoopbackChallengeProof(challenge);
+        String expectedProof = independentHmacHex(SECRET, "tpf-connector-listener-auth-v1\n" + challenge);
         assertEquals(expectedProof, chalJson.path("proof").asText());
 
         // Query FOUND
@@ -511,6 +561,12 @@ class TpfSpringHostIntegrationTest {
         return http.send(req, HttpResponse.BodyHandlers.ofString());
     }
 
+    private static String independentHmacHex(String secret, String message) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        return HexFormat.of().formatHex(mac.doFinal(message.getBytes(StandardCharsets.UTF_8)));
+    }
+
     private static List<JsonNode> parseNdjsonLines(String body) throws IOException {
         List<JsonNode> frames = new ArrayList<>();
         for (String rawLine : body.split("\n")) {
@@ -530,9 +586,23 @@ class TpfSpringHostIntegrationTest {
         out.flush();
     }
 
-    private static JsonNode readNextChunkedNdjsonFrame(BufferedReader in) throws IOException {
+    private static String readAsciiLine(InputStream in) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream(128);
+        int b;
+        while ((b = in.read()) != -1) {
+            if (b == '\n') {
+                byte[] raw = buf.toByteArray();
+                int len = raw.length > 0 && raw[raw.length - 1] == '\r' ? raw.length - 1 : raw.length;
+                return new String(raw, 0, len, StandardCharsets.ISO_8859_1);
+            }
+            buf.write(b);
+        }
+        return buf.size() == 0 ? null : buf.toString(StandardCharsets.ISO_8859_1);
+    }
+
+    private static JsonNode readNextChunkedNdjsonFrame(InputStream in) throws IOException {
         while (true) {
-            String sizeLine = in.readLine();
+            String sizeLine = readAsciiLine(in);
             if (sizeLine == null) {
                 throw new IOException("Unexpected EOF waiting for chunked NDJSON frame");
             }
@@ -548,7 +618,7 @@ class TpfSpringHostIntegrationTest {
             if (size == 0) {
                 throw new IOException("Stream ended before expected NDJSON frame");
             }
-            char[] buf = new char[size];
+            byte[] buf = new byte[size];
             int read = 0;
             while (read < size) {
                 int n = in.read(buf, read, size - read);
@@ -558,8 +628,8 @@ class TpfSpringHostIntegrationTest {
                 read += n;
             }
             // consume trailing CRLF after chunk payload
-            in.readLine();
-            String text = new String(buf).trim();
+            readAsciiLine(in);
+            String text = new String(buf, StandardCharsets.UTF_8).trim();
             if (!text.isEmpty()) {
                 return TpfHostJson.readStrictObject(text);
             }

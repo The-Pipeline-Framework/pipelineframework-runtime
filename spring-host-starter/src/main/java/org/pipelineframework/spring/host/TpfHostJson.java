@@ -41,6 +41,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 public final class TpfHostJson {
 
     private static final ObjectMapper MAPPER = createExactMapper();
+    private static final ObjectMapper BINDING_MAPPER = createBindingMapper();
     private static final ObjectReader STRICT_READER = MAPPER.reader()
         .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
         .with(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
@@ -57,12 +58,16 @@ public final class TpfHostJson {
     }
 
     public static ObjectMapper createExactMapper() {
+        return createBindingMapper()
+            .enable(JsonGenerator.Feature.WRITE_BIGDECIMAL_AS_PLAIN);
+    }
+
+    private static ObjectMapper createBindingMapper() {
         return new ObjectMapper()
             .registerModule(new Jdk8Module())
             .registerModule(new JavaTimeModule())
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
             .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
-            .enable(JsonGenerator.Feature.WRITE_BIGDECIMAL_AS_PLAIN)
             .configure(JsonNodeFeature.STRIP_TRAILING_BIGDECIMAL_ZEROES, false);
     }
 
@@ -82,9 +87,9 @@ public final class TpfHostJson {
         if (JsonNode.class.isAssignableFrom(targetType.getRawClass())) {
             return node;
         }
-        // Re-serialize via exact JSON bytes so BigDecimal scale and int64 values bind cleanly to Java types.
-        byte[] exactBytes = MAPPER.writeValueAsBytes(node);
-        return MAPPER.readValue(exactBytes, targetType);
+        // Preserve exact BigDecimal scale (including negative scales like 1E+3) and int64 values.
+        byte[] exactBytes = BINDING_MAPPER.writeValueAsBytes(node);
+        return BINDING_MAPPER.readValue(exactBytes, targetType);
     }
 
     public static JsonNode encodeValue(Object value) {

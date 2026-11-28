@@ -23,8 +23,14 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
 import org.pipelineframework.orchestrator.TransitionWorkerSignature;
@@ -48,6 +54,64 @@ class TpfHostRequestAuthenticatorTest {
         Optional<String> replay = auth.verify("POST", "/tpf/functions/step-a", ts, nonce, sig, body);
         assertTrue(replay.isPresent());
         assertTrue(replay.orElseThrow().contains("replayed"));
+    }
+
+    @Test
+    void concurrentRedemptionOfSameNonceAcceptsExactlyOnce() throws Exception {
+        Instant now = Instant.parse("2026-11-28T12:00:00Z");
+        Clock clock = Clock.fixed(now, ZoneOffset.UTC);
+        TpfHostRequestAuthenticator auth = new TpfHostRequestAuthenticator(SECRET, Duration.ofMinutes(5), 16, clock);
+
+        byte[] body = "{\"payload\":{\"id\":\"race\"}}".getBytes(StandardCharsets.UTF_8);
+        String ts = now.toString();
+        String nonce = "nonce-race";
+        String sig = TransitionWorkerSignature.sign(SECRET, "POST", "/tpf/functions/step-a", ts, nonce, body);
+
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch go = new CountDownLatch(1);
+        try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
+            Future<Optional<String>> f1 = pool.submit(() -> {
+                ready.countDown();
+                go.await();
+                return auth.verify("POST", "/tpf/functions/step-a", ts, nonce, sig, body);
+            });
+            Future<Optional<String>> f2 = pool.submit(() -> {
+                ready.countDown();
+                go.await();
+                return auth.verify("POST", "/tpf/functions/step-a", ts, nonce, sig, body);
+            });
+            ready.await();
+            go.countDown();
+            Optional<String> r1 = f1.get();
+            Optional<String> r2 = f2.get();
+            int accepted = (r1.isEmpty() ? 1 : 0) + (r2.isEmpty() ? 1 : 0);
+            assertEquals(1, accepted, "Exactly one concurrent verification of the same nonce must succeed");
+        }
+    }
+
+    @Test
+    void retainsForwardTimestampNonceThroughFullInclusiveExpiryBoundary() {
+        AtomicReference<Instant> currentTime = new AtomicReference<>(Instant.parse("2026-11-28T12:00:00Z"));
+        Clock mutableClock = new Clock() {
+            @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+            @Override public Clock withZone(ZoneId zone) { return this; }
+            @Override public Instant instant() { return currentTime.get(); }
+        };
+        Duration skew = Duration.ofMinutes(5);
+        TpfHostRequestAuthenticator auth = new TpfHostRequestAuthenticator(SECRET, skew, 16, mutableClock);
+
+        // Request signed 4 minutes ahead of host clock -> valid until 12:09:00Z inclusive
+        String aheadTs = Instant.parse("2026-11-28T12:04:00Z").toString();
+        byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
+        String sig = TransitionWorkerSignature.sign(SECRET, "POST", "/tpf/functions/s", aheadTs, "ahead-nonce", body);
+
+        assertEquals(Optional.empty(), auth.verify("POST", "/tpf/functions/s", aheadTs, "ahead-nonce", sig, body));
+
+        // Advance host clock to 12:09:00Z (exact inclusive expiry boundary of signature)
+        currentTime.set(Instant.parse("2026-11-28T12:09:00Z"));
+        Optional<String> replayAtBoundary = auth.verify("POST", "/tpf/functions/s", aheadTs, "ahead-nonce", sig, body);
+        assertTrue(replayAtBoundary.isPresent());
+        assertTrue(replayAtBoundary.orElseThrow().contains("replayed"));
     }
 
     @Test
